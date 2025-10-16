@@ -66,8 +66,7 @@ def register_builtin_routers(dp: Dispatcher, cfg: Config) -> None:
     @user_router.message(CommandStart())
     async def on_start(message: Message) -> None:
         await message.answer(
-            "Welcome to AJIB VPN Bot.\n\n"
-            "Use the menu or send /help to see available commands."
+            "Welcome to AJIB VPN Bot.\n\nUse the menu or send /help to see available commands."
         )
 
     @user_router.message(Command("help"))
@@ -85,23 +84,7 @@ def register_builtin_routers(dp: Dispatcher, cfg: Config) -> None:
     async def on_ping(message: Message) -> None:
         await message.answer("pong")
 
-    # Admin router (skeleton)
-    admin_router = Router(name="admin")
-    admin_router.message.filter(AdminFilter(cfg.admin_ids))
-
-    @admin_router.message(Command("admin"))
-    async def on_admin(message: Message) -> None:
-        await message.answer(
-            "Admin panel (skeleton).\n\n"
-            "- Backup/Restore\n"
-            "- Broadcast\n"
-            "- Plans (Add/Edit)\n"
-            "\n"
-            "Use the upcoming admin menu to navigate."
-        )
-
     dp.include_router(user_router)
-    dp.include_router(admin_router)
 
     # Attempt to include optional, more complete routers
     with contextlib.suppress(Exception):
@@ -129,10 +112,14 @@ async def _set_bot_commands(bot: Bot) -> None:
 
 
 def create_bot(cfg: Config) -> Bot:
-    """Create Bot instance with configured parse mode."""
+    """Create Bot instance with configured default settings."""
     return Bot(
         token=cfg.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML,
+            link_preview_is_disabled=True,
+            protect_content=True,
+        ),
     )
 
 
