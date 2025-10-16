@@ -20,6 +20,7 @@ import signal
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -129,7 +130,10 @@ async def _set_bot_commands(bot: Bot) -> None:
 
 def create_bot(cfg: Config) -> Bot:
     """Create Bot instance with configured parse mode."""
-    return Bot(token=cfg.bot_token, parse_mode=ParseMode.HTML)
+    return Bot(
+        token=cfg.bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
 
 
 def create_dispatcher(cfg: Config) -> Dispatcher:
