@@ -22,7 +22,7 @@ from typing import Optional
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import BaseFilter, Command, CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, BotCommand
 
@@ -35,22 +35,9 @@ __all__ = [
     "create_bot",
     "create_dispatcher",
     "register_builtin_routers",
-    "AdminFilter",
 ]
 
 log = get_logger(__name__)
-
-
-class AdminFilter(BaseFilter):
-    """Allow messages only from configured admin IDs."""
-
-    def __init__(self, admin_ids: set[int]):
-        self._admin_ids = set(admin_ids)
-
-    async def __call__(self, message: Message) -> bool:
-        if not message.from_user:
-            return False
-        return message.from_user.id in self._admin_ids
 
 
 def register_builtin_routers(dp: Dispatcher, cfg: Config) -> None:
@@ -88,16 +75,16 @@ def register_builtin_routers(dp: Dispatcher, cfg: Config) -> None:
 
     # Attempt to include optional, more complete routers
     with contextlib.suppress(Exception):
-        from ajib.bot.handlers.customer import router as customer_router  # type: ignore
-
-        dp.include_router(customer_router)
-        log.info("Registered external router: ajib.bot.handlers.customer")
-
-    with contextlib.suppress(Exception):
         from ajib.bot.handlers.admin import router as admin_ext_router  # type: ignore
 
         dp.include_router(admin_ext_router)
         log.info("Registered external router: ajib.bot.handlers.admin")
+
+    with contextlib.suppress(Exception):
+        from ajib.bot.handlers.customer import router as customer_router  # type: ignore
+
+        dp.include_router(customer_router)
+        log.info("Registered external router: ajib.bot.handlers.customer")
 
 
 async def _set_bot_commands(bot: Bot) -> None:
