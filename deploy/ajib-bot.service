@@ -1,0 +1,59 @@
+# AJIB Telegram Bot — systemd service unit
+# Save this file as: /etc/systemd/system/ajib-bot.service
+# Then run:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ajib-bot
+#
+# Paths assume the installer places the app at /opt/ajib with a venv in /opt/ajib/venv
+# and the repository checked out to /opt/ajib/app.
+# The environment variables are loaded from /opt/ajib/.env
+
+[Unit]
+Description=AJIB Telegram Bot (VPN customers/resellers/admin)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Run as a dedicated service user created by the installer
+User=ajib
+Group=ajib
+
+# Working directory where the repository is cloned
+WorkingDirectory=/opt/ajib/app
+
+# Load environment variables (bot token, admin ids, API keys, etc.)
+EnvironmentFile=/opt/ajib/.env
+
+# Ensure Python prints unbuffered logs to journal
+Environment=PYTHONUNBUFFERED=1
+# Ensure the Python module import path includes the repository
+Environment=PYTHONPATH=/opt/ajib/app
+
+# Launch the bot using the virtual environment Python interpreter
+ExecStart=/opt/ajib/venv/bin/python -m ajib.bot.core.bot
+
+# Basic restart policy
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+# Resource and security hardening (tune as needed)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/ajib
+UMask=0077
+# These can be tightened further depending on environment:
+# RestrictNamespaces=true
+# RestrictSUIDSGID=true
+# LockPersonality=true
+
+# Log to journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

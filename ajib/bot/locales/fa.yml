@@ -1,0 +1,93 @@
+# Persian (fa) locale for AJIB Telegram Bot
+# ساختار کلید-مقدار تخت برای سادگی پیاده‌سازی.
+# جاگذاری‌هایی مانند {audience}، {os}، {url} در کد جایگزین می‌شوند.
+
+# Customer — منوی اصلی و اقدامات
+menu_title: "منوی اصلی"
+btn_configs: "🧾 کانفیگ‌های من"
+btn_purchase: "🛒 خرید"
+btn_test: "🎁 تست ۱ گیگ"
+btn_downloads: "💻 دانلود کلاینت"
+btn_support: "🆘 پشتیبانی"
+btn_language: "🌐 زبان"
+btn_back: "⬅️ بازگشت"
+
+# Customer — زبان
+lang_title: "زبان خود را انتخاب کنید"
+lang_en: "English"
+lang_fa: "فارسی"
+lang_switched: "Language set to English."
+lang_switched_fa: "زبان به فارسی تغییر کرد."
+
+# Customer — عمومی
+welcome: "یکی از گزینه‌های زیر را انتخاب کنید."
+unknown_action: "دستور نامشخص. از منو استفاده کنید."
+
+# Customer — کانفیگ‌ها
+configs_loading: "در حال دریافت کانفیگ‌های فعال شما..."
+configs_empty: "شما در حال حاضر کانفیگ فعالی ندارید."
+
+# Customer — خرید
+purchase_intro: "فرایند خرید به زودی اضافه می‌شود."
+
+# Customer — تست
+test_intro: "کانفیگ تست ۱ گیگ به زودی ارائه می‌شود."
+
+# Customer — دانلودها
+downloads_title: "لینک‌های دانلود کلاینت:"
+downloads_item: "• {os}: {url}"
+downloads_empty: "لینک‌های دانلود کلاینت پیکربندی نشده‌اند."
+
+# Customer — پشتیبانی
+support_title: "پشتیبانی"
+support_contact: "ارتباط با پشتیبانی: {contact}"
+support_unset: "راه ارتباط با پشتیبانی تنظیم نشده است."
+
+# Admin — عمومی
+welcome_admin: "پنل ادمین. یکی از گزینه‌ها را انتخاب کنید."
+back: "⬅️ بازگشت"
+cancel: "✖️ لغو"
+
+# Admin — منوی اصلی
+menu_backup: "🧰 بکاپ/بازیابی"
+menu_broadcast: "📣 ارسال همگانی"
+menu_plans: "💲 پلن‌ها"
+menu_close: "🔚 خروج"
+
+# Admin — بکاپ / بازیابی
+backup_menu_title: "بکاپ/بازیابی"
+backup_create: "🧩 ساخت بکاپ"
+backup_restore: "🧿 بازیابی"
+backup_created: "بکاپ ایجاد شد."
+backup_failed: "ایجاد بکاپ ناموفق بود."
+backup_sending: "در حال ارسال فایل بکاپ..."
+backup_send_failed: "ارسال فایل بکاپ ممکن نشد."
+restore_send_file: "فایل بکاپ .tar.gz را برای بازیابی ارسال کنید."
+restore_received: "فایل بکاپ دریافت شد. فرآیند بازیابی در این نسخه آزمایشی است."
+restore_failed: "دریافت یا پردازش فایل بکاپ ناموفق بود."
+
+# Admin — ارسال همگانی
+broadcast_title: "ارسال همگانی — مخاطب را انتخاب کنید:"
+audience_active: "فعال"
+audience_expired: "منقضی"
+audience_test: "تست"
+audience_all: "همه"
+broadcast_enter_text: "پیام خود را برای ارسال به کاربران {audience} ارسال کنید."
+broadcast_sending: "ارسال همگانی به {audience} در صف قرار گرفت. (آزمایشی)"
+broadcast_cancelled: "ارسال همگانی لغو شد."
+
+# Admin — پلن‌ها
+plans_title: "پلن‌ها — انتخاب کنید:"
+plans_list: "📃 لیست پلن‌ها"
+plans_add: "➕ افزودن پلن"
+plans_edit: "✏️ ویرایش پلن"
+plans_none: "هیچ پلنی تنظیم نشده است."
+plans_list_header: "پلن‌های تنظیم‌شده:"
+plans_add_prompt: "پلن را به صورت JSON ارسال کنید، مثلا:\n{\"id\":\"basic\",\"name\":\"Basic\",\"price\":5.0,\"duration_days\":30,\"data_gb\":50,\"backend_plan_id\":\"BASIC_30\"}"
+plans_add_ok: "پلن اضافه شد."
+plans_add_err: "JSON نامعتبر یا خطا در ذخیره‌سازی."
+plans_edit_prompt_id: "شناسه (id) پلنی که می‌خواهید ویرایش کنید را ارسال کنید."
+plans_edit_prompt_json: "JSON را برای اعمال تغییرات ارسال کنید (ارسال بخشی از فیلدها مجاز است)."
+plans_edit_ok: "پلن بروزرسانی شد."
+plans_edit_err: "پلن یافت نشد یا JSON نامعتبر."
+plans_edit_cancel: "ویرایش لغو شد."

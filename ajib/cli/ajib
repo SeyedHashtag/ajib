@@ -1,0 +1,511 @@
+#!/usr/bin/env bash
+# AJIB CLI — manage the AJIB Telegram bot service on Ubuntu
+# Provides: status, logs, restart, update, uninstall, config get/set/unset, backup create/list/restore
+
+set -euo pipefail
+
+# -----------------------------
+# Constants and default paths
+# -----------------------------
+SERVICE_NAME="ajib-bot"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+INSTALL_DIR="/opt/ajib"
+APP_DIR="${INSTALL_DIR}/app"
+VENV_DIR="${INSTALL_DIR}/venv"
+ENV_FILE="${INSTALL_DIR}/.env"
+BACKUPS_DIR="${INSTALL_DIR}/backups"
+
+REPO_URL_DEFAULT="https://github.com/SeyedHashtag/ajib.git"
+REPO_BRANCH_DEFAULT="main"
+
+PY_ENTRY="ajib.bot.core.bot"
+PY="${VENV_DIR}/bin/python"
+PIP="${VENV_DIR}/bin/pip"
+
+# sudo helper
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  SUDO="sudo"
+else
+  SUDO=""
+fi
+
+# Colors (optional)
+BOLD="$(printf '\033[1m')"
+DIM="$(printf '\033[2m')"
+RED="$(printf '\033[31m')"
+GREEN="$(printf '\033[32m')"
+YELLOW="$(printf '\033[33m')"
+BLUE="$(printf '\033[34m')"
+RESET="$(printf '\033[0m')"
+
+# -----------------------------
+# Logging helpers
+# -----------------------------
+log() { printf "%s\n" "$*"; }
+info() { printf "%b[i]%b %s\n" "${BLUE}" "${RESET}" "$*"; }
+success() { printf "%b[✓]%b %s\n" "${GREEN}" "${RESET}" "$*"; }
+warn() { printf "%b[!]%b %s\n" "${YELLOW}" "${RESET}" "$*"; }
+error() { printf "%b[x]%b %s\n" "${RED}" "${RESET}" "$*" >&2; }
+
+# -----------------------------
+# Usage
+# -----------------------------
+usage() {
+  cat <<EOF
+${BOLD}AJIB CLI${RESET} — manage the AJIB Telegram bot
+
+Usage:
+  ajib status
+  ajib logs [-f|--follow]
+  ajib start | stop | restart
+  ajib enable | disable
+
+  ajib update [--repo URL] [--branch NAME]
+    Pull the latest code, install requirements, and restart the service.
+
+  ajib uninstall [--yes] [--keep-backups]
+    Stop/disable service, remove service/unit, and remove installation directory.
+
+  ajib config path
+  ajib config get KEY
+  ajib config set KEY VALUE
+  ajib config unset KEY
+
+  ajib backup create
+  ajib backup list
+  ajib backup restore /path/to/backup.tar.gz
+
+  ajib doctor
+  ajib help
+  ajib version
+EOF
+}
+
+# -----------------------------
+# System helpers
+# -----------------------------
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    error "Missing required command: $1"
+    exit 1
+  }
+}
+
+confirm() {
+  # confirm "Message?" -> returns 0 if yes
+  printf "%s [y/N]: " "$*"
+  read -r ans
+  case "${ans:-}" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_dirs() {
+  ${SUDO} mkdir -p "${INSTALL_DIR}" "${BACKUPS_DIR}"
+  ${SUDO} chown -R "${SUDO:+root:root}" "${INSTALL_DIR}" >/dev/null 2>&1 || true
+}
+
+ensure_env() {
+  ensure_dirs
+  if [ ! -f "${ENV_FILE}" ]; then
+    info "Creating ${ENV_FILE}"
+    ${SUDO} sh -c "umask 077 && touch '${ENV_FILE}'"
+  fi
+}
+
+# -----------------------------
+# ENV file operations
+# -----------------------------
+escape_value() {
+  # Wrap value in single quotes and escape internal single quotes
+  # Usage: esc=$(escape_value "some 'value'")
+  local val="$*"
+  # shellcheck disable=SC2001
+  val="$(printf "%s" "$val" | sed "s/'/'\"'\"'/g")"
+  printf "'%s'" "$val"
+}
+
+config_get() {
+  local key="$1"
+  ensure_env
+  if grep -E -q "^${key}=" "${ENV_FILE}"; then
+    # Extract raw value (keep quotes)
+    local raw
+    raw="$(grep -E "^${key}=" "${ENV_FILE}" | tail -n1 | sed -E "s/^${key}=//")"
+    # Strip outer quotes if any
+    # shellcheck disable=SC2001
+    raw="$(printf "%s" "$raw" | sed -E "s/^['\"]?(.*)['\"]?$/\1/")"
+    printf "%s\n" "$raw"
+  else
+    error "Key not found: ${key}"
+    return 1
+  fi
+}
+
+config_set() {
+  local key="$1"; shift
+  local val="$*"
+  ensure_env
+  local esc
+  esc="$(escape_value "${val}")"
+  if grep -E -q "^${key}=" "${ENV_FILE}"; then
+    ${SUDO} sed -i -E "s|^${key}=.*|${key}=${esc}|" "${ENV_FILE}"
+  else
+    ${SUDO} sh -c "printf '%s\n' '${key}=${esc}' >> '${ENV_FILE}'"
+  fi
+  success "Set ${key}"
+}
+
+config_unset() {
+  local key="$1"
+  ensure_env
+  if grep -E -q "^${key}=" "${ENV_FILE}"; then
+    ${SUDO} sed -i -E "/^${key}=.*/d" "${ENV_FILE}"
+    success "Unset ${key}"
+  else
+    warn "Key not present: ${key}"
+  fi
+}
+
+# -----------------------------
+# Git / Python / Venv
+# -----------------------------
+ensure_git() { need_cmd git; }
+ensure_python() { need_cmd python3; }
+ensure_venv() { need_cmd python3 -m venv; }
+
+create_or_update_repo() {
+  local repo_url="${1:-${AJIB_REPO_URL:-${REPO_URL_DEFAULT}}}"
+  local branch="${2:-${AJIB_REPO_BRANCH:-${REPO_BRANCH_DEFAULT}}}"
+
+  ensure_git
+  ensure_dirs
+
+  if [ -d "${APP_DIR}/.git" ]; then
+    info "Updating repository at ${APP_DIR}"
+    (cd "${APP_DIR}" && git fetch --all --tags && git checkout "${branch}" && git pull --ff-only origin "${branch}")
+  else
+    info "Cloning repo ${repo_url} (branch: ${branch}) into ${APP_DIR}"
+    ${SUDO} rm -rf "${APP_DIR}"
+    ${SUDO} mkdir -p "${APP_DIR}"
+    ${SUDO} chown -R "${USER:-$(id -un)}":"${USER:-$(id -un)}" "${APP_DIR}" || true
+    git clone --depth 1 -b "${branch}" "${repo_url}" "${APP_DIR}"
+  fi
+}
+
+setup_venv_and_deps() {
+  ensure_python
+  ensure_dirs
+  if [ ! -x "${PY}" ]; then
+    info "Creating virtualenv at ${VENV_DIR}"
+    ${SUDO} rm -rf "${VENV_DIR}"
+    python3 -m venv "${VENV_DIR}"
+  fi
+  info "Installing/upgrading dependencies"
+  "${PIP}" install --upgrade pip wheel
+  if [ -f "${APP_DIR}/ajib/requirements.txt" ]; then
+    "${PIP}" install -r "${APP_DIR}/ajib/requirements.txt"
+  elif [ -f "${APP_DIR}/requirements.txt" ]; then
+    "${PIP}" install -r "${APP_DIR}/requirements.txt"
+  else
+    warn "requirements.txt not found; skipping dependency install"
+  fi
+}
+
+# -----------------------------
+# systemd helpers
+# -----------------------------
+systemctl_do() {
+  # Proxy to systemctl, tolerate no-op errors minimally
+  ${SUDO} systemctl "$@" || true
+}
+
+service_status() { systemctl_do status "${SERVICE_NAME}"; }
+service_logs() {
+  local follow="${1:-}"
+  if [ "${follow}" = "-f" ] || [ "${follow}" = "--follow" ]; then
+    ${SUDO} journalctl -u "${SERVICE_NAME}" -f
+  else
+    ${SUDO} journalctl -u "${SERVICE_NAME}" --no-pager -n 200
+  fi
+}
+service_start() { systemctl_do start "${SERVICE_NAME}"; }
+service_stop() { systemctl_do stop "${SERVICE_NAME}"; }
+service_restart() { systemctl_do restart "${SERVICE_NAME}"; }
+service_enable() { systemctl_do enable "${SERVICE_NAME}"; }
+service_disable() { systemctl_do disable "${SERVICE_NAME}"; }
+
+# -----------------------------
+# Update
+# -----------------------------
+cmd_update() {
+  local repo=""
+  local branch=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="${2:-}"; shift 2 ;;
+      --branch) branch="${2:-}"; shift 2 ;;
+      *) error "Unknown flag: $1"; usage; exit 1 ;;
+    esac
+  done
+
+  create_or_update_repo "${repo:-}" "${branch:-}"
+  setup_venv_and_deps
+  info "Restarting service"
+  service_restart
+  success "Update complete"
+}
+
+# -----------------------------
+# Uninstall
+# -----------------------------
+cmd_uninstall() {
+  local yes="no"
+  local keep_backups="no"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes="yes"; shift ;;
+      --keep-backups) keep_backups="yes"; shift ;;
+      *) error "Unknown flag: $1"; usage; exit 1 ;;
+    esac
+  done
+
+  if [ "${yes}" != "yes" ]; then
+    confirm "This will stop and remove AJIB. Continue?" || { warn "Aborted."; exit 0; }
+  fi
+
+  info "Stopping and disabling service"
+  service_stop
+  service_disable
+
+  if [ -f "${SERVICE_FILE}" ]; then
+    info "Removing systemd unit ${SERVICE_FILE}"
+    ${SUDO} rm -f "${SERVICE_FILE}"
+    ${SUDO} systemctl daemon-reload
+  fi
+
+  if [ "${keep_backups}" = "yes" ] && [ -d "${BACKUPS_DIR}" ]; then
+    info "Preserving backups at ${BACKUPS_DIR}"
+    # Move backups out before removing install dir
+    TMP_BKP="/tmp/ajib-backups-$(date +%s)"
+    ${SUDO} mkdir -p "${TMP_BKP}"
+    ${SUDO} cp -a "${BACKUPS_DIR}/." "${TMP_BKP}/" || true
+    ${SUDO} rm -rf "${INSTALL_DIR}"
+    ${SUDO} mkdir -p "${INSTALL_DIR}"
+    ${SUDO} mv "${TMP_BKP}" "${BACKUPS_DIR}"
+    success "Backups preserved in ${BACKUPS_DIR}"
+  else
+    info "Removing ${INSTALL_DIR}"
+    ${SUDO} rm -rf "${INSTALL_DIR}"
+  fi
+
+  success "AJIB uninstalled."
+}
+
+# -----------------------------
+# Config
+# -----------------------------
+cmd_config() {
+  local action="${1:-}"; shift || true
+  case "${action}" in
+    path)
+      printf "%s\n" "${ENV_FILE}"
+      ;;
+    get)
+      local key="${1:-}"; [ -n "${key}" ] || { error "Usage: ajib config get KEY"; exit 1; }
+      config_get "${key}"
+      ;;
+    set)
+      local key="${1:-}"; shift || true
+      [ -n "${key}" ] || { error "Usage: ajib config set KEY VALUE"; exit 1; }
+      [ $# -gt 0 ] || { error "Usage: ajib config set KEY VALUE"; exit 1; }
+      config_set "${key}" "$*"
+      ;;
+    unset)
+      local key="${1:-}"; [ -n "${key}" ] || { error "Usage: ajib config unset KEY"; exit 1; }
+      config_unset "${key}"
+      ;;
+    *)
+      error "Unknown config action: ${action}"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+# -----------------------------
+# Backup
+# -----------------------------
+sqlite_path_from_env() {
+  # Determine sqlite path from ENV_FILE (DATABASE_URL) or default
+  local db_url
+  db_url="$(grep -E '^DATABASE_URL=' "${ENV_FILE}" 2>/dev/null | sed -E 's/^DATABASE_URL=//')"
+  db_url="$(printf "%s" "${db_url:-}" | sed -E "s/^['\"]?(.*)['\"]?$/\1/")"
+  if [ -z "${db_url:-}" ]; then
+    printf "%s\n" "${INSTALL_DIR}/ajib.sqlite3"
+    return
+  fi
+  case "${db_url}" in
+    sqlite:*|sqlite3:*)
+      # strip prefix sqlite:// or sqlite3:// and leading slashes
+      local p="${db_url#sqlite://}"
+      p="${p#sqlite3://}"
+      # normalize leading triple slash (sqlite:////abs/path)
+      p="$(printf "%s" "$p" | sed -E 's#^/*#/#')"
+      printf "%s\n" "$p"
+      ;;
+    *)
+      # Non-sqlite databases: still use default sqlite path for local backup context
+      printf "%s\n" "${INSTALL_DIR}/ajib.sqlite3"
+      ;;
+  esac
+}
+
+cmd_backup_create() {
+  ensure_dirs
+  ensure_env
+  local ts; ts="$(date -u +%Y%m%d-%H%M%S)"
+  local out="${BACKUPS_DIR}/ajib-backup-${ts}.tar.gz"
+
+  local sqlite_path; sqlite_path="$(sqlite_path_from_env)"
+  info "Creating backup ${out}"
+
+  # Build tar with available items
+  local tmpdir; tmpdir="$(mktemp -d)"
+  mkdir -p "${tmpdir}/env" "${tmpdir}/db" "${tmpdir}/data"
+
+  if [ -f "${ENV_FILE}" ]; then
+    cp -a "${ENV_FILE}" "${tmpdir}/env/.env"
+  fi
+  if [ -f "${sqlite_path}" ]; then
+    cp -a "${sqlite_path}" "${tmpdir}/db/ajib.sqlite3"
+  fi
+  if [ -f "${INSTALL_DIR}/plans.json" ]; then
+    cp -a "${INSTALL_DIR}/plans.json" "${tmpdir}/data/plans.json"
+  fi
+
+  (cd "${tmpdir}" && tar -czf "${out}" .)
+  rm -rf "${tmpdir}"
+
+  success "Backup created: ${out}"
+  printf "%s\n" "${out}"
+}
+
+cmd_backup_list() {
+  if [ ! -d "${BACKUPS_DIR}" ]; then
+    warn "No backups directory at ${BACKUPS_DIR}"
+    exit 0
+  fi
+  ls -1 "${BACKUPS_DIR}"/*.tar.gz 2>/dev/null || true
+}
+
+cmd_backup_restore() {
+  local src="${1:-}"
+  [ -n "${src}" ] || { error "Usage: ajib backup restore /path/to/backup.tar.gz"; exit 1; }
+  [ -f "${src}" ] || { error "Backup not found: ${src}"; exit 1; }
+
+  ensure_dirs
+  ensure_env
+
+  info "Restoring from ${src}"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  tar -xzf "${src}" -C "${tmpdir}"
+
+  # Restore .env if present
+  if [ -f "${tmpdir}/env/.env" ]; then
+    ${SUDO} cp -a "${tmpdir}/env/.env" "${ENV_FILE}"
+    success "Restored ${ENV_FILE}"
+  fi
+
+  # Restore sqlite if present
+  local sqlite_path; sqlite_path="$(sqlite_path_from_env)"
+  if [ -f "${tmpdir}/db/ajib.sqlite3" ]; then
+    ${SUDO} mkdir -p "$(dirname "${sqlite_path}")"
+    ${SUDO} cp -a "${tmpdir}/db/ajib.sqlite3" "${sqlite_path}"
+    success "Restored database to ${sqlite_path}"
+  fi
+
+  # Restore plans.json if present
+  if [ -f "${tmpdir}/data/plans.json" ]; then
+    ${SUDO} cp -a "${tmpdir}/data/plans.json" "${INSTALL_DIR}/plans.json"
+    success "Restored plans.json"
+  fi
+
+  rm -rf "${tmpdir}"
+  info "Restarting service"
+  service_restart
+  success "Restore completed"
+}
+
+cmd_backup() {
+  local action="${1:-}"; shift || true
+  case "${action}" in
+    create) cmd_backup_create "$@" ;;
+    list) cmd_backup_list "$@" ;;
+    restore) cmd_backup_restore "$@" ;;
+    *) error "Unknown backup action: ${action}"; usage; exit 1 ;;
+  esac
+}
+
+# -----------------------------
+# Doctor
+# -----------------------------
+cmd_doctor() {
+  cat <<EOF
+AJIB doctor:
+  Service: ${SERVICE_NAME}
+  Install dir: ${INSTALL_DIR}
+  App dir: ${APP_DIR}
+  Venv: ${VENV_DIR}
+  Env file: ${ENV_FILE}
+  Backups: ${BACKUPS_DIR}
+  Repo URL: ${AJIB_REPO_URL:-${REPO_URL_DEFAULT}}
+  Repo Branch: ${AJIB_REPO_BRANCH:-${REPO_BRANCH_DEFAULT}}
+
+$(printf "Python: "; command -v python3 || echo "python3 not found")
+$(printf "Git: "; command -v git || echo "git not found")
+$(printf "Systemctl: "; command -v systemctl || echo "systemctl not found")
+
+Systemd status (short):
+$(systemctl_do is-enabled "${SERVICE_NAME}" >/dev/null 2>&1 && echo "  enabled" || echo "  disabled")
+EOF
+}
+
+# -----------------------------
+# Version
+# -----------------------------
+cmd_version() {
+  printf "AJIB CLI version: %s\n" "0.1.0"
+}
+
+# -----------------------------
+# Entry
+# -----------------------------
+main() {
+  local cmd="${1:-}"
+  case "${cmd}" in
+    status) shift; service_status "$@" ;;
+    logs) shift; service_logs "${1:-}" ;;
+    restart) shift; service_restart ;;
+    start) shift; service_start ;;
+    stop) shift; service_stop ;;
+    enable) shift; service_enable ;;
+    disable) shift; service_disable ;;
+    update) shift; cmd_update "$@" ;;
+    uninstall) shift; cmd_uninstall "$@" ;;
+    config) shift; cmd_config "$@" ;;
+    backup) shift; cmd_backup "$@" ;;
+    doctor) shift; cmd_doctor "$@" ;;
+    help|"") usage ;;
+    version) shift; cmd_version ;;
+    *)
+      error "Unknown command: ${cmd}"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

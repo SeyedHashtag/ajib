@@ -1,0 +1,93 @@
+# AJIB Python project .gitignore
+# Covers common Python artifacts, virtual environments, editor junk,
+# local env/config, logs, backups, and build outputs.
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Pyenv / tools
+.python-version
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.dmypy.json
+dmypy.json
+.pdm-python
+__pypackages__/
+
+# Package/build artifacts
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+wheels/
+share/python-wheels/
+*.egg-info/
+*.egg
+.installed.cfg
+*.manifest
+*.spec
+target/
+
+# Testing / Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+.cache
+nose2-junit.xml
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+htmlcov/
+.tox/
+.nox/
+
+# Sphinx docs
+docs/_build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+
+# Databases (local/dev)
+*.sqlite
+*.sqlite3
+*.db
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Editors/IDEs
+.vscode/
+.idea/
+*.iml
+
+# Application runtime data (kept out of VCS)
+backups/
+plans.json

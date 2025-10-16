@@ -1,0 +1,93 @@
+# English locale for AJIB Telegram Bot
+# Flat key-value structure to keep implementation simple.
+# Placeholders like {audience}, {os}, {url} will be interpolated in code.
+
+# Customer — Main menu and actions
+menu_title: "Main Menu"
+btn_configs: "🧾 My Configs"
+btn_purchase: "🛒 Purchase"
+btn_test: "🎁 1GB Test"
+btn_downloads: "💻 Client Downloads"
+btn_support: "🆘 Support"
+btn_language: "🌐 Language"
+btn_back: "⬅️ Back"
+
+# Customer — Language
+lang_title: "Select your language"
+lang_en: "English"
+lang_fa: "فارسی"
+lang_switched: "Language set to English."
+lang_switched_fa: "Language switched to Persian."
+
+# Customer — General
+welcome: "Choose an option from the menu below."
+unknown_action: "Unknown action. Use the menu."
+
+# Customer — Configs
+configs_loading: "Fetching your active configs..."
+configs_empty: "You have no active configs yet."
+
+# Customer — Purchase
+purchase_intro: "Purchase flow is under construction."
+
+# Customer — Test
+test_intro: "A 1GB test config will be provided here. (Coming soon)"
+
+# Customer — Downloads
+downloads_title: "Client download links:"
+downloads_item: "• {os}: {url}"
+downloads_empty: "No client download links have been configured yet."
+
+# Customer — Support
+support_title: "Support"
+support_contact: "Contact support: {contact}"
+support_unset: "Support contact has not been configured."
+
+# Admin — Generic
+welcome_admin: "Admin panel. Choose an option."
+back: "⬅️ Back"
+cancel: "✖️ Cancel"
+
+# Admin — Main menu
+menu_backup: "🧰 Backup/Restore"
+menu_broadcast: "📣 Broadcast"
+menu_plans: "💲 Plans"
+menu_close: "🔚 Close"
+
+# Admin — Backup / Restore
+backup_menu_title: "Backup/Restore"
+backup_create: "🧩 Create Backup"
+backup_restore: "🧿 Restore"
+backup_created: "Backup created."
+backup_failed: "Backup failed."
+backup_sending: "Sending backup file..."
+backup_send_failed: "Could not send backup file."
+restore_send_file: "Send a backup .tar.gz file to restore."
+restore_received: "Backup file received. Restore process is a stub in this skeleton."
+restore_failed: "Failed to accept or process the backup file."
+
+# Admin — Broadcast
+broadcast_title: "Broadcast — choose audience:"
+audience_active: "Active"
+audience_expired: "Expired"
+audience_test: "Test"
+audience_all: "All"
+broadcast_enter_text: "Send the message to broadcast to {audience} users."
+broadcast_sending: "Broadcast queued to {audience}. (skeleton)"
+broadcast_cancelled: "Broadcast cancelled."
+
+# Admin — Plans
+plans_title: "Plans — choose:"
+plans_list: "📃 List Plans"
+plans_add: "➕ Add Plan"
+plans_edit: "✏️ Edit Plan"
+plans_none: "No plans configured."
+plans_list_header: "Configured plans:"
+plans_add_prompt: "Send plan JSON, for example:\n{\"id\":\"basic\",\"name\":\"Basic\",\"price\":5.0,\"duration_days\":30,\"data_gb\":50,\"backend_plan_id\":\"BASIC_30\"}"
+plans_add_ok: "Plan added."
+plans_add_err: "Invalid JSON or write error."
+plans_edit_prompt_id: "Send the plan 'id' you want to edit."
+plans_edit_prompt_json: "Send JSON to merge into the plan (partial fields allowed)."
+plans_edit_ok: "Plan updated."
+plans_edit_err: "Plan not found or invalid JSON."
+plans_edit_cancel: "Edit cancelled."
