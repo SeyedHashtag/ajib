@@ -203,11 +203,11 @@ prompt_bot_credentials() {
 
   if [ -z "${token}" ]; then
     printf "Enter your Telegram Bot API token: "
-    read -r token
+    read -r token </dev/tty
   fi
   if [ -z "${admin_id}" ]; then
     printf "Enter the primary Admin numeric ID: "
-    read -r admin_id
+    read -r admin_id </dev/tty
   fi
 
   if [ -z "${token}" ]; then
@@ -237,6 +237,36 @@ prompt_bot_credentials() {
 # -----------------------------
 main() {
   need_root
+
+  # Print banner
+  cat <<'BANNER'
+  ╔═══════════════════════════════════════════════╗
+  ║                                               ║
+  ║            AJIB Installer v0.1.0              ║
+  ║     Modular Telegram Bot for VPN Business     ║
+  ║                                               ║
+  ╚═══════════════════════════════════════════════╝
+BANNER
+  echo ""
+
+  # Check if running non-interactively
+  if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_ADMIN_ID:-}" ]; then
+    info "Running in non-interactive mode (credentials provided via environment)"
+  else
+    info "Running in interactive mode - you will be prompted for credentials"
+    if ! [ -t 0 ]; then
+      warn "Detected piped input (curl | bash)"
+      info "Input will be read from /dev/tty"
+      if ! [ -c /dev/tty ]; then
+        err "Cannot read from /dev/tty. Please run the installer directly or set environment variables:"
+        err "  export TELEGRAM_BOT_TOKEN='your_token'"
+        err "  export TELEGRAM_ADMIN_ID='your_admin_id'"
+        err "  curl ... | sudo -E bash"
+        exit 1
+      fi
+    fi
+  fi
+  echo ""
 
   info "Checking base dependencies (git, python3, venv, curl, ca-certificates)"
   # Install base deps if missing

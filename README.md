@@ -10,7 +10,7 @@
 
 **Simple to deploy · Easy to manage · Built for scale**
 
-[Features](#-features) • [Quick Start](#-quick-start) • [Documentation](#-documentation) • [CLI](#-the-ajib-cli)
+[Features](#-features) • [Quick Start](#-quick-start) • [Documentation](#-documentation) • [CLI](#-the-ajib-cli) • [Quickstart Guide](QUICKSTART.md)
 
 </div>
 
@@ -95,17 +95,37 @@ AJIB is a production-ready Telegram bot for VPN businesses, designed to serve **
 
 ### Installation
 
+#### Option 1: Interactive (Recommended)
+
 **One command to rule them all:**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SeyedHashtag/ajib/main/deploy/install.sh | sudo bash
 ```
 
+You'll be prompted to enter:
+- Your Telegram Bot Token (from @BotFather)
+- Your Admin User ID (from @userinfobot)
+
+#### Option 2: Non-Interactive (CI/CD)
+
+Set credentials via environment variables first:
+
+```bash
+export TELEGRAM_BOT_TOKEN="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
+export TELEGRAM_ADMIN_ID="123456789"
+curl -fsSL https://raw.githubusercontent.com/SeyedHashtag/ajib/main/deploy/install.sh | sudo -E bash
+```
+
+**Note:** Use `sudo -E` to preserve environment variables.
+
+---
+
 The installer will:
 1. ✅ Install system dependencies (git, python3, python3-venv)
 2. ✅ Create a dedicated service user
 3. ✅ Set up Python virtual environment
-4. ✅ Prompt for your Bot Token and Admin ID
+4. ✅ Configure credentials (interactive or from environment)
 5. ✅ Install the `ajib` CLI
 6. ✅ Start the systemd service
 

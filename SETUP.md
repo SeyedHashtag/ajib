@@ -13,18 +13,41 @@ This guide walks you through setting up AJIB on Ubuntu 22.04+ for production use
 
 ## Quick Install
 
+### Interactive Installation (Recommended)
+
 Run the one-line installer as root or with sudo:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SeyedHashtag/ajib/main/deploy/install.sh | sudo bash
 ```
 
+You will be prompted to enter:
+- Your Telegram Bot API Token
+- Your Admin Numeric User ID
+
+### Non-Interactive Installation (Automation/CI/CD)
+
+For automated deployments, provide credentials via environment variables:
+
+```bash
+# Set credentials
+export TELEGRAM_BOT_TOKEN="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
+export TELEGRAM_ADMIN_ID="123456789"
+
+# Run installer with -E flag to preserve environment
+curl -fsSL https://raw.githubusercontent.com/SeyedHashtag/ajib/main/deploy/install.sh | sudo -E bash
+```
+
+**Important:** Use `sudo -E` to preserve the environment variables when running as sudo.
+
+### What the Installer Does
+
 The installer will:
 1. Install system dependencies (git, python3, python3-venv)
 2. Create a service user (`ajib`)
 3. Clone the repository to `/opt/ajib/app`
 4. Set up a Python virtual environment at `/opt/ajib/venv`
-5. Prompt for your Telegram Bot Token and Admin ID
+5. Configure credentials (interactive prompts or from environment)
 6. Install the `ajib` CLI to `/usr/local/bin/ajib`
 7. Create and start the systemd service (`ajib-bot`)
 
@@ -244,6 +267,27 @@ Ensure the service user has proper permissions:
 sudo chown -R ajib:ajib /opt/ajib
 sudo chmod 600 /opt/ajib/.env
 ```
+
+### Installation Hangs at Credential Prompt
+
+If the installer seems to hang when asking for credentials:
+
+**Cause:** When using `curl | bash`, stdin is connected to the pipe, not the terminal.
+
+**Solution 1:** Use non-interactive mode:
+```bash
+export TELEGRAM_BOT_TOKEN="your_token"
+export TELEGRAM_ADMIN_ID="your_id"
+curl -fsSL https://raw.githubusercontent.com/SeyedHashtag/ajib/main/deploy/install.sh | sudo -E bash
+```
+
+**Solution 2:** Download and run the script directly:
+```bash
+curl -fsSL https://raw.githubusercontent.com/SeyedHashtag/ajib/main/deploy/install.sh -o install.sh
+sudo bash install.sh
+```
+
+The script automatically detects piped input and reads from `/dev/tty` instead, but this requires a controlling terminal.
 
 ### Restart from Scratch
 
