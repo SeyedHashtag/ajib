@@ -20,6 +20,7 @@ import signal
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -65,8 +66,7 @@ def register_builtin_routers(dp: Dispatcher, cfg: Config) -> None:
     @user_router.message(CommandStart())
     async def on_start(message: Message) -> None:
         await message.answer(
-            "Welcome to AJIB VPN Bot.\n\n"
-            "Use the menu or send /help to see available commands."
+            "Welcome to AJIB VPN Bot.\n\nUse the menu or send /help to see available commands."
         )
 
     @user_router.message(Command("help"))
@@ -128,8 +128,8 @@ async def _set_bot_commands(bot: Bot) -> None:
 
 
 def create_bot(cfg: Config) -> Bot:
-    """Create Bot instance with configured parse mode."""
-    return Bot(token=cfg.bot_token, parse_mode=ParseMode.HTML)
+    """Create Bot instance with configured default settings."""
+    return Bot(token=cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 
 def create_dispatcher(cfg: Config) -> Dispatcher:
