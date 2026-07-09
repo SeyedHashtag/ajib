@@ -116,11 +116,13 @@ ADMIN_CLEANUP_REVIEW_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="dijiq-expired-review",
 )
 RECOVERED_TEST_BATCH_SIZE = _int_env("DIJIQ_EXPIRED_RECOVERED_TEST_BATCH_SIZE", 25)
+RECOVERED_TEST_UNREACHABLE_ATTEMPTS = _int_env("DIJIQ_EXPIRED_RECOVERED_TEST_UNREACHABLE_ATTEMPTS", 3)
+RECOVERED_TEST_UNREACHABLE_GRACE_HOURS = _int_env("DIJIQ_EXPIRED_RECOVERED_TEST_UNREACHABLE_GRACE_HOURS", 48)
 ADMIN_CLEANUP_REVIEW_INFLIGHT_LOCK = threading.Lock()
 ADMIN_CLEANUP_REVIEW_INFLIGHT = set()
 ADMIN_CLEANUP_FILTER_DESCRIPTIONS = {
-    'pending': 'Notified users waiting for the grace period before automatic cleanup.',
-    'due': 'Notified users whose grace period has passed and are ready for automatic cleanup.',
+    'pending': 'Notified or queued users waiting for the grace period before automatic cleanup.',
+    'due': 'Notified or queued users whose grace period has passed and are ready for automatic cleanup.',
     'manual_review': 'Server-only or orphaned records that need an admin decision.',
     'duplicate_payment': 'Duplicate configs from repeated payment creation that need an admin decision.',
     'deleted': 'Users deleted by expired cleanup.',
@@ -136,6 +138,7 @@ ADMIN_CLEANUP_REASON_LABELS = {
     'missing_on_server': 'User was not found on the VPN server',
     'server_unavailable': 'VPN server was unavailable',
     'delete_failed': 'Deletion failed and will be retried',
+    'notification_unreachable': 'Telegram user unreachable after recovery notice attempts',
     'unknown': 'Reason unavailable',
 }
 ADMIN_CLEANUP_REVIEW_FILTER_CODES = {
@@ -681,7 +684,7 @@ def _effective_cleanup_status(entry, now=None):
         return 'unknown'
 
     status = str(entry.get('cleanup_status') or entry.get('delete_result') or 'unknown')
-    if status == 'notified':
+    if status in {'notified', 'notification_unreachable'}:
         delete_after = _effective_delete_after(entry)
         if delete_after and (now or datetime.now()) >= delete_after:
             return 'due'
@@ -705,6 +708,8 @@ def _cleanup_reason(entry):
 
     status = str(entry.get('cleanup_status') or entry.get('delete_result') or '')
     delete_result = str(entry.get('delete_result') or '')
+    if status == 'notification_unreachable' or entry.get('cleanup_error') == 'notification_unreachable':
+        return 'notification_unreachable', ADMIN_CLEANUP_REASON_LABELS['notification_unreachable']
     if status == 'server_unavailable':
         return 'server_unavailable', ADMIN_CLEANUP_REASON_LABELS['server_unavailable']
     if status == 'delete_failed':
@@ -736,7 +741,7 @@ def _cleanup_record_from_state(state_key, entry, now=None):
     effective_status = _effective_cleanup_status(entry, now=now)
     cleanup_status = entry.get('cleanup_status') or effective_status
     delete_after = entry.get('delete_after')
-    if cleanup_status == 'notified':
+    if cleanup_status in {'notified', 'notification_unreachable'}:
         delete_after = _format_time(_effective_delete_after(entry)) or delete_after
     return {
         'state_key': state_key,
@@ -1504,6 +1509,68 @@ def _select_recovered_test_batch(candidates, state, batch_size=RECOVERED_TEST_BA
     return selected
 
 
+def _is_permanent_recovered_test_notification_error(error):
+    text = str(error or '').lower()
+    return (
+        ('403' in text or 'forbidden' in text)
+        and (
+            'bot was blocked by the user' in text
+            or 'user is deactivated' in text
+        )
+    )
+
+
+def _recovered_test_unreachable_age_satisfied(entry, now):
+    first_seen = (
+        _parse_time((entry or {}).get('first_seen_at'))
+        or _parse_time((entry or {}).get('recovered_at'))
+        or _parse_time((entry or {}).get('recovery_discovered_at'))
+    )
+    if first_seen is None:
+        return False
+    return now >= first_seen + timedelta(hours=RECOVERED_TEST_UNREACHABLE_GRACE_HOURS)
+
+
+def _should_queue_recovered_test_unreachable(entry, notification_error, attempts, now):
+    if not isinstance(entry, dict):
+        return False
+    if entry.get('review_status') == 'kept' or entry.get('reviewed_by'):
+        return False
+    if entry.get('manual_review_reason'):
+        return False
+    return (
+        _is_permanent_recovered_test_notification_error(notification_error)
+        and attempts >= RECOVERED_TEST_UNREACHABLE_ATTEMPTS
+        and _recovered_test_unreachable_age_satisfied(entry, now)
+    )
+
+
+def _queue_recovered_test_unreachable_deletion(
+    entry,
+    candidate,
+    now_value,
+    notification_error,
+    attempts,
+    last_state=None,
+):
+    entry.update({
+        'username': candidate.get('username') or entry.get('username'),
+        'server_id': candidate.get('server_id') or entry.get('server_id') or 'primary',
+        'source': 'test',
+        'telegram_user_id': candidate.get('telegram_user_id') or entry.get('telegram_user_id'),
+        'cleanup_status': 'notification_unreachable',
+        'cleanup_error': 'notification_unreachable',
+        'notification_error': notification_error,
+        'recovery_source': 'verified_orphan_test',
+        'recovery_attempts': attempts,
+        'recovery_last_attempt_at': now_value,
+        'recovery_unreachable_queued_at': now_value,
+        'delete_after': now_value,
+        'last_checked_at': now_value,
+        'last_state': last_state,
+    })
+
+
 def _merge_cleanup_candidates(*candidate_groups):
     merged = []
     seen_keys = set()
@@ -1916,17 +1983,39 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
                     if not entry:
                         state[key] = _manual_review_entry(candidate, now_value, last_state=last_state)
                         entry = state[key]
+                    entry.setdefault('first_seen_at', now_value)
+                    first_notification_error = (
+                        entry.get('recovery_first_notification_error')
+                        or entry.get('notification_error')
+                        or notification_error
+                    )
                     entry.update({
                         'telegram_user_id': candidate.get('telegram_user_id'),
+                        'source': 'test',
                         'cleanup_status': 'manual_review',
                         'cleanup_error': 'notification_failed',
                         'notification_error': notification_error,
+                        'recovery_first_notification_error': first_notification_error,
                         'recovery_source': 'verified_orphan_test',
                         'recovery_attempts': attempts,
                         'recovery_last_attempt_at': now_value,
                         'last_checked_at': now_value,
                         'last_state': last_state,
                     })
+                    if _should_queue_recovered_test_unreachable(
+                        entry,
+                        notification_error,
+                        attempts,
+                        now,
+                    ):
+                        _queue_recovered_test_unreachable_deletion(
+                            entry,
+                            candidate,
+                            now_value,
+                            notification_error,
+                            attempts,
+                            last_state=last_state,
+                        )
                     recovery_stats['notification_failed'] += 1
                     continue
 

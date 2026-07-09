@@ -397,6 +397,174 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(notified["delete_after"], "2026-06-11 13:00:00")
         self.assertEqual(notified["recovery_attempts"], 2)
 
+    def test_recovered_permanent_telegram_failure_waits_for_retry_threshold(self):
+        self.write_default_files()
+        self.write_json(self.cleanup.STATE_FILE, {
+            "s1:t12345": {
+                "username": "t12345",
+                "server_id": "s1",
+                "source": "test",
+                "cleanup_status": "manual_review",
+                "recovery_source": "verified_orphan_test",
+                "recovery_attempts": 1,
+                "first_seen_at": "2026-06-06 12:00:00",
+            },
+        })
+        client = FakeClient("s1", {"t12345": self.recovered_test_user()})
+        original_notify = self.cleanup._notify_candidate
+        self.cleanup._notify_candidate = (
+            lambda *args, **kwargs:
+            "A request to the Telegram API was unsuccessful. Error code: 403. "
+            "Description: Forbidden: bot was blocked by the user"
+        )
+        self.addCleanup(setattr, self.cleanup, "_notify_candidate", original_notify)
+
+        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
+
+        state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.assertEqual(state["cleanup_status"], "manual_review")
+        self.assertEqual(state["cleanup_error"], "notification_failed")
+        self.assertEqual(state["recovery_attempts"], 2)
+        self.assertNotIn("delete_after", state)
+        self.assertEqual(client.deleted, [])
+
+    def test_recovered_permanent_telegram_failure_waits_for_unreachable_age(self):
+        self.write_default_files()
+        self.write_json(self.cleanup.STATE_FILE, {
+            "s1:t12345": {
+                "username": "t12345",
+                "server_id": "s1",
+                "source": "test",
+                "cleanup_status": "manual_review",
+                "recovery_source": "verified_orphan_test",
+                "recovery_attempts": 2,
+                "first_seen_at": "2026-06-08 13:00:00",
+            },
+        })
+        client = FakeClient("s1", {"t12345": self.recovered_test_user()})
+        original_notify = self.cleanup._notify_candidate
+        self.cleanup._notify_candidate = (
+            lambda *args, **kwargs:
+            "A request to the Telegram API was unsuccessful. Error code: 403. "
+            "Description: Forbidden: user is deactivated"
+        )
+        self.addCleanup(setattr, self.cleanup, "_notify_candidate", original_notify)
+
+        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
+
+        state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.assertEqual(state["cleanup_status"], "manual_review")
+        self.assertEqual(state["cleanup_error"], "notification_failed")
+        self.assertEqual(state["recovery_attempts"], 3)
+        self.assertNotIn("delete_after", state)
+        self.assertEqual(client.deleted, [])
+
+    def test_recovered_permanent_telegram_failure_enters_deletion_queue_then_deletes_next_scan(self):
+        self.write_default_files()
+        self.write_json(self.cleanup.STATE_FILE, {
+            "s1:t12345": {
+                "username": "t12345",
+                "server_id": "s1",
+                "source": "server_user",
+                "cleanup_status": "manual_review",
+                "recovery_source": "verified_orphan_test",
+                "recovery_attempts": 2,
+                "first_seen_at": "2026-06-07 11:00:00",
+            },
+        })
+        client = FakeClient("s1", {"t12345": self.recovered_test_user()})
+        original_notify = self.cleanup._notify_candidate
+        self.cleanup._notify_candidate = (
+            lambda *args, **kwargs:
+            "A request to the Telegram API was unsuccessful. Error code: 403. "
+            "Description: Forbidden: bot was blocked by the user"
+        )
+        self.addCleanup(setattr, self.cleanup, "_notify_candidate", original_notify)
+
+        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
+
+        queued = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.assertEqual(queued["source"], "test")
+        self.assertEqual(queued["cleanup_status"], "notification_unreachable")
+        self.assertEqual(queued["cleanup_error"], "notification_unreachable")
+        self.assertEqual(queued["delete_after"], "2026-06-09 12:00:00")
+        self.assertEqual(queued["recovery_unreachable_queued_at"], "2026-06-09 12:00:00")
+        self.assertEqual(queued["recovery_attempts"], 3)
+        self.assertEqual(client.deleted, [])
+        due_records = self.cleanup.get_expired_cleanup_records(filter_key="due", now=self.now)
+        self.assertEqual([record["username"] for record in due_records], ["t12345"])
+        self.assertEqual(due_records[0]["reason_code"], "notification_unreachable")
+
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now + timedelta(minutes=1),
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        deleted = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.assertEqual(client.deleted, ["t12345"])
+        self.assertEqual(deleted["cleanup_status"], "deleted")
+        self.assertEqual(deleted["delete_result"], "deleted")
+        self.assertEqual(deleted["notification_error"], queued["notification_error"])
+        self.assertEqual(deleted["recovery_unreachable_queued_at"], "2026-06-09 12:00:00")
+
+    def test_recovered_temporary_notification_failure_never_enters_deletion_queue(self):
+        self.write_default_files()
+        self.write_json(self.cleanup.STATE_FILE, {
+            "s1:t12345": {
+                "username": "t12345",
+                "server_id": "s1",
+                "source": "test",
+                "cleanup_status": "manual_review",
+                "recovery_source": "verified_orphan_test",
+                "recovery_attempts": 9,
+                "first_seen_at": "2026-06-01 12:00:00",
+            },
+        })
+        client = FakeClient("s1", {"t12345": self.recovered_test_user()})
+        original_notify = self.cleanup._notify_candidate
+        self.cleanup._notify_candidate = lambda *args, **kwargs: "Too Many Requests: retry after 10"
+        self.addCleanup(setattr, self.cleanup, "_notify_candidate", original_notify)
+
+        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
+
+        state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.assertEqual(state["cleanup_status"], "manual_review")
+        self.assertEqual(state["cleanup_error"], "notification_failed")
+        self.assertEqual(state["recovery_attempts"], 10)
+        self.assertNotIn("delete_after", state)
+        self.assertEqual(client.deleted, [])
+
+    def test_recovered_unreachable_queued_user_is_removed_from_queue_if_renewed(self):
+        self.write_default_files()
+        self.write_json(self.cleanup.STATE_FILE, {
+            "s1:t12345": {
+                "username": "t12345",
+                "server_id": "s1",
+                "source": "test",
+                "cleanup_status": "notification_unreachable",
+                "cleanup_error": "notification_unreachable",
+                "recovery_source": "verified_orphan_test",
+                "recovery_attempts": 3,
+                "recovery_unreachable_queued_at": "2026-06-09 10:00:00",
+                "delete_after": "2026-06-09 10:00:00",
+                "last_state": self.expired_user(),
+            },
+        })
+        active_user = {
+            "blocked": False,
+            "expiration_days": 30,
+            "upload_bytes": 0,
+            "download_bytes": 0,
+            "max_download_bytes": self.cleanup.GB_BYTES,
+            "status": "active",
+        }
+        client = FakeClient("s1", {"t12345": active_user})
+
+        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
+
+        self.assertEqual(self.read_json(self.cleanup.STATE_FILE), {})
+        self.assertEqual(client.deleted, [])
+
     def test_admin_kept_verified_orphan_remains_manual(self):
         self.write_default_files()
         self.write_json(self.cleanup.STATE_FILE, {
