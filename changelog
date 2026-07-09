@@ -1,3 +1,9 @@
+## v1.16.2
+✨ Queue recovered orphaned test accounts for cleanup when Telegram recovery notices permanently fail
+🐛 Require retry and age thresholds before treating blocked or deactivated Telegram users as unreachable
+🛠️ Show unreachable recovered-test records in pending/due cleanup views with a dedicated reason label
+✅ Add regression coverage for recovered-test notification retry thresholds and queued deletion handling
+
 ## v1.16.1
 ✨ Add atomic, file-locked storage for test configuration records and concurrent updates
 🐛 Prevent duplicate test configuration creation with recoverable creation claims
