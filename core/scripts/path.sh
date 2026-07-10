@@ -1,4 +1,5 @@
 CLI_PATH="/etc/ajib/core/cli.py"
+AJIB_PYTHON="/etc/ajib/ajib_venv/bin/python"
 TELEGRAM_ENV="/etc/ajib/core/scripts/telegrambot/.env"
 LOCALVERSION="/etc/ajib/VERSION"
 LATESTVERSION="https://raw.githubusercontent.com/SeyedHashtag/ajib/main/VERSION"

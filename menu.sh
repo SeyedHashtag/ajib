@@ -7,6 +7,15 @@ ajib_upgrade(){
     bash <(curl -fsSL https://raw.githubusercontent.com/SeyedHashtag/ajib/main/upgrade.sh)
 }
 
+run_ajib_cli() {
+    if [ ! -x "$AJIB_PYTHON" ]; then
+        echo "ajib Python environment is missing at $AJIB_PYTHON. Run the ajib installer or upgrade to recreate it." >&2
+        return 1
+    fi
+
+    "$AJIB_PYTHON" "$CLI_PATH" "$@"
+}
+
 telegram_env_value() {
     local key=$1
     if [ ! -f "$TELEGRAM_ENV" ]; then
@@ -348,7 +357,7 @@ configure_telegram_bot() {
         server_args+=(--server "${server_ids[$i]}=${server_urls[$i]},${server_tokens[$i]},${server_weights[$i]},${server_enabled[$i]}")
     done
 
-    python3 "$CLI_PATH" telegram -a start -t "$token" -aid "$admin_ids" -u "$api_url" -k "$api_key" "${server_args[@]}"
+    run_ajib_cli telegram -a start -t "$token" -aid "$admin_ids" -u "$api_url" -k "$api_key" "${server_args[@]}"
 }
 
 add_telegram_vpn_server() {
@@ -434,7 +443,7 @@ add_telegram_vpn_server() {
         server_args+=(--server "${server_ids[$i]}=${server_urls[$i]},${server_tokens[$i]},${server_weights[$i]},${server_enabled[$i]}")
     done
 
-    python3 "$CLI_PATH" telegram -a start -t "$token" -aid "$admin_ids" -u "$api_url" -k "$api_key" "${server_args[@]}"
+    run_ajib_cli telegram -a start -t "$token" -aid "$admin_ids" -u "$api_url" -k "$api_key" "${server_args[@]}"
 }
 
 restart_telegram_bot() {
@@ -478,7 +487,7 @@ telegram_bot_handler() {
                 restart_telegram_bot
                 ;;
             5)
-                python3 "$CLI_PATH" telegram -a stop
+                run_ajib_cli telegram -a stop
                 ;;
             0)
                 break
