@@ -1,3 +1,11 @@
+## v1.16.3
+♻️ Rename to Ajib across runtime paths, services, scripts, configuration variables, and documentation
+🛠️ Refocus the project on the Telegram bot and externally managed VPN APIs, removing bundled local VPN server management
+✨ Add safer bot-state backup and restore flows and preserve bot configuration during transactional upgrades
+🐛 Improve supported-OS detection, package installation, service handling, and installation failure cleanup
+📚 Document the external VPN API contract and simplify the bot management interface and runtime dependencies
+✅ Add regression coverage for the bot-only repository structure, state backup and restore, and Ajib environment migration
+
 ## v1.16.2
 ✨ Queue recovered orphaned test accounts for cleanup when Telegram recovery notices permanently fail
 🐛 Require retry and age thresholds before treating blocked or deactivated Telegram users as unreachable
