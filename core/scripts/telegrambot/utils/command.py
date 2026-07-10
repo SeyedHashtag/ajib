@@ -4,17 +4,17 @@ import json
 import os
 import shlex
 from dotenv import load_dotenv
-from telebot import types
 from utils.bot_logging import configure_logging, get_telegram_worker_count, instrument_bot
 from utils.telegram_safe import install_safe_telegram_methods
 
-load_dotenv()
+TELEGRAM_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
+load_dotenv(TELEGRAM_ENV_PATH)
 configure_logging()
 
 API_TOKEN = os.getenv('API_TOKEN')
 ADMIN_USER_IDS = json.loads(os.getenv('ADMIN_USER_IDS'))
 CLI_PATH = '/etc/ajib/core/cli.py'
-BACKUP_DIRECTORY = '/opt/hysbackup'
+BACKUP_DIRECTORY = '/opt/ajib-backups'
 bot = telebot.TeleBot(API_TOKEN, threaded=True, num_threads=get_telegram_worker_count())
 install_safe_telegram_methods(bot)
 instrument_bot(bot)

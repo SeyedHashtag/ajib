@@ -2,79 +2,9 @@
 
 source /etc/ajib/core/scripts/utils.sh
 source /etc/ajib/core/scripts/path.sh
-source /etc/ajib/core/scripts/services_status.sh >/dev/null 2>&1
-
-check_services() {
-    for service in "${services[@]}"; do
-        service_base_name=$(basename "$service" .service)
-
-        display_name=$(echo "$service_base_name" | sed -E 's/([^-]+)-?/\u\1/g') 
-
-        if systemctl is-active --quiet "$service"; then
-            echo -e "${NC}${display_name}:${green} Active${NC}"
-        else
-            echo -e "${NC}${display_name}:${red} Inactive${NC}"
-        fi
-    done
-}
-
-edit_ips() {
-    while true; do
-        echo "======================================"
-        echo "      IP/Domain Address Manager      "
-        echo "======================================"
-        echo "1. Change IPv4 or Domain"
-        echo "2. Change IPv6 or Domain"
-        echo "0. Back"
-        echo "======================================"
-        read -p "Enter your choice [0-2]: " choice
-
-        case $choice in
-            1)
-                read -p "Enter the new IPv4 address or domain: " new_ip4_or_domain
-                if [[ $new_ip4_or_domain =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-                    if [[ $(echo "$new_ip4_or_domain" | awk -F. '{for (i=1;i<=NF;i++) if ($i>255) exit 1}') ]]; then
-                        echo "Error: Invalid IPv4 address. Values must be between 0 and 255."
-                    else
-                        python3 "$CLI_PATH" ip-address --edit -4 "$new_ip4_or_domain"
-                        echo "IPv4 address has been updated to $new_ip4_or_domain."
-                    fi
-                elif [[ $new_ip4_or_domain =~ ^[a-zA-Z0-9.-]+$ ]] && [[ ! $new_ip4_or_domain =~ [/:] ]]; then
-                    python3 "$CLI_PATH" ip-address --edit -4 "$new_ip4_or_domain"
-                    echo "Domain has been updated to $new_ip4_or_domain."
-                else
-                    echo "Error: Invalid IPv4 or domain format."
-                fi
-                break
-                ;;
-            2)
-                read -p "Enter the new IPv6 address or domain: " new_ip6_or_domain
-                if [[ $new_ip6_or_domain =~ ^(([0-9a-fA-F]{1,4}:){7}([0-9a-fA-F]{1,4}|:)|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$ ]]; then
-                    python3 "$CLI_PATH" ip-address --edit -6 "$new_ip6_or_domain"
-                    echo "IPv6 address has been updated to $new_ip6_or_domain."
-                elif [[ $new_ip6_or_domain =~ ^[a-zA-Z0-9.-]+$ ]] && [[ ! $new_ip6_or_domain =~ [/:] ]]; then
-                    python3 "$CLI_PATH" ip-address --edit -6 "$new_ip6_or_domain"
-                    echo "Domain has been updated to $new_ip6_or_domain."
-                else
-                    echo "Error: Invalid IPv6 or domain format."
-                fi
-                break
-                ;;
-            0)
-                break
-                ;;
-            *)
-                echo "Invalid option. Please try again."
-                break
-                ;;
-        esac
-        echo "======================================"
-        read -p "Press Enter to continue..."
-    done
-}
 
 ajib_upgrade(){
-    bash <(curl https://raw.githubusercontent.com/SeyedHashtag/ajib/main/upgrade.sh)
+    bash <(curl -fsSL https://raw.githubusercontent.com/SeyedHashtag/ajib/main/upgrade.sh)
 }
 
 telegram_env_value() {
@@ -564,30 +494,31 @@ telegram_bot_handler() {
 display_main_menu() {
     clear
     tput setaf 7 ; tput setab 4 ; tput bold
-    echo -e "◇────────────────🚀 Welcome To ajib Management 🚀─────────────────◇"
+    echo -e "◇────────────────🚀 Welcome To ajib Bot Manager 🚀────────────────◇"
     tput sgr0
     echo -e "${LPurple}◇──────────────────────────────────────────────────────────────────────◇${NC}"
 
-    printf "\033[0;32m• OS:  \033[0m%-25s \033[0;32m• ARCH:  \033[0m%-25s\n" "$OS" "$ARCH"
-    printf "\033[0;32m• ISP: \033[0m%-25s \033[0;32m• CPU:   \033[0m%-25s\n" "$ISP" "$CPU"
-    printf "\033[0;32m• IP:  \033[0m%-25s \033[0;32m• RAM:   \033[0m%-25s\n" "$IP" "$RAM"
+    printf "\033[0;32m• OS:   \033[0m%-25s \033[0;32m• ARCH: \033[0m%-25s\n" "$OS" "$ARCH"
+    printf "\033[0;32m• CPU:  \033[0m%-25s \033[0;32m• RAM:  \033[0m%-25s\n" "$CPU" "$RAM"
 
     echo -e "${LPurple}◇──────────────────────────────────────────────────────────────────────◇${NC}"
-        check_core_version
         check_version
     echo -e "${LPurple}◇──────────────────────────────────────────────────────────────────────◇${NC}"
-    echo -e "${yellow}                   ☼ Services Status ☼                   ${NC}"
+    echo -e "${yellow}                   ☼ Bot Status ☼                   ${NC}"
     echo -e "${LPurple}◇──────────────────────────────────────────────────────────────────────◇${NC}"
 
-        check_services
+        if systemctl is-active --quiet ajib-telegram-bot.service; then
+            echo -e "Telegram Bot: ${green}Active${NC}"
+        else
+            echo -e "Telegram Bot: ${red}Inactive${NC}"
+        fi
         
     echo -e "${LPurple}◇──────────────────────────────────────────────────────────────────────◇${NC}"
     echo -e "${yellow}                   ☼ Main Menu ☼                   ${NC}"
 
     echo -e "${LPurple}◇──────────────────────────────────────────────────────────────────────◇${NC}"
     echo -e "${cyan}[1] ${NC}↝ Telegram Bot"
-    echo -e "${cyan}[2] ${NC}↝ Change IPs / Domains"
-    echo -e "${cyan}[3] ${NC}↝ Update Panel"
+    echo -e "${cyan}[2] ${NC}↝ Update Bot"
     echo -e "${red}[0] ${NC}↝ Exit"
     echo -e "${LPurple}◇──────────────────────────────────────────────────────────────────────◇${NC}"
     echo -ne "${yellow}➜ Enter your option: ${NC}"
@@ -603,8 +534,7 @@ main_menu() {
         read -r choice
         case $choice in
             1) telegram_bot_handler ;;
-            2) edit_ips ;;
-            3) ajib_upgrade ;;
+            2) ajib_upgrade ;;
             0) exit 0 ;;
             *) echo "Invalid option. Please try again." ;;
         esac

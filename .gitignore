@@ -161,3 +161,11 @@ cython_debug/
 
 ajib_venv/
 .vscode/
+
+# Telegram bot runtime state
+core/scripts/telegrambot/*.json
+core/scripts/telegrambot/logs/
+core/scripts/telegrambot/broadcast_logs/
+
+# Tool caches
+.ruff_cache/

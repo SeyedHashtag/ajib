@@ -42,19 +42,31 @@ class TelegramJsonPreservationTests(unittest.TestCase):
         restore_text = (REPO_ROOT / "core/scripts/ajib/restore.sh").read_text()
 
         for script_text in (upgrade_text, backup_text):
-            self.assertIn("/etc/ajib/*.env", script_text)
-            self.assertIn("/etc/ajib/*.json", script_text)
-            self.assertIn("/etc/ajib/core/scripts/telegrambot/*.env", script_text)
-            self.assertIn("/etc/ajib/core/scripts/telegrambot/*.json", script_text)
+            self.assertIn('"$BOT_DIR"/*.env', script_text)
+            self.assertIn('"$BOT_DIR"/*.json', script_text)
+            self.assertNotIn("/etc/ajib/*.env", script_text)
+            self.assertNotIn("/etc/ajib/*.json", script_text)
 
-        self.assertIn('restore_root_state_files "$RESTORE_DIR"', restore_text)
-        self.assertIn('restore_telegram_state_files "$RESTORE_DIR/core/scripts/telegrambot"', restore_text)
-        self.assertIn('restore_telegram_state_files "$RESTORE_DIR"', restore_text)
+        self.assertIn('"$RESTORE_DIR/core/scripts/telegrambot"/*.env', restore_text)
+        self.assertIn('"$RESTORE_DIR/core/scripts/telegrambot"/*.json', restore_text)
+        self.assertNotIn(".configs.env", restore_text)
 
         maintenance_text = "\n".join((upgrade_text, backup_text, restore_text))
         for path in referenced_json_files:
             self.assertNotIn(path, maintenance_text)
             self.assertNotIn(path[len("/etc/ajib/"):], maintenance_text)
+
+    def test_maintenance_scripts_do_not_manage_a_local_vpn_server(self):
+        maintenance_text = "\n".join(path.read_text() for path in MAINTENANCE_SCRIPTS)
+
+        for legacy_value in (
+            "ajib-server.service",
+            ".configs.env",
+            "get.hy2.sh",
+            "127.0.0.1:25413",
+            "config.yaml",
+        ):
+            self.assertNotIn(legacy_value, maintenance_text)
 
 
 if __name__ == "__main__":

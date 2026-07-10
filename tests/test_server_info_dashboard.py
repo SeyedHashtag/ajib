@@ -242,13 +242,6 @@ class ServerInfoDashboardTests(unittest.TestCase):
         self.assertIn("📊 **Server Info**", cli_api.format_server_info_section(snapshot, "full"))
         self.assertIn("Pending payments: 1", cli_api.format_server_info_section(snapshot, "alerts"))
 
-    def test_online_payload_parser_supports_nested_shapes(self):
-        cli_api = load_cli_api()
-
-        self.assertEqual(cli_api.parse_online_users_payload({"a": [1, {"b": 2}], "c": {"d": 3}}), 6)
-        self.assertEqual(cli_api.parse_online_users_payload([0, {"nested": [4, "5"]}]), 9)
-        self.assertIsNone(cli_api.parse_online_users_payload({"unsupported": object()}))
-
     def test_online_userlist_count_excludes_blocked_and_disabled_servers(self):
         servers = [
             {"id": "primary", "name": "Primary", "url": "https://primary.test", "token": "token", "enabled": True, "weight": 1},

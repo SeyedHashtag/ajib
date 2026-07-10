@@ -308,33 +308,6 @@ class APIClient:
         """Return subscription URI data dict, or ``None`` on failure."""
         return self._get(f"{self.base_url}api/v1/users/{username}/uri")
 
-    # ------------------------------------------------------------------ #
-    # Server / stats operations                                             #
-    # ------------------------------------------------------------------ #
-
-    def get_online_users(self) -> int:
-        """Return the total number of currently online users, or 0 on failure.
-
-        This calls the Hysteria2 local stats endpoint rather than the main
-        REST API, but uses the same auth token.
-        """
-        try:
-            response = self._request(
-                "GET",
-                "http://127.0.0.1:25413/online",
-                timeout=5,
-            )
-            if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, dict):
-                    return sum(data.values())
-                if isinstance(data, list):
-                    return sum(data)
-        except Exception:
-            pass
-        return 0
-
-
 class MultiServerAPI:
     """Coordinates API operations across configured VPN servers."""
 

@@ -3,30 +3,22 @@ import subprocess
 from enum import Enum
 from datetime import datetime, timedelta
 import json
-from typing import Any
-from dotenv import dotenv_values
+import sys
 
-DEBUG = False
+import psutil
+
 SCRIPT_DIR = '/etc/ajib/core/scripts'
-CONFIG_ENV_FILE = '/etc/ajib/.configs.env'
 
 
 class Command(Enum):
     '''Contains path to command's script'''
-    IP_ADD = os.path.join(SCRIPT_DIR, 'ajib', 'ip.sh')
-    SERVER_INFO = os.path.join(SCRIPT_DIR, 'ajib', 'server_info.sh')
     BACKUP_AJIB = os.path.join(SCRIPT_DIR, 'ajib', 'backup.sh')
     RESTORE_AJIB = os.path.join(SCRIPT_DIR, 'ajib', 'restore.sh')
     INSTALL_TELEGRAMBOT = os.path.join(SCRIPT_DIR, 'telegrambot', 'runbot.sh')
     SERVICES_STATUS = os.path.join(SCRIPT_DIR, 'services_status.sh')
     VERSION = os.path.join(SCRIPT_DIR, 'ajib', 'version.py')
 
-import psutil
-import requests
-import sys
-
 TELEGRAM_UTILS_PATH = '/etc/ajib/core/scripts/telegrambot'
-ONLINE_USERS_URL = "http://127.0.0.1:25413/online"
 PAID_STATUSES = {'completed', 'paid', 'success', 'succeeded'}
 FAILED_STATUSES = {'rejected', 'failed', 'canceled', 'cancelled', 'error'}
 EXPIRED_STATUSES = {'expired'}
@@ -51,47 +43,24 @@ class InvalidInputError(ajibError):
     pass
 
 
-class PasswordGenerationError(ajibError):
-    '''Raised when password generation fails.'''
-    pass
-
-
-class ScriptNotFoundError(ajibError):
-    '''Raised when a required script is not found.'''
-    pass
-
-# region Utils
-
-
 def run_cmd(command: list[str]) -> str | None:
     '''
     Runs a command and returns the output.
-    Could raise subprocess.CalledProcessError
-    '''
-    if (DEBUG) and not (Command.GET_USER.value in command or Command.LIST_USERS.value in command):
-        print(' '.join(command))
-    try:
-        result = subprocess.check_output(command, stderr=subprocess.STDOUT, shell=False)
-        if result:
-            result = result.decode().strip()
-            return result
-    except subprocess.CalledProcessError as e:
-        if DEBUG:
-            raise CommandExecutionError(f'Command execution failed: {e}\nOutput: {e.output.decode()}')
-        else:
-            return None
-    return None
-
-
-def generate_password() -> str:
-    '''
-    Generates a random password using pwgen for user.
-    Could raise subprocess.CalledProcessError
+    Raises CommandExecutionError when the command fails.
     '''
     try:
-        return subprocess.check_output(['pwgen', '-s', '32', '1'], shell=False).decode().strip()
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=True,
+            shell=False,
+            text=True,
+        )
+        return result.stdout.strip()
     except subprocess.CalledProcessError as e:
-        raise PasswordGenerationError(f'Failed to generate password: {e}')
+        output = e.stdout or ''
+        raise CommandExecutionError(f"Command failed: {' '.join(command)}\n{output}".strip()) from e
 
 # endregion
 
@@ -101,43 +70,13 @@ def generate_password() -> str:
 
 
 def backup_ajib():
-    '''Backups ajib configuration.  Raises an exception on failure.'''
-    try:
-        run_cmd(['bash', Command.BACKUP_AJIB.value])
-    except subprocess.CalledProcessError as e:
-        raise Exception(f"Backup failed: {e}")
-    except Exception as ex:
-        raise
+    '''Back up Telegram bot state.'''
+    return run_cmd(['bash', Command.BACKUP_AJIB.value])
 
 
 def restore_ajib(backup_file_path: str):
-    '''Restores ajib configuration from the given backup file.'''
-    try:
-        run_cmd(['bash', Command.RESTORE_AJIB.value, backup_file_path])
-    except subprocess.CalledProcessError as e:
-        raise Exception(f"Restore failed: {e}")
-    except Exception as ex:
-        raise
-
-
-def get_ajib_config_file() -> dict[str, Any]:
-    with open(CONFIG_FILE, 'r') as f:
-        return json.loads(f.read())
-
-
-def set_ajib_config_file(data: dict[str, Any]):
-    content = json.dumps(data, indent=4)
-
-    with open(CONFIG_FILE, 'w') as f:
-        f.write(content)
-# endregion
-
-# region Server
-
-
-def traffic_status():
-    '''Fetches traffic status.'''
-    traffic.traffic_status()
+    '''Restore Telegram bot state from a backup file.'''
+    return run_cmd(['bash', Command.RESTORE_AJIB.value, backup_file_path])
 
 
 def _ensure_telegram_utils_path():
@@ -224,69 +163,6 @@ def _format_bytes(value) -> str:
     if unit == "B":
         return f"{int(amount)}B"
     return f"{amount:.2f}{unit}"
-
-
-def _sum_online_value(value):
-    if isinstance(value, bool):
-        return int(value), True
-    if isinstance(value, (int, float)):
-        return int(value), True
-    if isinstance(value, str):
-        try:
-            return int(float(value)), True
-        except ValueError:
-            return 0, False
-    if isinstance(value, dict):
-        total = 0
-        found = False
-        for item in value.values():
-            count, has_number = _sum_online_value(item)
-            total += count
-            found = found or has_number
-        return total, found
-    if isinstance(value, list):
-        total = 0
-        found = False
-        for item in value:
-            count, has_number = _sum_online_value(item)
-            total += count
-            found = found or has_number
-        return total, found
-    return 0, False
-
-
-def parse_online_users_payload(payload):
-    total, found = _sum_online_value(payload)
-    return total if found else None
-
-
-def fetch_online_users(api_client_module=None) -> dict:
-    try:
-        if api_client_module is None:
-            _ensure_telegram_utils_path()
-            from utils import api_client as api_client_module
-        servers = api_client_module.get_server_configs()
-    except Exception as e:
-        return {"count": None, "status": "error", "error": str(e)}
-
-    enabled_servers = [server for server in servers if server.get("enabled", True)]
-    if not enabled_servers:
-        return {"count": None, "status": "unavailable", "error": "No enabled VPN server configured."}
-
-    token = enabled_servers[0].get("token")
-    if not token:
-        return {"count": None, "status": "unavailable", "error": "No VPN API token configured."}
-
-    try:
-        resp = requests.get(ONLINE_USERS_URL, headers={'Authorization': token}, timeout=5)
-        if resp.status_code != 200:
-            return {"count": None, "status": "error", "error": f"HTTP {resp.status_code}"}
-        count = parse_online_users_payload(resp.json())
-        if count is None:
-            return {"count": None, "status": "error", "error": "Unsupported online users payload."}
-        return {"count": count, "status": "ok", "error": None}
-    except Exception as e:
-        return {"count": None, "status": "error", "error": str(e)}
 
 
 def build_online_users_from_userlist(vpn: dict) -> dict:
@@ -1021,44 +897,6 @@ def server_info(section: str = "full") -> str | None:
         return format_server_info_section(snapshot, section)
     except Exception as e:
         return f"Error generating server info: {str(e)}"
-
-
-def get_ip_address() -> tuple[str | None, str | None]:
-    '''
-    Retrieves the IP address from the .configs.env file.
-    '''
-    env_vars = dotenv_values(CONFIG_ENV_FILE)
-
-    return env_vars.get('IP4'), env_vars.get('IP6')
-
-
-def add_ip_address():
-    '''
-    Adds IP addresses from the environment to the .configs.env file.
-    '''
-    run_cmd(['bash', Command.IP_ADD.value, 'add'])
-
-
-def edit_ip_address(ipv4: str, ipv6: str):
-    '''
-    Edits the IP address configuration based on provided IPv4 and/or IPv6 addresses.
-
-    :param ipv4: The new IPv4 address to be configured. If provided, the IPv4 address will be updated.
-    :param ipv6: The new IPv6 address to be configured. If provided, the IPv6 address will be updated.
-    :raises InvalidInputError: If neither ipv4 nor ipv6 is provided.
-    '''
-
-    if not ipv4 and not ipv6:
-        raise InvalidInputError('Error: --edit requires at least one of --ipv4 or --ipv6.')
-    if ipv4:
-        run_cmd(['bash', Command.IP_ADD.value, 'edit', '-4', ipv4])
-    if ipv6:
-        run_cmd(['bash', Command.IP_ADD.value, 'edit', '-6', ipv6])
-
-
-# endregion
-
-# region Advanced Menu
 
 
 def start_telegram_bot(token: str, adminid: str, api_url: str, api_key: str, servers=None):

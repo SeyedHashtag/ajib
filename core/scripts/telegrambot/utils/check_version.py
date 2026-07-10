@@ -1,19 +1,18 @@
-import telebot
 import subprocess
 import shlex
 import time
 import re
-from utils.command import *
+from utils.command import ADMIN_USER_IDS, CLI_PATH, bot
 
 def check_version():
     command = f"python3 {CLI_PATH} check-version"
     try:
         args = shlex.split(command)
         result = subprocess.check_output(args, stderr=subprocess.STDOUT).decode("utf-8").strip()      
-        panel_version = re.search(r'Panel Version: (\d+\.\d+\.\d+)', result)
+        bot_version = re.search(r'Bot Version: (\d+\.\d+\.\d+)', result)
         latest_version = re.search(r'Latest Version: (\d+\.\d+\.\d+)', result)
         
-        if panel_version and latest_version and panel_version.group(1) != latest_version.group(1):
+        if bot_version and latest_version and bot_version.group(1) != latest_version.group(1):
             notify_admins(f"🔔 New version available!\n\n{result}")
             
     except subprocess.CalledProcessError as e:

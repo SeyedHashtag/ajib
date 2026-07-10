@@ -1,17 +1,14 @@
 import qrcode
 import io
-import json
 import logging
 import os
-import requests
 import re
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dotenv import load_dotenv
 from telebot import types
 from utils.command import bot
-from utils.api_client import APIClient, MultiServerAPI
+from utils.api_client import MultiServerAPI
 from utils.edit_plans import load_plans
 from utils.translations import BUTTON_TRANSLATIONS, get_message_text, get_button_text
 from utils.language import get_user_language

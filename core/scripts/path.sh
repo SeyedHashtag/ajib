@@ -1,7 +1,5 @@
 CLI_PATH="/etc/ajib/core/cli.py"
-CONFIG_ENV="/etc/ajib/.configs.env"
 TELEGRAM_ENV="/etc/ajib/core/scripts/telegrambot/.env"
-ONLINE_API_URL="http://127.0.0.1:25413/online"
 LOCALVERSION="/etc/ajib/VERSION"
 LATESTVERSION="https://raw.githubusercontent.com/SeyedHashtag/ajib/main/VERSION"
 LASTESTCHANGE="https://raw.githubusercontent.com/SeyedHashtag/ajib/main/changelog"

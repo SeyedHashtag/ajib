@@ -1,61 +1,72 @@
 <div align="center">
 
 [![Latest Release](https://img.shields.io/badge/Release-Latest-brightgreen?logo=github)](https://github.com/SeyedHashtag/ajib/releases)
-[![License](https://img.shields.io/badge/License-MIT-blueviolet?logo=open-source-initiative&logoColor=white)](LICENSE)  
-
-[![Made with ❤️](https://img.shields.io/badge/Made%20with-%E2%9D%A4-red)](#)
+[![License](https://img.shields.io/badge/License-GPLv3-blueviolet?logo=gnu)](LICENSE)
 
 </div>
 
+# ajib Telegram VPN Bot
 
-# 🚀 ajib Management Shell Script 🚀
+ajib is a Telegram sales and administration bot for external VPN servers. It
+does not install or run a VPN server. The bot connects to one or more deployed
+VPN panels through their HTTP APIs.
 
-A powerful and user-friendly management panel for ajib proxy server. Features include complete user management, traffic monitoring, Telegram bot support, subscription format. Simple installation with advanced configuration options for both beginners and experienced users.
+## Features
 
-🛡️ **Key Features**
+- Create, edit, reset, renew, and delete VPN users through external APIs
+- Balance new accounts across multiple VPN servers
+- Sell plans through manual and cryptocurrency payment flows
+- Manage resellers, referrals, test accounts, and expired accounts
+- Show customers their configurations and QR codes
+- Broadcast messages and provide operational dashboards to administrators
+- Back up bot configuration and JSON state
 
-- ⚙️ ajib Installation & Configuration
-- 👤 User Management (Add, Edit, Reset, Remove)
-- ℹ️ Detailed User Information & Listing
-- 📊 Traffic Monitoring & Status
-- 🔗 User URI Generation
-- 🤖 Telegram Bot Integration
-- 🚀 System Information & Service Status
-- ✏️ IP Address Management (IPv4 and IPv6)
+## Requirements
 
+- Ubuntu 22+ or Debian 11+
+- Root access for installation and the systemd service
+- A Telegram bot token and at least one administrator user ID
+- At least one compatible VPN panel API URL and authorization token
 
+## Install
 
-## 📋 Quick Start Guide
-
-### One-Click Installation
 ```bash
-bash <(curl https://raw.githubusercontent.com/SeyedHashtag/ajib/main/install.sh)
-```
-After installation, use `ajib` to launch the management panel.
-
-There is no need to execute the installation command again.
-
-### Upgrade to Latest Version
-```bash
-bash <(curl https://raw.githubusercontent.com/SeyedHashtag/ajib/main/upgrade.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/SeyedHashtag/ajib/main/install.sh)
 ```
 
----
+The installer creates `/etc/ajib`, installs the Python environment, and opens
+the bot configuration menu. Run `ajib` later to reopen that menu.
 
-## 🤝 Contributing
+## Upgrade
 
-We welcome contributions! Whether you're fixing bugs, adding new features, improving documentation, or just have suggestions, your help is greatly appreciated! We believe that a diverse community of contributors is essential to building the best possible tools.  Every contribution, big or small, makes a difference.
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/SeyedHashtag/ajib/main/upgrade.sh)
+```
 
-We're excited to have you contribute! Thank you for helping make this project better!
+Upgrades preserve `.env` and JSON state files in
+`/etc/ajib/core/scripts/telegrambot` and restart the bot only if it was already
+running.
 
-## ⚠️ Disclaimer
+## Runtime layout
 
-This tool is provided for educational and research purposes only. Users are responsible for:
-- Complying with local laws and regulations
-- Ensuring appropriate usage of proxy servers
-- Maintaining server security
-- Protecting user privacy
+- `core/scripts/telegrambot/tbot.py`: bot entry point
+- `core/scripts/telegrambot/utils/`: Telegram handlers and external API client
+- `core/scripts/telegrambot/.env`: bot credentials and VPN server definitions
+- `core/cli.py`: bot lifecycle, backup, version, and dashboard commands
+- `menu.sh`: interactive bot configuration and service manager
 
----
+Do not commit `.env`, API tokens, payment details, or generated JSON state.
 
-<p align="center">Made with ❤️</p>
+## API compatibility
+
+The endpoints consumed by the bot are documented in [docs/api.md](docs/api.md).
+
+## Testing
+
+```bash
+python -m pytest -q tests
+```
+
+## License
+
+GNU General Public License v3.0. See [LICENSE](LICENSE).

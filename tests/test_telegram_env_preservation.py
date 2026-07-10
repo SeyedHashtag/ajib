@@ -36,6 +36,14 @@ class TelegramEnvPreservationTests(unittest.TestCase):
         self.assertNotIn("/etc/ajib/core/scripts/telegrambot/.env", stop_body)
         self.assertIn("Configuration preserved", stop_body)
 
+    def test_runtime_loads_only_the_canonical_telegram_env(self):
+        utils_dir = REPO_ROOT / "core/scripts/telegrambot/utils"
+        for module_name in ("command.py", "payments.py"):
+            module_text = (utils_dir / module_name).read_text()
+            self.assertIn("TELEGRAM_ENV_PATH", module_text)
+            self.assertIn("load_dotenv(TELEGRAM_ENV_PATH)", module_text)
+            self.assertNotIn("load_dotenv()", module_text)
+
 
 if __name__ == "__main__":
     unittest.main()

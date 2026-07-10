@@ -6,7 +6,8 @@ import requests
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+TELEGRAM_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
+load_dotenv(TELEGRAM_ENV_PATH)
 
 
 def _float_env(name, default, minimum=0.1):

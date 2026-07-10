@@ -1,193 +1,70 @@
 #!/bin/bash
-source /etc/ajib/core/scripts/path.sh
 
-# Usage: ./restore.sh <backup_zip_file>
+set -euo pipefail
 
-set -e 
+INSTALL_DIR=${AJIB_INSTALL_DIR:-/etc/ajib}
+BOT_DIR="$INSTALL_DIR/core/scripts/telegrambot"
+BACKUP_DIR=${AJIB_BACKUP_DIR:-/opt/ajib-backups}
+BACKUP_FILE=${1:-}
+RESTORE_DIR=$(mktemp -d)
 
-BACKUP_ZIP_FILE="$1"
-RESTORE_DIR="/tmp/ajib_restore_$(date +%Y%m%d_%H%M%S)"
-TARGET_DIR="/etc/ajib"
-
-if [ -z "$BACKUP_ZIP_FILE" ]; then
-  echo "Error: Backup file path is required."
-  exit 1
-fi
-
-if [ ! -f "$BACKUP_ZIP_FILE" ]; then
-  echo "Error: Backup file not found: $BACKUP_ZIP_FILE"
-  exit 1
-fi
-
-if [[ "$BACKUP_ZIP_FILE" != *.zip ]]; then
-  echo "Error: Backup file must be a .zip file."
-  exit 1
-fi
-
-mkdir -p "$RESTORE_DIR"
-
-unzip -l "$BACKUP_ZIP_FILE" >/dev/null 2>&1
-if [ $? -ne 0 ]; then
-    echo "Error: Invalid ZIP file."
-    rm -rf "$RESTORE_DIR" 
-    exit 1
-fi
-
-unzip -o "$BACKUP_ZIP_FILE" -d "$RESTORE_DIR" >/dev/null 2>&1
-if [ $? -ne 0 ]; then
-    echo "Error: Could not extract the ZIP file."
+cleanup() {
     rm -rf "$RESTORE_DIR"
+}
+trap cleanup EXIT
+
+if [ -z "$BACKUP_FILE" ] || [ ! -f "$BACKUP_FILE" ]; then
+    echo "A valid backup ZIP file is required." >&2
     exit 1
 fi
 
-backup_has_relative_paths=false
-if unzip -Z1 "$BACKUP_ZIP_FILE" 2>/dev/null | grep -q '^core/scripts/telegrambot/'; then
-    backup_has_relative_paths=true
-fi
+python3 - "$BACKUP_FILE" "$RESTORE_DIR" <<'PY'
+import pathlib
+import sys
+import zipfile
 
-required_files=(
-    ".configs.env"
-)
+archive_path = pathlib.Path(sys.argv[1])
+restore_dir = pathlib.Path(sys.argv[2]).resolve()
+prefix = "core/scripts/telegrambot/"
 
-for file in "${required_files[@]}"; do
-    if [ ! -f "$RESTORE_DIR/$file" ]; then
-        echo "Error: Required file '$file' is missing from the backup."
-        rm -rf "$RESTORE_DIR"
-        exit 1
-    fi
-    if [ ! -f "$RESTORE_DIR/$file" ]; then
-        echo "Error: '$file' in the backup is not a regular file."
-        rm -rf "$RESTORE_DIR"
-        exit 1
-    fi
-done
-
-collect_current_state_files() {
-    shopt -s nullglob dotglob
-    local files=(
-        "$TARGET_DIR"/*.env
-        "$TARGET_DIR"/*.json
-        "$TARGET_DIR/core/scripts/telegrambot"/*.env
-        "$TARGET_DIR/core/scripts/telegrambot"/*.json
-    )
-    shopt -u nullglob dotglob
-
-    for file in "${files[@]}"; do
-        if [ -f "$file" ]; then
-            echo "${file#$TARGET_DIR/}"
-        fi
-    done
-}
-
-restore_root_file() {
-    local source_file="$1"
-    local target_file="$TARGET_DIR/$(basename "$source_file")"
-
-    mkdir -p "$TARGET_DIR"
-    cp -p "$source_file" "$target_file"
-    if [ $? -ne 0 ]; then
-        echo "Error: replace Configuration Files '$(basename "$source_file")'."
-        rm -rf "$existing_backup_dir"
-        rm -rf "$RESTORE_DIR"
-        exit 1
-    fi
-}
-
-restore_root_state_files() {
-    local source_dir="$1"
-
-    if [ ! -d "$source_dir" ]; then
-        return
-    fi
-
-    shopt -s nullglob dotglob
-    local files=(
-        "$source_dir"/*.env
-        "$source_dir"/*.json
-    )
-    shopt -u nullglob dotglob
-
-    for source_file in "${files[@]}"; do
-        if [ -f "$source_file" ]; then
-            restore_root_file "$source_file"
-        fi
-    done
-}
-
-restore_telegram_state_files() {
-    local source_dir="$1"
-
-    if [ ! -d "$source_dir" ]; then
-        return
-    fi
-
-    shopt -s nullglob dotglob
-    local files=(
-        "$source_dir"/*.env
-        "$source_dir"/*.json
-    )
-    shopt -u nullglob dotglob
-
-    for source_file in "${files[@]}"; do
-        if [ ! -f "$source_file" ]; then
+with zipfile.ZipFile(archive_path) as archive:
+    members = []
+    for info in archive.infolist():
+        name = info.filename.replace("\\", "/")
+        path = pathlib.PurePosixPath(name)
+        if info.is_dir():
             continue
-        fi
-
-        local backup_name
-        backup_name="$(basename "$source_file")"
-        if [ "$backup_name" = ".configs.env" ]; then
-            continue
-        fi
-
-        local target_file="$TARGET_DIR/core/scripts/telegrambot/$backup_name"
-        mkdir -p "$(dirname "$target_file")"
-        cp -p "$source_file" "$target_file"
-        if [ $? -ne 0 ]; then
-            echo "Error: replace Telegram bot state file '$backup_name'."
-            rm -rf "$existing_backup_dir"
-            rm -rf "$RESTORE_DIR"
-            exit 1
-        fi
-    done
-}
+        if path.is_absolute() or ".." in path.parts:
+            raise SystemExit(f"Unsafe backup entry: {name}")
+        if not name.startswith(prefix) or path.parent.as_posix() != prefix.rstrip("/"):
+            raise SystemExit(f"Unsupported backup entry: {name}")
+        if path.suffix not in {".env", ".json"} and path.name != ".env":
+            raise SystemExit(f"Unsupported bot state file: {name}")
+        members.append(info)
+    if not members:
+        raise SystemExit("Backup contains no Telegram bot state files.")
+    for info in members:
+        archive.extract(info, restore_dir)
+PY
 
 timestamp=$(date +%Y%m%d_%H%M%S)
-existing_backup_dir="/opt/hysbackup/restore_pre_backup_$timestamp"
-mkdir -p "$existing_backup_dir"
-while IFS= read -r file; do
-  if [ -f "$TARGET_DIR/$file" ]; then
-    mkdir -p "$existing_backup_dir/$(dirname "$file")"
-    cp -p "$TARGET_DIR/$file" "$existing_backup_dir/$file"
-    if [ $? -ne 0 ]; then
-      echo "Error creating backup file before restore from '$TARGET_DIR/$file'."
-      exit 1
-    fi
-  fi
-done < <(collect_current_state_files)
+pre_restore_dir="$BACKUP_DIR/restore_pre_backup_$timestamp"
+mkdir -p "$pre_restore_dir" "$BOT_DIR"
 
-for file in "${required_files[@]}"; do
-    restore_root_file "$RESTORE_DIR/$file"
+shopt -s nullglob dotglob
+current_files=("$BOT_DIR"/*.env "$BOT_DIR"/*.json)
+restored_files=("$RESTORE_DIR/core/scripts/telegrambot"/*.env "$RESTORE_DIR/core/scripts/telegrambot"/*.json)
+shopt -u nullglob dotglob
+
+for file in "${current_files[@]}"; do
+    cp -p "$file" "$pre_restore_dir/"
+done
+for file in "${restored_files[@]}"; do
+    cp -p "$file" "$BOT_DIR/"
 done
 
-if [ "$backup_has_relative_paths" = true ]; then
-    restore_root_state_files "$RESTORE_DIR"
-    restore_telegram_state_files "$RESTORE_DIR/core/scripts/telegrambot"
-else
-    restore_telegram_state_files "$RESTORE_DIR"
+if [ "${AJIB_SKIP_SERVICE_RESTART:-0}" != "1" ] && systemctl is-active --quiet ajib-telegram-bot.service; then
+    systemctl restart ajib-telegram-bot.service
 fi
 
-rm -rf "$RESTORE_DIR"
-echo "ajib configuration restored successfully."
-
-python3 "$CLI_PATH" restart-ajib > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-      echo "Error: Restart service failed'."
-      rm -rf "$existing_backup_dir"
-      exit 1
-fi
-
-if [[ "$existing_backup_dir" != "" ]]; then
-    rm -rf "$existing_backup_dir"
-fi
-
-exit 0
+echo "Telegram bot state restored successfully."

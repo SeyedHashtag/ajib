@@ -3,7 +3,7 @@ from telebot import types
 ADMIN_MAIN_MENU_ROWS = (
     ('➕ Add User', '👤 Show User'),
     ('❌ Delete User', '📊 Server Info'),
-    ('💾 Backup Server', '💳 Payment Settings'),
+    ('💾 Backup Bot', '💳 Payment Settings'),
     ('📝 Edit Plans', '📢 Broadcast Message'),
     ('📞 Edit Support', '🔄 Update Keyboards'),
     ('💼 Manage Resellers', '🧪 Manage Test Accounts'),

@@ -1,107 +1,80 @@
 #!/bin/bash
 
-cd /root/
+set -euo pipefail
+
+INSTALL_DIR="/etc/ajib"
+BOT_DIR="$INSTALL_DIR/core/scripts/telegrambot"
+REPOSITORY="https://github.com/SeyedHashtag/ajib"
 TEMP_DIR=$(mktemp -d)
+STATE_DIR="$TEMP_DIR/state"
+NEW_DIR="$TEMP_DIR/new"
+OLD_DIR="$TEMP_DIR/old"
+was_active=false
+switched=false
+upgrade_succeeded=false
 
-shopt -s nullglob dotglob
-FILES=(
-    /etc/ajib/*.env
-    /etc/ajib/*.json
-    /etc/ajib/core/scripts/telegrambot/*.env
-    /etc/ajib/core/scripts/telegrambot/*.json
-)
-shopt -u nullglob dotglob
-
-echo "Backing up and stopping all cron jobs"
-crontab -l > /tmp/crontab_backup
-crontab -r
-
-echo "Backing up files to $TEMP_DIR"
-for FILE in "${FILES[@]}"; do
-    if [ -f "$FILE" ]; then
-        mkdir -p "$TEMP_DIR/$(dirname "$FILE")"
-        cp "$FILE" "$TEMP_DIR/$FILE"
-    fi
-done
-
-echo "Checking and renaming old systemd service files"
-declare -A SERVICE_MAP=(
-    ["/etc/systemd/system/ajib-bot.service"]="ajib-telegram-bot.service"
-)
-
-for OLD_SERVICE in "${!SERVICE_MAP[@]}"; do
-    NEW_SERVICE="/etc/systemd/system/${SERVICE_MAP[$OLD_SERVICE]}"
-
-    if [[ -f "$OLD_SERVICE" ]]; then
-        echo "Stopping old service: $(basename "$OLD_SERVICE")"
-        systemctl stop "$(basename "$OLD_SERVICE")" 2>/dev/null
-
-        echo "Renaming $OLD_SERVICE to $NEW_SERVICE"
-        mv "$OLD_SERVICE" "$NEW_SERVICE"
-
-        echo "Reloading systemd daemon"
+cleanup() {
+    status=$?
+    set +e
+    if [ "$switched" = true ] && [ "$upgrade_succeeded" != true ]; then
+        rm -rf "$INSTALL_DIR"
+        mv "$OLD_DIR" "$INSTALL_DIR"
         systemctl daemon-reload
+        if [ "$was_active" = true ]; then
+            systemctl start ajib-telegram-bot.service
+        fi
     fi
+    rm -rf "$TEMP_DIR"
+    exit "$status"
+}
+trap cleanup EXIT
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "This script must be run as root."
+    exit 1
+fi
+
+if [ ! -d "$INSTALL_DIR" ]; then
+    echo "$INSTALL_DIR does not exist. Run install.sh first."
+    exit 1
+fi
+
+mkdir -p "$STATE_DIR"
+shopt -s nullglob dotglob
+state_files=("$BOT_DIR"/*.env "$BOT_DIR"/*.json)
+shopt -u nullglob dotglob
+for file in "${state_files[@]}"; do
+    cp -p "$file" "$STATE_DIR/"
 done
 
-echo "Removing /etc/ajib directory"
-rm -rf /etc/ajib/
+git clone "$REPOSITORY" "$NEW_DIR"
 
-echo "Cloning ajib repository"
-git clone https://github.com/SeyedHashtag/ajib /etc/ajib
+if systemctl is-active --quiet ajib-telegram-bot.service; then
+    was_active=true
+    systemctl stop ajib-telegram-bot.service
+fi
 
-echo "Restoring backup files"
-for FILE in "${FILES[@]}"; do
-    if [ -f "$TEMP_DIR/$FILE" ]; then
-        mkdir -p "$(dirname "$FILE")"
-        cp "$TEMP_DIR/$FILE" "$FILE"
-    fi
+mv "$INSTALL_DIR" "$OLD_DIR"
+switched=true
+mv "$NEW_DIR" "$INSTALL_DIR"
+
+mkdir -p "$BOT_DIR"
+shopt -s nullglob dotglob
+saved_files=("$STATE_DIR"/*)
+shopt -u nullglob dotglob
+for file in "${saved_files[@]}"; do
+    cp -p "$file" "$BOT_DIR/"
 done
 
+python3 -m venv "$INSTALL_DIR/ajib_venv"
+"$INSTALL_DIR/ajib_venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
+chmod +x "$INSTALL_DIR/menu.sh"
 
-CONFIG_ENV="/etc/ajib/.configs.env"
-if [ ! -f "$CONFIG_ENV" ]; then
-    echo ".configs.env not found, creating it with default values."
-    echo "SNI=bts.com" > "$CONFIG_ENV"
+systemctl daemon-reload
+if [ "$was_active" = true ]; then
+    systemctl start ajib-telegram-bot.service
+    systemctl is-active --quiet ajib-telegram-bot.service
 fi
 
-export $(grep -v '^#' "$CONFIG_ENV" | xargs 2>/dev/null)
-
-if [[ -z "$IP4" ]]; then
-    echo "IP4 not found, fetching from ip.gs..."
-    IP4=$(curl -s -4 ip.gs || echo "")
-    echo "IP4=${IP4:-}" >> "$CONFIG_ENV"
-fi
-
-if [[ -z "$IP6" ]]; then
-    echo "IP6 not found, fetching from ip.gs..."
-    IP6=$(curl -s -6 ip.gs || echo "")
-    echo "IP6=${IP6:-}" >> "$CONFIG_ENV"
-fi
-
-echo "Setting ownership and permissions"
-chown -R ajib:ajib /etc/ajib/core/scripts/telegrambot
-
-cd /etc/ajib
-python3 -m venv ajib_venv
-source /etc/ajib/ajib_venv/bin/activate
-pip install -r requirements.txt
-
-echo "Restarting other ajib services"
-systemctl restart ajib-server.service
-systemctl restart ajib-telegram-bot.service
-
-
-echo "Checking ajib-server.service status"
-if systemctl is-active --quiet ajib-server.service; then
-    echo "Upgrade completed successfully"
-else
-    echo "Upgrade failed: ajib-server.service is not active"
-fi
-
-echo "Restoring cron jobs"
-crontab /tmp/crontab_backup
-rm /tmp/crontab_backup
-
-chmod +x menu.sh
-./menu.sh
+upgrade_succeeded=true
+echo "ajib Telegram bot upgraded successfully."

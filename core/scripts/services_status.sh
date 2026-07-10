@@ -1,21 +1,7 @@
 #!/bin/bash
 
-declare -a services=(
-    "ajib-server.service"
-    "ajib-telegram-bot.service"
-)
-
-status_json="{"
-for service in "${services[@]}"; do
-    if systemctl is-active --quiet "$service"; then
-        status_json+="\"$service\":true,"
-    else
-        status_json+="\"$service\":false,"
-    fi
-done
-
-# Remove trailing comma and close JSON properly
-status_json="${status_json%,}}"
-
-# Format output as valid JSON
-echo "$status_json" | jq -M .
+if systemctl is-active --quiet ajib-telegram-bot.service; then
+    echo '{"ajib-telegram-bot.service":true}'
+else
+    echo '{"ajib-telegram-bot.service":false}'
+fi

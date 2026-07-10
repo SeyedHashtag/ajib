@@ -1,70 +1,68 @@
 #!/bin/bash
 
-check_os_version() {
-    local os_name os_version
+set -euo pipefail
 
-    if [ -f /etc/os-release ]; then
-        os_name=$(grep '^ID=' /etc/os-release | cut -d= -f2)
-        os_version=$(grep '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
-    else
-        echo "Unsupported OS or unable to determine OS version."
-        exit 1
-    fi
+INSTALL_DIR="/etc/ajib"
+REPOSITORY="https://github.com/SeyedHashtag/ajib"
+install_complete=false
+install_started=false
 
-    if ! command -v bc &> /dev/null; then
-        apt update && apt install -y bc
+cleanup() {
+    status=$?
+    if [ "$install_started" = true ] && [ "$install_complete" != true ]; then
+        rm -rf "$INSTALL_DIR"
     fi
-
-    if [[ "$os_name" == "ubuntu" && $(echo "$os_version >= 22" | bc) -eq 1 ]] ||
-       [[ "$os_name" == "debian" && $(echo "$os_version >= 11" | bc) -eq 1 ]]; then
-        return 0
-    else
-        echo "This script is only supported on Ubuntu 22+ or Debian 11+."
-        exit 1
-    fi
+    exit "$status"
 }
+trap cleanup EXIT
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script must be run as root."
     exit 1
 fi
 
-check_os_version
+if [ ! -r /etc/os-release ]; then
+    echo "Unable to determine the operating system."
+    exit 1
+fi
 
-REQUIRED_PACKAGES=("jq" "qrencode" "curl" "pwgen" "python3" "python3-pip" "python3-venv" "git" "bc" "zip" "cron" "lsof")
-MISSING_PACKAGES=()
-heavy_checkmark=$(printf "\xE2\x9C\x85")
+. /etc/os-release
+major_version=${VERSION_ID%%.*}
+if { [ "$ID" != "ubuntu" ] || [ "$major_version" -lt 22 ]; } && \
+   { [ "$ID" != "debian" ] || [ "$major_version" -lt 11 ]; }; then
+    echo "This installer supports Ubuntu 22+ and Debian 11+."
+    exit 1
+fi
 
-for package in "${REQUIRED_PACKAGES[@]}"; do
-    if ! command -v "$package" &> /dev/null; then
-        MISSING_PACKAGES+=("$package")
-    else
-        echo "Install $package $heavy_checkmark"
+required_packages=(curl git python3 python3-venv procps)
+missing_packages=()
+for package in "${required_packages[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "ok installed"; then
+        missing_packages+=("$package")
     fi
 done
 
-if [ ${#MISSING_PACKAGES[@]} -ne 0 ]; then
-    echo "The following packages are missing and will be installed: ${MISSING_PACKAGES[@]}"
-    apt update -qq && apt upgrade -y -qq
-    for package in "${MISSING_PACKAGES[@]}"; do
-        apt install -y -qq "$package" &> /dev/null && echo "Install $package $heavy_checkmark"
-    done
-else
-    echo "All required packages are already installed."
+if [ ${#missing_packages[@]} -gt 0 ]; then
+    apt-get update -qq
+    apt-get install -y -qq "${missing_packages[@]}"
 fi
 
-git clone https://github.com/SeyedHashtag/ajib /etc/ajib
-
-cd /etc/ajib
-python3 -m venv ajib_venv
-source /etc/ajib/ajib_venv/bin/activate
-pip install -r requirements.txt &> /dev/null && echo "Install Python requirements ✅"
-
-if ! grep -q "alias ajib='source /etc/ajib/ajib_venv/bin/activate && /etc/ajib/menu.sh'" ~/.bashrc; then
-    echo "alias ajib='source /etc/ajib/ajib_venv/bin/activate && /etc/ajib/menu.sh'" >> ~/.bashrc
-    source ~/.bashrc
+if [ -e "$INSTALL_DIR" ]; then
+    echo "$INSTALL_DIR already exists. Use upgrade.sh to update an existing installation."
+    exit 1
 fi
-sleep 5
-cd /etc/ajib
-chmod +x menu.sh
-./menu.sh
+
+install_started=true
+git clone "$REPOSITORY" "$INSTALL_DIR"
+python3 -m venv "$INSTALL_DIR/ajib_venv"
+"$INSTALL_DIR/ajib_venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
+chmod +x "$INSTALL_DIR/menu.sh"
+
+alias_line="alias ajib='source /etc/ajib/ajib_venv/bin/activate && /etc/ajib/menu.sh'"
+if ! grep -Fqx "$alias_line" "$HOME/.bashrc" 2>/dev/null; then
+    echo "$alias_line" >> "$HOME/.bashrc"
+fi
+
+install_complete=true
+echo "ajib Telegram bot installed successfully."
+"$INSTALL_DIR/menu.sh"

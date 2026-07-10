@@ -1,11 +1,10 @@
-from dotenv import load_dotenv
 import os
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from telebot import types
-from utils.command import *
+from utils.command import CLI_PATH, bot, is_admin
 from utils.telegram_safe import safe_answer_callback_query, safe_edit_message_text, safe_reply_to
 
 
@@ -36,7 +35,7 @@ def _int_env(name, default, minimum=1):
 
 SERVER_INFO_JOB_EXECUTOR = ThreadPoolExecutor(
     max_workers=_int_env("AJIB_SERVER_INFO_WORKERS", 1),
-    thread_name_prefix="ajib-server-info",
+    thread_name_prefix="ajib-dashboard",
 )
 
 

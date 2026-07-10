@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 
-import os
 import sys
 import requests
-from pathlib import Path
 
 LOCALVERSION = "/etc/ajib/VERSION"
 LATESTVERSION = "https://raw.githubusercontent.com/SeyedHashtag/ajib/main/VERSION"
@@ -34,11 +32,11 @@ def check_version():
         latest_version = requests.get(LATESTVERSION).text.strip()
         latest_changelog = requests.get(LASTESTCHANGE).text
         
-        print(f"Panel Version: {local_version}")
+        print(f"Bot Version: {local_version}")
         
         if not version_greater_equal(local_version, latest_version):
             print(f"Latest Version: {latest_version}")
-            print(f"Recent Change Log (last 2 versions):")
+            print("Recent Change Log (last 2 versions):")
             sections = [s for s in latest_changelog.split("## v") if s.strip()]
             for section in sections[:2]:
                 print(f"## v{section.strip()}")
@@ -51,7 +49,7 @@ def show_version():
         with open(LOCALVERSION, 'r') as f:
             local_version = f.read().strip()
         
-        print(f"Panel Version: {local_version}")
+        print(f"Bot Version: {local_version}")
     except Exception as e:
         print(f"Error showing version: {e}", file=sys.stderr)
         sys.exit(1)

@@ -24,25 +24,20 @@ def cli():
 @cli.command('backup-ajib')
 def backup_ajib():
     try:
-        cli_api.backup_ajib()
-        click.echo('ajib configuration backed up successfully.')
+        click.echo(cli_api.backup_ajib())
     except Exception as e:
-        click.echo(f'{e}', err=True)
+        raise click.ClickException(str(e)) from e
 
 @cli.command('restore-ajib')
 @click.argument('backup_file_path', type=click.Path(exists=True, file_okay=True, dir_okay=False, readable=True))
 def restore_ajib(backup_file_path):
-    """Restores ajib configuration from a backup ZIP file."""
+    """Restore Telegram bot state from a backup ZIP file."""
     try:
-        cli_api.restore_ajib(backup_file_path)
-        click.echo('ajib configuration restored successfully.')
+        click.echo(cli_api.restore_ajib(backup_file_path))
     except Exception as e:
-        click.echo(f'{e}', err=True)
+        raise click.ClickException(str(e)) from e
 
 # endregion
-
-# region Server
-
 
 @cli.command('server-info')
 @click.option(
@@ -60,37 +55,7 @@ def server_info(section):
         else:
             click.echo('Server information not available.')
     except Exception as e:
-        click.echo(f'{e}', err=True)
-
-
-@cli.command('ip-address')
-@click.option('--edit', is_flag=True, help='Edit IP addresses manually.')
-@click.option('-4', '--ipv4', type=str, help='Specify the new IPv4 address.')
-@click.option('-6', '--ipv6', type=str, help='Specify the new IPv6 address.')
-def ip_address(edit: bool, ipv4: str, ipv6: str):
-    '''
-    Manage IP addresses in .configs.env.
-    - Use without options to add auto-detected IPs.
-    - Use --edit with -4 or -6 to manually update IPs.
-    '''
-    try:
-        if not edit:
-            cli_api.add_ip_address()
-            click.echo('IP addresses added successfully.')
-            return
-
-        if not ipv4 and not ipv6:
-            raise click.UsageError('Error: You must specify either -4 or -6')
-
-        cli_api.edit_ip_address(ipv4, ipv6)
-        click.echo('IP address configuration updated successfully.')
-    except Exception as e:
-        click.echo(f'{e}', err=True)
-
-# endregion
-
-# region Advanced Menu
-
+        raise click.ClickException(str(e)) from e
 
 @cli.command('telegram')
 @click.option('--action', '-a', required=True, help='Action to perform: start or stop', type=click.Choice(['start', 'stop'], case_sensitive=False))
@@ -105,12 +70,12 @@ def telegram(action: str, token: str, adminid: str, api_url: str, api_key: str, 
             if not token or not adminid or ((not api_url or not api_key) and not server):
                 raise click.UsageError('Error: --token and --adminid are required. Provide --api-url/--api-key or at least one --server.')
             cli_api.start_telegram_bot(token, adminid, api_url, api_key, servers=server)
-            click.echo(f'Telegram bot started successfully.')
+            click.echo('Telegram bot started successfully.')
         elif action == 'stop':
             cli_api.stop_telegram_bot()
-            click.echo(f'Telegram bot stopped successfully.')
+            click.echo('Telegram bot stopped successfully.')
     except Exception as e:
-        click.echo(f'{e}', err=True)
+        raise click.ClickException(str(e)) from e
 
 
 @cli.command('get-services-status')
@@ -122,19 +87,19 @@ def get_services_status():
         else:
             click.echo('Error: Services status not available.')
     except Exception as e:
-        click.echo(f'{e}', err=True)
+        raise click.ClickException(str(e)) from e
 
 
 @cli.command('show-version')
 def show_version():
-    """Displays the currently installed version of the panel."""
+    """Display the currently installed bot version."""
     try:
         if version_info := cli_api.show_version():
              click.echo(version_info)
         else:
             click.echo("Error retrieving version")
     except Exception as e:
-        click.echo(f"An unexpected error occurred: {e}", err=True)
+        raise click.ClickException(str(e)) from e
 
 
 @cli.command('check-version')
@@ -146,7 +111,7 @@ def check_version():
         else:
             click.echo("Error retrieving version")
     except Exception as e:
-        click.echo(f"An unexpected error occurred: {e}", err=True)
+        raise click.ClickException(str(e)) from e
 
 # endregion
 

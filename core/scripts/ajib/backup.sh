@@ -1,40 +1,40 @@
 #!/bin/bash
 
-BACKUP_DIR="/opt/hysbackup"
-BACKUP_FILE="$BACKUP_DIR/ajib_backup_$(date +%Y%m%d_%H%M%S).zip"
+set -euo pipefail
 
-if [ ! -d "$BACKUP_DIR" ]; then
-    mkdir -p "$BACKUP_DIR"
-fi
+INSTALL_DIR=${AJIB_INSTALL_DIR:-/etc/ajib}
+BOT_DIR="$INSTALL_DIR/core/scripts/telegrambot"
+BACKUP_DIR=${AJIB_BACKUP_DIR:-/opt/ajib-backups}
+BACKUP_FILE="$BACKUP_DIR/ajib_bot_backup_$(date +%Y%m%d_%H%M%S).zip"
+
+mkdir -p "$BACKUP_DIR"
 
 shopt -s nullglob dotglob
-FILES_TO_BACKUP=(
-    /etc/ajib/*.env
-    /etc/ajib/*.json
-    /etc/ajib/core/scripts/telegrambot/*.env
-    /etc/ajib/core/scripts/telegrambot/*.json
-)
+state_files=("$BOT_DIR"/*.env "$BOT_DIR"/*.json)
 shopt -u nullglob dotglob
 
-RELATIVE_FILES=()
-for FILE in "${FILES_TO_BACKUP[@]}"; do
-    if [ -f "$FILE" ]; then
-        RELATIVE_FILES+=("${FILE#/etc/ajib/}")
-    fi
-done
-
-if [ ${#RELATIVE_FILES[@]} -eq 0 ]; then
-    echo "Backup failed!"
+if [ ${#state_files[@]} -eq 0 ]; then
+    echo "Backup failed: no Telegram bot state files were found." >&2
     exit 1
 fi
 
-(
-    cd /etc/ajib || exit 1
-    zip "$BACKUP_FILE" "${RELATIVE_FILES[@]}" >/dev/null
-)
+relative_files=()
+for file in "${state_files[@]}"; do
+    relative_files+=("${file#$INSTALL_DIR/}")
+done
 
-if [ $? -eq 0 ]; then
-    echo "Backup successfully created"
-else
-    echo "Backup failed!"
-fi
+python3 - "$BACKUP_FILE" "$INSTALL_DIR" "${relative_files[@]}" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+backup_path = pathlib.Path(sys.argv[1])
+install_dir = pathlib.Path(sys.argv[2])
+relative_files = sys.argv[3:]
+
+with zipfile.ZipFile(backup_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    for relative_file in relative_files:
+        archive.write(install_dir / relative_file, relative_file)
+PY
+
+echo "$BACKUP_FILE"

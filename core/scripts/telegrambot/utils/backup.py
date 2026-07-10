@@ -1,15 +1,6 @@
-import telebot
-import subprocess
-import qrcode
-import io
-import json
 import os
-import shlex
-import re
 import threading
-from dotenv import load_dotenv
-from telebot import types
-from utils.command import *
+from utils.command import ADMIN_USER_IDS, BACKUP_DIRECTORY, CLI_PATH, bot, is_admin, run_cli_command
 
 BACKUP_LOCK = threading.Lock()
 
@@ -31,6 +22,10 @@ def _run_backup_command():
     result = run_cli_command(backup_command)
     if "Error" in result:
         return None, result
+
+    reported_path = result.splitlines()[-1].strip() if result else ""
+    if reported_path and os.path.isfile(reported_path):
+        return (reported_path, os.path.basename(reported_path)), None
 
     backup_file_path, latest_backup_file_or_error = _get_latest_backup_file()
     if not backup_file_path:
@@ -71,6 +66,6 @@ def run_backup_and_send_to_admins():
         _send_backup_file(admin_id, backup_file_path, latest_backup_file, caption_prefix="Automated backup completed")
 
 
-@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '💾 Backup Server')
-def backup_server(message):
+@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '💾 Backup Bot')
+def backup_bot(message):
     run_backup_and_send(message.chat.id)
