@@ -1,3 +1,8 @@
+## v1.16.4
+✨ Run Telegram bot CLI actions through the Ajib Python virtual environment
+🐛 Show an actionable error when the Ajib Python environment is missing
+✅ Add regression coverage for virtual-environment CLI execution and system-Python JSON parsing
+
 ## v1.16.3
 ♻️ Rename to Ajib across runtime paths, services, scripts, configuration variables, and documentation
 🛠️ Refocus the project on the Telegram bot and externally managed VPN APIs, removing bundled local VPN server management
