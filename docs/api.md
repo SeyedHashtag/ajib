@@ -1,6 +1,6 @@
 # API Reference
 
-This document summarizes the Blitz web panel API used by dijiq for Hysteria2 management.
+This document summarizes the Blitz web panel API used by ajib for Hysteria2 management.
 
 The original OpenAPI document is exposed by the deployed panel at:
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-source /etc/dijiq/core/scripts/path.sh
+source /etc/ajib/core/scripts/path.sh
 
 if [ ! -f "$CONFIG_ENV" ]; then
   echo "CONFIG_ENV not found. Creating a new one..."

@@ -1,5 +1,5 @@
-source /etc/dijiq/core/scripts/path.sh
-# source /etc/dijiq/core/scripts/services_status.sh
+source /etc/ajib/core/scripts/path.sh
+# source /etc/ajib/core/scripts/services_status.sh
 
 # Function to define colors
 define_colors() {
@@ -41,9 +41,9 @@ version_greater_equal() {
 }
 
 check_core_version() {
-    if systemctl is-active --quiet dijiq-server.service; then
-        HCVERSION=$(dijiq version | grep "^Version:" | awk '{print $2}')
-        echo -e "dijiq Core Version: ${cyan}$HCVERSION${NC}"
+    if systemctl is-active --quiet ajib-server.service; then
+        HCVERSION=$(ajib version | grep "^Version:" | awk '{print $2}')
+        echo -e "ajib Core Version: ${cyan}$HCVERSION${NC}"
     fi
 }
 
@@ -63,7 +63,7 @@ check_version() {
 }
 
 
-load_dijiq_env() {
+load_ajib_env() {
     if [ -f "$CONFIG_ENV" ]; then
         export $(grep -v '^#' "$CONFIG_ENV" | xargs)
     else
@@ -72,7 +72,7 @@ load_dijiq_env() {
     fi
 }
 
-load_dijiq_ips() {
+load_ajib_ips() {
     IP4=""
     IP6=""
 
@@ -167,7 +167,7 @@ load_dijiq_ips() {
 
 
 # check_services() {
-#     # source /etc/dijiq/core/scripts/services_status.sh
+#     # source /etc/ajib/core/scripts/services_status.sh
 #     for service in "${services[@]}"; do
 #         service_base_name=$(basename "$service" .service)
 

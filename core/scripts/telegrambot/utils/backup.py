@@ -27,7 +27,7 @@ def _get_latest_backup_file():
     return os.path.join(BACKUP_DIRECTORY, latest_backup_file), latest_backup_file
 
 def _run_backup_command():
-    backup_command = f"python3 {CLI_PATH} backup-dijiq"
+    backup_command = f"python3 {CLI_PATH} backup-ajib"
     result = run_cli_command(backup_command)
     if "Error" in result:
         return None, result

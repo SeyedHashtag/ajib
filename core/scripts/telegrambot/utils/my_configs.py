@@ -34,12 +34,12 @@ def _int_env(name, default, minimum=1):
 
 
 SHOW_CONFIG_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_SHOW_CONFIG_WORKERS", 2),
-    thread_name_prefix="dijiq-show-config",
+    max_workers=_int_env("AJIB_SHOW_CONFIG_WORKERS", 2),
+    thread_name_prefix="ajib-show-config",
 )
 MY_CONFIGS_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_MY_CONFIGS_WORKERS", 2),
-    thread_name_prefix="dijiq-my-configs",
+    max_workers=_int_env("AJIB_MY_CONFIGS_WORKERS", 2),
+    thread_name_prefix="ajib-my-configs",
 )
 
 
@@ -56,7 +56,7 @@ def _append_my_configs_cache_notice(text, language, show_cache_notice=True):
 
 def _log_renewal_unavailable(source, username, api_client, offer):
     offer = offer or {}
-    logging.getLogger("dijiq.renewal").info(
+    logging.getLogger("ajib.renewal").info(
         "Renewal unavailable source=%s username=%s server_id=%s reason=%s",
         offer.get("source") or source,
         offer.get("username") or username,

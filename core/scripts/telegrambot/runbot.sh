@@ -1,5 +1,5 @@
 #!/bin/bash
-source /etc/dijiq/core/scripts/utils.sh
+source /etc/ajib/core/scripts/utils.sh
 define_colors
 
 update_env_file() {
@@ -8,7 +8,7 @@ update_env_file() {
     local api_url=$3
     local api_key=$4
     local servers_json=$5
-    local env_file="/etc/dijiq/core/scripts/telegrambot/.env"
+    local env_file="/etc/ajib/core/scripts/telegrambot/.env"
     local tmp_file
     tmp_file=$(mktemp)
 
@@ -28,14 +28,14 @@ EOL
 }
 
 create_service_file() {
-    cat <<EOL > /etc/systemd/system/dijiq-telegram-bot.service
+    cat <<EOL > /etc/systemd/system/ajib-telegram-bot.service
 [Unit]
-Description=dijiq Telegram Bot
+Description=ajib Telegram Bot
 After=network.target
 
 [Service]
-ExecStart=/bin/bash -c 'source /etc/dijiq/dijiq_venv/bin/activate && /etc/dijiq/dijiq_venv/bin/python /etc/dijiq/core/scripts/telegrambot/tbot.py'
-WorkingDirectory=/etc/dijiq/core/scripts/telegrambot
+ExecStart=/bin/bash -c 'source /etc/ajib/ajib_venv/bin/activate && /etc/ajib/ajib_venv/bin/python /etc/ajib/core/scripts/telegrambot/tbot.py'
+WorkingDirectory=/etc/ajib/core/scripts/telegrambot
 Restart=always
 
 [Install]
@@ -50,10 +50,10 @@ start_service() {
     local api_key=$4
     local servers_json=$5
 
-    if systemctl is-active --quiet dijiq-telegram-bot.service; then
+    if systemctl is-active --quiet ajib-telegram-bot.service; then
         update_env_file "$api_token" "$admin_user_ids" "$api_url" "$api_key" "$servers_json"
-        systemctl restart dijiq-telegram-bot.service > /dev/null 2>&1
-        echo "The dijiq-telegram-bot.service is already running. Configuration updated and service restarted."
+        systemctl restart ajib-telegram-bot.service > /dev/null 2>&1
+        echo "The ajib-telegram-bot.service is already running. Configuration updated and service restarted."
         return
     fi
 
@@ -61,24 +61,24 @@ start_service() {
     create_service_file
 
     systemctl daemon-reload
-    systemctl enable dijiq-telegram-bot.service > /dev/null 2>&1
-    systemctl start dijiq-telegram-bot.service > /dev/null 2>&1
+    systemctl enable ajib-telegram-bot.service > /dev/null 2>&1
+    systemctl start ajib-telegram-bot.service > /dev/null 2>&1
 
-    if systemctl is-active --quiet dijiq-telegram-bot.service; then
-        echo -e "${green}dijiq bot setup completed. The service is now running. ${NC}"
+    if systemctl is-active --quiet ajib-telegram-bot.service; then
+        echo -e "${green}ajib bot setup completed. The service is now running. ${NC}"
         echo -e "\n\n"
     else
-        echo "dijiq bot setup completed. The service failed to start."
+        echo "ajib bot setup completed. The service failed to start."
     fi
 }
 
 stop_service() {
-    systemctl stop dijiq-telegram-bot.service > /dev/null 2>&1
-    systemctl disable dijiq-telegram-bot.service > /dev/null 2>&1
+    systemctl stop ajib-telegram-bot.service > /dev/null 2>&1
+    systemctl disable ajib-telegram-bot.service > /dev/null 2>&1
 
     echo -e "\n"
 
-    echo "dijiq bot service stopped and disabled. Configuration preserved."
+    echo "ajib bot service stopped and disabled. Configuration preserved."
 }
 
 case "$1" in

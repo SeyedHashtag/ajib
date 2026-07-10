@@ -65,32 +65,32 @@ def _int_env(name, default, minimum=1):
 
 
 RESELLER_CREATE_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_RESELLER_CREATE_WORKERS", 2),
-    thread_name_prefix="dijiq-reseller-create",
+    max_workers=_int_env("AJIB_RESELLER_CREATE_WORKERS", 2),
+    thread_name_prefix="ajib-reseller-create",
 )
 RESELLER_CUSTOMERS_LOCK = threading.Lock()
 RESELLER_CUSTOMERS_INFLIGHT = set()
 RESELLER_CUSTOMERS_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_RESELLER_CUSTOMERS_WORKERS", 2),
-    thread_name_prefix="dijiq-reseller-customers",
+    max_workers=_int_env("AJIB_RESELLER_CUSTOMERS_WORKERS", 2),
+    thread_name_prefix="ajib-reseller-customers",
 )
 RESELLER_CUSTOMER_CONFIG_LOCK = threading.Lock()
 RESELLER_CUSTOMER_CONFIG_INFLIGHT = set()
 RESELLER_CUSTOMER_CONFIG_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_RESELLER_CUSTOMER_CONFIG_WORKERS", 2),
-    thread_name_prefix="dijiq-reseller-cfg",
+    max_workers=_int_env("AJIB_RESELLER_CUSTOMER_CONFIG_WORKERS", 2),
+    thread_name_prefix="ajib-reseller-cfg",
 )
 RESELLER_REQUEST_LOCK = threading.Lock()
 RESELLER_REQUEST_INFLIGHT = set()
 RESELLER_REQUEST_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_RESELLER_REQUEST_WORKERS", 2),
-    thread_name_prefix="dijiq-reseller-request",
+    max_workers=_int_env("AJIB_RESELLER_REQUEST_WORKERS", 2),
+    thread_name_prefix="ajib-reseller-request",
 )
 RESELLER_RENEWAL_LOCK = threading.Lock()
 RESELLER_RENEWAL_INFLIGHT = set()
 RESELLER_RENEWAL_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_RESELLER_RENEWAL_WORKERS", 2),
-    thread_name_prefix="dijiq-reseller-renewal",
+    max_workers=_int_env("AJIB_RESELLER_RENEWAL_WORKERS", 2),
+    thread_name_prefix="ajib-reseller-renewal",
 )
 
 
@@ -121,7 +121,7 @@ def _is_reseller_suspended(reseller_data):
 
 def _log_renewal_unavailable(source, username, api_client, reason, offer=None):
     offer = offer or {}
-    logging.getLogger("dijiq.renewal").info(
+    logging.getLogger("ajib.renewal").info(
         "Renewal unavailable source=%s username=%s server_id=%s reason=%s",
         offer.get("source") or source,
         offer.get("username") or username,
@@ -232,7 +232,7 @@ def _create_reseller_user_with_note(api_client, user_id, gb, days, chosen_userna
         if result is None:
             result = target_client.add_user(username, int(gb), int(days))
             if result is not None:
-                logging.getLogger("dijiq.usernames").warning(
+                logging.getLogger("ajib.usernames").warning(
                     "Created reseller user without note fallback. reseller_id=%s username=%s",
                     user_id,
                     username,
@@ -301,7 +301,7 @@ def _rollback_unaccounted_reseller_user(api_client, username):
         if api_client is not None and username:
             return api_client.delete_user(username)
     except Exception as e:
-        logging.getLogger("dijiq.reseller").exception(
+        logging.getLogger("ajib.reseller").exception(
             "Failed to roll back unaccounted reseller user username=%s error=%s",
             username,
             e,
@@ -799,7 +799,7 @@ def handle_reseller_username_input(message):
     except Exception as e:
         with reseller_username_state_lock:
             user_data[user_id] = data
-        logging.getLogger("dijiq.reseller").exception("Failed to queue reseller customer creation: %s", e)
+        logging.getLogger("ajib.reseller").exception("Failed to queue reseller customer creation: %s", e)
         safe_reply_to(bot, message, "Failed to start config creation. Please try again.")
         return
 
@@ -855,7 +855,7 @@ def handle_reseller_settle(call):
         return
     
     # Re-use payment logic
-    env_path = '/etc/dijiq/core/scripts/telegrambot/.env'
+    env_path = '/etc/ajib/core/scripts/telegrambot/.env'
     load_dotenv(env_path)
     
     crypto_configured = all(os.getenv(key) for key in ['CRYPTO_MERCHANT_ID', 'CRYPTO_API_KEY'])

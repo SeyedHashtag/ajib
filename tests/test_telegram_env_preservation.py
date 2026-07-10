@@ -33,7 +33,7 @@ class TelegramEnvPreservationTests(unittest.TestCase):
         stop_body = shell_function_body(runbot_text, "stop_service")
 
         self.assertNotIn("rm -f", stop_body)
-        self.assertNotIn("/etc/dijiq/core/scripts/telegrambot/.env", stop_body)
+        self.assertNotIn("/etc/ajib/core/scripts/telegrambot/.env", stop_body)
         self.assertIn("Configuration preserved", stop_body)
 
 

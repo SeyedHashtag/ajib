@@ -67,7 +67,7 @@ class DummyBot:
 
     def get_me(self):
         self.get_me_calls += 1
-        return types.SimpleNamespace(username="DijiqBot")
+        return types.SimpleNamespace(username="AjibBot")
 
 
 class HoldingExecutor:
@@ -332,7 +332,7 @@ class ReferralAdminHandlerTests(unittest.TestCase):
 
         self.assertEqual(module.REFERRAL_MENU_INFLIGHT, set())
         self.assertEqual(bot.get_me_calls, 1)
-        self.assertIn("https://t.me/DijiqBot?start=CODE", bot.messages[0][0][1])
+        self.assertIn("https://t.me/AjibBot?start=CODE", bot.messages[0][0][1])
 
     def test_admin_menu_renders_eligible_users(self):
         module, bot = load_referral_handlers_module()

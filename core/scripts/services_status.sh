@@ -1,8 +1,8 @@
 #!/bin/bash
 
 declare -a services=(
-    "dijiq-server.service"
-    "dijiq-telegram-bot.service"
+    "ajib-server.service"
+    "ajib-telegram-bot.service"
 )
 
 status_json="{"

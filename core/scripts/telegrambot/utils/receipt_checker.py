@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 
 TELEGRAM_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
-CHECKER_SETTLEMENTS_FILE = '/etc/dijiq/core/scripts/telegrambot/checker_settlements.json'
+CHECKER_SETTLEMENTS_FILE = '/etc/ajib/core/scripts/telegrambot/checker_settlements.json'
 
 RECEIPT_TYPE_REGULAR = 'regular'
 RECEIPT_TYPE_SETTLEMENT = 'settlement'

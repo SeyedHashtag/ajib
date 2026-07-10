@@ -7,25 +7,25 @@ from typing import Any
 from dotenv import dotenv_values
 
 DEBUG = False
-SCRIPT_DIR = '/etc/dijiq/core/scripts'
-CONFIG_ENV_FILE = '/etc/dijiq/.configs.env'
+SCRIPT_DIR = '/etc/ajib/core/scripts'
+CONFIG_ENV_FILE = '/etc/ajib/.configs.env'
 
 
 class Command(Enum):
     '''Contains path to command's script'''
-    IP_ADD = os.path.join(SCRIPT_DIR, 'dijiq', 'ip.sh')
-    SERVER_INFO = os.path.join(SCRIPT_DIR, 'dijiq', 'server_info.sh')
-    BACKUP_DIJIQ = os.path.join(SCRIPT_DIR, 'dijiq', 'backup.sh')
-    RESTORE_DIJIQ = os.path.join(SCRIPT_DIR, 'dijiq', 'restore.sh')
+    IP_ADD = os.path.join(SCRIPT_DIR, 'ajib', 'ip.sh')
+    SERVER_INFO = os.path.join(SCRIPT_DIR, 'ajib', 'server_info.sh')
+    BACKUP_AJIB = os.path.join(SCRIPT_DIR, 'ajib', 'backup.sh')
+    RESTORE_AJIB = os.path.join(SCRIPT_DIR, 'ajib', 'restore.sh')
     INSTALL_TELEGRAMBOT = os.path.join(SCRIPT_DIR, 'telegrambot', 'runbot.sh')
     SERVICES_STATUS = os.path.join(SCRIPT_DIR, 'services_status.sh')
-    VERSION = os.path.join(SCRIPT_DIR, 'dijiq', 'version.py')
+    VERSION = os.path.join(SCRIPT_DIR, 'ajib', 'version.py')
 
 import psutil
 import requests
 import sys
 
-TELEGRAM_UTILS_PATH = '/etc/dijiq/core/scripts/telegrambot'
+TELEGRAM_UTILS_PATH = '/etc/ajib/core/scripts/telegrambot'
 ONLINE_USERS_URL = "http://127.0.0.1:25413/online"
 PAID_STATUSES = {'completed', 'paid', 'success', 'succeeded'}
 FAILED_STATUSES = {'rejected', 'failed', 'canceled', 'cancelled', 'error'}
@@ -36,27 +36,27 @@ SERVER_INFO_SECTIONS = {'overview', 'business', 'customers', 'tech', 'traffic', 
 # region Custom Exceptions
 
 
-class dijiqError(Exception):
-    '''Base class for dijiq-related exceptions.'''
+class ajibError(Exception):
+    '''Base class for ajib-related exceptions.'''
     pass
 
 
-class CommandExecutionError(dijiqError):
+class CommandExecutionError(ajibError):
     '''Raised when a command execution fails.'''
     pass
 
 
-class InvalidInputError(dijiqError):
+class InvalidInputError(ajibError):
     '''Raised when the provided input is invalid.'''
     pass
 
 
-class PasswordGenerationError(dijiqError):
+class PasswordGenerationError(ajibError):
     '''Raised when password generation fails.'''
     pass
 
 
-class ScriptNotFoundError(dijiqError):
+class ScriptNotFoundError(ajibError):
     '''Raised when a required script is not found.'''
     pass
 
@@ -97,35 +97,35 @@ def generate_password() -> str:
 
 # region APIs
 
-# region dijiq
+# region ajib
 
 
-def backup_dijiq():
-    '''Backups dijiq configuration.  Raises an exception on failure.'''
+def backup_ajib():
+    '''Backups ajib configuration.  Raises an exception on failure.'''
     try:
-        run_cmd(['bash', Command.BACKUP_DIJIQ.value])
+        run_cmd(['bash', Command.BACKUP_AJIB.value])
     except subprocess.CalledProcessError as e:
         raise Exception(f"Backup failed: {e}")
     except Exception as ex:
         raise
 
 
-def restore_dijiq(backup_file_path: str):
-    '''Restores dijiq configuration from the given backup file.'''
+def restore_ajib(backup_file_path: str):
+    '''Restores ajib configuration from the given backup file.'''
     try:
-        run_cmd(['bash', Command.RESTORE_DIJIQ.value, backup_file_path])
+        run_cmd(['bash', Command.RESTORE_AJIB.value, backup_file_path])
     except subprocess.CalledProcessError as e:
         raise Exception(f"Restore failed: {e}")
     except Exception as ex:
         raise
 
 
-def get_dijiq_config_file() -> dict[str, Any]:
+def get_ajib_config_file() -> dict[str, Any]:
     with open(CONFIG_FILE, 'r') as f:
         return json.loads(f.read())
 
 
-def set_dijiq_config_file(data: dict[str, Any]):
+def set_ajib_config_file(data: dict[str, Any]):
     content = json.dumps(data, indent=4)
 
     with open(CONFIG_FILE, 'w') as f:

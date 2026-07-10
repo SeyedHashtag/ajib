@@ -9,8 +9,8 @@ from utils.command import bot
 from utils.language import get_user_language
 from utils.translations import get_message_text
 
-ALERTS_FILE = '/etc/dijiq/core/scripts/telegrambot/traffic_alerts.json'
-RESELLERS_FILE = '/etc/dijiq/core/scripts/telegrambot/resellers.json'
+ALERTS_FILE = '/etc/ajib/core/scripts/telegrambot/traffic_alerts.json'
+RESELLERS_FILE = '/etc/ajib/core/scripts/telegrambot/resellers.json'
 ALERT_THRESHOLDS = [80, 90]
 ALERT_RESET_RATIO = 0.05
 

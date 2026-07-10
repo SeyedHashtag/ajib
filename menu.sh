@@ -1,8 +1,8 @@
 #!/bin/bash
 
-source /etc/dijiq/core/scripts/utils.sh
-source /etc/dijiq/core/scripts/path.sh
-source /etc/dijiq/core/scripts/services_status.sh >/dev/null 2>&1
+source /etc/ajib/core/scripts/utils.sh
+source /etc/ajib/core/scripts/path.sh
+source /etc/ajib/core/scripts/services_status.sh >/dev/null 2>&1
 
 check_services() {
     for service in "${services[@]}"; do
@@ -73,8 +73,8 @@ edit_ips() {
     done
 }
 
-dijiq_upgrade(){
-    bash <(curl https://raw.githubusercontent.com/SeyedHashtag/dijiq/main/upgrade.sh)
+ajib_upgrade(){
+    bash <(curl https://raw.githubusercontent.com/SeyedHashtag/ajib/main/upgrade.sh)
 }
 
 telegram_env_value() {
@@ -508,8 +508,8 @@ add_telegram_vpn_server() {
 }
 
 restart_telegram_bot() {
-    if systemctl is-active --quiet dijiq-telegram-bot.service; then
-        systemctl restart dijiq-telegram-bot.service
+    if systemctl is-active --quiet ajib-telegram-bot.service; then
+        systemctl restart ajib-telegram-bot.service
         echo "Telegram bot service restarted."
     else
         echo "Telegram bot service is not active. Use setup/start first."
@@ -521,7 +521,7 @@ telegram_bot_handler() {
         echo "======================================"
         echo "          Telegram Bot Manager        "
         echo "======================================"
-        if systemctl is-active --quiet dijiq-telegram-bot.service; then
+        if systemctl is-active --quiet ajib-telegram-bot.service; then
             echo -e "Service: ${green}Active${NC}"
         else
             echo -e "Service: ${red}Inactive${NC}"
@@ -564,7 +564,7 @@ telegram_bot_handler() {
 display_main_menu() {
     clear
     tput setaf 7 ; tput setab 4 ; tput bold
-    echo -e "◇────────────────🚀 Welcome To dijiq Management 🚀─────────────────◇"
+    echo -e "◇────────────────🚀 Welcome To ajib Management 🚀─────────────────◇"
     tput sgr0
     echo -e "${LPurple}◇──────────────────────────────────────────────────────────────────────◇${NC}"
 
@@ -604,7 +604,7 @@ main_menu() {
         case $choice in
             1) telegram_bot_handler ;;
             2) edit_ips ;;
-            3) dijiq_upgrade ;;
+            3) ajib_upgrade ;;
             0) exit 0 ;;
             *) echo "Invalid option. Please try again." ;;
         esac

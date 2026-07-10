@@ -18,7 +18,7 @@ def _float_env(name, default, minimum=0.1):
 
 
 def get_crypto_api_timeout_seconds():
-    return _float_env("DIJIQ_CRYPTO_API_TIMEOUT_SECONDS", 10)
+    return _float_env("AJIB_CRYPTO_API_TIMEOUT_SECONDS", 10)
 
 
 class CryptoPayment:

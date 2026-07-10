@@ -53,18 +53,18 @@ else
     echo "All required packages are already installed."
 fi
 
-git clone https://github.com/SeyedHashtag/dijiq /etc/dijiq
+git clone https://github.com/SeyedHashtag/ajib /etc/ajib
 
-cd /etc/dijiq
-python3 -m venv dijiq_venv
-source /etc/dijiq/dijiq_venv/bin/activate
+cd /etc/ajib
+python3 -m venv ajib_venv
+source /etc/ajib/ajib_venv/bin/activate
 pip install -r requirements.txt &> /dev/null && echo "Install Python requirements ✅"
 
-if ! grep -q "alias dijiq='source /etc/dijiq/dijiq_venv/bin/activate && /etc/dijiq/menu.sh'" ~/.bashrc; then
-    echo "alias dijiq='source /etc/dijiq/dijiq_venv/bin/activate && /etc/dijiq/menu.sh'" >> ~/.bashrc
+if ! grep -q "alias ajib='source /etc/ajib/ajib_venv/bin/activate && /etc/ajib/menu.sh'" ~/.bashrc; then
+    echo "alias ajib='source /etc/ajib/ajib_venv/bin/activate && /etc/ajib/menu.sh'" >> ~/.bashrc
     source ~/.bashrc
 fi
 sleep 5
-cd /etc/dijiq
+cd /etc/ajib
 chmod +x menu.sh
 ./menu.sh

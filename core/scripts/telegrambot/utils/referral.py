@@ -6,7 +6,7 @@ import string
 import uuid
 from datetime import datetime
 
-REFERRALS_FILE = '/etc/dijiq/core/scripts/telegrambot/referrals.json'
+REFERRALS_FILE = '/etc/ajib/core/scripts/telegrambot/referrals.json'
 referral_lock = threading.RLock()
 
 # Configuration

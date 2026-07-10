@@ -1,7 +1,7 @@
 """
-Unified API client for all dijiq REST API interactions.
+Unified API client for all ajib REST API interactions.
 
-This is the single source of truth for all HTTP communication with the dijiq
+This is the single source of truth for all HTTP communication with the ajib
 backend. Import ``APIClient`` from here instead of from individual handler
 modules (adduser, edituser, deleteuser, …).
 
@@ -35,11 +35,11 @@ def _float_env(name, default, minimum=0.1):
 
 
 def get_api_read_timeout_seconds() -> float:
-    return _float_env("DIJIQ_API_READ_TIMEOUT_SECONDS", 6)
+    return _float_env("AJIB_API_READ_TIMEOUT_SECONDS", 6)
 
 
 def get_api_write_timeout_seconds() -> float:
-    return _float_env("DIJIQ_API_WRITE_TIMEOUT_SECONDS", 10)
+    return _float_env("AJIB_API_WRITE_TIMEOUT_SECONDS", 10)
 
 
 def _get_thread_session(session_key) -> requests.Session:
@@ -165,7 +165,7 @@ def save_server_configs(servers: list[dict]) -> bool:
 
 
 class APIClient:
-    """HTTP client for the dijiq REST API."""
+    """HTTP client for the ajib REST API."""
 
     def __init__(self, server_config: dict | None = None):
         load_dotenv(TELEGRAM_ENV_PATH)
@@ -393,7 +393,7 @@ class MultiServerAPI:
         def fetch_users(entry):
             return {**entry, "users": entry["client"].get_users()}
 
-        with ThreadPoolExecutor(max_workers=self._max_parallel_workers(len(entries)), thread_name_prefix="dijiq-api") as executor:
+        with ThreadPoolExecutor(max_workers=self._max_parallel_workers(len(entries)), thread_name_prefix="ajib-api") as executor:
             future_to_index = {executor.submit(fetch_users, entry): index for index, entry in enumerate(entries)}
             for future in as_completed(future_to_index):
                 index = future_to_index[future]

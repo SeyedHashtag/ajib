@@ -55,11 +55,11 @@ from utils.language import get_user_language
 from utils.translations import get_button_text, get_message_text
 
 
-TEST_CONFIGS_FILE = '/etc/dijiq/core/scripts/telegrambot/test_configs.json'
-PAYMENTS_FILE = '/etc/dijiq/core/scripts/telegrambot/payments.json'
-RESELLERS_FILE = '/etc/dijiq/core/scripts/telegrambot/resellers.json'
-STATE_FILE = '/etc/dijiq/core/scripts/telegrambot/expired_user_cleanup.json'
-SCHEDULE_FILE = '/etc/dijiq/core/scripts/telegrambot/expired_cleanup_schedule.json'
+TEST_CONFIGS_FILE = '/etc/ajib/core/scripts/telegrambot/test_configs.json'
+PAYMENTS_FILE = '/etc/ajib/core/scripts/telegrambot/payments.json'
+RESELLERS_FILE = '/etc/ajib/core/scripts/telegrambot/resellers.json'
+STATE_FILE = '/etc/ajib/core/scripts/telegrambot/expired_user_cleanup.json'
+SCHEDULE_FILE = '/etc/ajib/core/scripts/telegrambot/expired_cleanup_schedule.json'
 
 GB_BYTES = 1024 ** 3
 TIMESTAMP_FORMAT = '%Y-%m-%d %H:%M:%S'
@@ -112,12 +112,12 @@ def _int_env(name, default, minimum=1):
 
 
 ADMIN_CLEANUP_REVIEW_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_EXPIRED_CLEANUP_REVIEW_WORKERS", 2),
-    thread_name_prefix="dijiq-expired-review",
+    max_workers=_int_env("AJIB_EXPIRED_CLEANUP_REVIEW_WORKERS", 2),
+    thread_name_prefix="ajib-expired-review",
 )
-RECOVERED_TEST_BATCH_SIZE = _int_env("DIJIQ_EXPIRED_RECOVERED_TEST_BATCH_SIZE", 25)
-RECOVERED_TEST_UNREACHABLE_ATTEMPTS = _int_env("DIJIQ_EXPIRED_RECOVERED_TEST_UNREACHABLE_ATTEMPTS", 3)
-RECOVERED_TEST_UNREACHABLE_GRACE_HOURS = _int_env("DIJIQ_EXPIRED_RECOVERED_TEST_UNREACHABLE_GRACE_HOURS", 48)
+RECOVERED_TEST_BATCH_SIZE = _int_env("AJIB_EXPIRED_RECOVERED_TEST_BATCH_SIZE", 25)
+RECOVERED_TEST_UNREACHABLE_ATTEMPTS = _int_env("AJIB_EXPIRED_RECOVERED_TEST_UNREACHABLE_ATTEMPTS", 3)
+RECOVERED_TEST_UNREACHABLE_GRACE_HOURS = _int_env("AJIB_EXPIRED_RECOVERED_TEST_UNREACHABLE_GRACE_HOURS", 48)
 ADMIN_CLEANUP_REVIEW_INFLIGHT_LOCK = threading.Lock()
 ADMIN_CLEANUP_REVIEW_INFLIGHT = set()
 ADMIN_CLEANUP_FILTER_DESCRIPTIONS = {

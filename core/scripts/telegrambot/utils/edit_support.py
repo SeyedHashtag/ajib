@@ -5,7 +5,7 @@ from utils.command import bot, is_admin
 from utils.common import create_main_markup
 from utils.translations import BUTTON_TRANSLATIONS
 
-SUPPORT_FILE = '/etc/dijiq/core/scripts/telegrambot/support_info.json'
+SUPPORT_FILE = '/etc/ajib/core/scripts/telegrambot/support_info.json'
 
 def load_support_info():
     try:

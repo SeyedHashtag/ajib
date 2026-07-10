@@ -9,7 +9,7 @@ try:
 except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
 
-RESELLERS_FILE = '/etc/dijiq/core/scripts/telegrambot/resellers.json'
+RESELLERS_FILE = '/etc/ajib/core/scripts/telegrambot/resellers.json'
 reseller_lock = threading.RLock()
 
 

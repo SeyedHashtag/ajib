@@ -27,8 +27,8 @@ def _int_env(name, default, minimum=1):
 
 
 VPN_SERVER_MENU_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_VPN_SERVER_MENU_WORKERS", 1),
-    thread_name_prefix="dijiq-vpn-servers",
+    max_workers=_int_env("AJIB_VPN_SERVER_MENU_WORKERS", 1),
+    thread_name_prefix="ajib-vpn-servers",
 )
 
 

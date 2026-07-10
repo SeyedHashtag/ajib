@@ -35,8 +35,8 @@ def _int_env(name, default, minimum=1):
 
 
 SERVER_INFO_JOB_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_SERVER_INFO_WORKERS", 1),
-    thread_name_prefix="dijiq-server-info",
+    max_workers=_int_env("AJIB_SERVER_INFO_WORKERS", 1),
+    thread_name_prefix="ajib-server-info",
 )
 
 

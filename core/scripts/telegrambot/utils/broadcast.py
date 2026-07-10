@@ -10,9 +10,9 @@ import os
 import time
 from datetime import datetime, timedelta
 
-BROADCAST_FAILED_USERS_PATH = "/etc/dijiq/core/scripts/telegrambot/broadcast_failed_users.json"
-BROADCAST_LOGS_DIR = "/etc/dijiq/core/scripts/telegrambot/broadcast_logs"
-TEST_CONFIGS_FILE = "/etc/dijiq/core/scripts/telegrambot/test_configs.json"
+BROADCAST_FAILED_USERS_PATH = "/etc/ajib/core/scripts/telegrambot/broadcast_failed_users.json"
+BROADCAST_LOGS_DIR = "/etc/ajib/core/scripts/telegrambot/broadcast_logs"
+TEST_CONFIGS_FILE = "/etc/ajib/core/scripts/telegrambot/test_configs.json"
 
 
 def load_failed_broadcast_users():

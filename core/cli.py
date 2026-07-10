@@ -18,24 +18,24 @@ def pretty_print(data: typing.Any):
 def cli():
     pass
 
-# region dijiq
+# region ajib
 
 
-@cli.command('backup-dijiq')
-def backup_dijiq():
+@cli.command('backup-ajib')
+def backup_ajib():
     try:
-        cli_api.backup_dijiq()
-        click.echo('dijiq configuration backed up successfully.')
+        cli_api.backup_ajib()
+        click.echo('ajib configuration backed up successfully.')
     except Exception as e:
         click.echo(f'{e}', err=True)
 
-@cli.command('restore-dijiq')
+@cli.command('restore-ajib')
 @click.argument('backup_file_path', type=click.Path(exists=True, file_okay=True, dir_okay=False, readable=True))
-def restore_dijiq(backup_file_path):
-    """Restores dijiq configuration from a backup ZIP file."""
+def restore_ajib(backup_file_path):
+    """Restores ajib configuration from a backup ZIP file."""
     try:
-        cli_api.restore_dijiq(backup_file_path)
-        click.echo('dijiq configuration restored successfully.')
+        cli_api.restore_ajib(backup_file_path)
+        click.echo('ajib configuration restored successfully.')
     except Exception as e:
         click.echo(f'{e}', err=True)
 

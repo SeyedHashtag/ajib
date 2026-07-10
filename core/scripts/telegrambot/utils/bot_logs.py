@@ -21,13 +21,13 @@ def _int_env(name, default, minimum=1):
 
 
 BOT_LOGS_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_BOT_LOG_WORKERS", 1),
-    thread_name_prefix="dijiq-bot-logs",
+    max_workers=_int_env("AJIB_BOT_LOG_WORKERS", 1),
+    thread_name_prefix="ajib-bot-logs",
 )
 
 
 def _send_bot_log_file(message, log_file):
-    logger = logging.getLogger("dijiq.bot.admin_logs")
+    logger = logging.getLogger("ajib.bot.admin_logs")
     try:
         with open(log_file, "rb") as document:
             bot.send_document(

@@ -37,15 +37,15 @@ def _int_env(name, default, minimum=1):
 
 
 REFERRAL_MENU_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_REFERRAL_MENU_WORKERS", 2),
-    thread_name_prefix="dijiq-referral-menu",
+    max_workers=_int_env("AJIB_REFERRAL_MENU_WORKERS", 2),
+    thread_name_prefix="ajib-referral-menu",
 )
 
 
 def _get_bot_username():
     global BOT_USERNAME_CACHE
     env_username = (
-        os.getenv("DIJIQ_BOT_USERNAME")
+        os.getenv("AJIB_BOT_USERNAME")
         or os.getenv("BOT_USERNAME")
         or os.getenv("TELEGRAM_BOT_USERNAME")
     )

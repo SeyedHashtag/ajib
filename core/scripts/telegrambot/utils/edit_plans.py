@@ -4,7 +4,7 @@ from utils.common import create_main_markup
 import json
 import os
 
-PLANS_FILE = '/etc/dijiq/core/scripts/telegrambot/plans.json'
+PLANS_FILE = '/etc/ajib/core/scripts/telegrambot/plans.json'
 
 def load_plans():
     try:

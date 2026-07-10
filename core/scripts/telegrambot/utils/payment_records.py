@@ -3,7 +3,7 @@ import os
 import threading
 from datetime import datetime
 
-PAYMENTS_FILE = '/etc/dijiq/core/scripts/telegrambot/payments.json'
+PAYMENTS_FILE = '/etc/ajib/core/scripts/telegrambot/payments.json'
 payment_lock = threading.Lock()
 
 def load_payments():

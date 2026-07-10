@@ -20,9 +20,9 @@ from utils.username_utils import (
 from utils.telegram_safe import safe_answer_callback_query, safe_edit_message_text, safe_send_message, safe_send_photo
 from utils import test_config_store
 
-TEST_CONFIGS_FILE = '/etc/dijiq/core/scripts/telegrambot/test_configs.json'
-TEST_SETTINGS_FILE = '/etc/dijiq/core/scripts/telegrambot/test_settings.json'
-TEST_WAITING_LIST_FILE = '/etc/dijiq/core/scripts/telegrambot/waiting_test_users.json'
+TEST_CONFIGS_FILE = '/etc/ajib/core/scripts/telegrambot/test_configs.json'
+TEST_SETTINGS_FILE = '/etc/ajib/core/scripts/telegrambot/test_settings.json'
+TEST_WAITING_LIST_FILE = '/etc/ajib/core/scripts/telegrambot/waiting_test_users.json'
 TEST_TRAFFIC_GB = 1
 TEST_DAYS = 30
 TEST_CREATION_CLAIM_TIMEOUT_MINUTES = 15
@@ -39,8 +39,8 @@ def _int_env(name, default, minimum=1):
 
 
 TEST_CONFIG_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_TEST_CONFIG_WORKERS", 2),
-    thread_name_prefix="dijiq-test-config",
+    max_workers=_int_env("AJIB_TEST_CONFIG_WORKERS", 2),
+    thread_name_prefix="ajib-test-config",
 )
 
 def load_test_settings():
@@ -482,7 +482,7 @@ def _create_test_config_with_client(
         if result is None:
             result = api_client.add_user(username, TEST_TRAFFIC_GB, TEST_DAYS, unlimited=True)
             if result is not None:
-                logging.getLogger("dijiq.usernames").warning(
+                logging.getLogger("ajib.usernames").warning(
                     "Created test user without note fallback. user_id=%s username=%s",
                     user_id,
                     username,
@@ -551,7 +551,7 @@ def create_test_config(user_id, chat_id, is_automatic=False, language=None, tele
         if result is None:
             result = api_client.add_user(username, TEST_TRAFFIC_GB, TEST_DAYS, unlimited=True)
             if result is not None:
-                logging.getLogger("dijiq.usernames").warning(
+                logging.getLogger("ajib.usernames").warning(
                     "Created test user without note fallback. user_id=%s username=%s",
                     user_id,
                     username,

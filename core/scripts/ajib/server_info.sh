@@ -1,6 +1,6 @@
 #!/bin/bash
 
-source /etc/dijiq/core/scripts/path.sh
+source /etc/ajib/core/scripts/path.sh
 
 convert_bytes() {
     local bytes=$1

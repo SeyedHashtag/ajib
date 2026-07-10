@@ -64,8 +64,8 @@ class MultiServerCreationCacheTests(unittest.TestCase):
         self.original_monotonic = api_client.time.monotonic
         self.original_ttl = os.environ.get("SERVER_USERS_CACHE_TTL_SECONDS")
         self.original_workers = os.environ.get("SERVER_FETCH_WORKERS")
-        self.original_read_timeout = os.environ.get("DIJIQ_API_READ_TIMEOUT_SECONDS")
-        self.original_write_timeout = os.environ.get("DIJIQ_API_WRITE_TIMEOUT_SECONDS")
+        self.original_read_timeout = os.environ.get("AJIB_API_READ_TIMEOUT_SECONDS")
+        self.original_write_timeout = os.environ.get("AJIB_API_WRITE_TIMEOUT_SECONDS")
         os.environ["SERVER_USERS_CACHE_TTL_SECONDS"] = "30"
         api_client.MultiServerAPI._creation_cache = None
         api_client.MultiServerAPI._user_snapshot_cache = {}
@@ -85,13 +85,13 @@ class MultiServerCreationCacheTests(unittest.TestCase):
         else:
             os.environ["SERVER_FETCH_WORKERS"] = self.original_workers
         if self.original_read_timeout is None:
-            os.environ.pop("DIJIQ_API_READ_TIMEOUT_SECONDS", None)
+            os.environ.pop("AJIB_API_READ_TIMEOUT_SECONDS", None)
         else:
-            os.environ["DIJIQ_API_READ_TIMEOUT_SECONDS"] = self.original_read_timeout
+            os.environ["AJIB_API_READ_TIMEOUT_SECONDS"] = self.original_read_timeout
         if self.original_write_timeout is None:
-            os.environ.pop("DIJIQ_API_WRITE_TIMEOUT_SECONDS", None)
+            os.environ.pop("AJIB_API_WRITE_TIMEOUT_SECONDS", None)
         else:
-            os.environ["DIJIQ_API_WRITE_TIMEOUT_SECONDS"] = self.original_write_timeout
+            os.environ["AJIB_API_WRITE_TIMEOUT_SECONDS"] = self.original_write_timeout
 
     def make_multi_api(self, clients):
         servers = [
@@ -434,8 +434,8 @@ class APIClientPoolingTests(unittest.TestCase):
     def setUp(self):
         self.original_session_factory = api_client.requests.Session
         self.original_thread_sessions = getattr(api_client._thread_local, "api_sessions", None)
-        self.original_read_timeout = os.environ.get("DIJIQ_API_READ_TIMEOUT_SECONDS")
-        self.original_write_timeout = os.environ.get("DIJIQ_API_WRITE_TIMEOUT_SECONDS")
+        self.original_read_timeout = os.environ.get("AJIB_API_READ_TIMEOUT_SECONDS")
+        self.original_write_timeout = os.environ.get("AJIB_API_WRITE_TIMEOUT_SECONDS")
         api_client._thread_local.api_sessions = {}
         api_client.MultiServerAPI._creation_cache = None
         api_client.MultiServerAPI._user_snapshot_cache = {}
@@ -452,13 +452,13 @@ class APIClientPoolingTests(unittest.TestCase):
         api_client.MultiServerAPI._creation_cache = None
         api_client.MultiServerAPI._user_snapshot_cache = {}
         if self.original_read_timeout is None:
-            os.environ.pop("DIJIQ_API_READ_TIMEOUT_SECONDS", None)
+            os.environ.pop("AJIB_API_READ_TIMEOUT_SECONDS", None)
         else:
-            os.environ["DIJIQ_API_READ_TIMEOUT_SECONDS"] = self.original_read_timeout
+            os.environ["AJIB_API_READ_TIMEOUT_SECONDS"] = self.original_read_timeout
         if self.original_write_timeout is None:
-            os.environ.pop("DIJIQ_API_WRITE_TIMEOUT_SECONDS", None)
+            os.environ.pop("AJIB_API_WRITE_TIMEOUT_SECONDS", None)
         else:
-            os.environ["DIJIQ_API_WRITE_TIMEOUT_SECONDS"] = self.original_write_timeout
+            os.environ["AJIB_API_WRITE_TIMEOUT_SECONDS"] = self.original_write_timeout
 
     def test_clients_reuse_thread_local_session_for_same_server(self):
         sessions = []
@@ -499,8 +499,8 @@ class APIClientPoolingTests(unittest.TestCase):
         self.assertEqual([call[0] for call in sessions[0].request_calls], ["GET", "GET"])
 
     def test_read_write_timeouts_and_write_invalidation_are_applied(self):
-        os.environ["DIJIQ_API_READ_TIMEOUT_SECONDS"] = "2.5"
-        os.environ["DIJIQ_API_WRITE_TIMEOUT_SECONDS"] = "7.5"
+        os.environ["AJIB_API_READ_TIMEOUT_SECONDS"] = "2.5"
+        os.environ["AJIB_API_WRITE_TIMEOUT_SECONDS"] = "7.5"
         sessions = []
 
         class FakeResponse:
@@ -545,7 +545,7 @@ class APIClientPoolingTests(unittest.TestCase):
         self.assertEqual(api_client.MultiServerAPI._user_snapshot_cache, {})
 
     def test_reset_user_uses_documented_mutating_get_endpoint(self):
-        os.environ["DIJIQ_API_WRITE_TIMEOUT_SECONDS"] = "7.5"
+        os.environ["AJIB_API_WRITE_TIMEOUT_SECONDS"] = "7.5"
         sessions = []
 
         class FakeResponse:

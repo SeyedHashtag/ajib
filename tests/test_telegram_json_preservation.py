@@ -6,8 +6,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MAINTENANCE_SCRIPTS = {
     REPO_ROOT / "upgrade.sh",
-    REPO_ROOT / "core/scripts/dijiq/backup.sh",
-    REPO_ROOT / "core/scripts/dijiq/restore.sh",
+    REPO_ROOT / "core/scripts/ajib/backup.sh",
+    REPO_ROOT / "core/scripts/ajib/restore.sh",
 }
 
 
@@ -24,7 +24,7 @@ def repo_text_files():
 
 
 def referenced_telegram_json_files():
-    pattern = re.compile(r"['\"](/etc/dijiq/core/scripts/telegrambot/[^'\"]+\.json)['\"]")
+    pattern = re.compile(r"['\"](/etc/ajib/core/scripts/telegrambot/[^'\"]+\.json)['\"]")
     files = set()
     for path in repo_text_files():
         text = path.read_text(errors="ignore")
@@ -38,14 +38,14 @@ class TelegramJsonPreservationTests(unittest.TestCase):
         self.assertTrue(referenced_json_files)
 
         upgrade_text = (REPO_ROOT / "upgrade.sh").read_text()
-        backup_text = (REPO_ROOT / "core/scripts/dijiq/backup.sh").read_text()
-        restore_text = (REPO_ROOT / "core/scripts/dijiq/restore.sh").read_text()
+        backup_text = (REPO_ROOT / "core/scripts/ajib/backup.sh").read_text()
+        restore_text = (REPO_ROOT / "core/scripts/ajib/restore.sh").read_text()
 
         for script_text in (upgrade_text, backup_text):
-            self.assertIn("/etc/dijiq/*.env", script_text)
-            self.assertIn("/etc/dijiq/*.json", script_text)
-            self.assertIn("/etc/dijiq/core/scripts/telegrambot/*.env", script_text)
-            self.assertIn("/etc/dijiq/core/scripts/telegrambot/*.json", script_text)
+            self.assertIn("/etc/ajib/*.env", script_text)
+            self.assertIn("/etc/ajib/*.json", script_text)
+            self.assertIn("/etc/ajib/core/scripts/telegrambot/*.env", script_text)
+            self.assertIn("/etc/ajib/core/scripts/telegrambot/*.json", script_text)
 
         self.assertIn('restore_root_state_files "$RESTORE_DIR"', restore_text)
         self.assertIn('restore_telegram_state_files "$RESTORE_DIR/core/scripts/telegrambot"', restore_text)
@@ -54,7 +54,7 @@ class TelegramJsonPreservationTests(unittest.TestCase):
         maintenance_text = "\n".join((upgrade_text, backup_text, restore_text))
         for path in referenced_json_files:
             self.assertNotIn(path, maintenance_text)
-            self.assertNotIn(path[len("/etc/dijiq/"):], maintenance_text)
+            self.assertNotIn(path[len("/etc/ajib/"):], maintenance_text)
 
 
 if __name__ == "__main__":

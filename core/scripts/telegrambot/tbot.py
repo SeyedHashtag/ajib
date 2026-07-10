@@ -19,8 +19,8 @@ def _int_env(name, default, minimum=1):
 
 
 START_TEST_CONFIG_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_START_JOB_WORKERS", 2),
-    thread_name_prefix="dijiq-start",
+    max_workers=_int_env("AJIB_START_JOB_WORKERS", 2),
+    thread_name_prefix="ajib-start",
 )
 START_TEST_CONFIG_LOCK = threading.Lock()
 START_TEST_CONFIG_INFLIGHT = set()

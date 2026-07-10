@@ -1,13 +1,13 @@
 #!/bin/bash
-source /etc/dijiq/core/scripts/path.sh
+source /etc/ajib/core/scripts/path.sh
 
 # Usage: ./restore.sh <backup_zip_file>
 
 set -e 
 
 BACKUP_ZIP_FILE="$1"
-RESTORE_DIR="/tmp/dijiq_restore_$(date +%Y%m%d_%H%M%S)"
-TARGET_DIR="/etc/dijiq"
+RESTORE_DIR="/tmp/ajib_restore_$(date +%Y%m%d_%H%M%S)"
+TARGET_DIR="/etc/ajib"
 
 if [ -z "$BACKUP_ZIP_FILE" ]; then
   echo "Error: Backup file path is required."
@@ -177,9 +177,9 @@ else
 fi
 
 rm -rf "$RESTORE_DIR"
-echo "dijiq configuration restored successfully."
+echo "ajib configuration restored successfully."
 
-python3 "$CLI_PATH" restart-dijiq > /dev/null 2>&1
+python3 "$CLI_PATH" restart-ajib > /dev/null 2>&1
 if [ $? -ne 0 ]; then
       echo "Error: Restart service failed'."
       rm -rf "$existing_backup_dir"

@@ -5,9 +5,9 @@ import sys
 import requests
 from pathlib import Path
 
-LOCALVERSION = "/etc/dijiq/VERSION"
-LATESTVERSION = "https://raw.githubusercontent.com/SeyedHashtag/dijiq/main/VERSION"
-LASTESTCHANGE = "https://raw.githubusercontent.com/SeyedHashtag/dijiq/main/changelog"
+LOCALVERSION = "/etc/ajib/VERSION"
+LATESTVERSION = "https://raw.githubusercontent.com/SeyedHashtag/ajib/main/VERSION"
+LASTESTCHANGE = "https://raw.githubusercontent.com/SeyedHashtag/ajib/main/changelog"
 
 def version_greater_equal(version1, version2):
     version1_parts = [int(part) for part in version1.strip().split('.')]

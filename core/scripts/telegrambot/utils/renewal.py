@@ -4,9 +4,9 @@ import os
 from datetime import datetime, timedelta
 
 
-PAYMENTS_FILE = '/etc/dijiq/core/scripts/telegrambot/payments.json'
-RESELLERS_FILE = '/etc/dijiq/core/scripts/telegrambot/resellers.json'
-STATE_FILE = '/etc/dijiq/core/scripts/telegrambot/expired_user_cleanup.json'
+PAYMENTS_FILE = '/etc/ajib/core/scripts/telegrambot/payments.json'
+RESELLERS_FILE = '/etc/ajib/core/scripts/telegrambot/resellers.json'
+STATE_FILE = '/etc/ajib/core/scripts/telegrambot/expired_user_cleanup.json'
 
 GB_BYTES = 1024 ** 3
 TIMESTAMP_FORMAT = '%Y-%m-%d %H:%M:%S'

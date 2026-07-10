@@ -5,7 +5,7 @@ import time
 from logging.handlers import RotatingFileHandler
 
 
-DEFAULT_LOG_FILE = "/etc/dijiq/core/scripts/telegrambot/logs/bot.log"
+DEFAULT_LOG_FILE = "/etc/ajib/core/scripts/telegrambot/logs/bot.log"
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_SLOW_HANDLER_MS = 1000
 MAX_LOG_VALUE_LENGTH = 160
@@ -26,18 +26,18 @@ def _int_env(name, default, minimum=1):
 
 
 def get_bot_log_file():
-    return os.getenv("DIJIQ_BOT_LOG_FILE", DEFAULT_LOG_FILE)
+    return os.getenv("AJIB_BOT_LOG_FILE", DEFAULT_LOG_FILE)
 
 
 def get_slow_handler_ms():
     if os.getenv("DIJQ_SLOW_HANDLER_MS") is not None:
         return _int_env("DIJQ_SLOW_HANDLER_MS", DEFAULT_SLOW_HANDLER_MS)
-    return _int_env("DIJIQ_SLOW_HANDLER_MS", DEFAULT_SLOW_HANDLER_MS)
+    return _int_env("AJIB_SLOW_HANDLER_MS", DEFAULT_SLOW_HANDLER_MS)
 
 
 def configure_logging(log_file=None):
     log_file = log_file or get_bot_log_file()
-    log_level = _coerce_log_level(os.getenv("DIJIQ_BOT_LOG_LEVEL", DEFAULT_LOG_LEVEL))
+    log_level = _coerce_log_level(os.getenv("AJIB_BOT_LOG_LEVEL", DEFAULT_LOG_LEVEL))
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
 
     root_logger = logging.getLogger()
@@ -61,7 +61,7 @@ def configure_logging(log_file=None):
     file_handler.setLevel(log_level)
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
     root_logger.addHandler(file_handler)
-    logging.getLogger("dijiq.bot").info("Bot logging initialized log_file=%s", absolute_log_file)
+    logging.getLogger("ajib.bot").info("Bot logging initialized log_file=%s", absolute_log_file)
     return absolute_log_file
 
 
@@ -105,7 +105,7 @@ def _describe_event(kind, event):
 
 
 def _wrap_handler(func, kind):
-    logger = logging.getLogger("dijiq.bot.handlers")
+    logger = logging.getLogger("ajib.bot.handlers")
     slow_handler_ms = get_slow_handler_ms()
 
     @functools.wraps(func)
@@ -155,7 +155,7 @@ def _wrap_handler(func, kind):
 
 
 def instrument_bot(bot):
-    if getattr(bot, "_dijiq_logging_instrumented", False):
+    if getattr(bot, "_ajib_logging_instrumented", False):
         return bot
 
     original_message_handler = bot.message_handler
@@ -179,5 +179,5 @@ def instrument_bot(bot):
 
     bot.message_handler = message_handler
     bot.callback_query_handler = callback_query_handler
-    bot._dijiq_logging_instrumented = True
+    bot._ajib_logging_instrumented = True
     return bot

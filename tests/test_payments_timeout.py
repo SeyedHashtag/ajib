@@ -33,7 +33,7 @@ class CryptoPaymentTimeoutTests(unittest.TestCase):
         self.original_env = {
             "CRYPTO_MERCHANT_ID": os.environ.get("CRYPTO_MERCHANT_ID"),
             "CRYPTO_API_KEY": os.environ.get("CRYPTO_API_KEY"),
-            "DIJIQ_CRYPTO_API_TIMEOUT_SECONDS": os.environ.get("DIJIQ_CRYPTO_API_TIMEOUT_SECONDS"),
+            "AJIB_CRYPTO_API_TIMEOUT_SECONDS": os.environ.get("AJIB_CRYPTO_API_TIMEOUT_SECONDS"),
         }
 
     def tearDown(self):
@@ -47,7 +47,7 @@ class CryptoPaymentTimeoutTests(unittest.TestCase):
         payments = load_payments_module()
         os.environ["CRYPTO_MERCHANT_ID"] = "merchant"
         os.environ["CRYPTO_API_KEY"] = "secret"
-        os.environ["DIJIQ_CRYPTO_API_TIMEOUT_SECONDS"] = "4.5"
+        os.environ["AJIB_CRYPTO_API_TIMEOUT_SECONDS"] = "4.5"
         calls = []
 
         class Response:

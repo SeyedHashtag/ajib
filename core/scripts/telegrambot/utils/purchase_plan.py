@@ -70,8 +70,8 @@ def _int_env(name, default, minimum=1):
 
 
 PAYMENT_JOB_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("DIJIQ_PAYMENT_JOB_WORKERS", 2),
-    thread_name_prefix="dijiq-payment",
+    max_workers=_int_env("AJIB_PAYMENT_JOB_WORKERS", 2),
+    thread_name_prefix="ajib-payment",
 )
 
 
@@ -583,7 +583,7 @@ def _complete_sale_payment_or_notify(payment_id, user_id, username, api_client):
 
     error = f"payment_completion_persistence_failed username={username} server_id={server_id}"
     _record_processing_error(payment_id, error)
-    logging.getLogger('dijiq.payments').error(
+    logging.getLogger('ajib.payments').error(
         "Payment completion persistence failed. payment_id=%s user_id=%s username=%s server_id=%s",
         payment_id,
         user_id,
@@ -630,7 +630,7 @@ def create_sale_user_with_note(api_client, user_id, plan_gb, days, unlimited):
         if result is None:
             result = target_client.add_user(username, int(plan_gb), int(days), unlimited=unlimited)
             if result is not None:
-                logging.getLogger("dijiq.usernames").warning(
+                logging.getLogger("ajib.usernames").warning(
                     "Created sale user without note fallback. user_id=%s username=%s",
                     user_id,
                     username,
@@ -1040,7 +1040,7 @@ def handle_payment_method_selection(call, data=None):
             queued = _queue_customer_crypto_payment(call, plan_gb)
             safe_answer_callback_query(bot, call.id)
             if not queued:
-                logging.getLogger('dijiq.payments').info(
+                logging.getLogger('ajib.payments').info(
                     "Skipped duplicate crypto payment job for user %s plan %s",
                     user_id,
                     plan_gb,
@@ -1059,7 +1059,7 @@ def handle_payment_method_selection(call, data=None):
                         bot.answer_callback_query(call.id, text=get_message_text(language, "card_to_card_second_purchase"), show_alert=False)
                         return
                 except Exception as e:
-                    logging.getLogger('dijiq.payments').warning(
+                    logging.getLogger('ajib.payments').warning(
                         f"Failed to determine previous customer status for user {user_id}: {e}"
                     )
             handle_card_to_card_payment(call, plan_gb)
@@ -1765,7 +1765,7 @@ def _process_check_payment_job(call):
         safe_send_message(bot, caller_id, get_message_text(language, "payment_status").format(status=status or 'unknown'))
     try:
         import logging
-        logging.getLogger('dijiq.payments').debug(f"Check payment response for {payment_id}: {payment_status_response}")
+        logging.getLogger('ajib.payments').debug(f"Check payment response for {payment_id}: {payment_status_response}")
     except Exception:
         pass
 

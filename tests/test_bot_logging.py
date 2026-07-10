@@ -104,10 +104,10 @@ class BotLoggingTests(unittest.TestCase):
         self.original_env = {
             name: os.environ.get(name)
             for name in (
-                "DIJIQ_BOT_LOG_FILE",
-                "DIJIQ_BOT_LOG_LEVEL",
+                "AJIB_BOT_LOG_FILE",
+                "AJIB_BOT_LOG_LEVEL",
                 "DIJQ_SLOW_HANDLER_MS",
-                "DIJIQ_SLOW_HANDLER_MS",
+                "AJIB_SLOW_HANDLER_MS",
                 "TELEGRAM_BOT_WORKERS",
             )
         }
@@ -123,19 +123,19 @@ class BotLoggingTests(unittest.TestCase):
         bot_logging = load_bot_logging()
         self.assertEqual(
             bot_logging.get_bot_log_file(),
-            "/etc/dijiq/core/scripts/telegrambot/logs/bot.log",
+            "/etc/ajib/core/scripts/telegrambot/logs/bot.log",
         )
         self.assertEqual(bot_logging.get_slow_handler_ms(), 1000)
         self.assertEqual(bot_logging.get_telegram_worker_count(), 8)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             log_file = os.path.join(tmpdir, "bot.log")
-            os.environ["DIJIQ_BOT_LOG_FILE"] = log_file
-            os.environ["DIJIQ_BOT_LOG_LEVEL"] = "DEBUG"
+            os.environ["AJIB_BOT_LOG_FILE"] = log_file
+            os.environ["AJIB_BOT_LOG_LEVEL"] = "DEBUG"
 
             before_handlers = list(logging.getLogger().handlers)
             configured_path = bot_logging.configure_logging()
-            logging.getLogger("dijiq.bot.test").debug("debug test line")
+            logging.getLogger("ajib.bot.test").debug("debug test line")
 
             self.assertEqual(configured_path, os.path.abspath(log_file))
             self.assertTrue(os.path.exists(log_file))
@@ -160,7 +160,7 @@ class BotLoggingTests(unittest.TestCase):
         def handle_callback(call):
             return "done"
 
-        with self.assertLogs("dijiq.bot.handlers", level="INFO") as captured:
+        with self.assertLogs("ajib.bot.handlers", level="INFO") as captured:
             self.assertEqual(bot.message_handlers[0](DummyMessage()), "ok")
             self.assertEqual(bot.callback_handlers[0](DummyCallback()), "done")
 
@@ -180,7 +180,7 @@ class BotLoggingTests(unittest.TestCase):
         def broken_callback(call):
             raise RuntimeError("boom")
 
-        with self.assertLogs("dijiq.bot.handlers", level="ERROR") as captured:
+        with self.assertLogs("ajib.bot.handlers", level="ERROR") as captured:
             with self.assertRaises(RuntimeError):
                 bot.callback_handlers[0](DummyCallback())
 
@@ -190,8 +190,8 @@ class BotLoggingTests(unittest.TestCase):
 class TelegramSafeTests(unittest.TestCase):
     def setUp(self):
         self.original_env = {
-            "DIJIQ_TELEGRAM_TIMEOUT_SECONDS": os.environ.get("DIJIQ_TELEGRAM_TIMEOUT_SECONDS"),
-            "DIJIQ_CALLBACK_TIMEOUT_SECONDS": os.environ.get("DIJIQ_CALLBACK_TIMEOUT_SECONDS"),
+            "AJIB_TELEGRAM_TIMEOUT_SECONDS": os.environ.get("AJIB_TELEGRAM_TIMEOUT_SECONDS"),
+            "AJIB_CALLBACK_TIMEOUT_SECONDS": os.environ.get("AJIB_CALLBACK_TIMEOUT_SECONDS"),
         }
 
     def tearDown(self):
@@ -203,7 +203,7 @@ class TelegramSafeTests(unittest.TestCase):
 
     def test_safe_answer_callback_uses_short_timeout_and_ignores_old_callback(self):
         telegram_safe = load_telegram_safe()
-        os.environ["DIJIQ_CALLBACK_TIMEOUT_SECONDS"] = "4"
+        os.environ["AJIB_CALLBACK_TIMEOUT_SECONDS"] = "4"
 
         class Bot:
             def __init__(self):
@@ -250,7 +250,7 @@ class TelegramSafeTests(unittest.TestCase):
 
     def test_install_safe_telegram_methods_wraps_direct_bot_calls(self):
         telegram_safe = load_telegram_safe()
-        os.environ["DIJIQ_TELEGRAM_TIMEOUT_SECONDS"] = "6"
+        os.environ["AJIB_TELEGRAM_TIMEOUT_SECONDS"] = "6"
 
         class Bot:
             def __init__(self):
@@ -265,7 +265,7 @@ class TelegramSafeTests(unittest.TestCase):
         self.assertIsNone(bot.edit_message_text("same", chat_id=1, message_id=2))
         self.assertEqual(bot.calls[0][1]["timeout"], 6)
         self.assertIs(telegram_safe.install_safe_telegram_methods(bot), bot)
-        self.assertTrue(getattr(bot, "_dijiq_safe_telegram_installed"))
+        self.assertTrue(getattr(bot, "_ajib_safe_telegram_installed"))
 
     def test_installed_callback_answer_runs_in_background_executor(self):
         telegram_safe = load_telegram_safe()

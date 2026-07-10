@@ -5,10 +5,10 @@ TEMP_DIR=$(mktemp -d)
 
 shopt -s nullglob dotglob
 FILES=(
-    /etc/dijiq/*.env
-    /etc/dijiq/*.json
-    /etc/dijiq/core/scripts/telegrambot/*.env
-    /etc/dijiq/core/scripts/telegrambot/*.json
+    /etc/ajib/*.env
+    /etc/ajib/*.json
+    /etc/ajib/core/scripts/telegrambot/*.env
+    /etc/ajib/core/scripts/telegrambot/*.json
 )
 shopt -u nullglob dotglob
 
@@ -26,7 +26,7 @@ done
 
 echo "Checking and renaming old systemd service files"
 declare -A SERVICE_MAP=(
-    ["/etc/systemd/system/dijiq-bot.service"]="dijiq-telegram-bot.service"
+    ["/etc/systemd/system/ajib-bot.service"]="ajib-telegram-bot.service"
 )
 
 for OLD_SERVICE in "${!SERVICE_MAP[@]}"; do
@@ -44,11 +44,11 @@ for OLD_SERVICE in "${!SERVICE_MAP[@]}"; do
     fi
 done
 
-echo "Removing /etc/dijiq directory"
-rm -rf /etc/dijiq/
+echo "Removing /etc/ajib directory"
+rm -rf /etc/ajib/
 
-echo "Cloning dijiq repository"
-git clone https://github.com/SeyedHashtag/dijiq /etc/dijiq
+echo "Cloning ajib repository"
+git clone https://github.com/SeyedHashtag/ajib /etc/ajib
 
 echo "Restoring backup files"
 for FILE in "${FILES[@]}"; do
@@ -59,7 +59,7 @@ for FILE in "${FILES[@]}"; do
 done
 
 
-CONFIG_ENV="/etc/dijiq/.configs.env"
+CONFIG_ENV="/etc/ajib/.configs.env"
 if [ ! -f "$CONFIG_ENV" ]; then
     echo ".configs.env not found, creating it with default values."
     echo "SNI=bts.com" > "$CONFIG_ENV"
@@ -80,23 +80,23 @@ if [[ -z "$IP6" ]]; then
 fi
 
 echo "Setting ownership and permissions"
-chown -R dijiq:dijiq /etc/dijiq/core/scripts/telegrambot
+chown -R ajib:ajib /etc/ajib/core/scripts/telegrambot
 
-cd /etc/dijiq
-python3 -m venv dijiq_venv
-source /etc/dijiq/dijiq_venv/bin/activate
+cd /etc/ajib
+python3 -m venv ajib_venv
+source /etc/ajib/ajib_venv/bin/activate
 pip install -r requirements.txt
 
-echo "Restarting other dijiq services"
-systemctl restart dijiq-server.service
-systemctl restart dijiq-telegram-bot.service
+echo "Restarting other ajib services"
+systemctl restart ajib-server.service
+systemctl restart ajib-telegram-bot.service
 
 
-echo "Checking dijiq-server.service status"
-if systemctl is-active --quiet dijiq-server.service; then
+echo "Checking ajib-server.service status"
+if systemctl is-active --quiet ajib-server.service; then
     echo "Upgrade completed successfully"
 else
-    echo "Upgrade failed: dijiq-server.service is not active"
+    echo "Upgrade failed: ajib-server.service is not active"
 fi
 
 echo "Restoring cron jobs"

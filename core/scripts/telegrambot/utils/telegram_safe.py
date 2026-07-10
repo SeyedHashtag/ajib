@@ -26,20 +26,20 @@ def _int_env(name, default, minimum=1):
 
 
 def get_telegram_timeout_seconds():
-    return _int_env("DIJIQ_TELEGRAM_TIMEOUT_SECONDS", DEFAULT_TELEGRAM_TIMEOUT_SECONDS)
+    return _int_env("AJIB_TELEGRAM_TIMEOUT_SECONDS", DEFAULT_TELEGRAM_TIMEOUT_SECONDS)
 
 
 def get_callback_timeout_seconds():
-    return _int_env("DIJIQ_CALLBACK_TIMEOUT_SECONDS", DEFAULT_CALLBACK_TIMEOUT_SECONDS)
+    return _int_env("AJIB_CALLBACK_TIMEOUT_SECONDS", DEFAULT_CALLBACK_TIMEOUT_SECONDS)
 
 
 def get_callback_worker_count():
-    return _int_env("DIJIQ_CALLBACK_WORKERS", DEFAULT_CALLBACK_WORKERS)
+    return _int_env("AJIB_CALLBACK_WORKERS", DEFAULT_CALLBACK_WORKERS)
 
 
 CALLBACK_ANSWER_EXECUTOR = ThreadPoolExecutor(
     max_workers=get_callback_worker_count(),
-    thread_name_prefix="dijiq-callback-answer",
+    thread_name_prefix="ajib-callback-answer",
 )
 
 
@@ -61,12 +61,12 @@ def _call_with_timeout(func, timeout_seconds, *args, ignore_expected=True, **kwa
             return func(*args, **kwargs)
         except Exception as retry_error:
             if ignore_expected and is_expected_telegram_error(retry_error):
-                logging.getLogger("dijiq.bot.telegram").info("Ignored Telegram API error: %s", retry_error)
+                logging.getLogger("ajib.bot.telegram").info("Ignored Telegram API error: %s", retry_error)
                 return None
             raise
     except Exception as error:
         if ignore_expected and is_expected_telegram_error(error):
-            logging.getLogger("dijiq.bot.telegram").info("Ignored Telegram API error: %s", error)
+            logging.getLogger("ajib.bot.telegram").info("Ignored Telegram API error: %s", error)
             return None
         raise
 
@@ -106,7 +106,7 @@ def safe_send_chat_action(bot, *args, **kwargs):
 
 
 def install_safe_telegram_methods(bot):
-    if getattr(bot, "_dijiq_safe_telegram_installed", False):
+    if getattr(bot, "_ajib_safe_telegram_installed", False):
         return bot
 
     methods = {
@@ -132,7 +132,7 @@ def install_safe_telegram_methods(bot):
                 **kwargs,
             )
 
-        setattr(bot, "_dijiq_original_answer_callback_query", answer_callback_query)
+        setattr(bot, "_ajib_original_answer_callback_query", answer_callback_query)
         setattr(bot, "answer_callback_query", wrapped_answer_callback_query)
 
     for method_name, timeout_getter in methods.items():
@@ -144,8 +144,8 @@ def install_safe_telegram_methods(bot):
         def wrapped(*args, __original=original, __timeout_getter=timeout_getter, **kwargs):
             return _call_with_timeout(__original, __timeout_getter(), *args, **kwargs)
 
-        setattr(bot, f"_dijiq_original_{method_name}", original)
+        setattr(bot, f"_ajib_original_{method_name}", original)
         setattr(bot, method_name, wrapped)
 
-    setattr(bot, "_dijiq_safe_telegram_installed", True)
+    setattr(bot, "_ajib_safe_telegram_installed", True)
     return bot
