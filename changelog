@@ -1,3 +1,11 @@
+## v1.16.5
+✨ Add supervised, isolated customer-facing Telegram bots for approved resellers
+✨ Let hosted-bot owners configure plans, markup, payments, referrals, support, earnings, and withdrawals
+🛠️ Preserve hosted-bot state during backup, restore, and upgrade flows and migrate existing services to the new supervisor
+🐛 Make hosted-bot credit, sale, renewal, and reseller accounting operations idempotent and atomically persisted
+🆙 Update Click to 8.4.2 and pyTelegramBotAPI to 4.34.0
+✅ Add regression coverage for hosted-bot state, accounting, lifecycle supervision, and nested backup restoration
+
 ## v1.16.4
 ✨ Run Telegram bot CLI actions through the Ajib Python virtual environment
 🐛 Show an actionable error when the Ajib Python environment is missing
