@@ -312,6 +312,12 @@ def add_reseller_debt(user_id, amount, config_data):
 
                 if user_id in resellers:
                     current = _ensure_reseller_defaults(resellers[user_id])
+                    order_id = str((config_data or {}).get('retail_order_id') or '')
+                    if order_id and any(
+                        isinstance(item, dict) and str(item.get('retail_order_id') or '') == order_id
+                        for item in current.get('configs', [])
+                    ):
+                        return True
                     before = _safe_float(current.get('debt', 0.0))
                     amount_value = _safe_float(amount, 0.0)
                     current['debt'] = before + amount_value
@@ -330,6 +336,74 @@ def add_reseller_debt(user_id, amount, config_data):
                     _write_resellers_file(resellers)
                     return True
                 return False
+        except Exception:
+            return False
+
+
+def record_funded_reseller_config(user_id, wholesale_amount, config_data):
+    """Record a reseller config whose wholesale cost was paid at checkout."""
+    user_id = str(user_id)
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                if user_id not in resellers:
+                    return False
+                current = _ensure_reseller_defaults(resellers[user_id])
+                record = dict(config_data or {})
+                order_id = str(record.get('retail_order_id') or '')
+                if order_id and any(
+                    isinstance(item, dict) and str(item.get('retail_order_id') or '') == order_id
+                    for item in current.get('configs', [])
+                ):
+                    return True
+                record.setdefault('price', _safe_float(wholesale_amount, 0.0))
+                record.setdefault('timestamp', _now_str())
+                record['funded_at_checkout'] = True
+                current.setdefault('configs', []).append(record)
+                current['total_paid'] = get_reseller_total_paid(current) + _safe_float(wholesale_amount, 0.0)
+                current['last_payment_at'] = _now_str()
+                current = _ensure_reseller_defaults(current)
+                resellers[user_id] = current
+                _write_resellers_file(resellers)
+                return True
+        except Exception:
+            return False
+
+
+def record_funded_reseller_renewal(user_id, username, wholesale_amount, renewal_data, server_id=None):
+    """Record a renewal whose wholesale cost was paid at crypto checkout."""
+    user_id = str(user_id)
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                if user_id not in resellers:
+                    return False
+                current = _ensure_reseller_defaults(resellers[user_id])
+                configs = current.get('configs', [])
+                target = next((item for item in configs if isinstance(item, dict)
+                               and str(item.get('username', '')).lower() == str(username).lower()
+                               and (not server_id or not item.get('server_id') or str(item.get('server_id')) == str(server_id))), None)
+                if target is None:
+                    return False
+                record = dict(renewal_data or {})
+                order_id = str(record.get('retail_order_id') or '')
+                if order_id and any(
+                    isinstance(item, dict) and str(item.get('retail_order_id') or '') == order_id
+                    for item in target.get('renewals', [])
+                ):
+                    return True
+                record.setdefault('price', _safe_float(wholesale_amount, 0.0))
+                record.setdefault('timestamp', _now_str())
+                record['funded_at_checkout'] = True
+                target.setdefault('renewals', []).append(record)
+                target['cleanup_status'] = 'renewed'
+                current['total_paid'] = get_reseller_total_paid(current) + _safe_float(wholesale_amount, 0.0)
+                current['last_payment_at'] = _now_str()
+                resellers[user_id] = _ensure_reseller_defaults(current)
+                _write_resellers_file(resellers)
+                return True
         except Exception:
             return False
 
@@ -392,6 +466,13 @@ def add_reseller_renewal_debt(user_id, username, amount, renewal_data, server_id
 
                 if target_index is None:
                     return False
+
+                order_id = str((renewal_data or {}).get('retail_order_id') or '')
+                if order_id and any(
+                    isinstance(item, dict) and str(item.get('retail_order_id') or '') == order_id
+                    for item in configs[target_index].get('renewals', [])
+                ):
+                    return True
 
                 before = _safe_float(current.get('debt', 0.0))
                 amount_value = _safe_float(amount, 0.0)

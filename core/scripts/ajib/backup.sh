@@ -9,32 +9,36 @@ BACKUP_FILE="$BACKUP_DIR/ajib_bot_backup_$(date +%Y%m%d_%H%M%S).zip"
 
 mkdir -p "$BACKUP_DIR"
 
+# Keep the established top-level state patterns while the Python archiver also
+# includes nested hosted-bot state.
 shopt -s nullglob dotglob
-state_files=("$BOT_DIR"/*.env "$BOT_DIR"/*.json)
+top_level_state_files=("$BOT_DIR"/*.env "$BOT_DIR"/*.json)
 shopt -u nullglob dotglob
 
-if [ ${#state_files[@]} -eq 0 ]; then
-    echo "Backup failed: no Telegram bot state files were found." >&2
-    exit 1
-fi
-
-relative_files=()
-for file in "${state_files[@]}"; do
-    relative_files+=("${file#$INSTALL_DIR/}")
-done
-
-python3 - "$BACKUP_FILE" "$INSTALL_DIR" "${relative_files[@]}" <<'PY'
+python3 - "$BACKUP_FILE" "$INSTALL_DIR" <<'PY'
 import pathlib
 import sys
 import zipfile
 
 backup_path = pathlib.Path(sys.argv[1])
 install_dir = pathlib.Path(sys.argv[2])
-relative_files = sys.argv[3:]
+bot_dir = install_dir / "core/scripts/telegrambot"
+files = []
+for path in bot_dir.rglob("*"):
+    if not path.is_file() or path.name.endswith((".lock", ".tmp")):
+        continue
+    relative_to_bot = path.relative_to(bot_dir)
+    is_top_level_state = len(relative_to_bot.parts) == 1 and (path.name == ".env" or path.suffix == ".json")
+    is_hosted_state = relative_to_bot.parts[0] == "hosted_bots" and path.suffix.lower() in {".json", ".jpg", ".jpeg", ".png"}
+    if is_top_level_state or is_hosted_state:
+        files.append(path)
+
+if not files:
+    raise SystemExit("Backup failed: no Telegram bot state files were found.")
 
 with zipfile.ZipFile(backup_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-    for relative_file in relative_files:
-        archive.write(install_dir / relative_file, relative_file)
+    for path in files:
+        archive.write(path, path.relative_to(install_dir).as_posix())
 PY
 
 echo "$BACKUP_FILE"

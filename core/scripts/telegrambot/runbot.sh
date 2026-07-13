@@ -34,7 +34,7 @@ Description=ajib Telegram Bot
 After=network.target
 
 [Service]
-ExecStart=/bin/bash -c 'source /etc/ajib/ajib_venv/bin/activate && /etc/ajib/ajib_venv/bin/python /etc/ajib/core/scripts/telegrambot/tbot.py'
+ExecStart=/bin/bash -c 'source /etc/ajib/ajib_venv/bin/activate && /etc/ajib/ajib_venv/bin/python /etc/ajib/core/scripts/telegrambot/supervisor.py'
 WorkingDirectory=/etc/ajib/core/scripts/telegrambot
 Restart=always
 

@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import tempfile
@@ -84,6 +85,28 @@ class BotStateBackupTests(unittest.TestCase):
         safety_copies = list(self.backup_dir.glob("restore_pre_backup_*/.env"))
         self.assertEqual(len(safety_copies), 1)
         self.assertEqual(safety_copies[0].read_text(), "API_TOKEN=old\n")
+
+    def test_backup_and_restore_include_nested_hosted_bot_state(self):
+        (self.bot_dir / ".env").write_text("API_TOKEN=secret\n")
+        tenant_dir = self.bot_dir / "hosted_bots" / "1988"
+        tenant_dir.mkdir(parents=True)
+        (tenant_dir / "settings.json").write_text('{"markup_percent": 20}')
+        (tenant_dir / "receipt.jpg").write_bytes(b"receipt")
+
+        result = subprocess.run(
+            ["bash", str(BACKUP_SCRIPT)], check=True, capture_output=True, text=True, env=self.env
+        )
+        archive_path = Path(result.stdout.strip())
+        with zipfile.ZipFile(archive_path) as archive:
+            self.assertIn("core/scripts/telegrambot/hosted_bots/1988/settings.json", archive.namelist())
+            self.assertIn("core/scripts/telegrambot/hosted_bots/1988/receipt.jpg", archive.namelist())
+
+        (tenant_dir / "settings.json").write_text("{}")
+        subprocess.run(
+            ["bash", str(RESTORE_SCRIPT), str(archive_path)],
+            check=True, capture_output=True, text=True, env=self.env,
+        )
+        self.assertEqual(json.loads((tenant_dir / "settings.json").read_text()), {"markup_percent": 20})
 
 
 if __name__ == "__main__":

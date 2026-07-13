@@ -1,35 +1,43 @@
-from .api_client import *
-from .common import *
-from .adduser import *
-from .backup import *
-from .bot_logs import *
-from .command import *
-from .deleteuser import *
-from .edituser import *
-from .search import *
-from .serverinfo import *
-from .cpu import *
-from .check_version import *
-from .payment_setup import *
-from .edit_plans import *
-from .payments import *
-from .payment_records import *
-from .receipt_checker import *
-from .renewal import *
-from .purchase_plan import *
-from .test_config import *
-from .edit_support import *
-from .downloads import *
-from .my_configs import *
-from .broadcast import *
-from .translations import *
-from .language import *
-from .referral import *
-from .referral_handlers import *
-from .update_keyboards import *
-from .reseller import *
-from .reseller_handlers import *
-from .traffic_monitor import *
-from .username_utils import *
-from .vpn_servers import *
-from .expired_cleanup import *
+import os
+
+# Hosted workers import selected infrastructure modules directly. Importing the
+# primary handler graph here would create a second bot with operator handlers.
+if os.getenv("AJIB_BOT_ROLE") in {"hosted", "supervisor"}:
+    __all__ = []
+else:
+    from .api_client import *
+    from .common import *
+    from .adduser import *
+    from .backup import *
+    from .bot_logs import *
+    from .command import *
+    from .deleteuser import *
+    from .edituser import *
+    from .search import *
+    from .serverinfo import *
+    from .cpu import *
+    from .check_version import *
+    from .payment_setup import *
+    from .edit_plans import *
+    from .payments import *
+    from .payment_records import *
+    from .receipt_checker import *
+    from .renewal import *
+    from .purchase_plan import *
+    from .test_config import *
+    from .edit_support import *
+    from .downloads import *
+    from .my_configs import *
+    from .broadcast import *
+    from .translations import *
+    from .language import *
+    from .referral import *
+    from .referral_handlers import *
+    from .update_keyboards import *
+    from .reseller import *
+    from .reseller_handlers import *
+    from .traffic_monitor import *
+    from .username_utils import *
+    from .vpn_servers import *
+    from .expired_cleanup import *
+    from .hosted_bot_handlers import *

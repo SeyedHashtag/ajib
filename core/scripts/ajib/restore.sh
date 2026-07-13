@@ -36,9 +36,12 @@ with zipfile.ZipFile(archive_path) as archive:
             continue
         if path.is_absolute() or ".." in path.parts:
             raise SystemExit(f"Unsafe backup entry: {name}")
-        if not name.startswith(prefix) or path.parent.as_posix() != prefix.rstrip("/"):
+        if not name.startswith(prefix):
             raise SystemExit(f"Unsupported backup entry: {name}")
-        if path.suffix not in {".env", ".json"} and path.name != ".env":
+        relative = pathlib.PurePosixPath(name[len(prefix):])
+        top_level = len(relative.parts) == 1 and (relative.name == ".env" or relative.suffix == ".json")
+        hosted = len(relative.parts) >= 2 and relative.parts[0] == "hosted_bots" and relative.suffix.lower() in {".json", ".jpg", ".jpeg", ".png"}
+        if not (top_level or hosted):
             raise SystemExit(f"Unsupported bot state file: {name}")
         members.append(info)
     if not members:
@@ -59,9 +62,16 @@ shopt -u nullglob dotglob
 for file in "${current_files[@]}"; do
     cp -p "$file" "$pre_restore_dir/"
 done
+if [ -d "$BOT_DIR/hosted_bots" ]; then
+    cp -a "$BOT_DIR/hosted_bots" "$pre_restore_dir/"
+fi
 for file in "${restored_files[@]}"; do
     cp -p "$file" "$BOT_DIR/"
 done
+if [ -d "$RESTORE_DIR/core/scripts/telegrambot/hosted_bots" ]; then
+    cp -a "$RESTORE_DIR/core/scripts/telegrambot/hosted_bots" "$BOT_DIR/"
+fi
+chmod 600 "$BOT_DIR/hosted_bot_tokens.json" "$BOT_DIR/hosted_bots.json" 2>/dev/null || true
 
 if [ "${AJIB_SKIP_SERVICE_RESTART:-0}" != "1" ] && systemctl is-active --quiet ajib-telegram-bot.service; then
     systemctl restart ajib-telegram-bot.service

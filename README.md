@@ -17,6 +17,7 @@ VPN panels through their HTTP APIs.
 - Balance new accounts across multiple VPN servers
 - Sell plans through manual and cryptocurrency payment flows
 - Manage resellers, referrals, test accounts, and expired accounts
+- Host customer-facing Telegram bots for approved resellers on the same VPN infrastructure
 - Show customers their configurations and QR codes
 - Broadcast messages and provide operational dashboards to administrators
 - Back up bot configuration and JSON state
@@ -50,12 +51,27 @@ running.
 ## Runtime layout
 
 - `core/scripts/telegrambot/tbot.py`: bot entry point
+- `core/scripts/telegrambot/supervisor.py`: primary and hosted reseller bot supervisor
+- `core/scripts/telegrambot/hosted_worker.py`: isolated reseller storefront worker
 - `core/scripts/telegrambot/utils/`: Telegram handlers and external API client
 - `core/scripts/telegrambot/.env`: bot credentials and VPN server definitions
 - `core/cli.py`: bot lifecycle, backup, version, and dashboard commands
 - `menu.sh`: interactive bot configuration and service manager
 
 Do not commit `.env`, API tokens, payment details, or generated JSON state.
+
+## Hosted reseller bots
+
+An approved reseller can open **Reseller Panel → My Hosted Bot** and submit a
+BotFather token. The token is validated and stored separately from public bot
+metadata. The systemd supervisor starts one isolated polling worker per active
+reseller bot (up to 50 per installation). Resellers configure their markup,
+visible wholesale plans, card details, optional operator crypto checkout,
+support text, referrals, and earnings inside their own bot's owner panel.
+
+Hosted bots use the operator's VPN servers and never expose panel credentials.
+New hosted bots start with crypto disabled. The existing 5% crypto discount is
+deducted from reseller margin when crypto is enabled.
 
 ## API compatibility
 

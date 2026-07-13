@@ -349,6 +349,7 @@ def reseller_panel(message):
             types.InlineKeyboardButton(get_button_text(language, "reseller_stats"), callback_data="reseller:stats"),
             types.InlineKeyboardButton(get_button_text(language, "my_debt"), callback_data="reseller:debt")
         )
+        markup.add(types.InlineKeyboardButton("🤖 My Hosted Bot", callback_data="hosted:menu"))
         debt = float(reseller_data.get('debt', 0.0))
         debt_state_text = get_message_text(language, _debt_state_label(reseller_data.get('debt_state', 'active')))
         trust_limit = get_reseller_trust_limit(get_reseller_total_paid(reseller_data))

@@ -46,6 +46,9 @@ shopt -u nullglob dotglob
 for file in "${state_files[@]}"; do
     cp -p "$file" "$STATE_DIR/"
 done
+if [ -d "$BOT_DIR/hosted_bots" ]; then
+    cp -a "$BOT_DIR/hosted_bots" "$STATE_DIR/"
+fi
 
 git clone "$REPOSITORY" "$NEW_DIR"
 
@@ -63,12 +66,19 @@ shopt -s nullglob dotglob
 saved_files=("$STATE_DIR"/*)
 shopt -u nullglob dotglob
 for file in "${saved_files[@]}"; do
-    cp -p "$file" "$BOT_DIR/"
+    cp -a "$file" "$BOT_DIR/"
 done
 
 python3 -m venv "$INSTALL_DIR/ajib_venv"
 "$INSTALL_DIR/ajib_venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
 chmod +x "$INSTALL_DIR/menu.sh"
+
+# Existing installations may still point systemd directly at tbot.py. Hosted
+# bots require the supervisor, which also runs and restarts the primary bot.
+service_file="/etc/systemd/system/ajib-telegram-bot.service"
+if [ -f "$service_file" ]; then
+    sed -i 's#/etc/ajib/core/scripts/telegrambot/tbot.py#/etc/ajib/core/scripts/telegrambot/supervisor.py#g' "$service_file"
+fi
 
 systemctl daemon-reload
 if [ "$was_active" = true ]; then
