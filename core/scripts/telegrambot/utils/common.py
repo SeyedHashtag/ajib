@@ -8,9 +8,8 @@ ADMIN_MAIN_MENU_ROWS = (
     ('📞 Edit Support', '🔄 Update Keyboards'),
     ('💼 Manage Resellers', '🧪 Manage Test Accounts'),
     ('💰 Referral Payouts', '⚖️ VPN Servers'),
-    ('🤖 Hosted Bots',),
     ('✅ Confirmations', '🧹 Expired Cleanup'),
-    ('📄 Bot Logs',),
+    ('📄 Bot Logs', '🤖 Hosted Bots'),
 )
 
 ADMIN_MAIN_MENU_BUTTONS = {button for row in ADMIN_MAIN_MENU_ROWS for button in row}
