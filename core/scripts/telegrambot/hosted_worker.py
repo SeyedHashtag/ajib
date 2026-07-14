@@ -796,18 +796,38 @@ def referral_resolve(call):
     bot.answer_callback_query(call.id, "Updated", show_alert=True)
 
 
+OWNER_MENU_ROWS = (
+    ("generate", "customers"),
+    ("debt", "markup"),
+    ("card", "rate"),
+    ("support", "welcome"),
+    ("refpercent", "plans"),
+    ("crypto", "earnings"),
+    ("referrals", "back"),
+)
+OWNER_SETTING_KEYS = ("markup", "card", "rate", "support", "welcome", "refpercent")
+
+
+def _owner_menu_command(text):
+    for row in OWNER_MENU_ROWS:
+        for key in row:
+            if key == "back" and text in _all_button_values("back", "🔙 Back"):
+                return "back", None
+            if any(catalog.get(key) == text for catalog in HOSTED_TRANSLATIONS.values()):
+                return ("setting" if key in OWNER_SETTING_KEYS else "action"), key
+    return None
+
+
+def _owner_menu_text(user_id, key):
+    if key == "back":
+        return _button(user_id, "back", "🔙 Back")
+    return _hosted_message(user_id, key)
+
+
 def _owner_markup(user_id=OWNER_ID):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton(_hosted_message(user_id, "generate"), callback_data="hb:owner:generate"),
-               types.InlineKeyboardButton(_hosted_message(user_id, "customers"), callback_data="hb:owner:customers"))
-    markup.add(types.InlineKeyboardButton(_hosted_message(user_id, "debt"), callback_data="hb:owner:debt"))
-    for key, action in (("markup", "markup"), ("card", "card"), ("rate", "rate"),
-                        ("support", "support"), ("welcome", "welcome"), ("refpercent", "refpercent")):
-        markup.add(types.InlineKeyboardButton(_hosted_message(user_id, key), callback_data=f"hb:setting:{action}"))
-    markup.add(types.InlineKeyboardButton(_hosted_message(user_id, "plans"), callback_data="hb:owner:plans"),
-               types.InlineKeyboardButton(_hosted_message(user_id, "crypto"), callback_data="hb:owner:crypto"))
-    markup.add(types.InlineKeyboardButton(_hosted_message(user_id, "earnings"), callback_data="hb:owner:earnings"),
-               types.InlineKeyboardButton(_hosted_message(user_id, "referrals"), callback_data="hb:owner:referrals"))
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for row in OWNER_MENU_ROWS:
+        markup.row(*(_owner_menu_text(user_id, key) for key in row))
     return markup
 
 
@@ -827,15 +847,34 @@ def owner_panel(message):
                  parse_mode="Markdown", reply_markup=_owner_markup())
 
 
+def _begin_owner_setting(chat_id, field):
+    INPUT_STATE[OWNER_ID] = {"kind": "owner_setting", "field": field}
+    bot.send_message(chat_id, _hosted_message(OWNER_ID, f"prompt_{field}"))
+
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:setting:"))
 def owner_setting(call):
     if call.from_user.id != OWNER_ID:
         bot.answer_callback_query(call.id, "Owner only", show_alert=True)
         return
     field = call.data.split(":")[2]
-    INPUT_STATE[OWNER_ID] = {"kind": "owner_setting", "field": field}
-    bot.send_message(call.message.chat.id, _hosted_message(OWNER_ID, f"prompt_{field}"))
+    _begin_owner_setting(call.message.chat.id, field)
     bot.answer_callback_query(call.id)
+
+
+@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and _owner_menu_command(m.text) is not None)
+def owner_menu_action(message):
+    command, action = _owner_menu_command(message.text)
+    INPUT_STATE.pop(OWNER_ID, None)
+    if command == "back":
+        settings = get_settings(OWNER_ID)
+        bot.reply_to(message, settings.get("welcome_text") or "Welcome!",
+                     reply_markup=_main_markup(OWNER_ID))
+        return
+    if command == "setting":
+        _begin_owner_setting(message.chat.id, action)
+        return
+    _handle_owner_action(message.chat.id, action, lambda text: bot.reply_to(message, text))
 
 
 @bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and INPUT_STATE.get(OWNER_ID, {}).get("kind") == "owner_setting")
@@ -857,16 +896,11 @@ def owner_setting_input(message):
         bot.reply_to(message, _hosted_message(OWNER_ID, "invalid_value"))
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("hb:owner:"))
-def owner_action(call):
-    if call.from_user.id != OWNER_ID:
-        bot.answer_callback_query(call.id, "Owner only", show_alert=True)
-        return
-    action = call.data.split(":")[2]
+def _handle_owner_action(chat_id, action, feedback):
     settings = get_settings(OWNER_ID)
     if action == "generate":
         if not _reseller(active_only=True):
-            bot.answer_callback_query(call.id, "Generation is unavailable while the reseller is suspended.", show_alert=True)
+            feedback("Generation is unavailable while the reseller is suspended.")
             return
         markup = types.InlineKeyboardMarkup(row_width=1)
         for plan_id, plan in sorted(_sellable_plans().items(), key=lambda item: int(item[0])):
@@ -874,8 +908,7 @@ def owner_action(call):
                 f"{plan_id} GB · {plan.get('days', 30)} days · ${float(plan['price']):.2f} wholesale",
                 callback_data=f"hb:ogen:{plan_id}",
             ))
-        bot.send_message(call.message.chat.id, "Select a wholesale plan:", reply_markup=markup)
-        bot.answer_callback_query(call.id)
+        bot.send_message(chat_id, "Select a wholesale plan:", reply_markup=markup)
         return
     if action == "customers":
         reseller = get_reseller_data(OWNER_ID) or {}
@@ -884,31 +917,29 @@ def owner_action(call):
         for item in configs[-30:]:
             label = item.get("customer_name") or item.get("customer_telegram_username") or item.get("customer_telegram_id") or "manual"
             lines.append(f"• `{item.get('username', '?')}` · {label} · {item.get('plan_gb', item.get('gb', '?'))} GB")
-        bot.send_message(call.message.chat.id, "\n".join(lines) if configs else "No reseller customers yet.", parse_mode="Markdown")
-        bot.answer_callback_query(call.id)
+        bot.send_message(chat_id, "\n".join(lines) if configs else "No reseller customers yet.", parse_mode="Markdown")
         return
     if action == "debt":
         reseller = get_reseller_data(OWNER_ID) or {}
         total_paid = get_reseller_total_paid(reseller)
         limit = get_reseller_trust_limit(total_paid)
         _, _, available = can_reseller_add_debt(reseller, 0)
-        bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id,
+        bot.send_message(chat_id,
                          f"Debt: ${float(reseller.get('debt', 0)):.2f}\nTrust limit: ${limit:.2f}\nAvailable credit: ${available:.2f}")
         return
     if action == "crypto":
         target = not settings.get("crypto_enabled")
         if target:
             if not os.getenv("CRYPTO_MERCHANT_ID") or not os.getenv("CRYPTO_API_KEY"):
-                bot.answer_callback_query(call.id, "Operator crypto gateway is not configured.", show_alert=True)
+                feedback("Operator crypto gateway is not configured.")
                 return
             unsupported = [pid for pid, plan in _sellable_plans().items()
                            if not calculate_quote(plan["price"], settings["markup_percent"])["crypto_supported"]]
             if unsupported:
-                bot.answer_callback_query(call.id, "Increase markup before enabling crypto.", show_alert=True)
+                feedback("Increase markup before enabling crypto.")
                 return
         update_settings(OWNER_ID, {"crypto_enabled": target})
-        bot.answer_callback_query(call.id, f"Crypto {'enabled' if target else 'disabled'}", show_alert=True)
+        feedback(f"Crypto {'enabled' if target else 'disabled'}")
         return
     if action == "plans":
         enabled = {str(item) for item in settings.get("enabled_plan_ids", [])}
@@ -919,8 +950,7 @@ def owner_action(call):
             selected = plan_id in enabled if settings.get("plan_selection_configured") else True
             markup.add(types.InlineKeyboardButton(f"{'✅' if selected else '❌'} {plan_id} GB",
                                                    callback_data=f"hb:plantoggle:{plan_id}"))
-        bot.send_message(call.message.chat.id, "Select plans sold by this bot:", reply_markup=markup)
-        bot.answer_callback_query(call.id)
+        bot.send_message(chat_id, "Select plans sold by this bot:", reply_markup=markup)
         return
     if action == "earnings":
         ledger = get_ledger(OWNER_ID)
@@ -928,22 +958,38 @@ def owner_action(call):
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(types.InlineKeyboardButton("Apply earnings to debt", callback_data="hb:earn:settle"),
                    types.InlineKeyboardButton("Request withdrawal", callback_data="hb:earn:withdraw"))
-        bot.send_message(call.message.chat.id,
+        bot.send_message(chat_id,
                          f"Available earnings: ${ledger['earnings_available']:.2f}\nReserved: ${ledger['earnings_reserved']:.2f}\n"
                          f"Debt: ${float(reseller.get('debt', 0)):.2f}\nReferral liability: ${ledger['referral_liability']:.2f}",
                          reply_markup=markup)
-        bot.answer_callback_query(call.id)
         return
     if action == "referrals":
         pending = [item for item in _referral_data().get("pending_withdrawals", []) if item.get("status") == "pending"]
-        bot.answer_callback_query(call.id, f"{len(pending)} pending referral payouts", show_alert=True)
+        feedback(f"{len(pending)} pending referral payouts")
         for request in pending:
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("✅ Mark Paid", callback_data=f"hb:refresolve:paid:{request['id']}"),
                        types.InlineKeyboardButton("❌ Reject", callback_data=f"hb:refresolve:rejected:{request['id']}"))
-            bot.send_message(call.message.chat.id,
+            bot.send_message(chat_id,
                              f"User: `{request['user_id']}`\nAmount: ${request['amount']:.2f}\nWallet: `{request['wallet']}`",
                              parse_mode="Markdown", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("hb:owner:"))
+def owner_action(call):
+    if call.from_user.id != OWNER_ID:
+        bot.answer_callback_query(call.id, "Owner only", show_alert=True)
+        return
+    callback_answered = False
+
+    def feedback(text):
+        nonlocal callback_answered
+        bot.answer_callback_query(call.id, text, show_alert=True)
+        callback_answered = True
+
+    _handle_owner_action(call.message.chat.id, call.data.split(":")[2], feedback)
+    if not callback_answered:
+        bot.answer_callback_query(call.id)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:ogen:"))
