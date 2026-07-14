@@ -21,6 +21,7 @@ load_dotenv(os.path.join(BOT_DIR, ".env"))
 
 from utils.api_client import APIClient, MultiServerAPI
 from utils.atomic_store import locked_json, read_json
+from utils.currency_format import format_toman_amount, format_usd_amount
 from utils.hosted_bots import (
     add_referral_liability, calculate_quote, consume_credit,
     consume_renewal_credit, credit_crypto_sale, get_ledger, get_settings,
@@ -28,13 +29,14 @@ from utils.hosted_bots import (
     set_bot_runtime_status, settle_referral_liability, tenant_file, transfer_earnings_to_debt,
     update_settings,
 )
+from utils.hosted_translations import HOSTED_TRANSLATIONS, hosted_text
 from utils.payments import CryptoPayment
 from utils.reseller import (
     can_reseller_add_debt, get_reseller_data, get_reseller_total_paid,
     get_reseller_trust_limit, record_funded_reseller_config,
     record_funded_reseller_renewal,
 )
-from utils.translations import BUTTON_TRANSLATIONS, LANGUAGES
+from utils.translations import BUTTON_TRANSLATIONS, LANGUAGES, get_button_text, get_message_text
 from utils.username_utils import allocate_username, build_user_note
 
 
@@ -95,6 +97,14 @@ def _button(user_id, key, fallback):
     return BUTTON_TRANSLATIONS.get(_language(user_id), BUTTON_TRANSLATIONS["en"]).get(key, fallback)
 
 
+def _message(user_id, key):
+    return get_message_text(_language(user_id), key)
+
+
+def _hosted_message(user_id, key, **values):
+    return hosted_text(_language(user_id), key, **values)
+
+
 def _all_button_values(key, fallback):
     return {items.get(key, fallback) for items in BUTTON_TRANSLATIONS.values()}
 
@@ -106,7 +116,7 @@ def _main_markup(user_id):
     markup.row(_button(user_id, "referral", "💰 Earn Crypto"), _button(user_id, "support", "📞 Support"))
     markup.row(_button(user_id, "language", "🌐 Language/زبان"))
     if user_id == OWNER_ID:
-        markup.row("🛠 Owner Panel")
+        markup.row(_hosted_message(user_id, "owner_panel"))
     return markup
 
 
@@ -209,14 +219,19 @@ def _create_user(customer_id, plan, note):
 
 def _deliver_config(chat_id, username, client, renewed=False):
     uri = client.get_user_uri(username) if client else None
+    action = _hosted_message(chat_id, "renewed" if renewed else "created")
     if not uri or not uri.get("normal_sub"):
-        bot.send_message(chat_id, f"✅ {'Renewed' if renewed else 'Created'} `{username}`, but its subscription URL is not available yet.", parse_mode="Markdown")
+        bot.send_message(chat_id, _hosted_message(chat_id, "config_no_url", action=action, username=username),
+                         parse_mode="Markdown")
         return
     url = uri.get("ipv4") or uri["normal_sub"]
     image = io.BytesIO()
     qrcode.make(url).save(image, "PNG")
     image.seek(0)
-    bot.send_photo(chat_id, image, caption=f"✅ {'Renewed' if renewed else 'Your config is ready'}\nUsername: `{username}`\nSubscription: `{uri['normal_sub']}`", parse_mode="Markdown")
+    bot.send_photo(chat_id, image,
+                   caption=_hosted_message(chat_id, "config_ready", action=action, username=username,
+                                           subscription=uri["normal_sub"]),
+                   parse_mode="Markdown")
 
 
 def _provision_payment(payment_id, record, funded):
@@ -300,16 +315,37 @@ def _provision_payment(payment_id, record, funded):
     return True, username
 
 
-def _purchase_options(chat_id, user_id, plan_id, renewal=None):
+def _show_plans(chat_id, user_id, message_id=None):
+    language = _language(user_id)
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    settings = get_settings(OWNER_ID)
+    for plan_id, plan in sorted(_sellable_plans().items(), key=lambda item: int(item[0])):
+        quote = calculate_quote(plan["price"], settings["markup_percent"])
+        account_type = get_message_text(
+            language, "unlimited_users" if plan.get("unlimited", False) else "single_user"
+        )
+        markup.add(types.InlineKeyboardButton(
+            f"{plan_id} GB · {plan.get('days', 30)} days · ${format_usd_amount(quote['retail'])}{account_type}",
+            callback_data=f"hb:buy:{plan_id}",
+        ))
+    text = _message(user_id, "select_plan") if markup.keyboard else _message(user_id, "plan_not_found")
+    if message_id is not None:
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
+    else:
+        bot.send_message(chat_id, text, reply_markup=markup)
+
+
+def _purchase_options(chat_id, user_id, plan_id, renewal=None, message_id=None):
     reseller = _reseller(active_only=True)
     if not reseller:
-        bot.send_message(chat_id, "Purchases are temporarily unavailable.")
+        bot.send_message(chat_id, _hosted_message(user_id, "purchase_unavailable"))
         return
     plan = _sellable_plans().get(str(plan_id))
     if not plan:
-        bot.send_message(chat_id, "Plan is no longer available.")
+        bot.send_message(chat_id, _message(user_id, "plan_not_found"))
         return
     settings = get_settings(OWNER_ID)
+    language = _language(user_id)
     quote = calculate_quote(plan["price"], settings["markup_percent"], settings["referral_margin_percent"],
                             referred=str(user_id) in _referral_data().get("referrals", {}))
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -319,13 +355,34 @@ def _purchase_options(chat_id, user_id, plan_id, renewal=None):
         RENEWAL_TOKENS[token] = dict(renewal)
         suffix = f":{token}"
     if settings.get("card_number"):
-        markup.add(types.InlineKeyboardButton("📄 Card to Card", callback_data=f"hb:pay:card:{plan_id}{suffix}"))
+        markup.add(types.InlineKeyboardButton(get_button_text(language, "card_to_card"),
+                                              callback_data=f"hb:pay:card:{plan_id}{suffix}"))
     if settings.get("crypto_enabled") and quote["crypto_supported"] and os.getenv("CRYPTO_MERCHANT_ID") and os.getenv("CRYPTO_API_KEY"):
-        markup.add(types.InlineKeyboardButton("💳 Crypto (5% off)", callback_data=f"hb:pay:crypto:{plan_id}{suffix}"))
+        markup.add(types.InlineKeyboardButton(
+            get_message_text(language, "crypto_discount_button").format(percent=5),
+            callback_data=f"hb:pay:crypto:{plan_id}{suffix}",
+        ))
     if not markup.keyboard:
-        bot.send_message(chat_id, "No payment method is currently available.")
+        bot.send_message(chat_id, _message(user_id, "no_payment_methods"))
         return
-    bot.send_message(chat_id, f"{plan_id} GB · {plan.get('days', 30)} days\nRetail price: ${quote['retail']:.2f}\nSelect payment method:", reply_markup=markup)
+    markup.add(types.InlineKeyboardButton(get_button_text(language, "back"), callback_data="hb:plans"))
+    exchange_rate = float(settings.get("exchange_rate", 1) or 1)
+    unlimited_text = get_button_text(language, "yes" if plan.get("unlimited", False) else "no")
+    text = _message(user_id, "plan_details")
+    text += _message(user_id, "data").format(plan_gb=plan_id)
+    text += _message(user_id, "duration").format(days=plan.get("days", 30))
+    text += _message(user_id, "unlimited").format(unlimited_text=unlimited_text)
+    text += _message(user_id, "price").format(price=format_usd_amount(quote["retail"]))
+    text += _message(user_id, "exchange_rate").format(exchange_rate=format_toman_amount(exchange_rate))
+    text += _message(user_id, "toman_price").format(
+        toman_price=format_toman_amount(quote["retail"] * exchange_rate)
+    )
+    text += _message(user_id, "purchase_connection_warning")
+    text += _message(user_id, "select_payment_method")
+    if message_id is not None:
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
+    else:
+        bot.send_message(chat_id, text, reply_markup=markup)
 
 
 @bot.message_handler(commands=["start"])
@@ -339,18 +396,20 @@ def start(message):
 
 @bot.message_handler(func=lambda m: m.text in _all_button_values("purchase_plan", "💳 Purchase Plan"))
 def plans(message):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    settings = get_settings(OWNER_ID)
-    for plan_id, plan in sorted(_sellable_plans().items(), key=lambda item: int(item[0])):
-        quote = calculate_quote(plan["price"], settings["markup_percent"])
-        markup.add(types.InlineKeyboardButton(f"{plan_id} GB · {plan.get('days', 30)} days · ${quote['retail']:.2f}", callback_data=f"hb:buy:{plan_id}"))
-    bot.reply_to(message, "Select a plan:" if markup.keyboard else "No plans are enabled.", reply_markup=markup)
+    _show_plans(message.chat.id, message.from_user.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "hb:plans")
+def plans_back(call):
+    bot.answer_callback_query(call.id)
+    _show_plans(call.message.chat.id, call.from_user.id, call.message.message_id)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:buy:"))
 def buy(call):
     bot.answer_callback_query(call.id)
-    _purchase_options(call.message.chat.id, call.from_user.id, call.data.split(":")[2])
+    _purchase_options(call.message.chat.id, call.from_user.id, call.data.split(":")[2],
+                      message_id=call.message.message_id)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:pay:"))
@@ -361,7 +420,7 @@ def payment_method(call):
     plan = _sellable_plans().get(plan_id)
     settings = get_settings(OWNER_ID)
     if not plan or not _reseller(active_only=True):
-        bot.answer_callback_query(call.id, "Plan unavailable", show_alert=True)
+        bot.answer_callback_query(call.id, _message(call.from_user.id, "plan_not_found"), show_alert=True)
         return
     referred = str(call.from_user.id) in _referral_data().get("referrals", {})
     quote = calculate_quote(plan["price"], settings["markup_percent"], settings["referral_margin_percent"], referred)
@@ -381,37 +440,88 @@ def payment_method(call):
         reseller = get_reseller_data(OWNER_ID) or {}
         _, _, available = can_reseller_add_debt(reseller, 0)
         if not reserve_credit(OWNER_ID, order_id, quote["wholesale"], available):
-            bot.answer_callback_query(call.id, "Reseller credit is temporarily unavailable.", show_alert=True)
+            bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "credit_unavailable"),
+                                      show_alert=True)
             return
-        record.update({"status": "waiting_receipt", "reservation_id": order_id})
+        exchange_rate = float(settings.get("exchange_rate", 1) or 1)
+        toman_price = quote["retail"] * exchange_rate
+        record.update({"status": "waiting_receipt", "reservation_id": order_id,
+                       "exchange_rate": exchange_rate, "converted_amount": toman_price,
+                       "converted_currency": "TOMAN"})
         _save_payment(order_id, record)
         INPUT_STATE[call.from_user.id] = {"kind": "receipt", "payment_id": order_id}
         bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id,
-                         f"Send ${quote['retail']:.2f} using this card and upload the receipt photo:\n`{settings['card_number']}`",
-                         parse_mode="Markdown")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(get_button_text(_language(call.from_user.id), "cancel"),
+                                              callback_data=f"hb:cancel:{order_id}"))
+        bot.edit_message_text(
+            _message(call.from_user.id, "card_to_card_payment").format(
+                price=format_toman_amount(toman_price),
+                exchange_rate=format_toman_amount(exchange_rate),
+                card_number=settings["card_number"],
+            ), call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup,
+        )
         return
     if not settings.get("crypto_enabled") or not quote["crypto_supported"]:
-        bot.answer_callback_query(call.id, "Crypto checkout is disabled.", show_alert=True)
+        bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "crypto_disabled"), show_alert=True)
         return
     response = CryptoPayment().create_payment(quote["crypto_collected"], plan_id, call.from_user.id,
                                                additional_data={"reseller_id": str(OWNER_ID), "hosted_order_id": order_id})
     if "error" in response:
-        bot.answer_callback_query(call.id, response["error"], show_alert=True)
+        bot.answer_callback_query(
+            call.id, _message(call.from_user.id, "error_creating_payment").format(error=response["error"]),
+            show_alert=True,
+        )
         return
     gateway = response.get("result", {})
     gateway_id, url = gateway.get("uuid"), gateway.get("url")
     if not gateway_id or not url:
-        bot.answer_callback_query(call.id, "Invalid gateway response.", show_alert=True)
+        bot.answer_callback_query(
+            call.id, _message(call.from_user.id, "error_creating_payment").format(error="Invalid gateway response"),
+            show_alert=True,
+        )
         return
     record.update({"status": "pending", "gateway_payment_id": gateway_id,
                    "crypto_collected": quote["crypto_collected"], "margin": quote["crypto_margin"]})
     _save_payment(order_id, record)
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔗 Pay", url=url),
-               types.InlineKeyboardButton("🔄 Check", callback_data=f"hb:check:{order_id}"))
+    language = _language(call.from_user.id)
+    markup.add(types.InlineKeyboardButton(get_button_text(language, "payment_link"), url=url),
+               types.InlineKeyboardButton(get_button_text(language, "check_status"),
+                                          callback_data=f"hb:check:{order_id}"))
+    caption = _message(call.from_user.id, "payment_instructions").format(
+        price=format_usd_amount(quote["crypto_collected"]), payment_url=url, payment_id=gateway_id
+    )
+    caption += "\n\n" + _message(call.from_user.id, "crypto_discount_summary").format(
+        percent=5,
+        original_price=format_usd_amount(quote["retail"]),
+        discount_amount=format_usd_amount(quote["retail"] - quote["crypto_collected"]),
+        discounted_price=format_usd_amount(quote["crypto_collected"]),
+    )
+    caption += _message(call.from_user.id, "purchase_connection_warning")
+    image = io.BytesIO()
+    qrcode.make(url).save(image, "PNG")
+    image.seek(0)
     bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, f"Crypto total after 5% discount: ${quote['crypto_collected']:.2f}", reply_markup=markup)
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    bot.send_photo(call.message.chat.id, image, caption=caption, parse_mode="Markdown", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("hb:cancel:"))
+def cancel_card_payment(call):
+    payment_id = call.data.split(":", 2)[2]
+    record = _tenant_payments().get(payment_id)
+    if (not record or str(record.get("user_id")) != str(call.from_user.id)
+            or record.get("status") not in {"waiting_receipt", "pending_approval"}):
+        bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "already_processed"),
+                                  show_alert=True)
+        return
+    release_credit(OWNER_ID, payment_id, kind="credit_canceled")
+    _save_payment(payment_id, {"status": "canceled"})
+    INPUT_STATE.pop(call.from_user.id, None)
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(_message(call.from_user.id, "purchase_canceled"),
+                          call.message.chat.id, call.message.message_id)
 
 
 @bot.message_handler(content_types=["photo"])
@@ -433,11 +543,18 @@ def receipt_photo(message):
             handle.write(content)
         _save_payment(payment_id, {"status": "pending_approval", "receipt_path": receipt_path})
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("✅ Approve", callback_data=f"hb:approve:{payment_id}"),
-                   types.InlineKeyboardButton("❌ Reject", callback_data=f"hb:reject:{payment_id}"))
+        markup.add(types.InlineKeyboardButton(_hosted_message(OWNER_ID, "approved"),
+                                              callback_data=f"hb:approve:{payment_id}"),
+                   types.InlineKeyboardButton(_hosted_message(OWNER_ID, "rejected"),
+                                              callback_data=f"hb:reject:{payment_id}"))
+        caption = _hosted_message(
+            OWNER_ID, "receipt_owner_caption", user_id=message.from_user.id,
+            plan_gb=record["plan_gb"], days=record["days"],
+            toman_price=format_toman_amount(record.get("converted_amount", record["retail_price"])),
+        )
         with open(receipt_path, "rb") as handle:
-            bot.send_photo(OWNER_ID, handle, caption=f"Receipt from {message.from_user.id}\nRetail: ${record['retail_price']:.2f}", reply_markup=markup)
-        bot.reply_to(message, "Receipt submitted to the reseller.")
+            bot.send_photo(OWNER_ID, handle, caption=caption, parse_mode="Markdown", reply_markup=markup)
+        bot.reply_to(message, _message(message.from_user.id, "receipt_submitted"))
     finally:
         INPUT_STATE.pop(message.from_user.id, None)
 
@@ -445,25 +562,25 @@ def receipt_photo(message):
 @bot.callback_query_handler(func=lambda c: c.data.startswith(("hb:approve:", "hb:reject:")))
 def owner_receipt(call):
     if call.from_user.id != OWNER_ID:
-        bot.answer_callback_query(call.id, "Owner only", show_alert=True)
+        bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "owner_panel"), show_alert=True)
         return
     action, payment_id = call.data.split(":")[1:]
     record = _claim_payment(payment_id, {"pending_approval"})
     if not record:
-        bot.answer_callback_query(call.id, "Already processed", show_alert=True)
+        bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "already_processed"), show_alert=True)
         return
     if action == "reject":
         release_credit(OWNER_ID, payment_id)
         _save_payment(payment_id, {"status": "rejected"})
-        bot.send_message(record["user_id"], "Your receipt was rejected by the reseller.")
-        bot.answer_callback_query(call.id, "Rejected")
+        bot.send_message(record["user_id"], _hosted_message(record["user_id"], "receipt_rejected"))
+        bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "rejected"))
         return
     success, result = _provision_payment(payment_id, record, funded=False)
     if not success:
         _save_payment(payment_id, {"status": "pending_approval", "last_error": result})
         bot.answer_callback_query(call.id, result, show_alert=True)
         return
-    bot.answer_callback_query(call.id, "Approved")
+    bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "approved"))
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:check:"))
@@ -471,28 +588,38 @@ def check_crypto(call):
     payment_id = call.data.split(":")[2]
     current = _tenant_payments().get(payment_id)
     if not current or str(current.get("user_id")) != str(call.from_user.id):
-        bot.answer_callback_query(call.id, "Payment not found", show_alert=True)
+        bot.answer_callback_query(call.id, _message(call.from_user.id, "payment_record_not_found"), show_alert=True)
         return
     if current.get("status") == "completed":
-        bot.answer_callback_query(call.id, "Already completed", show_alert=True)
+        bot.answer_callback_query(
+            call.id, _message(call.from_user.id, "payment_already_processed").format(status="completed"),
+            show_alert=True,
+        )
         return
     response = CryptoPayment().check_payment_status(current["gateway_payment_id"])
     result = response.get("result", {}) if isinstance(response, dict) else {}
     status = result.get("status") or result.get("payment_status") or result.get("paymentStatus")
     if str(status).lower() != "paid":
-        bot.answer_callback_query(call.id, f"Status: {status or 'unknown'}", show_alert=True)
+        bot.answer_callback_query(
+            call.id,
+            (_message(call.from_user.id, "payment_pending") if not status else
+             _message(call.from_user.id, "payment_status").format(status=status)),
+            show_alert=True,
+        )
         return
     record = _claim_payment(payment_id, {"pending", "paid_provision_failed"})
     if not record:
-        bot.answer_callback_query(call.id, "Payment is already processing", show_alert=True)
+        bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "payment_processing"), show_alert=True)
         return
     success, detail = _provision_payment(payment_id, record, funded=True)
     if not success:
         _save_payment(payment_id, {"status": "paid_provision_failed", "last_error": detail})
         bot.send_message(OWNER_ID, f"⚠️ Paid order `{payment_id}` needs retry: {detail}", parse_mode="Markdown")
-        bot.answer_callback_query(call.id, "Paid, but provisioning needs attention.", show_alert=True)
+        bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "paid_needs_attention"),
+                                  show_alert=True)
         return
-    bot.answer_callback_query(call.id, "Payment completed", show_alert=True)
+    bot.answer_callback_query(call.id, _message(call.from_user.id, "payment_status").format(status="completed"),
+                              show_alert=True)
 
 
 @bot.message_handler(func=lambda m: m.text in _all_button_values("my_configs", "📱 My Configs"))
@@ -539,7 +666,8 @@ def renew(call):
 
 @bot.message_handler(func=lambda m: m.text in _all_button_values("support", "📞 Support"))
 def support(message):
-    bot.reply_to(message, get_settings(OWNER_ID).get("support_text") or "Contact the reseller for support.")
+    bot.reply_to(message, get_settings(OWNER_ID).get("support_text") or
+                 _hosted_message(message.from_user.id, "support_default"))
 
 
 @bot.message_handler(func=lambda m: m.text in _all_button_values("language", "🌐 Language/زبان"))
@@ -663,32 +791,40 @@ def referral_resolve(call):
         else:
             data.setdefault("payouts", []).append(dict(request))
             settle_referral_liability(OWNER_ID, request_id, request["amount"])
-    bot.send_message(int(request["user_id"]), f"Your referral withdrawal was {action} by the reseller.")
+    bot.send_message(int(request["user_id"]),
+                     _hosted_message(int(request["user_id"]), "referral_withdrawal_result", action=action))
     bot.answer_callback_query(call.id, "Updated", show_alert=True)
 
 
-def _owner_markup():
+def _owner_markup(user_id=OWNER_ID):
     markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton("Generate config", callback_data="hb:owner:generate"),
-               types.InlineKeyboardButton("My customers", callback_data="hb:owner:customers"))
-    markup.add(types.InlineKeyboardButton("Debt & credit", callback_data="hb:owner:debt"))
-    for label, action in (("Markup", "markup"), ("Card", "card"), ("Exchange rate", "rate"),
-                          ("Support", "support"), ("Welcome", "welcome"), ("Referral %", "refpercent")):
-        markup.add(types.InlineKeyboardButton(label, callback_data=f"hb:setting:{action}"))
-    markup.add(types.InlineKeyboardButton("Toggle plans", callback_data="hb:owner:plans"),
-               types.InlineKeyboardButton("Toggle crypto", callback_data="hb:owner:crypto"))
-    markup.add(types.InlineKeyboardButton("Earnings", callback_data="hb:owner:earnings"),
-               types.InlineKeyboardButton("Referral payouts", callback_data="hb:owner:referrals"))
+    markup.add(types.InlineKeyboardButton(_hosted_message(user_id, "generate"), callback_data="hb:owner:generate"),
+               types.InlineKeyboardButton(_hosted_message(user_id, "customers"), callback_data="hb:owner:customers"))
+    markup.add(types.InlineKeyboardButton(_hosted_message(user_id, "debt"), callback_data="hb:owner:debt"))
+    for key, action in (("markup", "markup"), ("card", "card"), ("rate", "rate"),
+                        ("support", "support"), ("welcome", "welcome"), ("refpercent", "refpercent")):
+        markup.add(types.InlineKeyboardButton(_hosted_message(user_id, key), callback_data=f"hb:setting:{action}"))
+    markup.add(types.InlineKeyboardButton(_hosted_message(user_id, "plans"), callback_data="hb:owner:plans"),
+               types.InlineKeyboardButton(_hosted_message(user_id, "crypto"), callback_data="hb:owner:crypto"))
+    markup.add(types.InlineKeyboardButton(_hosted_message(user_id, "earnings"), callback_data="hb:owner:earnings"),
+               types.InlineKeyboardButton(_hosted_message(user_id, "referrals"), callback_data="hb:owner:referrals"))
     return markup
 
 
-@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and m.text == "🛠 Owner Panel")
+@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and m.text in {
+    catalog["owner_panel"] for catalog in HOSTED_TRANSLATIONS.values()
+})
 def owner_panel(message):
     settings = get_settings(OWNER_ID)
-    bot.reply_to(message,
-                 f"Hosted Bot Owner Panel\nMarkup: {settings['markup_percent']}%\nCrypto: {'enabled' if settings['crypto_enabled'] else 'disabled'}\n"
-                 f"Card: {settings['card_number'] or 'not set'}\nReferral share: {settings['referral_margin_percent']}%",
-                 reply_markup=_owner_markup())
+    summary = _hosted_message(
+        OWNER_ID, "owner_summary", markup=settings["markup_percent"],
+        crypto=_hosted_message(OWNER_ID, "enabled" if settings["crypto_enabled"] else "disabled"),
+        card=settings["card_number"] or _hosted_message(OWNER_ID, "not_set"),
+        referral=settings["referral_margin_percent"],
+    )
+    bot.reply_to(message, f"{_hosted_message(OWNER_ID, 'owner_title')}\n\n{summary}"
+                          f"{_hosted_message(OWNER_ID, 'owner_guide')}",
+                 parse_mode="Markdown", reply_markup=_owner_markup())
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:setting:"))
@@ -698,9 +834,7 @@ def owner_setting(call):
         return
     field = call.data.split(":")[2]
     INPUT_STATE[OWNER_ID] = {"kind": "owner_setting", "field": field}
-    prompts = {"markup": "Send markup percentage.", "card": "Send card number.", "rate": "Send exchange rate.",
-               "support": "Send support text.", "welcome": "Send welcome text.", "refpercent": "Send referral percentage of margin (0-100)."}
-    bot.send_message(call.message.chat.id, prompts[field])
+    bot.send_message(call.message.chat.id, _hosted_message(OWNER_ID, f"prompt_{field}"))
     bot.answer_callback_query(call.id)
 
 
@@ -718,9 +852,9 @@ def owner_setting_input(message):
         key = {"markup": "markup_percent", "card": "card_number", "rate": "exchange_rate",
                "support": "support_text", "welcome": "welcome_text", "refpercent": "referral_margin_percent"}[field]
         update_settings(OWNER_ID, {key: value})
-        bot.reply_to(message, "Setting updated.")
+        bot.reply_to(message, _hosted_message(OWNER_ID, "setting_updated"))
     except ValueError:
-        bot.reply_to(message, "Invalid value.")
+        bot.reply_to(message, _hosted_message(OWNER_ID, "invalid_value"))
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:owner:"))

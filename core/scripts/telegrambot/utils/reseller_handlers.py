@@ -27,6 +27,11 @@ from utils.api_client import APIClient, MultiServerAPI
 from utils.payments import CryptoPayment
 from utils.payment_records import add_payment_record
 from utils.currency_format import format_toman_amount, format_usd_amount
+try:
+    from utils.hosted_translations import hosted_text
+except ImportError:  # Keep the reseller panel usable during partial/rolling upgrades.
+    def hosted_text(language, key, **values):
+        return ""
 from utils.purchase_plan import (
     build_crypto_discount_display,
     build_crypto_discount_metadata,
@@ -349,7 +354,8 @@ def reseller_panel(message):
             types.InlineKeyboardButton(get_button_text(language, "reseller_stats"), callback_data="reseller:stats"),
             types.InlineKeyboardButton(get_button_text(language, "my_debt"), callback_data="reseller:debt")
         )
-        markup.add(types.InlineKeyboardButton("🤖 My Hosted Bot", callback_data="hosted:menu"))
+        markup.add(types.InlineKeyboardButton(hosted_text(language, "main_hosted_bot") or "🤖 My Hosted Bot",
+                                              callback_data="hosted:menu"))
         debt = float(reseller_data.get('debt', 0.0))
         debt_state_text = get_message_text(language, _debt_state_label(reseller_data.get('debt_state', 'active')))
         trust_limit = get_reseller_trust_limit(get_reseller_total_paid(reseller_data))
@@ -358,6 +364,7 @@ def reseller_panel(message):
         intro += "\n" + get_message_text(language, "reseller_debt_status_line").format(debt_state=debt_state_text)
         if _is_reseller_suspended(reseller_data) or status == 'suspended':
             intro += "\n" + get_message_text(language, "reseller_suspended_intro_notice")
+        intro += hosted_text(language, "main_reseller_guide").replace("*", "")
         bot.reply_to(message, intro, reply_markup=markup)
         
     elif status == 'pending':
