@@ -1,3 +1,9 @@
+## v1.16.7
+✨ Replace the hosted-bot owner panel's inline menu with a persistent, localized reply keyboard
+🛠️ Keep plan generation, plan toggles, earnings, and referral controls inline while sharing owner actions across reply and callback flows
+🐛 Restore the main menu when owners go back and preserve legacy owner-panel callback compatibility
+✅ Add regression coverage for owner-menu layout, localized commands, dynamic controls, navigation, and legacy callbacks
+
 ## v1.16.6
 ✨ Localize hosted reseller storefronts in English, Persian, Russian, and Turkmen
 ✨ Improve hosted-bot plan, card, crypto, receipt, renewal, referral, and owner-panel flows with localized pricing and status details
