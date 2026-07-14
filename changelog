@@ -1,3 +1,10 @@
+## v1.16.6
+✨ Localize hosted reseller storefronts in English, Persian, Russian, and Turkmen
+✨ Improve hosted-bot plan, card, crypto, receipt, renewal, referral, and owner-panel flows with localized pricing and status details
+🛠️ Add purchase cancellation, payment QR codes, plan navigation, and partial-upgrade translation fallbacks to hosted bots
+⬆️ Update v2rayN and v2rayNG download links and remove obsolete Karing downloads
+✅ Add regression coverage for hosted storefront translations and customer-facing terminology
+
 ## v1.16.5
 ✨ Add supervised, isolated customer-facing Telegram bots for approved resellers
 ✨ Let hosted-bot owners configure plans, markup, payments, referrals, support, earnings, and withdrawals
