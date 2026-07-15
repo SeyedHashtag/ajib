@@ -1,3 +1,9 @@
+## v1.16.11
+✨ Route receipt photos through the active checkout or the payment message a customer replied to
+🛠️ Recover saved receipts after interrupted uploads and retry failed owner notifications without losing approval state
+🐛 Keep receipt handling resilient when Telegram message delivery or caption generation fails
+✅ Add regression coverage for checkout selection, saved-receipt recovery, and owner-notification retries
+
 ## v1.16.10
 ✨ Allow customers to keep multiple independent card or crypto checkouts open at the same time
 🛠️ Route receipt uploads to an explicitly selected card order when multiple checkouts are waiting
