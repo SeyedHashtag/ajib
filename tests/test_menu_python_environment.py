@@ -1,7 +1,10 @@
+import ast
 import re
+import shlex
 import subprocess
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +62,46 @@ class MenuPythonEnvironmentTests(unittest.TestCase):
         self.assertIn("ajib Python environment is missing", result.stderr)
         self.assertIn("installer or upgrade", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_telegram_maintenance_uses_ajib_virtual_environment(self):
+        command_text = (
+            REPO_ROOT / "core" / "scripts" / "telegrambot" / "utils" / "command.py"
+        ).read_text()
+        backup_text = (
+            REPO_ROOT / "core" / "scripts" / "telegrambot" / "utils" / "backup.py"
+        ).read_text()
+        version_text = (
+            REPO_ROOT / "core" / "scripts" / "telegrambot" / "utils" / "check_version.py"
+        ).read_text()
+
+        self.assertIn("'/etc/ajib/ajib_venv/bin/python'", command_text)
+        self.assertIn('[AJIB_PYTHON, CLI_PATH, "backup-ajib"]', backup_text)
+        self.assertIn('[AJIB_PYTHON, CLI_PATH, "check-version"]', version_text)
+        self.assertNotIn("python3 {CLI_PATH}", backup_text + version_text)
+
+    def test_cli_runner_executes_argument_lists_without_a_shell(self):
+        command_path = REPO_ROOT / "core" / "scripts" / "telegrambot" / "utils" / "command.py"
+        source = command_path.read_text()
+        tree = ast.parse(source)
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "run_cli_command"
+        )
+        namespace = {"subprocess": subprocess, "shlex": shlex}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(command_path), "exec"), namespace)
+
+        completed = subprocess.CompletedProcess([], 0, stdout="/opt/ajib-backups/backup.zip\n")
+        with mock.patch.object(subprocess, "run", return_value=completed) as run:
+            result = namespace["run_cli_command"](
+                ["/etc/ajib/ajib_venv/bin/python", "/etc/ajib/core/cli.py", "backup-ajib"]
+            )
+
+        self.assertEqual(result, "/opt/ajib-backups/backup.zip")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/etc/ajib/ajib_venv/bin/python", "/etc/ajib/core/cli.py", "backup-ajib"],
+        )
+        self.assertNotIn("shell", run.call_args.kwargs)
 
 
 if __name__ == "__main__":

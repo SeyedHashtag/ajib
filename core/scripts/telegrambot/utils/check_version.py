@@ -1,24 +1,20 @@
-import subprocess
-import shlex
 import time
 import re
-from utils.command import ADMIN_USER_IDS, CLI_PATH, bot
+from utils.command import AJIB_PYTHON, ADMIN_USER_IDS, CLI_PATH, bot, run_cli_command
 
 def check_version():
-    command = f"python3 {CLI_PATH} check-version"
-    try:
-        args = shlex.split(command)
-        result = subprocess.check_output(args, stderr=subprocess.STDOUT).decode("utf-8").strip()      
-        bot_version = re.search(r'Bot Version: (\d+\.\d+\.\d+)', result)
-        latest_version = re.search(r'Latest Version: (\d+\.\d+\.\d+)', result)
-        
-        if bot_version and latest_version and bot_version.group(1) != latest_version.group(1):
-            notify_admins(f"🔔 New version available!\n\n{result}")
-            
-    except subprocess.CalledProcessError as e:
-        error_message = f"Error checking version: {e.output.decode('utf-8')}"
-        print(f"Error checking version: {e.output.decode('utf-8')}")
+    result = run_cli_command([AJIB_PYTHON, CLI_PATH, "check-version"])
+    if result.startswith("Error:"):
+        error_message = f"Error checking version: {result}"
+        print(error_message)
         notify_admins(error_message)
+        return
+
+    bot_version = re.search(r'Bot Version: (\d+\.\d+\.\d+)', result)
+    latest_version = re.search(r'Latest Version: (\d+\.\d+\.\d+)', result)
+
+    if bot_version and latest_version and bot_version.group(1) != latest_version.group(1):
+        notify_admins(f"🔔 New version available!\n\n{result}")
 
 def notify_admins(message):
     for admin_id in ADMIN_USER_IDS:

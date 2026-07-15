@@ -14,18 +14,28 @@ configure_logging()
 API_TOKEN = os.getenv('API_TOKEN')
 ADMIN_USER_IDS = json.loads(os.getenv('ADMIN_USER_IDS'))
 CLI_PATH = '/etc/ajib/core/cli.py'
+AJIB_PYTHON = os.getenv('AJIB_PYTHON', '/etc/ajib/ajib_venv/bin/python')
 BACKUP_DIRECTORY = '/opt/ajib-backups'
 bot = telebot.TeleBot(API_TOKEN, threaded=True, num_threads=get_telegram_worker_count())
 install_safe_telegram_methods(bot)
 instrument_bot(bot)
 
 def run_cli_command(command):
+    args = shlex.split(command) if isinstance(command, str) else [str(item) for item in command]
     try:
-        args = shlex.split(command)
-        result = subprocess.check_output(args, stderr=subprocess.STDOUT)
-        return result.decode('utf-8').strip()
+        result = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=True,
+            text=True,
+        )
+        return result.stdout.strip()
     except subprocess.CalledProcessError as e:
-        return f'Error: {e.output.decode("utf-8")}'
+        return f'Error: {e.stdout or str(e)}'.strip()
+    except OSError as e:
+        executable = args[0] if args else 'command'
+        return f'Error: Unable to run {executable}: {e}'
 
 def is_admin(user_id):
     return user_id in ADMIN_USER_IDS

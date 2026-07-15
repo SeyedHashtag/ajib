@@ -1,6 +1,6 @@
 import os
 import threading
-from utils.command import ADMIN_USER_IDS, BACKUP_DIRECTORY, CLI_PATH, bot, is_admin, run_cli_command
+from utils.command import AJIB_PYTHON, ADMIN_USER_IDS, BACKUP_DIRECTORY, CLI_PATH, bot, is_admin, run_cli_command
 
 BACKUP_LOCK = threading.Lock()
 
@@ -18,9 +18,9 @@ def _get_latest_backup_file():
     return os.path.join(BACKUP_DIRECTORY, latest_backup_file), latest_backup_file
 
 def _run_backup_command():
-    backup_command = f"python3 {CLI_PATH} backup-ajib"
+    backup_command = [AJIB_PYTHON, CLI_PATH, "backup-ajib"]
     result = run_cli_command(backup_command)
-    if "Error" in result:
+    if result.startswith("Error:"):
         return None, result
 
     reported_path = result.splitlines()[-1].strip() if result else ""
