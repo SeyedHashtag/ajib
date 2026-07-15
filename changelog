@@ -1,3 +1,10 @@
+## v1.16.8
+✨ Keep hosted VPN usernames owner-scoped while storing Telegram customer IDs in user notes
+🛠️ Recover stale payment claims and credit reservations after interruptions, persist user-bound renewal tokens, and prevent duplicate checkouts
+🐛 Validate hosted financial settings, protect tenant storage paths, and preserve corrupt JSON for recovery
+⚡ Harden hosted-bot supervision and systemd upgrades with secure worker secrets, restart backoff, and clean process shutdowns
+✅ Add regression coverage for hosted user metadata, payment recovery, financial validation, storage safety, and runtime supervision
+
 ## v1.16.7
 ✨ Replace the hosted-bot owner panel's inline menu with a persistent, localized reply keyboard
 🛠️ Keep plan generation, plan toggles, earnings, and referral controls inline while sharing owner actions across reply and callback flows
