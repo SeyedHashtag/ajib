@@ -1,3 +1,9 @@
+## v1.16.10
+✨ Allow customers to keep multiple independent card or crypto checkouts open at the same time
+🛠️ Route receipt uploads to an explicitly selected card order when multiple checkouts are waiting
+🐛 Prevent duplicate payment-button taps and order ID collisions from creating or replacing checkouts
+✅ Add regression coverage for independent checkouts, duplicate taps, receipt selection, and localized storefront controls
+
 ## v1.16.9
 🛠️ Run Telegram backup and version-check commands through the configured Ajib Python environment
 🐛 Handle CLI execution and launch failures consistently while preserving actionable error messages
