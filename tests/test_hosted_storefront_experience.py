@@ -281,7 +281,7 @@ class HostedStorefrontParityTests(unittest.TestCase):
     def test_owner_back_restores_main_menu_and_legacy_callbacks_remain(self):
         owner_menu = ast.get_source_segment(WORKER_SOURCE, _worker_function("owner_menu_action"))
 
-        self.assertIn("INPUT_STATE.pop(OWNER_ID, None)", owner_menu)
+        self.assertIn("_pop_input_state(OWNER_ID)", owner_menu)
         self.assertIn("reply_markup=_main_markup(OWNER_ID)", owner_menu)
         self.assertIn('c.data.startswith("hb:owner:")', WORKER_SOURCE)
         self.assertIn('c.data.startswith("hb:setting:")', WORKER_SOURCE)

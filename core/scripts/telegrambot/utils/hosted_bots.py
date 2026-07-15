@@ -1,8 +1,8 @@
 import hashlib
 import os
 import uuid
-from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from .atomic_store import locked_json, read_json
 from . import reseller as reseller_store
@@ -12,7 +12,16 @@ BOT_DIR = os.getenv("AJIB_BOT_DIR", "/etc/ajib/core/scripts/telegrambot")
 HOSTED_ROOT = os.path.join(BOT_DIR, "hosted_bots")
 REGISTRY_FILE = os.path.join(BOT_DIR, "hosted_bots.json")
 SECRETS_FILE = os.path.join(BOT_DIR, "hosted_bot_tokens.json")
-MAX_ACTIVE_BOTS = 50
+
+
+def _positive_int_env(name, default):
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_ACTIVE_BOTS = _positive_int_env("AJIB_MAX_HOSTED_BOTS", 50)
 CRYPTO_DISCOUNT_PERCENT = Decimal("5")
 MINIMUM_PAYOUT = Decimal("2.00")
 
@@ -22,15 +31,38 @@ def _now():
 
 
 def _money(value):
-    return Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    try:
+        amount = Decimal(str(value or 0))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError("Invalid monetary amount") from error
+    if not amount.is_finite():
+        raise ValueError("Invalid monetary amount")
+    return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _reseller_key(reseller_id):
+    key = str(reseller_id).strip()
+    if not key.isdigit() or len(key) > 20:
+        raise ValueError("Invalid reseller ID")
+    return key
 
 
 def _tenant_dir(reseller_id):
-    return os.path.join(HOSTED_ROOT, str(reseller_id))
+    return os.path.join(HOSTED_ROOT, _reseller_key(reseller_id))
 
 
 def tenant_file(reseller_id, name):
-    return os.path.join(_tenant_dir(reseller_id), name)
+    root = os.path.abspath(_tenant_dir(reseller_id))
+    candidate = os.path.abspath(os.path.join(root, str(name)))
+    if os.path.commonpath((root, candidate)) != root:
+        raise ValueError("Invalid hosted-bot state path")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    for directory in (os.path.abspath(HOSTED_ROOT), root):
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+    return candidate
 
 
 def default_settings():
@@ -47,30 +79,101 @@ def default_settings():
     }
 
 
-def get_settings(reseller_id):
+def _finite_setting(value, name, minimum, maximum):
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid {name}") from error
+    if not Decimal(str(result)).is_finite() or result < minimum or result > maximum:
+        raise ValueError(f"Invalid {name}")
+    return result
+
+
+def _validate_setting(key, value):
+    if key == "markup_percent":
+        return _finite_setting(value, "markup percentage", 0, 1000)
+    if key == "exchange_rate":
+        return _finite_setting(value, "exchange rate", 0.000001, 1_000_000_000_000)
+    if key == "referral_margin_percent":
+        return _finite_setting(value, "referral percentage", 0, 100)
+    if key in {"crypto_enabled", "plan_selection_configured"}:
+        if not isinstance(value, bool):
+            raise ValueError(f"Invalid {key}")
+        return value
+    if key == "enabled_plan_ids":
+        if not isinstance(value, (list, tuple, set)):
+            raise ValueError("Invalid plan selection")
+        normalized = []
+        for item in value:
+            plan_id = str(item).strip()
+            if not plan_id.isdigit() or len(plan_id) > 12:
+                raise ValueError("Invalid plan selection")
+            if plan_id not in normalized:
+                normalized.append(plan_id)
+            if len(normalized) > 200:
+                raise ValueError("Too many selected plans")
+        return normalized
+    if key in {"card_number", "welcome_text", "support_text"}:
+        limits = {"card_number": 64, "welcome_text": 2000, "support_text": 2000}
+        text = str(value or "").strip()
+        if "\x00" in text or len(text) > limits[key]:
+            raise ValueError(f"Invalid {key}")
+        if key == "card_number" and any(character not in "0123456789 -" for character in text):
+            raise ValueError("Invalid card number")
+        return text
+    raise ValueError("Unknown hosted-bot setting")
+
+
+def _normalized_settings(stored):
     settings = default_settings()
-    stored = read_json(tenant_file(reseller_id, "settings.json"), {})
-    if isinstance(stored, dict):
-        settings.update(stored)
+    if not isinstance(stored, dict):
+        return settings
+    for key, default in default_settings().items():
+        if key not in stored:
+            continue
+        try:
+            settings[key] = _validate_setting(key, stored[key])
+        except ValueError:
+            settings[key] = default
+    if stored.get("updated_at"):
+        settings["updated_at"] = str(stored["updated_at"])
     return settings
+
+
+def get_settings(reseller_id):
+    stored = read_json(tenant_file(reseller_id, "settings.json"), {})
+    return _normalized_settings(stored)
 
 
 def update_settings(reseller_id, updates):
     allowed = set(default_settings())
+    validated = {
+        key: _validate_setting(key, value)
+        for key, value in dict(updates or {}).items()
+        if key in allowed
+    }
     with locked_json(tenant_file(reseller_id, "settings.json"), default_settings()) as settings:
-        settings.update({key: value for key, value in updates.items() if key in allowed})
+        normalized = _normalized_settings(settings)
+        normalized.update(validated)
+        settings.clear()
+        settings.update(normalized)
         settings["updated_at"] = _now()
         return dict(settings)
 
 
 def calculate_quote(wholesale, markup_percent, referral_margin_percent=0, referred=False):
     wholesale_amount = _money(wholesale)
-    markup = Decimal(str(markup_percent or 0))
+    if wholesale_amount < 0:
+        raise ValueError("Wholesale price cannot be negative")
+    markup = Decimal(str(_finite_setting(markup_percent or 0, "markup percentage", 0, 1000)))
     retail = _money(wholesale_amount * (Decimal("1") + markup / Decimal("100")))
     collected = _money(retail * (Decimal("1") - CRYPTO_DISCOUNT_PERCENT / Decimal("100")))
     margin = _money(collected - wholesale_amount)
     card_margin = _money(retail - wholesale_amount)
-    referral_rate = Decimal(str(referral_margin_percent or 0)) if referred else Decimal("0")
+    referral_rate = (
+        Decimal(str(_finite_setting(referral_margin_percent or 0, "referral percentage", 0, 100)))
+        if referred else Decimal("0")
+    )
     referral_reward = _money(max(Decimal("0"), margin) * referral_rate / Decimal("100"))
     card_referral_reward = _money(max(Decimal("0"), card_margin) * referral_rate / Decimal("100"))
     return {
@@ -93,20 +196,35 @@ def _token_fingerprint(token):
 
 def list_bots():
     data = read_json(REGISTRY_FILE, {})
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in data.items()
+        if isinstance(value, dict) and str(key).isdigit() and len(str(key)) <= 20
+    }
 
 
 def get_bot(reseller_id):
-    return list_bots().get(str(reseller_id))
+    return list_bots().get(_reseller_key(reseller_id))
 
 
 def get_token(reseller_id):
     data = read_json(SECRETS_FILE, {})
-    return data.get(str(reseller_id)) if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    token = data.get(_reseller_key(reseller_id))
+    if not isinstance(token, str):
+        return None
+    token = token.strip()
+    return token if ":" in token and len(token) <= 256 else None
 
 
 def register_bot(reseller_id, token, bot_info, main_bot_id=None):
-    reseller_key = str(reseller_id)
+    reseller_key = _reseller_key(reseller_id)
+    clean_token = str(token or "").strip()
+    if ":" not in clean_token or len(clean_token) > 256:
+        return False, "Telegram bot token is invalid."
     mapping = bot_info if isinstance(bot_info, dict) else {}
     bot_id = str(getattr(bot_info, "id", "") or mapping.get("id") or "")
     username = str(getattr(bot_info, "username", "") or mapping.get("username") or "")
@@ -115,7 +233,7 @@ def register_bot(reseller_id, token, bot_info, main_bot_id=None):
     if main_bot_id is not None and bot_id == str(main_bot_id):
         return False, "The main ajib bot token cannot be used as a reseller bot."
 
-    fingerprint = _token_fingerprint(token)
+    fingerprint = _token_fingerprint(clean_token)
     with locked_json(REGISTRY_FILE, {}) as registry:
         for owner_id, record in registry.items():
             if owner_id == reseller_key:
@@ -124,7 +242,8 @@ def register_bot(reseller_id, token, bot_info, main_bot_id=None):
                 return False, "This Telegram bot is already connected to another reseller."
         active_others = sum(
             1 for owner_id, record in registry.items()
-            if owner_id != reseller_key and record.get("status") in {"active", "starting", "error"}
+            if (owner_id != reseller_key and isinstance(record, dict)
+                and record.get("enabled", True) and record.get("status") not in {"disabled", "disconnected", "blocked"})
         )
         if active_others >= MAX_ACTIVE_BOTS:
             return False, f"This installation already has {MAX_ACTIVE_BOTS} hosted bots."
@@ -132,7 +251,7 @@ def register_bot(reseller_id, token, bot_info, main_bot_id=None):
         # Commit the secret before publishing its fingerprint. Readers continue
         # using the old registry until the atomic registry replacement below.
         with locked_json(SECRETS_FILE, {}) as secrets:
-            secrets[reseller_key] = str(token).strip()
+            secrets[reseller_key] = clean_token
         registry[reseller_key] = {
             "reseller_id": reseller_key,
             "bot_id": bot_id,
@@ -149,7 +268,7 @@ def register_bot(reseller_id, token, bot_info, main_bot_id=None):
 
 
 def disconnect_bot(reseller_id):
-    key = str(reseller_id)
+    key = _reseller_key(reseller_id)
     found = False
     with locked_json(REGISTRY_FILE, {}) as registry:
         if key in registry:
@@ -163,18 +282,20 @@ def disconnect_bot(reseller_id):
 
 
 def set_bot_runtime_status(reseller_id, status, error=None):
-    key = str(reseller_id)
+    key = _reseller_key(reseller_id)
     with locked_json(REGISTRY_FILE, {}) as registry:
         if key not in registry:
             return False
         registry[key]["status"] = str(status)
         registry[key]["last_error"] = str(error)[:500] if error else None
         registry[key]["updated_at"] = _now()
+        if status == "active":
+            registry[key].setdefault("started_at", _now())
         return True
 
 
 def set_bot_enabled(reseller_id, enabled):
-    key = str(reseller_id)
+    key = _reseller_key(reseller_id)
     with locked_json(REGISTRY_FILE, {}) as registry:
         if key not in registry:
             return False
@@ -218,46 +339,63 @@ def _append_transaction(ledger, kind, amount, metadata=None, transaction_id=None
 
 
 def credit_crypto_sale(reseller_id, order_id, margin, referral_reward=0, metadata=None):
+    margin_value = _money(margin)
+    referral_value = _money(referral_reward)
+    if margin_value < 0 or referral_value < 0 or referral_value > margin_value:
+        return False
     path = tenant_file(reseller_id, "ledger.json")
     with locked_json(path, _default_ledger()) as ledger:
-        if not _append_transaction(ledger, "crypto_sale", margin, metadata, transaction_id=f"sale:{order_id}"):
+        if not _append_transaction(ledger, "crypto_sale", margin_value, metadata, transaction_id=f"sale:{order_id}"):
             return False
-        ledger["earnings_available"] = float(_money(ledger.get("earnings_available", 0)) + _money(margin))
-        if _money(referral_reward) > 0:
-            ledger["referral_liability"] = float(_money(ledger.get("referral_liability", 0)) + _money(referral_reward))
-            _append_transaction(ledger, "referral_liability", referral_reward, metadata, transaction_id=f"referral:{order_id}")
+        ledger["earnings_available"] = float(_money(ledger.get("earnings_available", 0)) + margin_value)
+        if referral_value > 0:
+            ledger["referral_liability"] = float(_money(ledger.get("referral_liability", 0)) + referral_value)
+            _append_transaction(ledger, "referral_liability", referral_value, metadata, transaction_id=f"referral:{order_id}")
         return True
 
 
 def add_referral_liability(reseller_id, order_id, amount, metadata=None):
+    amount_value = _money(amount)
+    if amount_value <= 0:
+        return False
     with locked_json(tenant_file(reseller_id, "ledger.json"), _default_ledger()) as ledger:
-        if not _append_transaction(ledger, "referral_liability", amount, metadata, transaction_id=f"referral:{order_id}"):
+        if not _append_transaction(ledger, "referral_liability", amount_value, metadata, transaction_id=f"referral:{order_id}"):
             return False
-        ledger["referral_liability"] = float(_money(ledger.get("referral_liability", 0)) + _money(amount))
+        ledger["referral_liability"] = float(_money(ledger.get("referral_liability", 0)) + amount_value)
         return True
 
 
 def settle_referral_liability(reseller_id, withdrawal_id, amount):
+    requested = _money(amount)
+    if requested <= 0:
+        return False
     with locked_json(tenant_file(reseller_id, "ledger.json"), _default_ledger()) as ledger:
         transaction_id = f"referral-paid:{withdrawal_id}"
         if any(item.get("id") == transaction_id for item in ledger.get("transactions", [])):
             return False
-        value = min(_money(amount), _money(ledger.get("referral_liability", 0)))
+        value = min(requested, _money(ledger.get("referral_liability", 0)))
+        if value <= 0:
+            return False
         ledger["referral_liability"] = float(_money(ledger.get("referral_liability", 0)) - value)
         _append_transaction(ledger, "referral_paid", -value, {"withdrawal_id": withdrawal_id}, transaction_id)
         return True
 
 
 def reserve_credit(reseller_id, reservation_id, amount, available_credit):
+    reservation_key = str(reservation_id or "").strip()
+    amount_value = _money(amount)
+    available_value = _money(available_credit)
+    if not reservation_key or len(reservation_key) > 128 or amount_value <= 0 or available_value < 0:
+        return False
     with locked_json(tenant_file(reseller_id, "ledger.json"), _default_ledger()) as ledger:
         reservations = ledger.setdefault("credit_reservations", {})
-        if reservation_id in reservations:
+        if reservation_key in reservations:
             return True
         reserved = sum(_money(item.get("amount", 0)) for item in reservations.values())
-        if reserved + _money(amount) > _money(available_credit):
+        if reserved + amount_value > available_value:
             return False
-        reservations[reservation_id] = {"amount": float(_money(amount)), "created_at": _now()}
-        _append_transaction(ledger, "credit_reserved", amount, {"reservation_id": reservation_id})
+        reservations[reservation_key] = {"amount": float(amount_value), "created_at": _now()}
+        _append_transaction(ledger, "credit_reserved", amount_value, {"reservation_id": reservation_key})
         return True
 
 
@@ -268,6 +406,34 @@ def release_credit(reseller_id, reservation_id, kind="credit_released"):
             return False
         _append_transaction(ledger, kind, reservation.get("amount", 0), {"reservation_id": reservation_id})
         return True
+
+
+def release_stale_credit_reservations(reseller_id, active_reservation_ids, max_age_seconds=86400, now=None):
+    """Release old reservations that no live checkout still owns."""
+    active = {str(item) for item in (active_reservation_ids or ())}
+    current_time = now or datetime.now()
+    released = []
+    with locked_json(tenant_file(reseller_id, "ledger.json"), _default_ledger()) as ledger:
+        reservations = ledger.setdefault("credit_reservations", {})
+        for reservation_id, reservation in list(reservations.items()):
+            if reservation_id in active:
+                continue
+            try:
+                created_at = datetime.strptime(reservation.get("created_at", ""), "%Y-%m-%d %H:%M:%S")
+            except (AttributeError, TypeError, ValueError):
+                created_at = current_time - timedelta(seconds=max_age_seconds + 1)
+            if (current_time - created_at).total_seconds() < max_age_seconds:
+                continue
+            reservations.pop(reservation_id, None)
+            _append_transaction(
+                ledger,
+                "credit_stale_released",
+                reservation.get("amount", 0),
+                {"reservation_id": reservation_id},
+                transaction_id=f"stale-release:{reservation_id}",
+            )
+            released.append(reservation_id)
+    return released
 
 
 def consume_credit(reseller_id, reservation_id, config_data):
@@ -319,7 +485,8 @@ def request_earnings_withdrawal(reseller_id, destination):
     debt = _money((reseller_store.get_reseller_data(reseller_id) or {}).get("debt", 0))
     if debt > 0:
         return False, "All reseller debt must be settled first."
-    if not str(destination or "").strip():
+    clean_destination = str(destination or "").strip()
+    if not clean_destination or len(clean_destination) > 500 or "\x00" in clean_destination:
         return False, "A payout destination is required."
     with locked_json(tenant_file(reseller_id, "ledger.json"), _default_ledger()) as ledger:
         if any(item.get("status") == "pending" for item in ledger.get("withdrawals", [])):
@@ -329,7 +496,7 @@ def request_earnings_withdrawal(reseller_id, destination):
             return False, f"Minimum withdrawal is ${MINIMUM_PAYOUT:.2f}."
         request = {
             "id": str(uuid.uuid4()), "status": "pending", "amount": float(amount),
-            "destination": str(destination).strip(), "requested_at": _now(),
+            "destination": clean_destination, "requested_at": _now(),
         }
         ledger["earnings_available"] = float(_money(ledger.get("earnings_available", 0)) - amount)
         ledger["earnings_reserved"] = float(_money(ledger.get("earnings_reserved", 0)) + amount)

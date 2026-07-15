@@ -78,6 +78,13 @@ chmod +x "$INSTALL_DIR/menu.sh"
 service_file="/etc/systemd/system/ajib-telegram-bot.service"
 if [ -f "$service_file" ]; then
     sed -i 's#/etc/ajib/core/scripts/telegrambot/tbot.py#/etc/ajib/core/scripts/telegrambot/supervisor.py#g' "$service_file"
+    sed -i "s#^ExecStart=/bin/bash -c 'source /etc/ajib/ajib_venv/bin/activate && /etc/ajib/ajib_venv/bin/python /etc/ajib/core/scripts/telegrambot/supervisor.py'#ExecStart=/etc/ajib/ajib_venv/bin/python /etc/ajib/core/scripts/telegrambot/supervisor.py#" "$service_file"
+    sed -i 's/^After=network.target$/Wants=network-online.target\nAfter=network-online.target/' "$service_file"
+    grep -q '^RestartSec=' "$service_file" || sed -i '/^Restart=/a RestartSec=5s' "$service_file"
+    grep -q '^TimeoutStopSec=' "$service_file" || sed -i '/^RestartSec=/a TimeoutStopSec=30s' "$service_file"
+    grep -q '^KillMode=' "$service_file" || sed -i '/^TimeoutStopSec=/a KillMode=control-group' "$service_file"
+    grep -q '^Environment=PYTHONUNBUFFERED=1$' "$service_file" || sed -i '/^KillMode=/a Environment=PYTHONUNBUFFERED=1' "$service_file"
+    grep -q '^UMask=' "$service_file" || sed -i '/^Environment=PYTHONUNBUFFERED=1$/a UMask=0077' "$service_file"
 fi
 
 systemctl daemon-reload

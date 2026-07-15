@@ -2,7 +2,7 @@
 """Isolated polling worker for one reseller-owned Telegram bot."""
 
 import io
-import json
+import math
 import os
 import threading
 import time
@@ -19,13 +19,13 @@ from telebot import types
 BOT_DIR = os.getenv("AJIB_BOT_DIR", "/etc/ajib/core/scripts/telegrambot")
 load_dotenv(os.path.join(BOT_DIR, ".env"))
 
-from utils.api_client import APIClient, MultiServerAPI
+from utils.api_client import MultiServerAPI
 from utils.atomic_store import locked_json, read_json
 from utils.currency_format import format_toman_amount, format_usd_amount
 from utils.hosted_bots import (
     add_referral_liability, calculate_quote, consume_credit,
-    consume_renewal_credit, credit_crypto_sale, get_ledger, get_settings,
-    release_credit, request_earnings_withdrawal, reserve_credit,
+    consume_renewal_credit, credit_crypto_sale, get_ledger, get_settings, get_token,
+    release_credit, release_stale_credit_reservations, request_earnings_withdrawal, reserve_credit,
     set_bot_runtime_status, settle_referral_liability, tenant_file, transfer_earnings_to_debt,
     update_settings,
 )
@@ -40,20 +40,76 @@ from utils.translations import BUTTON_TRANSLATIONS, LANGUAGES, get_button_text, 
 from utils.username_utils import allocate_username, build_user_note
 
 
-TOKEN = os.environ["AJIB_HOSTED_BOT_TOKEN"]
 OWNER_ID = int(os.environ["AJIB_HOSTED_RESELLER_ID"])
+TOKEN = get_token(OWNER_ID)
+if not TOKEN:
+    raise SystemExit("Hosted bot token is missing")
 BOT_USERNAME = os.getenv("AJIB_HOSTED_BOT_USERNAME", "").lstrip("@")
 PLANS_FILE = os.path.join(BOT_DIR, "plans.json")
 GLOBAL_TEST_FILE = os.path.join(BOT_DIR, "test_configs.json")
 INPUT_STATE = {}
-RENEWAL_TOKENS = {}
-PAYMENT_LOCK = threading.RLock()
+INPUT_STATE_LOCK = threading.RLock()
+
+
+def _positive_int_env(name, default, minimum=1):
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+PROCESSING_LEASE_SECONDS = _positive_int_env("AJIB_HOSTED_PAYMENT_LEASE_SECONDS", 900, 60)
+CHECKOUT_CREATION_LEASE_SECONDS = _positive_int_env(
+    "AJIB_HOSTED_CHECKOUT_CREATION_LEASE_SECONDS", 300, 60
+)
+TEST_CREATION_LEASE_SECONDS = _positive_int_env("AJIB_HOSTED_TEST_CREATION_LEASE_SECONDS", 900, 60)
+RENEWAL_TOKEN_TTL_SECONDS = _positive_int_env("AJIB_HOSTED_RENEWAL_TOKEN_TTL_SECONDS", 1800, 60)
+CREDIT_RESERVATION_MAX_AGE_SECONDS = _positive_int_env(
+    "AJIB_HOSTED_CREDIT_RESERVATION_MAX_AGE_SECONDS", 86400, 300
+)
+MAX_RECEIPT_BYTES = _positive_int_env("AJIB_HOSTED_MAX_RECEIPT_BYTES", 10 * 1024 * 1024, 1024)
+INPUT_STATE_TTL_SECONDS = _positive_int_env("AJIB_HOSTED_INPUT_STATE_TTL_SECONDS", 3600, 60)
+MAX_INPUT_STATES = _positive_int_env("AJIB_HOSTED_MAX_INPUT_STATES", 5000, 100)
 
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=4)
 
 
 def _now():
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_time(value):
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def _set_input_state(user_id, state):
+    now = time.time()
+    with INPUT_STATE_LOCK:
+        for key, item in list(INPUT_STATE.items()):
+            if not isinstance(item, dict) or float(item.get("expires_at", 0) or 0) <= now:
+                INPUT_STATE.pop(key, None)
+        if len(INPUT_STATE) >= MAX_INPUT_STATES:
+            oldest = min(INPUT_STATE, key=lambda key: float(INPUT_STATE[key].get("expires_at", 0) or 0))
+            INPUT_STATE.pop(oldest, None)
+        INPUT_STATE[user_id] = {**dict(state), "expires_at": now + INPUT_STATE_TTL_SECONDS}
+
+
+def _get_input_state(user_id):
+    with INPUT_STATE_LOCK:
+        state = INPUT_STATE.get(user_id)
+        if not isinstance(state, dict) or float(state.get("expires_at", 0) or 0) <= time.time():
+            INPUT_STATE.pop(user_id, None)
+            return None
+        return dict(state)
+
+
+def _pop_input_state(user_id):
+    with INPUT_STATE_LOCK:
+        state = INPUT_STATE.pop(user_id, None)
+        return dict(state) if isinstance(state, dict) else None
 
 
 def _reseller(active_only=False):
@@ -72,11 +128,25 @@ def _sellable_plans():
     enabled = {str(value) for value in settings.get("enabled_plan_ids", [])}
     result = {}
     for plan_id, plan in _load_plans().items():
-        if not isinstance(plan, dict) or plan.get("target", "both") == "customer":
+        plan_key = str(plan_id).strip()
+        if (
+            not isinstance(plan, dict)
+            or not plan_key.isdigit()
+            or len(plan_key) > 12
+            or plan.get("target", "both") == "customer"
+        ):
             continue
-        if settings.get("plan_selection_configured") and str(plan_id) not in enabled:
+        try:
+            price = float(plan["price"])
+            days = int(plan.get("days", 30))
+            gigabytes = int(plan.get("gb", plan_key))
+        except (KeyError, TypeError, ValueError):
             continue
-        result[str(plan_id)] = plan
+        if not math.isfinite(price) or price <= 0 or days <= 0 or days > 3650 or gigabytes <= 0:
+            continue
+        if settings.get("plan_selection_configured") and plan_key not in enabled:
+            continue
+        result[plan_key] = {**plan, "price": price, "days": days, "gb": gigabytes}
     return result
 
 
@@ -129,6 +199,9 @@ def _save_payment(payment_id, record):
     with locked_json(tenant_file(OWNER_ID, "payments.json"), {}) as payments:
         current = payments.get(payment_id, {})
         current.update(record)
+        if record.get("status") and record.get("status") != "processing":
+            current.pop("processing_started_at", None)
+            current.pop("processing_from_status", None)
         current.setdefault("created_at", _now())
         current["updated_at"] = _now()
         payments[payment_id] = current
@@ -138,11 +211,135 @@ def _save_payment(payment_id, record):
 def _claim_payment(payment_id, allowed):
     with locked_json(tenant_file(OWNER_ID, "payments.json"), {}) as payments:
         record = payments.get(payment_id)
-        if not record or record.get("status") not in set(allowed):
+        if not isinstance(record, dict):
+            return None
+        allowed_statuses = set(allowed)
+        current_status = record.get("status")
+        if current_status == "processing":
+            started_at = _parse_time(record.get("processing_started_at"))
+            stale = started_at is None or (datetime.now() - started_at).total_seconds() >= PROCESSING_LEASE_SECONDS
+            original_status = record.get("processing_from_status")
+            if not stale or original_status not in allowed_statuses:
+                return None
+        elif current_status not in allowed_statuses:
             return None
         record["status"] = "processing"
+        record["processing_from_status"] = (
+            record.get("processing_from_status") if current_status == "processing" else current_status
+        )
+        record["processing_started_at"] = _now()
+        record["processing_attempts"] = int(record.get("processing_attempts", 0) or 0) + 1
         record["updated_at"] = _now()
         return dict(record)
+
+
+def _start_checkout(payment_id, record):
+    """Atomically allow only one live checkout per customer."""
+    user_id = str(record.get("user_id"))
+    open_statuses = {
+        "creating", "waiting_receipt", "pending_approval", "pending", "processing",
+        "paid_provision_failed",
+    }
+    with locked_json(tenant_file(OWNER_ID, "payments.json"), {}) as payments:
+        for existing_id, existing in payments.items():
+            if not isinstance(existing, dict) or str(existing.get("user_id")) != user_id:
+                continue
+            if existing.get("status") in open_statuses:
+                return False, existing_id
+        payment = dict(record)
+        payment["status"] = "creating"
+        payment["created_at"] = _now()
+        payment["updated_at"] = _now()
+        payments[payment_id] = payment
+        return True, payment_id
+
+
+def _recover_stale_payment_claims():
+    recovered = []
+    release_reservations = []
+    with locked_json(tenant_file(OWNER_ID, "payments.json"), {}) as payments:
+        for payment_id, record in payments.items():
+            if not isinstance(record, dict):
+                continue
+            if record.get("status") == "creating":
+                created_at = _parse_time(record.get("created_at"))
+                if created_at is None or (datetime.now() - created_at).total_seconds() >= CHECKOUT_CREATION_LEASE_SECONDS:
+                    record["status"] = "failed"
+                    record["last_error"] = "Recovered an interrupted checkout creation"
+                    record["recovered_at"] = _now()
+                    record["updated_at"] = _now()
+                    if record.get("reservation_id"):
+                        release_reservations.append(str(record["reservation_id"]))
+                    recovered.append(payment_id)
+                continue
+            if record.get("status") != "processing":
+                continue
+            started_at = _parse_time(record.get("processing_started_at"))
+            if started_at is not None and (datetime.now() - started_at).total_seconds() < PROCESSING_LEASE_SECONDS:
+                continue
+            retry_status = record.get("processing_from_status")
+            if retry_status not in {"waiting_receipt", "pending_approval", "pending", "paid_provision_failed"}:
+                retry_status = "paid_provision_failed" if record.get("gateway_payment_id") else "pending_approval"
+            record["status"] = retry_status
+            record["last_error"] = "Recovered an interrupted payment attempt"
+            record["recovered_at"] = _now()
+            record["updated_at"] = _now()
+            record.pop("processing_started_at", None)
+            record.pop("processing_from_status", None)
+            recovered.append(payment_id)
+    for reservation_id in release_reservations:
+        release_credit(OWNER_ID, reservation_id, kind="credit_creation_recovered")
+    return recovered
+
+
+def _reconcile_credit_reservations():
+    payments = _tenant_payments()
+    active = {
+        str(payment_id)
+        for payment_id, record in payments.items()
+        if isinstance(record, dict) and record.get("status") in {
+            "creating", "waiting_receipt", "pending_approval", "processing"
+        }
+    }
+    return release_stale_credit_reservations(
+        OWNER_ID,
+        active,
+        max_age_seconds=CREDIT_RESERVATION_MAX_AGE_SECONDS,
+    )
+
+
+def _store_renewal_token(user_id, renewal):
+    token = uuid.uuid4().hex[:12]
+    now = time.time()
+    with locked_json(tenant_file(OWNER_ID, "renewal_tokens.json"), {}) as tokens:
+        for existing, item in list(tokens.items()):
+            try:
+                expires_at = float(item.get("expires_at", 0) or 0) if isinstance(item, dict) else 0
+            except (TypeError, ValueError):
+                expires_at = 0
+            if expires_at <= now:
+                tokens.pop(existing, None)
+        tokens[token] = {
+            "user_id": str(user_id),
+            "renewal": dict(renewal or {}),
+            "expires_at": now + RENEWAL_TOKEN_TTL_SECONDS,
+        }
+    return token
+
+
+def _consume_renewal_token(token, user_id):
+    with locked_json(tenant_file(OWNER_ID, "renewal_tokens.json"), {}) as tokens:
+        item = tokens.pop(str(token), None)
+        if not isinstance(item, dict):
+            return None
+        try:
+            expires_at = float(item.get("expires_at", 0) or 0)
+        except (TypeError, ValueError):
+            expires_at = 0
+        if str(item.get("user_id")) != str(user_id) or expires_at <= time.time():
+            return None
+        renewal = item.get("renewal")
+        return dict(renewal) if isinstance(renewal, dict) else None
 
 
 def _find_customer_configs(user_id):
@@ -202,10 +399,18 @@ def _credit_referral(order_id, customer_id, reward):
     return float(reward)
 
 
-def _create_user(plan, note, customer_id=None):
+def _operation_username(operation_id):
+    suffix = "".join(character for character in str(operation_id) if character.isalnum())[:12]
+    return f"h{OWNER_ID}{suffix}" if suffix else None
+
+
+def _create_user(plan, note, customer_id=None, operation_id=None):
     multi = MultiServerAPI()
 
     def allocate(existing):
+        operation_username = _operation_username(operation_id) if operation_id else None
+        if operation_username:
+            return operation_username
         return allocate_username("h", OWNER_ID, existing)
 
     def create(client, username):
@@ -235,6 +440,18 @@ def _deliver_config(chat_id, username, client, renewed=False):
                    caption=_hosted_message(chat_id, "config_ready", action=action, username=username,
                                            subscription=uri["normal_sub"]),
                    parse_mode="Markdown")
+
+
+def _deliver_config_safely(chat_id, username, client, renewed=False):
+    try:
+        _deliver_config(chat_id, username, client, renewed=renewed)
+        return True
+    except Exception as error:
+        print(
+            f"Hosted config delivery failed for reseller {OWNER_ID}: {type(error).__name__}",
+            flush=True,
+        )
+        return False
 
 
 def _provision_payment(payment_id, record, funded):
@@ -268,7 +485,7 @@ def _provision_payment(payment_id, record, funded):
         _credit_referral(payment_id, customer_id, record.get("referral_reward", 0))
         _save_payment(payment_id, {"status": "completed", "username": username,
                                    "server_id": existing_config.get("server_id")})
-        _deliver_config(customer_id, username, client, renewed=renewed)
+        _deliver_config_safely(customer_id, username, client, renewed=renewed)
         return True, username
     if renewed:
         client, live = MultiServerAPI().find_user(username, preferred_server_id=record.get("server_id"))
@@ -282,9 +499,18 @@ def _provision_payment(payment_id, record, funded):
             client, live = MultiServerAPI().find_user(provisioned_username,
                                                        preferred_server_id=record.get("provisioned_server_id"))
             username = provisioned_username if client and live else None
+        operation_username = _operation_username(payment_id)
+        if not username and operation_username:
+            client, live = MultiServerAPI().find_user(operation_username)
+            username = operation_username if client and live else None
         if not username:
             plan = {"gb": record["plan_gb"], "days": record["days"], "unlimited": record.get("unlimited", False)}
-            username, result, client = _create_user(plan, f"hosted reseller {OWNER_ID}", customer_id=customer_id)
+            username, result, client = _create_user(
+                plan,
+                f"hosted reseller {OWNER_ID}",
+                customer_id=customer_id,
+                operation_id=payment_id,
+            )
             if result is None:
                 return False, "VPN user creation failed"
             _save_payment(payment_id, {"provisioned_username": username,
@@ -314,8 +540,22 @@ def _provision_payment(payment_id, record, funded):
         add_referral_liability(OWNER_ID, payment_id, record.get("referral_reward", 0), common)
     _credit_referral(payment_id, customer_id, record.get("referral_reward", 0))
     _save_payment(payment_id, {"status": "completed", "username": username, "server_id": server_id})
-    _deliver_config(customer_id, username, client, renewed=renewed)
+    _deliver_config_safely(customer_id, username, client, renewed=renewed)
     return True, username
+
+
+def _provision_claimed_payment(payment_id, record, funded, retry_status):
+    try:
+        success, detail = _provision_payment(payment_id, record, funded=funded)
+    except Exception as error:
+        success, detail = False, f"Provisioning raised {type(error).__name__}"
+        print(
+            f"Hosted payment provisioning failed for reseller {OWNER_ID}: {type(error).__name__}",
+            flush=True,
+        )
+    if not success:
+        _save_payment(payment_id, {"status": retry_status, "last_error": str(detail)[:500]})
+    return success, detail
 
 
 def _show_plans(chat_id, user_id, message_id=None):
@@ -354,8 +594,7 @@ def _purchase_options(chat_id, user_id, plan_id, renewal=None, message_id=None):
     markup = types.InlineKeyboardMarkup(row_width=1)
     suffix = ""
     if renewal:
-        token = uuid.uuid4().hex[:12]
-        RENEWAL_TOKENS[token] = dict(renewal)
+        token = _store_renewal_token(user_id, renewal)
         suffix = f":{token}"
     if settings.get("card_number"):
         markup.add(types.InlineKeyboardButton(get_button_text(language, "card_to_card"),
@@ -418,13 +657,25 @@ def buy(call):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:pay:"))
 def payment_method(call):
     parts = call.data.split(":")
+    if len(parts) not in {4, 5} or parts[2] not in {"card", "crypto"}:
+        bot.answer_callback_query(call.id, "Invalid checkout action.", show_alert=True)
+        return
     method, plan_id = parts[2], parts[3]
-    renewal = RENEWAL_TOKENS.get(parts[4]) if len(parts) >= 5 else None
     plan = _sellable_plans().get(plan_id)
     settings = get_settings(OWNER_ID)
     if not plan or not _reseller(active_only=True):
         bot.answer_callback_query(call.id, _message(call.from_user.id, "plan_not_found"), show_alert=True)
         return
+    renewal = None
+    if len(parts) >= 5:
+        renewal = _consume_renewal_token(parts[4], call.from_user.id)
+        if not renewal:
+            bot.answer_callback_query(
+                call.id,
+                "This renewal checkout expired. Open the config and start again.",
+                show_alert=True,
+            )
+            return
     referred = str(call.from_user.id) in _referral_data().get("referrals", {})
     quote = calculate_quote(plan["price"], settings["markup_percent"], settings["referral_margin_percent"], referred)
     order_id = str(uuid.uuid4())
@@ -437,12 +688,27 @@ def payment_method(call):
         "payment_method": method,
         "renew_username": renewal and renewal["username"], "server_id": renewal and renewal.get("server_id"),
     }
-    if len(parts) >= 5:
-        RENEWAL_TOKENS.pop(parts[4], None)
+    if method == "card" and not settings.get("card_number"):
+        bot.answer_callback_query(call.id, _message(call.from_user.id, "no_payment_methods"), show_alert=True)
+        return
+    if method == "crypto" and (not settings.get("crypto_enabled") or not quote["crypto_supported"]):
+        bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "crypto_disabled"), show_alert=True)
+        return
+    if method == "card":
+        record["reservation_id"] = order_id
+    started, existing_id = _start_checkout(order_id, record)
+    if not started:
+        bot.answer_callback_query(
+            call.id,
+            f"Another checkout is already open ({str(existing_id)[:8]}). Finish or cancel it first.",
+            show_alert=True,
+        )
+        return
     if method == "card":
         reseller = get_reseller_data(OWNER_ID) or {}
         _, _, available = can_reseller_add_debt(reseller, 0)
         if not reserve_credit(OWNER_ID, order_id, quote["wholesale"], available):
+            _save_payment(order_id, {"status": "failed", "last_error": "Reseller credit is unavailable"})
             bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "credit_unavailable"),
                                       show_alert=True)
             return
@@ -452,7 +718,7 @@ def payment_method(call):
                        "exchange_rate": exchange_rate, "converted_amount": toman_price,
                        "converted_currency": "TOMAN"})
         _save_payment(order_id, record)
-        INPUT_STATE[call.from_user.id] = {"kind": "receipt", "payment_id": order_id}
+        _set_input_state(call.from_user.id, {"kind": "receipt", "payment_id": order_id})
         bot.answer_callback_query(call.id)
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton(get_button_text(_language(call.from_user.id), "cancel"),
@@ -465,26 +731,31 @@ def payment_method(call):
             ), call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup,
         )
         return
-    if not settings.get("crypto_enabled") or not quote["crypto_supported"]:
-        bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "crypto_disabled"), show_alert=True)
-        return
-    response = CryptoPayment().create_payment(quote["crypto_collected"], plan_id, call.from_user.id,
-                                               additional_data={"reseller_id": str(OWNER_ID), "hosted_order_id": order_id})
-    if "error" in response:
+    try:
+        response = CryptoPayment().create_payment(
+            quote["crypto_collected"], plan_id, call.from_user.id,
+            additional_data={"reseller_id": str(OWNER_ID), "hosted_order_id": order_id},
+        )
+    except Exception as error:
+        response = {"error": f"Gateway request failed ({type(error).__name__})"}
+    if not isinstance(response, dict) or "error" in response:
+        error_message = response.get("error", "Invalid gateway response") if isinstance(response, dict) else "Invalid gateway response"
+        _save_payment(order_id, {"status": "failed", "last_error": str(error_message)[:500]})
         bot.answer_callback_query(
-            call.id, _message(call.from_user.id, "error_creating_payment").format(error=response["error"]),
+            call.id, _message(call.from_user.id, "error_creating_payment").format(error=error_message),
             show_alert=True,
         )
         return
     gateway = response.get("result", {})
     gateway_id, url = gateway.get("uuid"), gateway.get("url")
     if not gateway_id or not url:
+        _save_payment(order_id, {"status": "failed", "last_error": "Invalid gateway response"})
         bot.answer_callback_query(
             call.id, _message(call.from_user.id, "error_creating_payment").format(error="Invalid gateway response"),
             show_alert=True,
         )
         return
-    record.update({"status": "pending", "gateway_payment_id": gateway_id,
+    record.update({"status": "pending", "gateway_payment_id": gateway_id, "payment_url": url,
                    "crypto_collected": quote["crypto_collected"], "margin": quote["crypto_margin"]})
     _save_payment(order_id, record)
     markup = types.InlineKeyboardMarkup()
@@ -513,15 +784,19 @@ def payment_method(call):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:cancel:"))
 def cancel_card_payment(call):
     payment_id = call.data.split(":", 2)[2]
-    record = _tenant_payments().get(payment_id)
-    if (not record or str(record.get("user_id")) != str(call.from_user.id)
-            or record.get("status") not in {"waiting_receipt", "pending_approval"}):
+    current = _tenant_payments().get(payment_id)
+    if not isinstance(current, dict) or str(current.get("user_id")) != str(call.from_user.id):
+        bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "already_processed"),
+                                  show_alert=True)
+        return
+    record = _claim_payment(payment_id, {"waiting_receipt", "pending_approval"})
+    if not record:
         bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "already_processed"),
                                   show_alert=True)
         return
     release_credit(OWNER_ID, payment_id, kind="credit_canceled")
     _save_payment(payment_id, {"status": "canceled"})
-    INPUT_STATE.pop(call.from_user.id, None)
+    _pop_input_state(call.from_user.id)
     bot.answer_callback_query(call.id)
     bot.edit_message_text(_message(call.from_user.id, "purchase_canceled"),
                           call.message.chat.id, call.message.message_id)
@@ -529,21 +804,42 @@ def cancel_card_payment(call):
 
 @bot.message_handler(content_types=["photo"])
 def receipt_photo(message):
-    state = INPUT_STATE.get(message.from_user.id)
-    if not state or state.get("kind") != "receipt":
+    state = _get_input_state(message.from_user.id)
+    payment_id = state.get("payment_id") if state and state.get("kind") == "receipt" else None
+    if not payment_id:
+        candidates = [
+            (candidate_id, record)
+            for candidate_id, record in _tenant_payments().items()
+            if isinstance(record, dict)
+            and str(record.get("user_id")) == str(message.from_user.id)
+            and record.get("status") == "waiting_receipt"
+        ]
+        if candidates:
+            payment_id = max(candidates, key=lambda item: str(item[1].get("created_at", "")))[0]
+    if not payment_id:
         return
-    payment_id = state["payment_id"]
-    record = _tenant_payments().get(payment_id)
-    if not record or record.get("status") != "waiting_receipt":
-        INPUT_STATE.pop(message.from_user.id, None)
+    current = _tenant_payments().get(payment_id)
+    if not isinstance(current, dict) or str(current.get("user_id")) != str(message.from_user.id):
+        _pop_input_state(message.from_user.id)
+        return
+    record = _claim_payment(payment_id, {"waiting_receipt"})
+    if not record:
+        _pop_input_state(message.from_user.id)
         return
     try:
         info = bot.get_file(message.photo[-1].file_id)
         content = bot.download_file(info.file_path)
+        if len(content) > MAX_RECEIPT_BYTES:
+            raise ValueError("receipt is too large")
         receipt_path = tenant_file(OWNER_ID, os.path.join("receipts", f"{payment_id}.jpg"))
         os.makedirs(os.path.dirname(receipt_path), exist_ok=True)
-        with open(receipt_path, "wb") as handle:
+        temporary_path = f"{receipt_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(temporary_path, "wb") as handle:
             handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, receipt_path)
         _save_payment(payment_id, {"status": "pending_approval", "receipt_path": receipt_path})
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton(_hosted_message(OWNER_ID, "approved"),
@@ -558,8 +854,19 @@ def receipt_photo(message):
         with open(receipt_path, "rb") as handle:
             bot.send_photo(OWNER_ID, handle, caption=caption, parse_mode="Markdown", reply_markup=markup)
         bot.reply_to(message, _message(message.from_user.id, "receipt_submitted"))
+    except Exception as error:
+        _save_payment(
+            payment_id,
+            {"status": "waiting_receipt", "last_error": f"Receipt upload failed: {type(error).__name__}"},
+        )
+        bot.reply_to(message, "Receipt upload failed. Please send the photo again.")
     finally:
-        INPUT_STATE.pop(message.from_user.id, None)
+        try:
+            if "temporary_path" in locals() and os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        except OSError:
+            pass
+        _pop_input_state(message.from_user.id)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith(("hb:approve:", "hb:reject:")))
@@ -578,9 +885,10 @@ def owner_receipt(call):
         bot.send_message(record["user_id"], _hosted_message(record["user_id"], "receipt_rejected"))
         bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "rejected"))
         return
-    success, result = _provision_payment(payment_id, record, funded=False)
+    success, result = _provision_claimed_payment(
+        payment_id, record, funded=False, retry_status="pending_approval"
+    )
     if not success:
-        _save_payment(payment_id, {"status": "pending_approval", "last_error": result})
         bot.answer_callback_query(call.id, result, show_alert=True)
         return
     bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "approved"))
@@ -599,14 +907,10 @@ def check_crypto(call):
             show_alert=True,
         )
         return
-    response = CryptoPayment().check_payment_status(current["gateway_payment_id"])
-    result = response.get("result", {}) if isinstance(response, dict) else {}
-    status = result.get("status") or result.get("payment_status") or result.get("paymentStatus")
-    if str(status).lower() != "paid":
+    if current.get("status") not in {"pending", "paid_provision_failed", "processing"}:
         bot.answer_callback_query(
             call.id,
-            (_message(call.from_user.id, "payment_pending") if not status else
-             _message(call.from_user.id, "payment_status").format(status=status)),
+            _message(call.from_user.id, "payment_already_processed").format(status=current.get("status", "unknown")),
             show_alert=True,
         )
         return
@@ -614,9 +918,37 @@ def check_crypto(call):
     if not record:
         bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "payment_processing"), show_alert=True)
         return
-    success, detail = _provision_payment(payment_id, record, funded=True)
+    retry_status = record.get("processing_from_status")
+    if retry_status not in {"pending", "paid_provision_failed"}:
+        retry_status = "pending"
+    if not record.get("gateway_payment_id"):
+        _save_payment(payment_id, {"status": retry_status, "last_error": "Gateway reference is missing"})
+        bot.answer_callback_query(call.id, "Payment gateway reference is missing.", show_alert=True)
+        return
+    try:
+        response = CryptoPayment().check_payment_status(record["gateway_payment_id"])
+    except Exception as error:
+        _save_payment(
+            payment_id,
+            {"status": retry_status, "last_error": f"Gateway status failed: {type(error).__name__}"},
+        )
+        bot.answer_callback_query(call.id, "Payment status is temporarily unavailable.", show_alert=True)
+        return
+    result = response.get("result", {}) if isinstance(response, dict) else {}
+    status = result.get("status") or result.get("payment_status") or result.get("paymentStatus")
+    if str(status).lower() != "paid":
+        _save_payment(payment_id, {"status": retry_status})
+        bot.answer_callback_query(
+            call.id,
+            (_message(call.from_user.id, "payment_pending") if not status else
+             _message(call.from_user.id, "payment_status").format(status=status)),
+            show_alert=True,
+        )
+        return
+    success, detail = _provision_claimed_payment(
+        payment_id, record, funded=True, retry_status="paid_provision_failed"
+    )
     if not success:
-        _save_payment(payment_id, {"status": "paid_provision_failed", "last_error": detail})
         bot.send_message(OWNER_ID, f"⚠️ Paid order `{payment_id}` needs retry: {detail}", parse_mode="Markdown")
         bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "paid_needs_attention"),
                                   show_alert=True)
@@ -655,16 +987,29 @@ def config_detail(call):
         plan_id = str(config.get("plan_gb") or config.get("gb") or "")
         if plan_id in _sellable_plans():
             markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🔄 Renew", callback_data=f"hb:renew:{plan_id}:{config['username']}:{config.get('server_id') or '-'}"))
+            renewal_token = _store_renewal_token(
+                call.from_user.id,
+                {"username": config["username"], "server_id": config.get("server_id")},
+            )
+            markup.add(types.InlineKeyboardButton(
+                "🔄 Renew", callback_data=f"hb:renew:{plan_id}:{renewal_token}"
+            ))
             bot.send_message(call.message.chat.id, "This config is eligible for renewal.", reply_markup=markup)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:renew:"))
 def renew(call):
-    _, _, plan_id, username, server_id = call.data.split(":", 4)
+    parts = call.data.split(":")
+    if len(parts) != 4:
+        bot.answer_callback_query(call.id, "Invalid renewal action.", show_alert=True)
+        return
+    plan_id, token = parts[2], parts[3]
+    renewal = _consume_renewal_token(token, call.from_user.id)
+    if not renewal:
+        bot.answer_callback_query(call.id, "This renewal action expired. Open the config again.", show_alert=True)
+        return
     bot.answer_callback_query(call.id)
-    _purchase_options(call.message.chat.id, call.from_user.id, plan_id,
-                      {"username": username, "server_id": None if server_id == "-" else server_id})
+    _purchase_options(call.message.chat.id, call.from_user.id, plan_id, renewal)
 
 
 @bot.message_handler(func=lambda m: m.text in _all_button_values("support", "📞 Support"))
@@ -706,15 +1051,37 @@ def downloads(message):
 
 @bot.message_handler(func=lambda m: m.text in _all_button_values("test_config", "🎁 Test Config"))
 def free_test(message):
+    recovering_pending_test = False
     with locked_json(GLOBAL_TEST_FILE, {}) as tests:
         key = str(message.from_user.id)
         if key in tests:
-            bot.reply_to(message, "You have already used a free test on this infrastructure.")
-            return
+            existing = tests.get(key)
+            pending_at = _parse_time(existing.get("creation_pending_at")) if isinstance(existing, dict) else None
+            pending_is_stale = (
+                isinstance(existing, dict)
+                and existing.get("creation_pending_at")
+                and (pending_at is None or (datetime.now() - pending_at).total_seconds() >= TEST_CREATION_LEASE_SECONDS)
+                and str(existing.get("reseller_id")) == str(OWNER_ID)
+                and not existing.get("username")
+            )
+            if not pending_is_stale:
+                bot.reply_to(message, "You have already used a free test on this infrastructure.")
+                return
+            recovering_pending_test = True
         tests[key] = {"telegram_id": message.from_user.id, "creation_pending_at": _now(),
                       "origin_bot_id": os.getenv("AJIB_HOSTED_BOT_ID"), "reseller_id": str(OWNER_ID)}
     plan = {"gb": 1, "days": 30, "unlimited": False}
-    username, result, client = _create_user(plan, f"hosted test {OWNER_ID}", customer_id=message.from_user.id)
+    operation_id = f"test{message.from_user.id}"
+    username = _operation_username(operation_id) if recovering_pending_test else None
+    client, live = MultiServerAPI().find_user(username) if username else (None, None)
+    result = live if recovering_pending_test else None
+    if not client or not live:
+        username, result, client = _create_user(
+            plan,
+            f"hosted test {OWNER_ID}",
+            customer_id=message.from_user.id,
+            operation_id=operation_id,
+        )
     if result is None:
         with locked_json(GLOBAL_TEST_FILE, {}) as tests:
             tests.pop(str(message.from_user.id), None)
@@ -723,7 +1090,7 @@ def free_test(message):
     with locked_json(GLOBAL_TEST_FILE, {}) as tests:
         tests[str(message.from_user.id)].update({"username": username, "server_id": getattr(client, "server_id", None),
                                                  "used_at": _now(), "creation_pending_at": None})
-    _deliver_config(message.chat.id, username, client)
+    _deliver_config_safely(message.chat.id, username, client)
 
 
 @bot.message_handler(func=lambda m: m.text in _all_button_values("referral", "💰 Earn Crypto"))
@@ -744,7 +1111,7 @@ def referral(message):
 @bot.callback_query_handler(func=lambda c: c.data in {"hb:refwallet", "hb:refwithdraw"})
 def referral_action(call):
     if call.data == "hb:refwallet":
-        INPUT_STATE[call.from_user.id] = {"kind": "referral_wallet"}
+        _set_input_state(call.from_user.id, {"kind": "referral_wallet"})
         bot.send_message(call.message.chat.id, "Send your payout wallet/destination.")
         bot.answer_callback_query(call.id)
         return
@@ -762,16 +1129,24 @@ def referral_action(call):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("✅ Mark Paid", callback_data=f"hb:refresolve:paid:{request['id']}"),
                types.InlineKeyboardButton("❌ Reject", callback_data=f"hb:refresolve:rejected:{request['id']}"))
-    bot.send_message(OWNER_ID, f"Referral payout ${amount:.2f}\nUser: {call.from_user.id}\nWallet: `{wallet}`",
-                     parse_mode="Markdown", reply_markup=markup)
+    bot.send_message(
+        OWNER_ID,
+        f"Referral payout ${amount:.2f}\nUser: {call.from_user.id}\nWallet: {wallet}",
+        reply_markup=markup,
+    )
     bot.answer_callback_query(call.id, "Withdrawal requested", show_alert=True)
 
 
-@bot.message_handler(func=lambda m: m.from_user.id in INPUT_STATE and INPUT_STATE[m.from_user.id].get("kind") == "referral_wallet")
+@bot.message_handler(func=lambda m: (_get_input_state(m.from_user.id) or {}).get("kind") == "referral_wallet")
 def referral_wallet_input(message):
+    destination = (message.text or "").strip()
+    if not destination or len(destination) > 500 or "\x00" in destination:
+        _pop_input_state(message.from_user.id)
+        bot.reply_to(message, "That payout destination is invalid.")
+        return
     with locked_json(tenant_file(OWNER_ID, "referrals.json"), _referral_data()) as data:
-        data.setdefault("wallets", {})[str(message.from_user.id)] = (message.text or "").strip()
-    INPUT_STATE.pop(message.from_user.id, None)
+        data.setdefault("wallets", {})[str(message.from_user.id)] = destination
+    _pop_input_state(message.from_user.id)
     bot.reply_to(message, "Wallet saved.")
 
 
@@ -781,6 +1156,9 @@ def referral_resolve(call):
         bot.answer_callback_query(call.id, "Owner only", show_alert=True)
         return
     _, _, action, request_id = call.data.split(":")
+    if action not in {"paid", "rejected"}:
+        bot.answer_callback_query(call.id, "Invalid payout action", show_alert=True)
+        return
     with locked_json(tenant_file(OWNER_ID, "referrals.json"), _referral_data()) as data:
         request = next((item for item in data.get("pending_withdrawals", []) if item.get("id") == request_id), None)
         if not request or request.get("status") != "pending":
@@ -851,7 +1229,7 @@ def owner_panel(message):
 
 
 def _begin_owner_setting(chat_id, field):
-    INPUT_STATE[OWNER_ID] = {"kind": "owner_setting", "field": field}
+    _set_input_state(OWNER_ID, {"kind": "owner_setting", "field": field})
     bot.send_message(chat_id, _hosted_message(OWNER_ID, f"prompt_{field}"))
 
 
@@ -861,6 +1239,9 @@ def owner_setting(call):
         bot.answer_callback_query(call.id, "Owner only", show_alert=True)
         return
     field = call.data.split(":")[2]
+    if field not in OWNER_SETTING_KEYS:
+        bot.answer_callback_query(call.id, "Invalid setting", show_alert=True)
+        return
     _begin_owner_setting(call.message.chat.id, field)
     bot.answer_callback_query(call.id)
 
@@ -868,7 +1249,7 @@ def owner_setting(call):
 @bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and _owner_menu_command(m.text) is not None)
 def owner_menu_action(message):
     command, action = _owner_menu_command(message.text)
-    INPUT_STATE.pop(OWNER_ID, None)
+    _pop_input_state(OWNER_ID)
     if command == "back":
         settings = get_settings(OWNER_ID)
         bot.reply_to(message, settings.get("welcome_text") or "Welcome!",
@@ -880,9 +1261,13 @@ def owner_menu_action(message):
     _handle_owner_action(message.chat.id, action, lambda text: bot.reply_to(message, text))
 
 
-@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and INPUT_STATE.get(OWNER_ID, {}).get("kind") == "owner_setting")
+@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and (_get_input_state(OWNER_ID) or {}).get("kind") == "owner_setting")
 def owner_setting_input(message):
-    field = INPUT_STATE.pop(OWNER_ID)["field"]
+    state = _pop_input_state(OWNER_ID)
+    if not state:
+        bot.reply_to(message, "This setting prompt expired. Open the owner panel again.")
+        return
+    field = state["field"]
     raw = (message.text or "").strip()
     try:
         if field in {"markup", "rate", "refpercent"}:
@@ -919,8 +1304,8 @@ def _handle_owner_action(chat_id, action, feedback):
         lines = ["Your provisioned customers:", ""]
         for item in configs[-30:]:
             label = item.get("customer_name") or item.get("customer_telegram_username") or item.get("customer_telegram_id") or "manual"
-            lines.append(f"• `{item.get('username', '?')}` · {label} · {item.get('plan_gb', item.get('gb', '?'))} GB")
-        bot.send_message(chat_id, "\n".join(lines) if configs else "No reseller customers yet.", parse_mode="Markdown")
+            lines.append(f"• {item.get('username', '?')} · {label} · {item.get('plan_gb', item.get('gb', '?'))} GB")
+        bot.send_message(chat_id, "\n".join(lines) if configs else "No reseller customers yet.")
         return
     if action == "debt":
         reseller = get_reseller_data(OWNER_ID) or {}
@@ -948,7 +1333,9 @@ def _handle_owner_action(chat_id, action, feedback):
         enabled = {str(item) for item in settings.get("enabled_plan_ids", [])}
         markup = types.InlineKeyboardMarkup(row_width=1)
         for plan_id, plan in _load_plans().items():
-            if plan.get("target", "both") == "customer":
+            plan_id = str(plan_id).strip()
+            if (not isinstance(plan, dict) or not plan_id.isdigit()
+                    or plan.get("target", "both") == "customer"):
                 continue
             selected = plan_id in enabled if settings.get("plan_selection_configured") else True
             markup.add(types.InlineKeyboardButton(f"{'✅' if selected else '❌'} {plan_id} GB",
@@ -974,8 +1361,8 @@ def _handle_owner_action(chat_id, action, feedback):
             markup.add(types.InlineKeyboardButton("✅ Mark Paid", callback_data=f"hb:refresolve:paid:{request['id']}"),
                        types.InlineKeyboardButton("❌ Reject", callback_data=f"hb:refresolve:rejected:{request['id']}"))
             bot.send_message(chat_id,
-                             f"User: `{request['user_id']}`\nAmount: ${request['amount']:.2f}\nWallet: `{request['wallet']}`",
-                             parse_mode="Markdown", reply_markup=markup)
+                             f"User: {request['user_id']}\nAmount: ${request['amount']:.2f}\nWallet: {request['wallet']}",
+                             reply_markup=markup)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:owner:"))
@@ -1004,17 +1391,20 @@ def owner_generate_plan(call):
     if plan_id not in _sellable_plans():
         bot.answer_callback_query(call.id, "Plan unavailable.", show_alert=True)
         return
-    INPUT_STATE[OWNER_ID] = {"kind": "owner_generate", "plan_id": plan_id}
+    _set_input_state(OWNER_ID, {"kind": "owner_generate", "plan_id": plan_id})
     bot.send_message(call.message.chat.id, "Send a short customer name/label.")
     bot.answer_callback_query(call.id)
 
 
-@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and INPUT_STATE.get(OWNER_ID, {}).get("kind") == "owner_generate")
+@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and (_get_input_state(OWNER_ID) or {}).get("kind") == "owner_generate")
 def owner_generate_input(message):
-    state = INPUT_STATE.pop(OWNER_ID)
+    state = _pop_input_state(OWNER_ID)
+    if not state:
+        bot.reply_to(message, "This generation prompt expired. Open the owner panel again.")
+        return
     plan_id = state["plan_id"]
     plan = _sellable_plans().get(plan_id)
-    label = (message.text or "customer").strip()[:64]
+    label = (message.text or "customer").strip()[:64] or "customer"
     reseller = get_reseller_data(OWNER_ID) or {}
     _, _, available = can_reseller_add_debt(reseller, 0)
     reservation_id = f"manual-{uuid.uuid4()}"
@@ -1044,7 +1434,13 @@ def plan_toggle(call):
         return
     plan_id = call.data.split(":")[2]
     settings = get_settings(OWNER_ID)
-    all_ids = {pid for pid, plan in _load_plans().items() if plan.get("target", "both") != "customer"}
+    all_ids = {
+        str(pid) for pid, plan in _load_plans().items()
+        if isinstance(plan, dict) and str(pid).isdigit() and plan.get("target", "both") != "customer"
+    }
+    if plan_id not in all_ids:
+        bot.answer_callback_query(call.id, "Plan unavailable", show_alert=True)
+        return
     enabled = set(settings.get("enabled_plan_ids", [])) if settings.get("plan_selection_configured") else set(all_ids)
     enabled.symmetric_difference_update({plan_id})
     update_settings(OWNER_ID, {"enabled_plan_ids": sorted(enabled), "plan_selection_configured": True})
@@ -1060,14 +1456,14 @@ def earnings_action(call):
         success, result = transfer_earnings_to_debt(OWNER_ID)
         bot.answer_callback_query(call.id, f"Applied ${result['amount']:.2f}" if success else str(result), show_alert=True)
         return
-    INPUT_STATE[OWNER_ID] = {"kind": "earnings_destination"}
+    _set_input_state(OWNER_ID, {"kind": "earnings_destination"})
     bot.send_message(call.message.chat.id, "Send the payout wallet/destination for the full available balance.")
     bot.answer_callback_query(call.id)
 
 
-@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and INPUT_STATE.get(OWNER_ID, {}).get("kind") == "earnings_destination")
+@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and (_get_input_state(OWNER_ID) or {}).get("kind") == "earnings_destination")
 def earnings_destination(message):
-    INPUT_STATE.pop(OWNER_ID, None)
+    _pop_input_state(OWNER_ID)
     success, result = request_earnings_withdrawal(OWNER_ID, (message.text or "").strip())
     bot.reply_to(message, f"Withdrawal requested for ${result['amount']:.2f}." if success else str(result))
 
@@ -1075,33 +1471,51 @@ def earnings_destination(message):
 def _crypto_monitor():
     while True:
         try:
+            _recover_stale_payment_claims()
+            _reconcile_credit_reservations()
             for payment_id, current in _tenant_payments().items():
+                if not isinstance(current, dict):
+                    continue
                 if current.get("status") in {"waiting_receipt", "pending_approval"}:
-                    try:
-                        created = datetime.strptime(current.get("created_at", ""), "%Y-%m-%d %H:%M:%S")
-                    except (TypeError, ValueError):
-                        created = datetime.now()
+                    created = _parse_time(current.get("created_at")) or datetime.min
                     if datetime.now() - created >= timedelta(hours=24):
-                        if release_credit(OWNER_ID, payment_id, kind="credit_expired"):
+                        claimed = _claim_payment(payment_id, {"waiting_receipt", "pending_approval"})
+                        if claimed:
+                            release_credit(OWNER_ID, payment_id, kind="credit_expired")
                             _save_payment(payment_id, {"status": "expired"})
                             try:
-                                bot.send_message(current["user_id"], "Your pending card order expired. Start a new purchase if needed.")
+                                bot.send_message(
+                                    current["user_id"],
+                                    "Your pending card order expired. Start a new purchase if needed.",
+                                )
                             except Exception:
                                 pass
                     continue
                 if current.get("status") not in {"pending", "paid_provision_failed"} or not current.get("gateway_payment_id"):
                     continue
-                response = CryptoPayment().check_payment_status(current["gateway_payment_id"])
-                result = response.get("result", {}) if isinstance(response, dict) else {}
-                status = result.get("status") or result.get("payment_status") or result.get("paymentStatus")
-                if str(status).lower() != "paid":
-                    continue
                 record = _claim_payment(payment_id, {"pending", "paid_provision_failed"})
                 if not record:
                     continue
-                success, detail = _provision_payment(payment_id, record, funded=True)
+                retry_status = record.get("processing_from_status")
+                if retry_status not in {"pending", "paid_provision_failed"}:
+                    retry_status = "pending"
+                try:
+                    response = CryptoPayment().check_payment_status(record["gateway_payment_id"])
+                except Exception as error:
+                    _save_payment(
+                        payment_id,
+                        {"status": retry_status, "last_error": f"Gateway status failed: {type(error).__name__}"},
+                    )
+                    continue
+                result = response.get("result", {}) if isinstance(response, dict) else {}
+                status = result.get("status") or result.get("payment_status") or result.get("paymentStatus")
+                if str(status).lower() != "paid":
+                    _save_payment(payment_id, {"status": retry_status})
+                    continue
+                success, detail = _provision_claimed_payment(
+                    payment_id, record, funded=True, retry_status="paid_provision_failed"
+                )
                 if not success:
-                    _save_payment(payment_id, {"status": "paid_provision_failed", "last_error": detail})
                     bot.send_message(OWNER_ID, f"⚠️ Paid order `{payment_id}` needs retry: {detail}", parse_mode="Markdown")
         except Exception as error:
             print(f"Hosted crypto monitor failed for reseller {OWNER_ID}: {type(error).__name__}", flush=True)
@@ -1147,12 +1561,14 @@ def run():
         set_bot_runtime_status(OWNER_ID, "error", f"Telegram authentication failed: {type(error).__name__}")
         raise SystemExit(2)
     set_bot_runtime_status(OWNER_ID, "active")
+    _recover_stale_payment_claims()
+    _reconcile_credit_reservations()
     threading.Thread(target=_crypto_monitor, daemon=True, name="hosted-crypto").start()
     threading.Thread(target=_customer_notification_monitor, daemon=True, name="hosted-notifications").start()
     retry = 3
     while True:
         try:
-            bot.polling(none_stop=False, timeout=25, long_polling_timeout=25, skip_pending=True)
+            bot.polling(none_stop=False, timeout=25, long_polling_timeout=25, skip_pending=False)
             retry = 3
         except Exception as error:
             set_bot_runtime_status(OWNER_ID, "error", f"Telegram polling failed: {type(error).__name__}")

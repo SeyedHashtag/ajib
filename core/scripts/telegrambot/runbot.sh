@@ -31,12 +31,19 @@ create_service_file() {
     cat <<EOL > /etc/systemd/system/ajib-telegram-bot.service
 [Unit]
 Description=ajib Telegram Bot
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
-ExecStart=/bin/bash -c 'source /etc/ajib/ajib_venv/bin/activate && /etc/ajib/ajib_venv/bin/python /etc/ajib/core/scripts/telegrambot/supervisor.py'
+Type=simple
+ExecStart=/etc/ajib/ajib_venv/bin/python /etc/ajib/core/scripts/telegrambot/supervisor.py
 WorkingDirectory=/etc/ajib/core/scripts/telegrambot
 Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+KillMode=control-group
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

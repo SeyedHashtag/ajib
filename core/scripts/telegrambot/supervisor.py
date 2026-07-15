@@ -22,6 +22,19 @@ from utils.hosted_bots import MAX_ACTIVE_BOTS, get_token, list_bots, set_bot_run
 RESELLERS_FILE = os.path.join(BOT_DIR, "resellers.json")
 PYTHON = sys.executable
 STOPPING = False
+POLL_INTERVAL_SECONDS = 3
+STABLE_UPTIME_SECONDS = 300
+
+
+def _set_hosted_status(reseller_id, status, error=None):
+    try:
+        return set_bot_runtime_status(reseller_id, status, error)
+    except Exception as status_error:
+        print(
+            f"Hosted status update failed for {reseller_id}: {type(status_error).__name__}",
+            flush=True,
+        )
+        return False
 
 
 class Worker:
@@ -33,13 +46,31 @@ class Worker:
         self.process = None
         self.failures = 0
         self.next_start = 0.0
+        self.started_at = None
+
+    def _record_failure(self, detail):
+        self.failures += 1
+        delay = min(60, 2 ** min(self.failures, 6))
+        self.next_start = time.monotonic() + delay
+        if self.hosted:
+            _set_hosted_status(self.key, "error", f"{detail}; retry in {delay}s")
+        else:
+            print(f"Primary bot {detail}; retry in {delay}s", flush=True)
 
     def start(self):
         if STOPPING or time.monotonic() < self.next_start:
-            return
-        self.process = subprocess.Popen(self.command, cwd=BOT_DIR, env=self.env)
+            return False
         if self.hosted:
-            set_bot_runtime_status(self.key, "active")
+            _set_hosted_status(self.key, "starting")
+        try:
+            self.process = subprocess.Popen(self.command, cwd=BOT_DIR, env=self.env)
+        except (OSError, subprocess.SubprocessError) as error:
+            self.process = None
+            self.started_at = None
+            self._record_failure(f"Worker failed to start ({type(error).__name__})")
+            return False
+        self.started_at = time.monotonic()
+        return True
 
     def poll(self):
         if self.process is None:
@@ -47,25 +78,36 @@ class Worker:
             return
         return_code = self.process.poll()
         if return_code is None:
+            if self.started_at is not None and time.monotonic() - self.started_at >= STABLE_UPTIME_SECONDS:
+                self.failures = 0
+                self.next_start = 0.0
+                self.started_at = None
             return
         self.process = None
-        self.failures += 1
-        delay = min(60, 2 ** min(self.failures, 6))
-        self.next_start = time.monotonic() + delay
-        if self.hosted:
-            set_bot_runtime_status(self.key, "error", f"Worker exited with status {return_code}; retry in {delay}s")
+        self.started_at = None
+        self._record_failure(f"Worker exited with status {return_code}")
 
     def stop(self):
-        if not self.process or self.process.poll() is not None:
-            self.process = None
-            return
-        self.process.terminate()
-        try:
-            self.process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait(timeout=5)
+        process = self.process
         self.process = None
+        self.started_at = None
+        if not process or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                return
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                print(f"Worker {self.key} did not exit after SIGKILL", flush=True)
 
 
 def _eligible_hosted_bots():
@@ -73,27 +115,30 @@ def _eligible_hosted_bots():
     resellers = read_json(RESELLERS_FILE, {})
     eligible = []
     for reseller_id, record in sorted(registry.items()):
+        if not isinstance(record, dict):
+            continue
         reseller = resellers.get(str(reseller_id), {}) if isinstance(resellers, dict) else {}
+        if not isinstance(reseller, dict):
+            reseller = {}
         if not record.get("enabled", True) or record.get("status") == "disconnected":
             continue
         if reseller.get("status") not in {"approved", "suspended"}:
-            set_bot_runtime_status(reseller_id, "blocked", "Reseller is not approved or suspended")
+            _set_hosted_status(reseller_id, "blocked", "Reseller is not approved or suspended")
             continue
         token = get_token(reseller_id)
         if not token:
-            set_bot_runtime_status(reseller_id, "error", "Hosted bot token is missing")
+            _set_hosted_status(reseller_id, "error", "Hosted bot token is missing")
             continue
-        eligible.append((reseller_id, record, token))
+        eligible.append((reseller_id, record))
     return eligible[:MAX_ACTIVE_BOTS]
 
 
-def _hosted_worker(reseller_id, record, token):
+def _hosted_worker(reseller_id, record):
     env = dict(os.environ)
     env.update({
         "AJIB_BOT_ROLE": "hosted",
         "AJIB_BOT_DIR": BOT_DIR,
         "AJIB_HOSTED_RESELLER_ID": str(reseller_id),
-        "AJIB_HOSTED_BOT_TOKEN": token,
         "AJIB_HOSTED_BOT_ID": str(record.get("bot_id", "")),
         "AJIB_HOSTED_BOT_USERNAME": str(record.get("username", "")),
     })
@@ -121,7 +166,7 @@ def main():
                 continue
             if key not in desired:
                 workers.pop(key).stop()
-        for key, (reseller_id, record, token) in desired.items():
+        for key, (reseller_id, record) in desired.items():
             fingerprint = record.get("token_fingerprint")
             existing = workers.get(key)
             if existing and existing.env.get("AJIB_HOSTED_TOKEN_FINGERPRINT") != fingerprint:
@@ -129,12 +174,12 @@ def main():
                 workers.pop(key, None)
                 existing = None
             if not existing:
-                worker = _hosted_worker(reseller_id, record, token)
+                worker = _hosted_worker(reseller_id, record)
                 worker.env["AJIB_HOSTED_TOKEN_FINGERPRINT"] = str(fingerprint or "")
                 workers[key] = worker
         for worker in list(workers.values()):
             worker.poll()
-        time.sleep(3)
+        time.sleep(POLL_INTERVAL_SECONDS)
 
     for worker in list(workers.values()):
         worker.stop()

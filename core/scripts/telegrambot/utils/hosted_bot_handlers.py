@@ -28,12 +28,17 @@ def _menu_markup(connected):
 def _render_menu(chat_id, reseller_id, message_id=None):
     record = get_bot(reseller_id)
     if record:
-        text = (
-            "🤖 *Your Hosted Bot*\n\n"
-            f"Bot: @{record.get('username', 'unknown')}\n"
-            f"Status: `{record.get('status', 'unknown')}`\n\n"
-            "Configure markup, payments, support, referrals, and earnings from its owner panel."
-        )
+        error_text = record.get("last_error")
+        lines = [
+            "🤖 *Your Hosted Bot*",
+            "",
+            f"Bot: @{record.get('username', 'unknown')}",
+            f"Status: `{record.get('status', 'unknown')}`",
+        ]
+        if error_text:
+            lines.append(f"Last error: `{str(error_text)[:300]}`")
+        lines.extend(["", "Configure markup, payments, support, referrals, and earnings from its owner panel."])
+        text = "\n".join(lines)
     else:
         text = (
             "🤖 *Your Hosted Bot*\n\nCreate a bot with @BotFather, then connect its token here. "
@@ -81,6 +86,7 @@ def hosted_token_input(message):
     if not token or ":" not in token:
         bot.send_message(message.chat.id, "That does not look like a BotFather token.")
         return
+    candidate = None
     try:
         candidate = telebot.TeleBot(token, threaded=False)
         info = candidate.get_me()
@@ -88,7 +94,18 @@ def hosted_token_input(message):
     except Exception:
         bot.send_message(message.chat.id, "Telegram rejected that token. Check it in BotFather and try again.")
         return
-    success, result = register_bot(message.from_user.id, token, info, main_bot_id=main_id)
+    finally:
+        if candidate is not None:
+            try:
+                candidate.close_session()
+            except Exception:
+                pass
+    try:
+        success, result = register_bot(message.from_user.id, token, info, main_bot_id=main_id)
+    except Exception as error:
+        print(f"Hosted bot registration failed: {type(error).__name__}", flush=True)
+        bot.send_message(message.chat.id, "The bot could not be saved safely. Please contact the operator.")
+        return
     if not success:
         bot.send_message(message.chat.id, str(result))
         return
@@ -161,8 +178,8 @@ def hosted_admin_callback(call):
             types.InlineKeyboardButton("❌ Reject", callback_data=f"hosted_admin:resolve:rejected:{reseller_id}:{request_id}"),
         )
         bot.send_message(call.message.chat.id,
-                         f"Reseller: `{reseller_id}`\nAmount: `${request['amount']:.2f}`\nDestination: `{request['destination']}`",
-                         reply_markup=markup, parse_mode="Markdown")
+                         f"Reseller: {reseller_id}\nAmount: ${request['amount']:.2f}\nDestination: {request['destination']}",
+                         reply_markup=markup)
         safe_answer_callback_query(bot, call.id)
         return
     if action == "resolve" and len(parts) == 5:

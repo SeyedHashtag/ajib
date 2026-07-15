@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ os.environ["AJIB_BOT_ROLE"] = "supervisor"
 
 from utils import hosted_bots
 from utils import reseller
+from utils.atomic_store import locked_json
 
 
 class HostedBotStateTests(unittest.TestCase):
@@ -126,12 +128,62 @@ class HostedBotStateTests(unittest.TestCase):
         self.assertFalse(success)
         self.assertIn("debt", message.lower())
 
+    def test_invalid_financial_values_cannot_increase_liability_or_reserve_credit(self):
+        self.assertTrue(hosted_bots.add_referral_liability("7", "order", 5))
+
+        self.assertFalse(hosted_bots.settle_referral_liability("7", "withdrawal", -10))
+        self.assertFalse(hosted_bots.reserve_credit("7", "negative", -5, 10))
+
+        self.assertEqual(hosted_bots.get_ledger("7")["referral_liability"], 5.0)
+
+    def test_stale_orphaned_credit_reservations_are_released(self):
+        self.assertTrue(hosted_bots.reserve_credit("7", "orphan", 5, 10))
+
+        released = hosted_bots.release_stale_credit_reservations(
+            "7", set(), now=datetime.now() + timedelta(days=2)
+        )
+
+        self.assertEqual(released, ["orphan"])
+        ledger = hosted_bots.get_ledger("7")
+        self.assertFalse(ledger["credit_reservations"])
+        self.assertIn("stale-release:orphan", {item["id"] for item in ledger["transactions"]})
+
+    def test_settings_reject_non_finite_values_and_sanitize_bad_persisted_values(self):
+        with self.assertRaises(ValueError):
+            hosted_bots.update_settings("7", {"markup_percent": float("nan")})
+        Path(hosted_bots.tenant_file("7", "settings.json")).write_text(
+            json.dumps({"markup_percent": "invalid", "exchange_rate": -10}), encoding="utf-8"
+        )
+
+        settings = hosted_bots.get_settings("7")
+
+        self.assertEqual(settings["markup_percent"], 20.0)
+        self.assertEqual(settings["exchange_rate"], 1.0)
+
+    def test_tenant_paths_cannot_escape_private_reseller_directory(self):
+        with self.assertRaises(ValueError):
+            hosted_bots.tenant_file("7", "../../hosted_bot_tokens.json")
+
+    def test_locked_updates_preserve_corrupt_json_for_recovery(self):
+        path = Path(self.temp.name) / "damaged.json"
+        path.write_text("{damaged", encoding="utf-8")
+
+        with self.assertRaises(json.JSONDecodeError):
+            with locked_json(str(path), {}) as data:
+                data["replacement"] = True
+
+        self.assertEqual(path.read_text(encoding="utf-8"), "{damaged")
+
 
 class HostedLifecycleScriptTests(unittest.TestCase):
     def test_systemd_service_runs_supervisor(self):
         script = (BOT_DIR / "runbot.sh").read_text(encoding="utf-8")
         self.assertIn("telegrambot/supervisor.py", script)
         self.assertNotIn("python /etc/ajib/core/scripts/telegrambot/tbot.py'", script)
+        self.assertIn("After=network-online.target", script)
+        self.assertIn("RestartSec=5s", script)
+        self.assertIn("KillMode=control-group", script)
+        self.assertIn("UMask=0077", script)
 
     def test_upgrade_migrates_existing_service(self):
         script = (ROOT / "upgrade.sh").read_text(encoding="utf-8")
