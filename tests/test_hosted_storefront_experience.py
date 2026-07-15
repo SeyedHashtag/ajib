@@ -12,6 +12,10 @@ TRANSLATIONS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(TRANSLATIONS)
 HOSTED_TRANSLATIONS = TRANSLATIONS.HOSTED_TRANSLATIONS
 hosted_text = TRANSLATIONS.hosted_text
+USERNAME_UTILS_PATH = BOT_DIR / "utils" / "username_utils.py"
+USERNAME_SPEC = importlib.util.spec_from_file_location("username_utils", USERNAME_UTILS_PATH)
+USERNAME_UTILS = importlib.util.module_from_spec(USERNAME_SPEC)
+USERNAME_SPEC.loader.exec_module(USERNAME_UTILS)
 WORKER_SOURCE = (BOT_DIR / "hosted_worker.py").read_text(encoding="utf-8")
 WORKER_TREE = ast.parse(WORKER_SOURCE)
 
@@ -36,6 +40,41 @@ def _button_translations():
         ):
             return ast.literal_eval(node.value)
     raise AssertionError("Missing BUTTON_TRANSLATIONS")
+
+
+def _hosted_user_creator(existing_usernames, add_user_results=None):
+    calls = []
+    note_texts = []
+    results = list(add_user_results or [{"ok": True}])
+
+    class FakeClient:
+        server_id = "server-1"
+
+        def add_user(self, username, traffic_limit, expiration_days, **kwargs):
+            calls.append((username, traffic_limit, expiration_days, kwargs))
+            return results.pop(0) if results else {"ok": True}
+
+    client = FakeClient()
+
+    class FakeMultiServerAPI:
+        def create_user_with_retry(self, allocator, creator):
+            username = allocator(existing_usernames)
+            result = creator(client, username)
+            return username, result, client
+
+    def fake_build_user_note(username, traffic_limit, expiration_days, **kwargs):
+        note_texts.append(kwargs.get("note_text"))
+        return f"note:{kwargs.get('note_text')}"
+
+    namespace = {
+        "MultiServerAPI": FakeMultiServerAPI,
+        "OWNER_ID": 5956844665,
+        "allocate_username": USERNAME_UTILS.allocate_username,
+        "build_user_note": fake_build_user_note,
+    }
+    module = ast.Module(body=[_worker_function("_create_user")], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), "hosted_worker.py", "exec"), namespace)
+    return namespace["_create_user"], calls, note_texts
 
 
 class HostedStorefrontTranslationTests(unittest.TestCase):
@@ -97,6 +136,70 @@ class HostedStorefrontTranslationTests(unittest.TestCase):
 
 
 class HostedStorefrontParityTests(unittest.TestCase):
+    def test_hosted_usernames_are_owner_scoped_and_customer_id_moves_to_note(self):
+        base = "h5956844665"
+        create_user, calls, note_texts = _hosted_user_creator({base, f"{base}a"})
+
+        username, result, _client = create_user(
+            {"gb": 30, "days": 30},
+            "hosted reseller 5956844665",
+            customer_id=124041600,
+        )
+
+        self.assertEqual(username, f"{base}b")
+        self.assertNotIn("124041600", username)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(
+            note_texts,
+            ["hosted reseller 5956844665 | Telegram user ID: u124041600"],
+        )
+        self.assertEqual(calls[0][0], f"{base}b")
+        self.assertEqual(calls[0][3]["note"], "note:hosted reseller 5956844665 | Telegram user ID: u124041600")
+
+        suffixes = [""] + [chr(ord("a") + index) for index in range(26)]
+        existing = {f"{base}{suffix}" for suffix in suffixes}
+        self.assertEqual(USERNAME_UTILS.allocate_username("h", 5956844665, existing), f"{base}aa")
+
+    def test_manual_hosted_user_keeps_label_without_customer_id(self):
+        create_user, _calls, note_texts = _hosted_user_creator(set())
+
+        username, result, _client = create_user(
+            {"gb": 10, "days": 30},
+            "manual customer",
+        )
+
+        self.assertEqual(username, "h5956844665")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(note_texts, ["manual customer"])
+        self.assertNotIn("Telegram user ID", note_texts[0])
+
+    def test_hosted_user_creation_preserves_no_note_fallback(self):
+        create_user, calls, note_texts = _hosted_user_creator(
+            set(),
+            add_user_results=[None, {"ok": True}],
+        )
+
+        username, result, _client = create_user(
+            {"gb": 1, "days": 30},
+            "hosted test 5956844665",
+            customer_id=124041600,
+        )
+
+        self.assertEqual(username, "h5956844665")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(note_texts, ["hosted test 5956844665 | Telegram user ID: u124041600"])
+        self.assertIn("note", calls[0][3])
+        self.assertNotIn("note", calls[1][3])
+
+    def test_hosted_customer_ids_are_passed_only_for_telegram_customer_flows(self):
+        provision = ast.get_source_segment(WORKER_SOURCE, _worker_function("_provision_payment"))
+        free_test = ast.get_source_segment(WORKER_SOURCE, _worker_function("free_test"))
+        manual = ast.get_source_segment(WORKER_SOURCE, _worker_function("owner_generate_input"))
+
+        self.assertIn("customer_id=customer_id", provision)
+        self.assertIn("customer_id=message.from_user.id", free_test)
+        self.assertNotIn("customer_id=", manual)
+
     def test_checkout_keeps_main_bot_navigation_and_payment_context(self):
         source = (BOT_DIR / "hosted_worker.py").read_text(encoding="utf-8")
 

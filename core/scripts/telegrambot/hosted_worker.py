@@ -202,15 +202,18 @@ def _credit_referral(order_id, customer_id, reward):
     return float(reward)
 
 
-def _create_user(customer_id, plan, note):
+def _create_user(plan, note, customer_id=None):
     multi = MultiServerAPI()
-    prefix = f"h{OWNER_ID}u"
 
     def allocate(existing):
-        return allocate_username(prefix, customer_id, existing)
+        return allocate_username("h", OWNER_ID, existing)
 
     def create(client, username):
-        payload = build_user_note(username, plan["gb"], plan["days"], unlimited=plan.get("unlimited", False), note_text=note)
+        note_parts = [str(note or "").strip()]
+        if customer_id is not None:
+            note_parts.append(f"Telegram user ID: u{customer_id}")
+        note_text = " | ".join(part for part in note_parts if part)
+        payload = build_user_note(username, plan["gb"], plan["days"], unlimited=plan.get("unlimited", False), note_text=note_text)
         result = client.add_user(username, int(plan["gb"]), int(plan["days"]), unlimited=plan.get("unlimited", False), note=payload)
         return result if result is not None else client.add_user(username, int(plan["gb"]), int(plan["days"]), unlimited=plan.get("unlimited", False))
 
@@ -281,7 +284,7 @@ def _provision_payment(payment_id, record, funded):
             username = provisioned_username if client and live else None
         if not username:
             plan = {"gb": record["plan_gb"], "days": record["days"], "unlimited": record.get("unlimited", False)}
-            username, result, client = _create_user(customer_id, plan, f"hosted reseller {OWNER_ID}")
+            username, result, client = _create_user(plan, f"hosted reseller {OWNER_ID}", customer_id=customer_id)
             if result is None:
                 return False, "VPN user creation failed"
             _save_payment(payment_id, {"provisioned_username": username,
@@ -711,7 +714,7 @@ def free_test(message):
         tests[key] = {"telegram_id": message.from_user.id, "creation_pending_at": _now(),
                       "origin_bot_id": os.getenv("AJIB_HOSTED_BOT_ID"), "reseller_id": str(OWNER_ID)}
     plan = {"gb": 1, "days": 30, "unlimited": False}
-    username, result, client = _create_user(message.from_user.id, plan, f"hosted test {OWNER_ID}")
+    username, result, client = _create_user(plan, f"hosted test {OWNER_ID}", customer_id=message.from_user.id)
     if result is None:
         with locked_json(GLOBAL_TEST_FILE, {}) as tests:
             tests.pop(str(message.from_user.id), None)
@@ -1018,8 +1021,8 @@ def owner_generate_input(message):
     if not plan or not reserve_credit(OWNER_ID, reservation_id, plan["price"], available):
         bot.reply_to(message, "Insufficient reseller credit or unavailable plan.")
         return
-    username, result, client = _create_user(OWNER_ID, {"gb": plan_id, "days": plan.get("days", 30),
-                                                       "unlimited": plan.get("unlimited", False)}, label)
+    username, result, client = _create_user({"gb": plan_id, "days": plan.get("days", 30),
+                                             "unlimited": plan.get("unlimited", False)}, label)
     if result is None:
         release_credit(OWNER_ID, reservation_id)
         bot.reply_to(message, "VPN user creation failed.")
