@@ -1,3 +1,8 @@
+## v1.16.9
+🛠️ Run Telegram backup and version-check commands through the configured Ajib Python environment
+🐛 Handle CLI execution and launch failures consistently while preserving actionable error messages
+✅ Add regression coverage for argument-list command execution and Telegram maintenance commands
+
 ## v1.16.8
 ✨ Keep hosted VPN usernames owner-scoped while storing Telegram customer IDs in user notes
 🛠️ Recover stale payment claims and credit reservations after interruptions, persist user-bound renewal tokens, and prevent duplicate checkouts
