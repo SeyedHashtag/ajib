@@ -178,27 +178,101 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(retry, (True, "two"))
         self.assertEqual(independent, (True, "three"))
 
-    def test_multiple_card_receipts_require_an_explicit_checkout_selection(self):
-        for payment_id in ("one", "two"):
+    def test_multiple_card_receipts_use_active_latest_or_replied_checkout(self):
+        for payment_id, message_id in (("one", 11), ("two", 22)):
             self.worker._save_payment(
                 payment_id,
-                {"user_id": 100, "payment_method": "card", "status": "waiting_receipt"},
+                {
+                    "user_id": 100,
+                    "payment_method": "card",
+                    "status": "waiting_receipt",
+                    "receipt_prompt_chat_id": 100,
+                    "receipt_prompt_message_id": message_id,
+                },
             )
 
-        self.assertEqual(self.worker._receipt_checkout(100), (None, True))
+        self.assertEqual(self.worker._receipt_checkout(100), "two")
 
         self.worker._set_input_state(100, {"kind": "receipt", "payment_id": "one"})
 
-        self.assertEqual(self.worker._receipt_checkout(100), ("one", False))
+        self.assertEqual(self.worker._receipt_checkout(100), "one")
+        self.assertEqual(
+            self.worker._receipt_checkout(100, reply_message_id=22, chat_id=100),
+            "two",
+        )
         self.worker._save_payment("one", {"status": "processing"})
-        self.assertEqual(self.worker._receipt_checkout(100), ("one", False))
+        self.assertEqual(self.worker._receipt_checkout(100), "one")
         self.assertFalse(
             self.worker._clear_input_state(100, kind="receipt", payment_id="two")
         )
-        self.assertEqual(self.worker._receipt_checkout(100), ("one", False))
+        self.assertEqual(self.worker._receipt_checkout(100), "one")
         self.assertTrue(
             self.worker._clear_input_state(100, kind="receipt", payment_id="one")
         )
+
+    def test_saved_receipt_survives_owner_notification_failure_and_retries(self):
+        receipt_path = Path(self.hosted_bots.tenant_file("7", "receipts/order.jpg"))
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_bytes(b"receipt")
+        self.worker._save_payment(
+            "order",
+            {
+                "user_id": 100,
+                "status": "pending_approval",
+                "receipt_path": str(receipt_path),
+                "plan_gb": "10",
+                "days": 30,
+                "retail_price": 5,
+                "converted_amount": 500000,
+            },
+        )
+
+        with mock.patch.object(
+            self.worker.bot, "send_photo", side_effect=RuntimeError("owner unavailable")
+        ), mock.patch("builtins.print"):
+            notified = self.worker._notify_owner_of_receipt("order")
+
+        failed = self.worker._tenant_payments()["order"]
+        self.assertFalse(notified)
+        self.assertEqual(failed["status"], "pending_approval")
+        self.assertIn("owner unavailable", failed["owner_receipt_notification_error"])
+
+        with mock.patch.object(self.worker.bot, "send_photo") as send_photo:
+            notified = self.worker._notify_owner_of_receipt("order")
+
+        completed = self.worker._tenant_payments()["order"]
+        self.assertTrue(notified)
+        send_photo.assert_called_once()
+        self.assertIn("owner_receipt_notified_at", completed)
+        self.assertNotIn("owner_receipt_notification_error", completed)
+        self.assertEqual(completed["status"], "pending_approval")
+
+    def test_startup_recovers_a_receipt_saved_by_the_legacy_caption_failure(self):
+        receipt_path = Path(self.hosted_bots.tenant_file("7", "receipts/legacy.jpg"))
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_bytes(b"receipt")
+        self.worker._save_payment(
+            "legacy",
+            {
+                "user_id": 100,
+                "status": "waiting_receipt",
+                "receipt_path": str(receipt_path),
+                "last_error": "Receipt upload failed: TypeError",
+            },
+        )
+
+        with mock.patch.object(
+            self.worker, "_notify_owner_of_receipt", return_value=True
+        ) as notify_owner, mock.patch.object(self.worker.bot, "send_message") as send_message:
+            recovered = self.worker._recover_saved_receipts()
+
+        record = self.worker._tenant_payments()["legacy"]
+        self.assertEqual(recovered, ["legacy"])
+        self.assertEqual(record["status"], "pending_approval")
+        self.assertIn("receipt_recovered_at", record)
+        self.assertNotIn("last_error", record)
+        notify_owner.assert_called_once_with("legacy")
+        send_message.assert_called_once()
 
 
 class HostedSupervisorHardeningTests(unittest.TestCase):

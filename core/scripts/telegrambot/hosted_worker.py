@@ -183,8 +183,8 @@ def _message(user_id, key):
     return get_message_text(_language(user_id), key)
 
 
-def _hosted_message(user_id, key, **values):
-    return hosted_text(_language(user_id), key, **values)
+def _hosted_message(recipient_id, key, **values):
+    return hosted_text(_language(recipient_id), key, **values)
 
 
 def _all_button_values(key, fallback):
@@ -271,9 +271,20 @@ def _start_checkout(payment_id, record):
         return True, payment_id
 
 
-def _receipt_checkout(user_id):
-    """Return the explicitly selected receipt checkout, or an unambiguous fallback."""
+def _receipt_checkout(user_id, reply_message_id=None, chat_id=None):
+    """Route a receipt to its replied-to, active, or newest card checkout."""
     payments = _tenant_payments()
+    if reply_message_id is not None:
+        for candidate_id, record in payments.items():
+            if (
+                isinstance(record, dict)
+                and str(record.get("user_id")) == str(user_id)
+                and record.get("status") == "waiting_receipt"
+                and str(record.get("receipt_prompt_message_id")) == str(reply_message_id)
+                and str(record.get("receipt_prompt_chat_id")) == str(chat_id)
+            ):
+                return candidate_id
+
     state = _get_input_state(user_id)
     selected_id = state.get("payment_id") if state and state.get("kind") == "receipt" else None
     selected = payments.get(selected_id) if selected_id else None
@@ -282,7 +293,7 @@ def _receipt_checkout(user_id):
             # Keep routing to the selected order even while another upload thread
             # has it claimed. Falling back here could attach a rapid second photo
             # to a different open checkout.
-            return selected_id, False
+            return selected_id
         _clear_input_state(user_id, kind="receipt", payment_id=selected_id)
 
     candidates = [
@@ -292,9 +303,149 @@ def _receipt_checkout(user_id):
         and str(record.get("user_id")) == str(user_id)
         and record.get("status") == "waiting_receipt"
     ]
-    if len(candidates) == 1:
-        return candidates[0], False
-    return None, len(candidates) > 1
+    return candidates[-1] if candidates else None
+
+
+def _claim_receipt_notification(payment_id):
+    with locked_json(tenant_file(OWNER_ID, "payments.json"), {}) as payments:
+        record = payments.get(payment_id)
+        if (
+            not isinstance(record, dict)
+            or record.get("status") != "pending_approval"
+            or not record.get("receipt_path")
+            or record.get("owner_receipt_notified_at")
+        ):
+            return None
+        started_at = _parse_time(record.get("owner_receipt_notification_started_at"))
+        if (
+            started_at is not None
+            and (datetime.now() - started_at).total_seconds() < PROCESSING_LEASE_SECONDS
+        ):
+            return None
+        record["owner_receipt_notification_started_at"] = _now()
+        record["owner_receipt_notification_attempts"] = int(
+            record.get("owner_receipt_notification_attempts", 0) or 0
+        ) + 1
+        record["updated_at"] = _now()
+        return dict(record)
+
+
+def _finish_receipt_notification(payment_id, error=None):
+    with locked_json(tenant_file(OWNER_ID, "payments.json"), {}) as payments:
+        record = payments.get(payment_id)
+        if not isinstance(record, dict):
+            return False
+        record.pop("owner_receipt_notification_started_at", None)
+        if error is None:
+            record["owner_receipt_notified_at"] = _now()
+            record.pop("owner_receipt_notification_error", None)
+        else:
+            record["owner_receipt_notification_error"] = str(error)[:500]
+        record["updated_at"] = _now()
+        return True
+
+
+def _notify_owner_of_receipt(payment_id):
+    record = _claim_receipt_notification(payment_id)
+    if not record:
+        current = _tenant_payments().get(payment_id, {})
+        return bool(isinstance(current, dict) and current.get("owner_receipt_notified_at"))
+    try:
+        caption = _hosted_message(
+            OWNER_ID,
+            "receipt_owner_caption",
+            user_id=record["user_id"],
+            plan_gb=record["plan_gb"],
+            days=record["days"],
+            toman_price=format_toman_amount(
+                record.get("converted_amount", record["retail_price"])
+            ),
+        )
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton(
+                _hosted_message(OWNER_ID, "approved"),
+                callback_data=f"hb:approve:{payment_id}",
+            ),
+            types.InlineKeyboardButton(
+                _hosted_message(OWNER_ID, "rejected"),
+                callback_data=f"hb:reject:{payment_id}",
+            ),
+        )
+        with open(record["receipt_path"], "rb") as handle:
+            bot.send_photo(
+                OWNER_ID,
+                handle,
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=markup,
+            )
+    except Exception as error:
+        detail = f"{type(error).__name__}: {error}"
+        _finish_receipt_notification(payment_id, detail)
+        print(
+            f"Hosted receipt notification failed for reseller {OWNER_ID}, "
+            f"payment {payment_id}: {detail}",
+            flush=True,
+        )
+        return False
+    _finish_receipt_notification(payment_id)
+    return True
+
+
+def _store_receipt_photo(message, payment_id):
+    temporary_path = None
+    try:
+        info = bot.get_file(message.photo[-1].file_id)
+        content = bot.download_file(info.file_path)
+        if len(content) > MAX_RECEIPT_BYTES:
+            raise ValueError("receipt is too large")
+        receipt_path = tenant_file(OWNER_ID, os.path.join("receipts", f"{payment_id}.jpg"))
+        os.makedirs(os.path.dirname(receipt_path), exist_ok=True)
+        temporary_path = f"{receipt_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(temporary_path, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, receipt_path)
+        temporary_path = None
+        return receipt_path
+    finally:
+        try:
+            if temporary_path and os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        except OSError:
+            pass
+
+
+def _recover_saved_receipts():
+    """Recover receipts saved before the legacy owner-caption failure."""
+    recovered = []
+    with locked_json(tenant_file(OWNER_ID, "payments.json"), {}) as payments:
+        for payment_id, record in payments.items():
+            if not isinstance(record, dict) or record.get("status") != "waiting_receipt":
+                continue
+            receipt_path = record.get("receipt_path")
+            if not receipt_path or not os.path.isfile(receipt_path):
+                continue
+            record["status"] = "pending_approval"
+            record.setdefault("receipt_received_at", record.get("updated_at") or _now())
+            record["receipt_recovered_at"] = _now()
+            record["updated_at"] = _now()
+            record.pop("last_error", None)
+            recovered.append((payment_id, record.get("user_id")))
+    for payment_id, user_id in recovered:
+        _notify_owner_of_receipt(payment_id)
+        try:
+            bot.send_message(user_id, _message(user_id, "receipt_submitted"))
+        except Exception as error:
+            print(
+                f"Hosted recovered-receipt confirmation failed for reseller {OWNER_ID}, "
+                f"payment {payment_id}: {type(error).__name__}: {error}",
+                flush=True,
+            )
+    return [payment_id for payment_id, _user_id in recovered]
 
 
 def _recover_stale_payment_claims():
@@ -763,21 +914,17 @@ def payment_method(call):
         toman_price = quote["retail"] * exchange_rate
         record.update({"status": "waiting_receipt", "reservation_id": order_id,
                        "exchange_rate": exchange_rate, "converted_amount": toman_price,
-                       "converted_currency": "TOMAN"})
+                       "converted_currency": "TOMAN",
+                       "receipt_prompt_chat_id": call.message.chat.id,
+                       "receipt_prompt_message_id": call.message.message_id})
         _save_payment(order_id, record)
         _set_input_state(call.from_user.id, {"kind": "receipt", "payment_id": order_id})
         bot.answer_callback_query(call.id)
         markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton(
-                _hosted_message(call.from_user.id, "submit_receipt"),
-                callback_data=f"hb:receipt:{order_id}",
-            ),
-            types.InlineKeyboardButton(
-                get_button_text(_language(call.from_user.id), "cancel"),
-                callback_data=f"hb:cancel:{order_id}",
-            ),
-        )
+        markup.add(types.InlineKeyboardButton(
+            get_button_text(_language(call.from_user.id), "cancel"),
+            callback_data=f"hb:cancel:{order_id}",
+        ))
         bot.edit_message_text(
             _message(call.from_user.id, "card_to_card_payment").format(
                 price=format_toman_amount(toman_price),
@@ -836,25 +983,6 @@ def payment_method(call):
     bot.send_photo(call.message.chat.id, image, caption=caption, parse_mode="Markdown", reply_markup=markup)
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("hb:receipt:"))
-def select_receipt_checkout(call):
-    payment_id = call.data.split(":", 2)[2]
-    current = _tenant_payments().get(payment_id)
-    if (
-        not isinstance(current, dict)
-        or str(current.get("user_id")) != str(call.from_user.id)
-        or current.get("status") != "waiting_receipt"
-    ):
-        bot.answer_callback_query(
-            call.id,
-            _hosted_message(call.from_user.id, "already_processed"),
-            show_alert=True,
-        )
-        return
-    _set_input_state(call.from_user.id, {"kind": "receipt", "payment_id": payment_id})
-    bot.answer_callback_query(call.id, _message(call.from_user.id, "upload_receipt"), show_alert=True)
-
-
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:cancel:"))
 def cancel_card_payment(call):
     payment_id = call.data.split(":", 2)[2]
@@ -878,10 +1006,12 @@ def cancel_card_payment(call):
 
 @bot.message_handler(content_types=["photo"])
 def receipt_photo(message):
-    payment_id, needs_selection = _receipt_checkout(message.from_user.id)
-    if needs_selection:
-        bot.reply_to(message, _hosted_message(message.from_user.id, "choose_receipt_checkout"))
-        return
+    reply = getattr(message, "reply_to_message", None)
+    payment_id = _receipt_checkout(
+        message.from_user.id,
+        reply_message_id=getattr(reply, "message_id", None),
+        chat_id=message.chat.id,
+    )
     if not payment_id:
         return
     current = _tenant_payments().get(payment_id)
@@ -893,46 +1023,43 @@ def receipt_photo(message):
         _clear_input_state(message.from_user.id, kind="receipt", payment_id=payment_id)
         return
     try:
-        info = bot.get_file(message.photo[-1].file_id)
-        content = bot.download_file(info.file_path)
-        if len(content) > MAX_RECEIPT_BYTES:
-            raise ValueError("receipt is too large")
-        receipt_path = tenant_file(OWNER_ID, os.path.join("receipts", f"{payment_id}.jpg"))
-        os.makedirs(os.path.dirname(receipt_path), exist_ok=True)
-        temporary_path = f"{receipt_path}.{os.getpid()}.{threading.get_ident()}.tmp"
-        with open(temporary_path, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary_path, 0o600)
-        os.replace(temporary_path, receipt_path)
-        _save_payment(payment_id, {"status": "pending_approval", "receipt_path": receipt_path})
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton(_hosted_message(OWNER_ID, "approved"),
-                                              callback_data=f"hb:approve:{payment_id}"),
-                   types.InlineKeyboardButton(_hosted_message(OWNER_ID, "rejected"),
-                                              callback_data=f"hb:reject:{payment_id}"))
-        caption = _hosted_message(
-            OWNER_ID, "receipt_owner_caption", user_id=message.from_user.id,
-            plan_gb=record["plan_gb"], days=record["days"],
-            toman_price=format_toman_amount(record.get("converted_amount", record["retail_price"])),
-        )
-        with open(receipt_path, "rb") as handle:
-            bot.send_photo(OWNER_ID, handle, caption=caption, parse_mode="Markdown", reply_markup=markup)
-        bot.reply_to(message, _message(message.from_user.id, "receipt_submitted"))
-    except Exception as error:
+        receipt_path = _store_receipt_photo(message, payment_id)
         _save_payment(
             payment_id,
-            {"status": "waiting_receipt", "last_error": f"Receipt upload failed: {type(error).__name__}"},
+            {
+                "status": "pending_approval",
+                "receipt_path": receipt_path,
+                "receipt_received_at": _now(),
+            },
         )
-        bot.reply_to(message, "Receipt upload failed. Please send the photo again.")
-    finally:
+    except Exception as error:
+        detail = f"{type(error).__name__}: {error}"
+        _save_payment(
+            payment_id,
+            {"status": "waiting_receipt", "last_error": f"Receipt upload failed: {detail}"[:500]},
+        )
+        _set_input_state(message.from_user.id, {"kind": "receipt", "payment_id": payment_id})
+        print(
+            f"Hosted receipt upload failed for reseller {OWNER_ID}, "
+            f"payment {payment_id}: {detail}",
+            flush=True,
+        )
         try:
-            if "temporary_path" in locals() and os.path.exists(temporary_path):
-                os.remove(temporary_path)
-        except OSError:
+            bot.reply_to(message, "Receipt upload failed. Please send the photo again.")
+        except Exception:
             pass
-        _clear_input_state(message.from_user.id, kind="receipt", payment_id=payment_id)
+        return
+
+    _notify_owner_of_receipt(payment_id)
+    try:
+        bot.reply_to(message, _message(message.from_user.id, "receipt_submitted"))
+    except Exception as error:
+        print(
+            f"Hosted receipt confirmation failed for reseller {OWNER_ID}, "
+            f"payment {payment_id}: {type(error).__name__}: {error}",
+            flush=True,
+        )
+    _clear_input_state(message.from_user.id, kind="receipt", payment_id=payment_id)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith(("hb:approve:", "hb:reject:")))
@@ -1538,6 +1665,7 @@ def _crypto_monitor():
     while True:
         try:
             _recover_stale_payment_claims()
+            _recover_saved_receipts()
             _reconcile_credit_reservations()
             for payment_id, current in _tenant_payments().items():
                 if not isinstance(current, dict):
@@ -1556,6 +1684,8 @@ def _crypto_monitor():
                                 )
                             except Exception:
                                 pass
+                    elif current.get("status") == "pending_approval":
+                        _notify_owner_of_receipt(payment_id)
                     continue
                 if current.get("status") not in {"pending", "paid_provision_failed"} or not current.get("gateway_payment_id"):
                     continue
@@ -1628,6 +1758,7 @@ def run():
         raise SystemExit(2)
     set_bot_runtime_status(OWNER_ID, "active")
     _recover_stale_payment_claims()
+    _recover_saved_receipts()
     _reconcile_credit_reservations()
     threading.Thread(target=_crypto_monitor, daemon=True, name="hosted-crypto").start()
     threading.Thread(target=_customer_notification_monitor, daemon=True, name="hosted-notifications").start()
