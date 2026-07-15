@@ -140,15 +140,65 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(renewal, {"username": "customer", "server_id": "a"})
         self.assertIsNone(self.worker._consume_renewal_token(second, 100))
 
-    def test_only_one_live_checkout_can_be_created_per_customer(self):
+    def test_multiple_live_checkouts_can_be_created_per_customer(self):
         record = {"user_id": 100, "payment_method": "crypto"}
 
         first = self.worker._start_checkout("one", record)
         second = self.worker._start_checkout("two", record)
 
         self.assertEqual(first, (True, "one"))
-        self.assertEqual(second, (False, "one"))
-        self.assertNotIn("two", self.worker._tenant_payments())
+        self.assertEqual(second, (True, "two"))
+        self.assertEqual(set(self.worker._tenant_payments()), {"one", "two"})
+
+    def test_checkout_id_collision_cannot_replace_an_existing_order(self):
+        self.worker._start_checkout("order", {"user_id": 100, "plan_gb": "10"})
+
+        duplicate = self.worker._start_checkout("order", {"user_id": 200, "plan_gb": "50"})
+
+        self.assertEqual(duplicate, (False, "order"))
+        self.assertEqual(self.worker._tenant_payments()["order"]["user_id"], 100)
+
+    def test_duplicate_taps_on_one_payment_button_reuse_the_live_checkout(self):
+        record = {
+            "user_id": 100,
+            "payment_method": "crypto",
+            "checkout_source": "100:50:crypto:10",
+        }
+
+        first = self.worker._start_checkout("one", record)
+        duplicate = self.worker._start_checkout("two", record)
+        self.worker._save_payment("one", {"status": "failed"})
+        retry = self.worker._start_checkout("two", record)
+        independent = self.worker._start_checkout(
+            "three", {**record, "checkout_source": "100:51:crypto:10"}
+        )
+
+        self.assertEqual(first, (True, "one"))
+        self.assertEqual(duplicate, (False, "one"))
+        self.assertEqual(retry, (True, "two"))
+        self.assertEqual(independent, (True, "three"))
+
+    def test_multiple_card_receipts_require_an_explicit_checkout_selection(self):
+        for payment_id in ("one", "two"):
+            self.worker._save_payment(
+                payment_id,
+                {"user_id": 100, "payment_method": "card", "status": "waiting_receipt"},
+            )
+
+        self.assertEqual(self.worker._receipt_checkout(100), (None, True))
+
+        self.worker._set_input_state(100, {"kind": "receipt", "payment_id": "one"})
+
+        self.assertEqual(self.worker._receipt_checkout(100), ("one", False))
+        self.worker._save_payment("one", {"status": "processing"})
+        self.assertEqual(self.worker._receipt_checkout(100), ("one", False))
+        self.assertFalse(
+            self.worker._clear_input_state(100, kind="receipt", payment_id="two")
+        )
+        self.assertEqual(self.worker._receipt_checkout(100), ("one", False))
+        self.assertTrue(
+            self.worker._clear_input_state(100, kind="receipt", payment_id="one")
+        )
 
 
 class HostedSupervisorHardeningTests(unittest.TestCase):

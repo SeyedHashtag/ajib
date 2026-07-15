@@ -206,6 +206,8 @@ class HostedStorefrontParityTests(unittest.TestCase):
         for behavior in (
             'callback_data="hb:plans"',
             'callback_data=f"hb:cancel:{order_id}"',
+            'callback_data=f"hb:receipt:{order_id}"',
+            '"checkout_source"',
             '"card_to_card_payment"',
             '"payment_instructions"',
             '"purchase_connection_warning"',
@@ -214,6 +216,8 @@ class HostedStorefrontParityTests(unittest.TestCase):
         ):
             with self.subTest(behavior=behavior):
                 self.assertIn(behavior, source)
+
+        self.assertNotIn("Another checkout is already open", source)
 
     def test_customer_handlers_do_not_use_old_reseller_disclosures(self):
         source = (BOT_DIR / "hosted_worker.py").read_text(encoding="utf-8")

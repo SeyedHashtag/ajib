@@ -112,6 +112,18 @@ def _pop_input_state(user_id):
         return dict(state) if isinstance(state, dict) else None
 
 
+def _clear_input_state(user_id, **expected):
+    """Clear a prompt only when it still belongs to the completed action."""
+    with INPUT_STATE_LOCK:
+        state = INPUT_STATE.get(user_id)
+        if not isinstance(state, dict):
+            return False
+        if any(state.get(key) != value for key, value in expected.items()):
+            return False
+        INPUT_STATE.pop(user_id, None)
+        return True
+
+
 def _reseller(active_only=False):
     data = get_reseller_data(OWNER_ID) or {}
     allowed = {"approved"} if active_only else {"approved", "suspended"}
@@ -234,24 +246,55 @@ def _claim_payment(payment_id, allowed):
 
 
 def _start_checkout(payment_id, record):
-    """Atomically allow only one live checkout per customer."""
-    user_id = str(record.get("user_id"))
-    open_statuses = {
+    """Atomically create an independent checkout without replacing another order."""
+    checkout_source = str(record.get("checkout_source") or "")
+    live_statuses = {
         "creating", "waiting_receipt", "pending_approval", "pending", "processing",
         "paid_provision_failed",
     }
     with locked_json(tenant_file(OWNER_ID, "payments.json"), {}) as payments:
-        for existing_id, existing in payments.items():
-            if not isinstance(existing, dict) or str(existing.get("user_id")) != user_id:
-                continue
-            if existing.get("status") in open_statuses:
-                return False, existing_id
+        if payment_id in payments:
+            return False, payment_id
+        if checkout_source:
+            for existing_id, existing in payments.items():
+                if (
+                    isinstance(existing, dict)
+                    and existing.get("checkout_source") == checkout_source
+                    and existing.get("status") in live_statuses
+                ):
+                    return False, existing_id
         payment = dict(record)
         payment["status"] = "creating"
         payment["created_at"] = _now()
         payment["updated_at"] = _now()
         payments[payment_id] = payment
         return True, payment_id
+
+
+def _receipt_checkout(user_id):
+    """Return the explicitly selected receipt checkout, or an unambiguous fallback."""
+    payments = _tenant_payments()
+    state = _get_input_state(user_id)
+    selected_id = state.get("payment_id") if state and state.get("kind") == "receipt" else None
+    selected = payments.get(selected_id) if selected_id else None
+    if selected_id:
+        if isinstance(selected, dict) and str(selected.get("user_id")) == str(user_id):
+            # Keep routing to the selected order even while another upload thread
+            # has it claimed. Falling back here could attach a rapid second photo
+            # to a different open checkout.
+            return selected_id, False
+        _clear_input_state(user_id, kind="receipt", payment_id=selected_id)
+
+    candidates = [
+        candidate_id
+        for candidate_id, record in payments.items()
+        if isinstance(record, dict)
+        and str(record.get("user_id")) == str(user_id)
+        and record.get("status") == "waiting_receipt"
+    ]
+    if len(candidates) == 1:
+        return candidates[0], False
+    return None, len(candidates) > 1
 
 
 def _recover_stale_payment_claims():
@@ -686,6 +729,7 @@ def payment_method(call):
         "wholesale_price": quote["wholesale"], "retail_price": quote["retail"],
         "referral_reward": quote["card_referral_reward"] if method == "card" else quote["crypto_referral_reward"],
         "payment_method": method,
+        "checkout_source": f"{call.message.chat.id}:{call.message.message_id}:{method}:{plan_id}",
         "renew_username": renewal and renewal["username"], "server_id": renewal and renewal.get("server_id"),
     }
     if method == "card" and not settings.get("card_number"):
@@ -700,7 +744,10 @@ def payment_method(call):
     if not started:
         bot.answer_callback_query(
             call.id,
-            f"Another checkout is already open ({str(existing_id)[:8]}). Finish or cancel it first.",
+            _hosted_message(
+                call.from_user.id,
+                "checkout_already_started" if existing_id != order_id else "checkout_creation_failed",
+            ),
             show_alert=True,
         )
         return
@@ -721,8 +768,16 @@ def payment_method(call):
         _set_input_state(call.from_user.id, {"kind": "receipt", "payment_id": order_id})
         bot.answer_callback_query(call.id)
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton(get_button_text(_language(call.from_user.id), "cancel"),
-                                              callback_data=f"hb:cancel:{order_id}"))
+        markup.add(
+            types.InlineKeyboardButton(
+                _hosted_message(call.from_user.id, "submit_receipt"),
+                callback_data=f"hb:receipt:{order_id}",
+            ),
+            types.InlineKeyboardButton(
+                get_button_text(_language(call.from_user.id), "cancel"),
+                callback_data=f"hb:cancel:{order_id}",
+            ),
+        )
         bot.edit_message_text(
             _message(call.from_user.id, "card_to_card_payment").format(
                 price=format_toman_amount(toman_price),
@@ -781,6 +836,25 @@ def payment_method(call):
     bot.send_photo(call.message.chat.id, image, caption=caption, parse_mode="Markdown", reply_markup=markup)
 
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith("hb:receipt:"))
+def select_receipt_checkout(call):
+    payment_id = call.data.split(":", 2)[2]
+    current = _tenant_payments().get(payment_id)
+    if (
+        not isinstance(current, dict)
+        or str(current.get("user_id")) != str(call.from_user.id)
+        or current.get("status") != "waiting_receipt"
+    ):
+        bot.answer_callback_query(
+            call.id,
+            _hosted_message(call.from_user.id, "already_processed"),
+            show_alert=True,
+        )
+        return
+    _set_input_state(call.from_user.id, {"kind": "receipt", "payment_id": payment_id})
+    bot.answer_callback_query(call.id, _message(call.from_user.id, "upload_receipt"), show_alert=True)
+
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:cancel:"))
 def cancel_card_payment(call):
     payment_id = call.data.split(":", 2)[2]
@@ -796,7 +870,7 @@ def cancel_card_payment(call):
         return
     release_credit(OWNER_ID, payment_id, kind="credit_canceled")
     _save_payment(payment_id, {"status": "canceled"})
-    _pop_input_state(call.from_user.id)
+    _clear_input_state(call.from_user.id, kind="receipt", payment_id=payment_id)
     bot.answer_callback_query(call.id)
     bot.edit_message_text(_message(call.from_user.id, "purchase_canceled"),
                           call.message.chat.id, call.message.message_id)
@@ -804,27 +878,19 @@ def cancel_card_payment(call):
 
 @bot.message_handler(content_types=["photo"])
 def receipt_photo(message):
-    state = _get_input_state(message.from_user.id)
-    payment_id = state.get("payment_id") if state and state.get("kind") == "receipt" else None
-    if not payment_id:
-        candidates = [
-            (candidate_id, record)
-            for candidate_id, record in _tenant_payments().items()
-            if isinstance(record, dict)
-            and str(record.get("user_id")) == str(message.from_user.id)
-            and record.get("status") == "waiting_receipt"
-        ]
-        if candidates:
-            payment_id = max(candidates, key=lambda item: str(item[1].get("created_at", "")))[0]
+    payment_id, needs_selection = _receipt_checkout(message.from_user.id)
+    if needs_selection:
+        bot.reply_to(message, _hosted_message(message.from_user.id, "choose_receipt_checkout"))
+        return
     if not payment_id:
         return
     current = _tenant_payments().get(payment_id)
     if not isinstance(current, dict) or str(current.get("user_id")) != str(message.from_user.id):
-        _pop_input_state(message.from_user.id)
+        _clear_input_state(message.from_user.id, kind="receipt", payment_id=payment_id)
         return
     record = _claim_payment(payment_id, {"waiting_receipt"})
     if not record:
-        _pop_input_state(message.from_user.id)
+        _clear_input_state(message.from_user.id, kind="receipt", payment_id=payment_id)
         return
     try:
         info = bot.get_file(message.photo[-1].file_id)
@@ -866,7 +932,7 @@ def receipt_photo(message):
                 os.remove(temporary_path)
         except OSError:
             pass
-        _pop_input_state(message.from_user.id)
+        _clear_input_state(message.from_user.id, kind="receipt", payment_id=payment_id)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith(("hb:approve:", "hb:reject:")))
