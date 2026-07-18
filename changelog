@@ -1,3 +1,9 @@
+## v1.17.0
+✨ Add six reseller loyalty levels with increasing wholesale discounts, trust limits, and localized progress presentation
+🛠️ Persist hosted purchase and free-test usernames before provisioning so interrupted operations can recover safely
+🐛 Reuse the allocated username and server during creation retries to prevent duplicate accounts
+✅ Add regression coverage for reseller pricing, level UI, renewals, debt policy, and hosted-user recovery
+
 ## v1.16.11
 ✨ Route receipt photos through the active checkout or the payment message a customer replied to
 🛠️ Recover saved receipts after interrupted uploads and retry failed owner notifications without losing approval state
