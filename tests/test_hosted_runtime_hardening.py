@@ -85,7 +85,35 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
         self.worker = load_module(
             "hosted_worker_hardening_test", BOT_DIR / "hosted_worker.py"
         )
-        self.addCleanup(lambda: sys.modules.pop("hosted_worker_hardening_test", None))
+        self.addCleanup(
+            lambda: sys.modules.pop("hosted_worker_hardening_test", None)
+        )
+
+    def test_hosted_quote_uses_level_wholesale_and_catalog_based_retail(self):
+        Path(self.reseller.RESELLERS_FILE).write_text(
+            json.dumps({
+                "7": {
+                    "status": "approved",
+                    "debt": 0,
+                    "total_paid": 50,
+                    "configs": [],
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        quote = self.worker._hosted_plan_quote(
+            {"price": 100.0},
+            {
+                "markup_percent": 20,
+                "referral_margin_percent": 0,
+            },
+        )
+
+        self.assertEqual(quote["wholesale"], 75.0)
+        self.assertEqual(quote["retail"], 120.0)
+        self.assertEqual(quote["reseller_level"], 6)
+        self.assertEqual(quote["discount_percent"], 25)
 
     def age_payment_claim(self, payment_id):
         path = self.hosted_bots.tenant_file("7", "payments.json")

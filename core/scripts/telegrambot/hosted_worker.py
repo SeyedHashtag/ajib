@@ -32,9 +32,14 @@ from utils.hosted_bots import (
 from utils.hosted_translations import HOSTED_TRANSLATIONS, hosted_text
 from utils.payments import CryptoPayment
 from utils.reseller import (
-    can_reseller_add_debt, get_reseller_data, get_reseller_total_paid,
-    get_reseller_trust_limit, record_funded_reseller_config,
+    calculate_reseller_wholesale_price, can_reseller_add_debt, get_reseller_data,
+    get_reseller_level_summary, get_reseller_total_paid, get_reseller_trust_limit,
+    record_funded_reseller_config,
     record_funded_reseller_renewal,
+)
+from utils.reseller_level_ui import (
+    build_reseller_level_compact,
+    present_pending_reseller_level,
 )
 from utils.translations import BUTTON_TRANSLATIONS, LANGUAGES, get_button_text, get_message_text
 from utils.username_utils import allocate_username, build_user_note
@@ -160,6 +165,30 @@ def _sellable_plans():
             continue
         result[plan_key] = {**plan, "price": price, "days": days, "gb": gigabytes}
     return result
+
+
+def _reseller_plan_pricing(plan, reseller=None):
+    reseller = reseller if reseller is not None else (get_reseller_data(OWNER_ID) or {})
+    summary = get_reseller_level_summary(reseller)
+    list_price = float(plan["price"])
+    return {
+        "list_price": list_price,
+        "wholesale_price": calculate_reseller_wholesale_price(list_price, reseller),
+        "reseller_level": summary["level"],
+        "discount_percent": summary["discount_percent"],
+    }
+
+
+def _hosted_plan_quote(plan, settings, referral_margin_percent=0, referred=False):
+    pricing = _reseller_plan_pricing(plan)
+    quote = calculate_quote(
+        pricing["wholesale_price"],
+        settings["markup_percent"],
+        referral_margin_percent,
+        referred,
+        retail_base=pricing["list_price"],
+    )
+    return {**quote, **pricing}
 
 
 def _languages():
@@ -693,6 +722,13 @@ def _provision_payment(payment_id, record, funded):
         _save_payment(payment_id, {"status": "completed", "username": username,
                                    "server_id": existing_config.get("server_id")})
         _deliver_config_safely(customer_id, username, client, renewed=renewed)
+        if funded:
+            present_pending_reseller_level(
+                bot,
+                OWNER_ID,
+                _language(OWNER_ID),
+                allow_introduction=False,
+            )
         return True, username
     if renewed:
         client, live = MultiServerAPI().find_user(username, preferred_server_id=record.get("server_id"))
@@ -738,6 +774,9 @@ def _provision_payment(payment_id, record, funded):
         "server_id": server_id, "reseller_id": str(OWNER_ID),
         "origin_bot_id": os.getenv("AJIB_HOSTED_BOT_ID"), "retail_order_id": payment_id,
         "retail_price": record["retail_price"], "price": record["wholesale_price"],
+        "list_price": record.get("list_price"),
+        "reseller_level": record.get("reseller_level"),
+        "discount_percent": record.get("discount_percent"),
         "plan_gb": record["plan_gb"], "days": record["days"],
     }
     if funded:
@@ -750,6 +789,13 @@ def _provision_payment(payment_id, record, funded):
         if not renewed and client:
             client.delete_user(username)
         return False, "Reseller accounting failed"
+    if funded:
+        present_pending_reseller_level(
+            bot,
+            OWNER_ID,
+            _language(OWNER_ID),
+            allow_introduction=False,
+        )
     if funded:
         credit_crypto_sale(OWNER_ID, payment_id, record["margin"], record.get("referral_reward", 0), common)
     else:
@@ -779,7 +825,7 @@ def _show_plans(chat_id, user_id, message_id=None):
     markup = types.InlineKeyboardMarkup(row_width=1)
     settings = get_settings(OWNER_ID)
     for plan_id, plan in sorted(_sellable_plans().items(), key=lambda item: int(item[0])):
-        quote = calculate_quote(plan["price"], settings["markup_percent"])
+        quote = _hosted_plan_quote(plan, settings)
         account_type = get_message_text(
             language, "unlimited_users" if plan.get("unlimited", False) else "single_user"
         )
@@ -805,8 +851,12 @@ def _purchase_options(chat_id, user_id, plan_id, renewal=None, message_id=None):
         return
     settings = get_settings(OWNER_ID)
     language = _language(user_id)
-    quote = calculate_quote(plan["price"], settings["markup_percent"], settings["referral_margin_percent"],
-                            referred=str(user_id) in _referral_data().get("referrals", {}))
+    quote = _hosted_plan_quote(
+        plan,
+        settings,
+        settings["referral_margin_percent"],
+        referred=str(user_id) in _referral_data().get("referrals", {}),
+    )
     markup = types.InlineKeyboardMarkup(row_width=1)
     suffix = ""
     if renewal:
@@ -893,13 +943,20 @@ def payment_method(call):
             )
             return
     referred = str(call.from_user.id) in _referral_data().get("referrals", {})
-    quote = calculate_quote(plan["price"], settings["markup_percent"], settings["referral_margin_percent"], referred)
+    quote = _hosted_plan_quote(
+        plan,
+        settings,
+        settings["referral_margin_percent"],
+        referred,
+    )
     order_id = str(uuid.uuid4())
     record = {
         "id": order_id, "user_id": call.from_user.id, "telegram_username": call.from_user.username,
         "reseller_id": str(OWNER_ID), "origin_bot_id": os.getenv("AJIB_HOSTED_BOT_ID"),
         "plan_gb": plan_id, "days": plan.get("days", 30), "unlimited": plan.get("unlimited", False),
         "wholesale_price": quote["wholesale"], "retail_price": quote["retail"],
+        "list_price": quote["list_price"], "reseller_level": quote["reseller_level"],
+        "discount_percent": quote["discount_percent"],
         "referral_reward": quote["card_referral_reward"] if method == "card" else quote["crypto_referral_reward"],
         "payment_method": method,
         "checkout_source": f"{call.message.chat.id}:{call.message.message_id}:{method}:{plan_id}",
@@ -1455,6 +1512,8 @@ def _owner_markup(user_id=OWNER_ID):
     catalog["owner_panel"] for catalog in HOSTED_TRANSLATIONS.values()
 })
 def owner_panel(message):
+    reseller = get_reseller_data(OWNER_ID) or {}
+    present_pending_reseller_level(bot, OWNER_ID, _language(OWNER_ID))
     settings = get_settings(OWNER_ID)
     summary = _hosted_message(
         OWNER_ID, "owner_summary", markup=settings["markup_percent"],
@@ -1462,7 +1521,8 @@ def owner_panel(message):
         card=settings["card_number"] or _hosted_message(OWNER_ID, "not_set"),
         referral=settings["referral_margin_percent"],
     )
-    bot.reply_to(message, f"{_hosted_message(OWNER_ID, 'owner_title')}\n\n{summary}"
+    bot.reply_to(message, f"{_hosted_message(OWNER_ID, 'owner_title')}\n\n"
+                          f"{build_reseller_level_compact(_language(OWNER_ID), reseller)}\n{summary}"
                           f"{_hosted_message(OWNER_ID, 'owner_guide')}",
                  parse_mode="Markdown", reply_markup=_owner_markup())
 
@@ -1531,11 +1591,23 @@ def _handle_owner_action(chat_id, action, feedback):
             return
         markup = types.InlineKeyboardMarkup(row_width=1)
         for plan_id, plan in sorted(_sellable_plans().items(), key=lambda item: int(item[0])):
+            pricing = _reseller_plan_pricing(plan)
             markup.add(types.InlineKeyboardButton(
-                f"{plan_id} GB · {plan.get('days', 30)} days · ${float(plan['price']):.2f} wholesale",
+                _hosted_message(
+                    OWNER_ID,
+                    "owner_plan_button",
+                    plan_gb=plan_id,
+                    days=plan.get("days", 30),
+                    price=f"{pricing['wholesale_price']:.2f}",
+                    discount=f"{pricing['discount_percent']:.0f}",
+                ),
                 callback_data=f"hb:ogen:{plan_id}",
             ))
-        bot.send_message(chat_id, "Select a wholesale plan:", reply_markup=markup)
+        bot.send_message(
+            chat_id,
+            _hosted_message(OWNER_ID, "owner_select_wholesale_plan"),
+            reply_markup=markup,
+        )
         return
     if action == "customers":
         reseller = get_reseller_data(OWNER_ID) or {}
@@ -1552,6 +1624,7 @@ def _handle_owner_action(chat_id, action, feedback):
         limit = get_reseller_trust_limit(total_paid)
         _, _, available = can_reseller_add_debt(reseller, 0)
         bot.send_message(chat_id,
+                         f"{build_reseller_level_compact(_language(OWNER_ID), reseller)}\n"
                          f"Debt: ${float(reseller.get('debt', 0)):.2f}\nTrust limit: ${limit:.2f}\nAvailable credit: ${available:.2f}")
         return
     if action == "crypto":
@@ -1560,8 +1633,11 @@ def _handle_owner_action(chat_id, action, feedback):
             if not os.getenv("CRYPTO_MERCHANT_ID") or not os.getenv("CRYPTO_API_KEY"):
                 feedback("Operator crypto gateway is not configured.")
                 return
-            unsupported = [pid for pid, plan in _sellable_plans().items()
-                           if not calculate_quote(plan["price"], settings["markup_percent"])["crypto_supported"]]
+            unsupported = [
+                pid
+                for pid, plan in _sellable_plans().items()
+                if not _hosted_plan_quote(plan, settings)["crypto_supported"]
+            ]
             if unsupported:
                 feedback("Increase markup before enabling crypto.")
                 return
@@ -1645,9 +1721,15 @@ def owner_generate_input(message):
     plan = _sellable_plans().get(plan_id)
     label = (message.text or "customer").strip()[:64] or "customer"
     reseller = get_reseller_data(OWNER_ID) or {}
+    pricing = _reseller_plan_pricing(plan, reseller) if plan else None
     _, _, available = can_reseller_add_debt(reseller, 0)
     reservation_id = f"manual-{uuid.uuid4()}"
-    if not plan or not reserve_credit(OWNER_ID, reservation_id, plan["price"], available):
+    if not plan or not reserve_credit(
+        OWNER_ID,
+        reservation_id,
+        pricing["wholesale_price"],
+        available,
+    ):
         bot.reply_to(message, "Insufficient reseller credit or unavailable plan.")
         return
     username, result, client = _create_user({"gb": plan_id, "days": plan.get("days", 30),
@@ -1658,7 +1740,10 @@ def owner_generate_input(message):
         return
     config = {"username": username, "customer_name": label, "server_id": getattr(client, "server_id", None),
               "reseller_id": str(OWNER_ID), "origin_bot_id": os.getenv("AJIB_HOSTED_BOT_ID"),
-              "plan_gb": plan_id, "days": plan.get("days", 30), "price": float(plan["price"]),
+              "plan_gb": plan_id, "days": plan.get("days", 30),
+              "price": pricing["wholesale_price"], "list_price": pricing["list_price"],
+              "reseller_level": pricing["reseller_level"],
+              "discount_percent": pricing["discount_percent"],
               "retail_order_id": reservation_id}
     if not consume_credit(OWNER_ID, reservation_id, config):
         client.delete_user(username)
@@ -1693,6 +1778,13 @@ def earnings_action(call):
     action = call.data.split(":")[2]
     if action == "settle":
         success, result = transfer_earnings_to_debt(OWNER_ID)
+        if success:
+            present_pending_reseller_level(
+                bot,
+                OWNER_ID,
+                _language(OWNER_ID),
+                allow_introduction=False,
+            )
         bot.answer_callback_query(call.id, f"Applied ${result['amount']:.2f}" if success else str(result), show_alert=True)
         return
     _set_input_state(OWNER_ID, {"kind": "earnings_destination"})

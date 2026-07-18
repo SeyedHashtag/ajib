@@ -182,6 +182,19 @@ def _apply_reseller_settlement_payment(user_id, payment_record):
 
     credited_amount = _settlement_credit_amount(payment_record)
     result = apply_reseller_payment(user_id, credited_amount)
+    success = bool(result[0]) if isinstance(result, tuple) and result else bool(result)
+    if success:
+        try:
+            from utils.reseller_level_ui import present_pending_reseller_level
+
+            present_pending_reseller_level(
+                bot,
+                user_id,
+                get_user_language(user_id),
+                allow_introduction=False,
+            )
+        except Exception:
+            pass
     if isinstance(result, tuple) and len(result) >= 2:
         return bool(result[0]), credited_amount, result[1]
     return True, credited_amount, None

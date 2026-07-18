@@ -42,6 +42,24 @@ class HostedBotStateTests(unittest.TestCase):
         self.assertEqual(quote["crypto_referral_reward"], 2.8)
         self.assertEqual(quote["card_referral_reward"], 4.0)
 
+    def test_level_wholesale_discount_increases_margin_without_changing_retail(self):
+        level_one = hosted_bots.calculate_quote(
+            80,
+            20,
+            retail_base=100,
+        )
+        level_six = hosted_bots.calculate_quote(
+            75,
+            20,
+            retail_base=100,
+        )
+
+        self.assertEqual(level_one["retail"], 120.0)
+        self.assertEqual(level_six["retail"], 120.0)
+        self.assertEqual(level_one["card_margin"], 40.0)
+        self.assertEqual(level_six["card_margin"], 45.0)
+        self.assertEqual(level_six["crypto_margin"], 39.0)
+
     def test_crypto_is_disabled_by_default(self):
         settings = hosted_bots.get_settings("7")
         self.assertFalse(settings["crypto_enabled"])

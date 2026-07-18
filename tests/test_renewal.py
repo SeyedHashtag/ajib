@@ -76,6 +76,21 @@ def load_renewal_module():
     currency_stub.format_usd_amount = lambda value: f"{float(value):.2f}"
     sys.modules["utils.currency_format"] = currency_stub
 
+    reseller_stub = types.ModuleType("utils.reseller")
+    reseller_stub.get_reseller_level_summary = lambda data: {
+        "level": min(6, 1 + int(float(data.get("total_paid", 0) or 0) // 10)),
+        "discount_percent": min(
+            25,
+            20 + int(float(data.get("total_paid", 0) or 0) // 10),
+        ),
+    }
+    reseller_stub.calculate_reseller_wholesale_price = lambda price, data: round(
+        float(price)
+        * (1 - reseller_stub.get_reseller_level_summary(data)["discount_percent"] / 100),
+        2,
+    )
+    sys.modules["utils.reseller"] = reseller_stub
+
     translations_stub = types.ModuleType("utils.translations")
     translations_stub.get_message_text = lambda _language, key: {
         "renewal_offer_details": (

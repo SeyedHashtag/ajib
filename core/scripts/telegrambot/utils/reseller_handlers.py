@@ -20,13 +20,20 @@ from utils.reseller import (
     get_banned_reseller_cleanup_candidates, cleanup_banned_reseller_users,
     can_reseller_add_debt, get_reseller_total_paid, get_reseller_trust_limit,
     apply_reseller_payment, validate_reseller_manual_payment_amount,
-    reseller_config_is_recorded,
+    reseller_config_is_recorded, calculate_reseller_wholesale_price,
+    get_reseller_level_summary,
 )
 from utils.edit_plans import load_plans
 from utils.api_client import APIClient, MultiServerAPI
 from utils.payments import CryptoPayment
 from utils.payment_records import add_payment_record
 from utils.currency_format import format_toman_amount, format_usd_amount
+from utils.reseller_level_ui import (
+    build_reseller_level_compact,
+    build_reseller_level_profile,
+    build_reseller_level_roadmap,
+    present_pending_reseller_level,
+)
 try:
     from utils.hosted_translations import hosted_text
 except ImportError:  # Keep the reseller panel usable during partial/rolling upgrades.
@@ -247,13 +254,34 @@ def _create_reseller_user_with_note(api_client, user_id, gb, days, chosen_userna
     return multi_api.create_user_with_retry(allocate, create, fallback_client=api_client)
 
 
-def _build_reseller_purchase_details(language, gb, days, price, current_debt, trust_limit):
+def _reseller_plan_quote(list_price, reseller_data):
+    summary = get_reseller_level_summary(reseller_data)
+    return {
+        'list_price': float(list_price),
+        'price': calculate_reseller_wholesale_price(list_price, reseller_data),
+        'level': summary['level'],
+        'discount_percent': summary['discount_percent'],
+    }
+
+
+def _build_reseller_purchase_details(
+    language,
+    gb,
+    days,
+    quote,
+    current_debt,
+    trust_limit,
+):
+    price = quote['price']
     exchange_rate = get_exchange_rate()
     converted_price = price * exchange_rate
     projected_debt = current_debt + price
     return get_message_text(language, "reseller_purchase_details").format(
         plan_gb=gb,
         days=days,
+        list_price=format_usd_amount(quote['list_price']),
+        reseller_level=quote['level'],
+        discount_percent=quote['discount_percent'],
         price=format_usd_amount(price),
         exchange_rate=format_toman_amount(exchange_rate),
         toman_price=format_toman_amount(converted_price),
@@ -269,13 +297,13 @@ def _reseller_username_prompt_markup(language):
     return markup
 
 
-def _show_reseller_purchase_details(call, language, gb, days, price, current_debt, trust_limit):
+def _show_reseller_purchase_details(call, language, gb, days, quote, current_debt, trust_limit):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton(get_button_text(language, "confirm"), callback_data=f"reseller:confirm_buy:{gb}"))
     markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
 
     bot.edit_message_text(
-        _build_reseller_purchase_details(language, gb, days, price, current_debt, trust_limit),
+        _build_reseller_purchase_details(language, gb, days, quote, current_debt, trust_limit),
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         reply_markup=markup
@@ -344,6 +372,7 @@ def reseller_panel(message):
     status = reseller_data.get('status') if reseller_data else None
     
     if status in ('approved', 'suspended'):
+        present_pending_reseller_level(bot, user_id, language)
         # Show Reseller Menu (suspended can still access panel but with restrictions)
         markup = types.InlineKeyboardMarkup(row_width=2)
         markup.add(
@@ -360,6 +389,7 @@ def reseller_panel(message):
         debt_state_text = get_message_text(language, _debt_state_label(reseller_data.get('debt_state', 'active')))
         trust_limit = get_reseller_trust_limit(get_reseller_total_paid(reseller_data))
         intro = get_message_text(language, "reseller_intro").replace("${debt}", f"${format_usd_amount(debt)}")
+        intro += "\n" + build_reseller_level_compact(language, reseller_data)
         intro += "\n" + get_message_text(language, "reseller_trust_limit_line").format(trust_limit=trust_limit)
         intro += "\n" + get_message_text(language, "reseller_debt_status_line").format(debt_state=debt_state_text)
         if _is_reseller_suspended(reseller_data) or status == 'suspended':
@@ -487,6 +517,7 @@ def handle_admin_reseller(call):
             bot.send_message(target_user_id, get_message_text(target_language, "reseller_approved_notification"))
         except:
             pass
+        present_pending_reseller_level(bot, target_user_id, target_language)
         bot.edit_message_text(f"✅ User {target_user_id} approved as reseller.", chat_id=call.message.chat.id, message_id=call.message.message_id)
         
     elif action == 'reject':
@@ -521,9 +552,13 @@ def handle_reseller_generate(call):
     for gb, details in sorted_plans:
         if details.get("target", "both") == "customer":
             continue
-        original_price = float(details['price'])
-        discounted_price = original_price * 0.8
-        button_text = f"{gb} GB - ${format_usd_amount(discounted_price)} (20% OFF) - {details['days']} days"
+        quote = _reseller_plan_quote(details['price'], reseller_data)
+        button_text = get_message_text(language, "reseller_plan_button").format(
+            plan_gb=gb,
+            price=format_usd_amount(quote['price']),
+            discount_percent=quote['discount_percent'],
+            days=details['days'],
+        )
         markup.add(types.InlineKeyboardButton(button_text, callback_data=f"reseller:buy:{gb}"))
         
     markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
@@ -562,8 +597,8 @@ def handle_reseller_buy(call):
         bot.answer_callback_query(call.id, "This plan is for customers only.")
         return
         
-    original_price = float(plan['price'])
-    price = original_price * 0.8  # 20% discount for resellers
+    quote = _reseller_plan_quote(plan['price'], reseller_data)
+    price = quote['price']
     days = plan['days']
 
     current_debt = float(reseller_data.get('debt', 0.0))
@@ -590,7 +625,7 @@ def handle_reseller_buy(call):
         )
         return
     
-    _show_reseller_purchase_details(call, language, gb, days, price, current_debt, trust_limit)
+    _show_reseller_purchase_details(call, language, gb, days, quote, current_debt, trust_limit)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reseller:details:"))
@@ -621,14 +656,15 @@ def handle_reseller_purchase_details(call):
         bot.answer_callback_query(call.id, "This plan is for customers only.")
         return
 
-    price = float(plan['price']) * 0.8
+    quote = _reseller_plan_quote(plan['price'], reseller_data)
+    price = quote['price']
     current_debt = float(reseller_data.get('debt', 0.0))
     can_add, trust_limit, available_credit = can_reseller_add_debt(reseller_data, price)
     if not can_add:
         _show_reseller_trust_limit_block(call, language, current_debt, price, trust_limit, available_credit)
         return
 
-    _show_reseller_purchase_details(call, language, gb, plan['days'], price, current_debt, trust_limit)
+    _show_reseller_purchase_details(call, language, gb, plan['days'], quote, current_debt, trust_limit)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reseller:confirm_buy:"))
@@ -659,8 +695,8 @@ def handle_reseller_confirm_buy(call):
         bot.answer_callback_query(call.id, "This plan is for customers only.")
         return
         
-    original_price = float(plan['price'])
-    price = original_price * 0.8
+    quote = _reseller_plan_quote(plan['price'], reseller_data)
+    price = quote['price']
     days = plan['days']
     current_debt = float(reseller_data.get('debt', 0.0))
     can_add, trust_limit, available_credit = can_reseller_add_debt(reseller_data, price)
@@ -681,6 +717,9 @@ def handle_reseller_confirm_buy(call):
         'gb': gb,
         'days': days,
         'price': price,
+        'list_price': quote['list_price'],
+        'reseller_level': quote['level'],
+        'discount_percent': quote['discount_percent'],
         'unlimited': plan.get('unlimited', False)
     }
 
@@ -738,6 +777,9 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
             "days": days,
             "unlimited": unlimited,
             "price": price,
+            "list_price": data.get("list_price"),
+            "reseller_level": data.get("reseller_level"),
+            "discount_percent": data.get("discount_percent"),
             "server_id": api_client.server_id,
         }
         debt_added = add_reseller_debt(user_id, price, config_data)
@@ -1008,26 +1050,30 @@ def handle_reseller_stats(call):
     if not reseller_data:
         bot.answer_callback_query(call.id, "Reseller access required.")
         return
+    present_pending_reseller_level(bot, user_id, language)
 
     configs = reseller_data.get('configs', [])
     total_configs = len(configs)
     
     total_value = sum(_reseller_config_value(c) for c in configs if isinstance(c, dict))
     current_debt = float(reseller_data.get('debt', 0.0))
-    total_paid = get_reseller_total_paid(reseller_data)
-    trust_limit = get_reseller_trust_limit(total_paid)
-    
-    msg = get_message_text(language, "reseller_stats_message").format(
+    msg = build_reseller_level_profile(
+        language,
+        reseller_data,
         user_id=user_id,
         joined_date=reseller_data.get('created_at', 'N/A'),
         total_configs=total_configs,
-        total_value=format_usd_amount(total_value),
-        total_paid=format_usd_amount(total_paid),
-        current_debt=format_usd_amount(current_debt),
-        trust_limit=format_usd_amount(trust_limit),
+        total_value=total_value,
+        current_debt=current_debt,
     )
     
-    markup = types.InlineKeyboardMarkup()
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            get_message_text(language, "reseller_view_all_levels"),
+            callback_data="reseller:levels",
+        )
+    )
     markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
     
     bot.edit_message_text(
@@ -1036,6 +1082,36 @@ def handle_reseller_stats(call):
         message_id=call.message.message_id,
         reply_markup=markup,
         parse_mode="Markdown"
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "reseller:levels")
+def handle_reseller_levels(call):
+    user_id = call.from_user.id
+    language = get_user_language(user_id)
+    reseller_data = _get_active_reseller_data(user_id)
+    if not reseller_data:
+        bot.answer_callback_query(call.id, "Reseller access required.")
+        return
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            get_button_text(language, "back"),
+            callback_data="reseller:stats",
+        )
+    )
+    markup.add(
+        types.InlineKeyboardButton(
+            get_button_text(language, "cancel"),
+            callback_data="reseller:cancel",
+        )
+    )
+    bot.edit_message_text(
+        build_reseller_level_roadmap(language, reseller_data),
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=markup,
+        parse_mode="Markdown",
     )
 
 RESELLER_CUSTOMERS_PAGE_SIZE = 5
@@ -1804,6 +1880,9 @@ def _reseller_renewal_details_message(language, offer, current_debt, trust_limit
     projected_debt = current_debt + float(offer.get('price', 0.0))
     message = format_renewal_offer(language, offer, include_payment_prompt=False)
     message += "\n\n" + get_message_text(language, "reseller_renewal_debt_details").format(
+        list_price=format_usd_amount(offer.get('full_price', offer.get('price', 0.0))),
+        reseller_level=offer.get('reseller_level', 1),
+        discount_percent=offer.get('discount_percent', 20),
         price=format_usd_amount(offer.get('price', 0.0)),
         current_debt=format_usd_amount(current_debt),
         projected_debt=format_usd_amount(projected_debt),
@@ -2321,7 +2400,7 @@ def _build_admin_reseller_detail_text(language, reseller_id, reseller_data):
     status = (reseller_data or {}).get("status", "rejected")
     debt_state = get_message_text(language, _debt_state_label((reseller_data or {}).get("debt_state", "active")))
     stats = _reseller_financial_stats(reseller_data)
-    return get_message_text(language, "admin_reseller_details_extended").format(
+    details = get_message_text(language, "admin_reseller_details_extended").format(
         user_id=_escape_markdown(reseller_id),
         username_display=_escape_markdown(_username_display(language, reseller_data)),
         status=_escape_markdown(_admin_status_label(language, status)),
@@ -2337,6 +2416,7 @@ def _build_admin_reseller_detail_text(language, reseller_id, reseller_data):
         last_payment_at=_escape_markdown((reseller_data or {}).get("last_payment_at", "N/A")),
         debt_since=_escape_markdown((reseller_data or {}).get("debt_since", "N/A")),
     )
+    return details + "\n\n" + build_reseller_level_compact(language, reseller_data)
 
 
 def _build_admin_reseller_detail_markup(language, reseller_id, reseller_data, return_status, return_page):
@@ -2491,6 +2571,8 @@ def _send_reseller_status_notification(reseller_id, action, fallback_language):
         bot.send_message(int(reseller_id), get_message_text(target_language, key))
     except Exception:
         pass
+    if action == "approve":
+        present_pending_reseller_level(bot, int(reseller_id), target_language)
 
 
 def _apply_admin_reseller_status_action(reseller_id, target_action):
@@ -3054,6 +3136,7 @@ def handle_admin_reseller_ui(call):
                 bot.send_message(int(reseller_id), get_message_text(target_language, "reseller_approved_notification"))
             except:
                 pass
+            present_pending_reseller_level(bot, int(reseller_id), target_language)
         elif target_action == "reject":
             update_reseller_status(reseller_id, "rejected")
             target_language = get_user_language(int(reseller_id)) if str(reseller_id).isdigit() else language
@@ -3198,8 +3281,8 @@ def handle_admin_reseller_ui(call):
 
         payment_id = _create_manual_payment_audit_record(reseller_id, call.from_user.id, normalized, notify_user)
         if notify_user and str(reseller_id).isdigit():
+            user_language = get_user_language(int(reseller_id))
             try:
-                user_language = get_user_language(int(reseller_id))
                 bot.send_message(
                     int(reseller_id),
                     get_message_text(user_language, "reseller_manual_payment_recorded").format(
@@ -3209,6 +3292,12 @@ def handle_admin_reseller_ui(call):
                 )
             except Exception:
                 pass
+            present_pending_reseller_level(
+                bot,
+                int(reseller_id),
+                user_language,
+                allow_introduction=False,
+            )
 
         bot.answer_callback_query(
             call.id,

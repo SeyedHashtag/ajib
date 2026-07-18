@@ -161,12 +161,21 @@ def update_settings(reseller_id, updates):
         return dict(settings)
 
 
-def calculate_quote(wholesale, markup_percent, referral_margin_percent=0, referred=False):
+def calculate_quote(
+    wholesale,
+    markup_percent,
+    referral_margin_percent=0,
+    referred=False,
+    retail_base=None,
+):
     wholesale_amount = _money(wholesale)
     if wholesale_amount < 0:
         raise ValueError("Wholesale price cannot be negative")
+    retail_base_amount = _money(wholesale if retail_base is None else retail_base)
+    if retail_base_amount < 0:
+        raise ValueError("Retail base price cannot be negative")
     markup = Decimal(str(_finite_setting(markup_percent or 0, "markup percentage", 0, 1000)))
-    retail = _money(wholesale_amount * (Decimal("1") + markup / Decimal("100")))
+    retail = _money(retail_base_amount * (Decimal("1") + markup / Decimal("100")))
     collected = _money(retail * (Decimal("1") - CRYPTO_DISCOUNT_PERCENT / Decimal("100")))
     margin = _money(collected - wholesale_amount)
     card_margin = _money(retail - wholesale_amount)
@@ -178,6 +187,7 @@ def calculate_quote(wholesale, markup_percent, referral_margin_percent=0, referr
     card_referral_reward = _money(max(Decimal("0"), card_margin) * referral_rate / Decimal("100"))
     return {
         "wholesale": float(wholesale_amount),
+        "retail_base": float(retail_base_amount),
         "retail": float(retail),
         "crypto_collected": float(collected),
         "crypto_margin": float(margin),

@@ -188,6 +188,15 @@ def install_stubs():
         ) or 0.0),
     )
     reseller_stub.get_reseller_trust_limit = lambda total_paid: min(30.0, 5.0 + int(float(total_paid or 0.0) // 10.0) * 5.0)
+    reseller_stub.get_reseller_level_summary = lambda data: {
+        "level": min(6, 1 + int(reseller_stub.get_reseller_total_paid(data) // 10)),
+        "discount_percent": min(25, 20 + int(reseller_stub.get_reseller_total_paid(data) // 10)),
+    }
+    reseller_stub.calculate_reseller_wholesale_price = lambda price, data: round(
+        float(price)
+        * (1 - reseller_stub.get_reseller_level_summary(data)["discount_percent"] / 100),
+        2,
+    )
     reseller_stub.can_reseller_add_debt = lambda data, amount: (
         float(data.get("debt", 0.0)) + float(amount or 0.0) <= reseller_stub.get_reseller_trust_limit(reseller_stub.get_reseller_total_paid(data)),
         reseller_stub.get_reseller_trust_limit(reseller_stub.get_reseller_total_paid(data)),
@@ -211,6 +220,13 @@ def install_stubs():
     reseller_stub.DEBT_WARNING_THRESHOLD = 20.0
     reseller_stub.SUSPENDED_REASON_UNBAN_GRACE = "unban_grace"
     sys.modules["utils.reseller"] = reseller_stub
+
+    level_ui_stub = types.ModuleType("utils.reseller_level_ui")
+    level_ui_stub.build_reseller_level_compact = lambda language, data: "Level"
+    level_ui_stub.build_reseller_level_profile = lambda *args, **kwargs: "Profile"
+    level_ui_stub.build_reseller_level_roadmap = lambda language, data: "Roadmap"
+    level_ui_stub.present_pending_reseller_level = lambda *args, **kwargs: False
+    sys.modules["utils.reseller_level_ui"] = level_ui_stub
 
     edit_plans_stub = types.ModuleType("utils.edit_plans")
     edit_plans_stub.load_plans = lambda: {}

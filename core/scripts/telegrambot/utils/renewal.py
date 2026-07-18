@@ -249,7 +249,17 @@ def _live_quota_matches_plan(user_data, plan_gb):
     return abs(live_gb - _safe_float(plan_gb)) <= 0.01
 
 
-def _build_offer(record, source, username, server_id, api_client, user_data, plans, extra=None):
+def _build_offer(
+    record,
+    source,
+    username,
+    server_id,
+    api_client,
+    user_data,
+    plans,
+    extra=None,
+    reseller_data=None,
+):
     if not api_client or not user_data:
         return {
             'eligible': False,
@@ -291,9 +301,20 @@ def _build_offer(record, source, username, server_id, api_client, user_data, pla
             'before_state': capture_user_state(user_data),
         }
 
-    price = _safe_float(plan.get('price'))
+    full_price = _safe_float(plan.get('price'))
+    price = full_price
+    reseller_level = None
+    discount_percent = None
     if source == 'reseller_customer':
-        price = price * 0.8
+        from utils.reseller import (
+            calculate_reseller_wholesale_price,
+            get_reseller_level_summary,
+        )
+
+        level_summary = get_reseller_level_summary(reseller_data or {})
+        reseller_level = level_summary['level']
+        discount_percent = level_summary['discount_percent']
+        price = calculate_reseller_wholesale_price(full_price, reseller_data or {})
 
     offer = {
         'eligible': True,
@@ -305,7 +326,9 @@ def _build_offer(record, source, username, server_id, api_client, user_data, pla
         'days': _safe_int(plan.get('days'), 0),
         'unlimited': _safe_bool(plan.get('unlimited', False)),
         'price': price,
-        'full_price': _safe_float(plan.get('price')),
+        'full_price': full_price,
+        'reseller_level': reseller_level,
+        'discount_percent': discount_percent,
         'plan': plan,
         'before_state': capture_user_state(user_data),
         'expected_after_state': expected_after_state(plan_gb, plan.get('days')),
@@ -434,6 +457,7 @@ def find_reseller_renewal_offer(reseller_id, config_index, api_client, user_data
             'config_index': config_index,
             'config': config,
         },
+        reseller_data=reseller_data,
     )
 
 
@@ -480,6 +504,9 @@ def reseller_renewal_record(offer, before_state, after_state):
     return {
         'timestamp': _now_str(),
         'price': offer.get('price'),
+        'list_price': offer.get('full_price'),
+        'reseller_level': offer.get('reseller_level'),
+        'discount_percent': offer.get('discount_percent'),
         'gb': offer.get('plan_gb'),
         'days': offer.get('days'),
         'unlimited': offer.get('unlimited', False),
@@ -596,6 +623,9 @@ def format_renewal_offer(language, offer, include_payment_prompt=True):
         plan_gb=offer.get('plan_gb'),
         days=offer.get('days'),
         price=format_usd_amount(offer.get('price', 0)),
+        list_price=format_usd_amount(offer.get('full_price', offer.get('price', 0))),
+        reseller_level=offer.get('reseller_level') or 1,
+        discount_percent=offer.get('discount_percent') or 0,
         before=before,
         after=after,
         payment_prompt=payment_prompt,

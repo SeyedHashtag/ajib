@@ -257,6 +257,15 @@ def install_common_stubs(bot, payment_records):
         float(data.get("total_paid", sum(float(config.get("price", 0.0)) for config in data.get("configs", [])) - float(data.get("debt", 0.0))) or 0.0),
     )
     reseller_stub.get_reseller_trust_limit = lambda total_paid: min(30.0, 5.0 + int(float(total_paid or 0.0) // 10.0) * 5.0)
+    reseller_stub.get_reseller_level_summary = lambda data: {
+        "level": min(6, 1 + int(reseller_stub.get_reseller_total_paid(data) // 10)),
+        "discount_percent": min(25, 20 + int(reseller_stub.get_reseller_total_paid(data) // 10)),
+    }
+    reseller_stub.calculate_reseller_wholesale_price = lambda price, data: round(
+        float(price)
+        * (1 - reseller_stub.get_reseller_level_summary(data)["discount_percent"] / 100),
+        2,
+    )
     reseller_stub.can_reseller_add_debt = lambda data, amount: (
         float(data.get("debt", 0.0)) + float(amount or 0.0) <= reseller_stub.get_reseller_trust_limit(reseller_stub.get_reseller_total_paid(data)),
         reseller_stub.get_reseller_trust_limit(reseller_stub.get_reseller_total_paid(data)),
@@ -285,6 +294,13 @@ def install_common_stubs(bot, payment_records):
     reseller_stub.get_banned_reseller_cleanup_candidates = lambda reseller_data: []
     reseller_stub.cleanup_banned_reseller_users = lambda user_id, multi_api: (True, {})
     sys.modules["utils.reseller"] = reseller_stub
+
+    level_ui_stub = types.ModuleType("utils.reseller_level_ui")
+    level_ui_stub.build_reseller_level_compact = lambda language, data: "Level"
+    level_ui_stub.build_reseller_level_profile = lambda *args, **kwargs: "Profile"
+    level_ui_stub.build_reseller_level_roadmap = lambda language, data: "Roadmap"
+    level_ui_stub.present_pending_reseller_level = lambda *args, **kwargs: False
+    sys.modules["utils.reseller_level_ui"] = level_ui_stub
 
     currency_stub = types.ModuleType("utils.currency_format")
     currency_stub.format_toman_amount = lambda value: str(int(round(float(value))))
@@ -1353,7 +1369,7 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         reseller_handlers.handle_reseller_buy(make_call("reseller:buy:5"))
 
         message = bot.edited_messages[0][0][0]
-        self.assertIn("Debt $8.00 -> $10.00", message)
+        self.assertIn("Debt $8.00 -> $9.98", message)
         self.assertIn("Limit $10.00", message)
         self.assertNotIn("Trust limit exceeded", message)
 
@@ -1375,6 +1391,34 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         self.assertIn("Trust limit exceeded", message)
         self.assertIn("limit $30.00", message)
         self.assertIn("credit $1.00", message)
+
+    def test_level_six_purchase_locks_discount_metadata_at_confirmation(self):
+        bot = DummyBot()
+        purchase_plan = load_purchase_plan(bot, [])
+        reseller_handlers = load_reseller_handlers(purchase_plan)
+        reseller_handlers.load_plans = lambda: {
+            "5": {
+                "price": 10.0,
+                "days": 30,
+                "unlimited": False,
+            }
+        }
+        reseller_handlers.get_reseller_data = lambda _user_id: {
+            "status": "approved",
+            "debt": 0.0,
+            "total_paid": 50.0,
+            "configs": [],
+        }
+
+        reseller_handlers.handle_reseller_confirm_buy(
+            make_call("reseller:confirm_buy:5")
+        )
+
+        locked = purchase_plan.user_data[1988]
+        self.assertEqual(locked["list_price"], 10.0)
+        self.assertEqual(locked["price"], 7.5)
+        self.assertEqual(locked["reseller_level"], 6)
+        self.assertEqual(locked["discount_percent"], 25)
 
     def test_old_crypto_settlement_record_credits_original_amount(self):
         purchase_plan = load_purchase_plan()
@@ -1588,7 +1632,19 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
             "purchase_connection_warning": "\n\nVPN warning",
         }.get(key, key)
 
-        details = reseller_handlers._build_reseller_purchase_details("en", "40", 30, 80.0, 10.0, 30.0)
+        details = reseller_handlers._build_reseller_purchase_details(
+            "en",
+            "40",
+            30,
+            {
+                "list_price": 100.0,
+                "price": 80.0,
+                "level": 1,
+                "discount_percent": 20,
+            },
+            10.0,
+            30.0,
+        )
 
         self.assertIn("Plan 40 costs $80.00.", details)
         self.assertIn("VPN warning", details)

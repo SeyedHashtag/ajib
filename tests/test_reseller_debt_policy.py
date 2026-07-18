@@ -50,6 +50,100 @@ class ResellerDebtPolicyTests(unittest.TestCase):
             with self.subTest(total_paid=total_paid):
                 self.assertEqual(self.reseller.get_reseller_trust_limit(total_paid), expected_limit)
 
+    def test_reseller_levels_discount_and_progress_share_trust_thresholds(self):
+        cases = [
+            (0.0, 1, 20, 5.0, 10.0),
+            (9.99, 1, 20, 5.0, 0.01),
+            (10.0, 2, 21, 10.0, 10.0),
+            (20.0, 3, 22, 15.0, 10.0),
+            (30.0, 4, 23, 20.0, 10.0),
+            (40.0, 5, 24, 25.0, 10.0),
+            (50.0, 6, 25, 30.0, 0.0),
+            (200.0, 6, 25, 30.0, 0.0),
+        ]
+
+        for total_paid, level, discount, trust_limit, amount_to_next in cases:
+            with self.subTest(total_paid=total_paid):
+                summary = self.reseller.get_reseller_level_summary(
+                    {"total_paid": total_paid}
+                )
+                self.assertEqual(summary["level"], level)
+                self.assertEqual(summary["discount_percent"], discount)
+                self.assertEqual(summary["trust_limit"], trust_limit)
+                self.assertAlmostEqual(summary["amount_to_next"], amount_to_next)
+
+        for invalid_total in (-10, float("nan"), float("inf"), "invalid"):
+            with self.subTest(invalid_total=invalid_total):
+                summary = self.reseller.get_reseller_level_summary({
+                    "total_paid": invalid_total,
+                })
+                self.assertEqual(summary["level"], 1)
+                self.assertEqual(summary["discount_percent"], 20)
+
+    def test_reseller_wholesale_prices_use_level_discount_and_half_up_cents(self):
+        self.assertEqual(
+            self.reseller.calculate_reseller_wholesale_price(
+                1.25625,
+                {"total_paid": 0},
+            ),
+            1.01,
+        )
+        self.assertEqual(
+            self.reseller.calculate_reseller_wholesale_price(
+                100,
+                {"total_paid": 50},
+            ),
+            75.0,
+        )
+        with self.assertRaises(ValueError):
+            self.reseller.calculate_reseller_wholesale_price(
+                -1,
+                {"total_paid": 0},
+            )
+
+    def test_level_presentation_claim_is_atomic_releasable_and_completable(self):
+        self.write_resellers({
+            "1988": {
+                "status": "approved",
+                "debt": 0,
+                "total_paid": 20,
+                "configs": [],
+            }
+        })
+
+        first = self.reseller.claim_reseller_level_presentation("1988")
+        duplicate = self.reseller.claim_reseller_level_presentation("1988")
+
+        self.assertEqual(first["kind"], "introduction")
+        self.assertEqual(first["summary"]["level"], 3)
+        self.assertIsNone(duplicate)
+
+        self.assertTrue(
+            self.reseller.release_reseller_level_presentation(
+                "1988",
+                first["id"],
+            )
+        )
+        retry = self.reseller.claim_reseller_level_presentation("1988")
+        self.assertNotEqual(retry["id"], first["id"])
+        self.assertTrue(
+            self.reseller.complete_reseller_level_presentation(
+                "1988",
+                retry["id"],
+            )
+        )
+        self.assertIsNone(
+            self.reseller.claim_reseller_level_presentation("1988")
+        )
+
+        saved = self.read_resellers()["1988"]
+        saved["total_paid"] = 50
+        self.write_resellers({"1988": saved})
+        level_up = self.reseller.claim_reseller_level_presentation("1988")
+        self.assertEqual(level_up["kind"], "level_up")
+        self.assertEqual(level_up["from_level"], 3)
+        self.assertEqual(level_up["summary"]["level"], 6)
+
     def test_missing_total_paid_is_derived_from_legacy_turnover_minus_debt(self):
         self.write_resellers({
             "1988": {

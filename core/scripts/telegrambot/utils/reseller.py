@@ -1,8 +1,11 @@
 import json
+import math
 import os
 import threading
+import uuid
 from datetime import datetime, timedelta
 from contextlib import contextmanager
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 try:
     import fcntl
@@ -37,6 +40,15 @@ RESELLER_TRUST_START_LIMIT = 5.0
 RESELLER_TRUST_LIMIT_STEP = 5.0
 RESELLER_TRUST_PAID_STEP = 10.0
 RESELLER_TRUST_MAX_LIMIT = 30.0
+RESELLER_LEVEL_COUNT = 6
+RESELLER_BASE_DISCOUNT_PERCENT = 20
+RESELLER_DISCOUNT_STEP_PERCENT = 1
+RESELLER_LEVEL_ICONS = ('🌱', '🥉', '🥈', '🥇', '💎', '👑')
+RESELLER_LEVEL_PRESENTATION_LEASE_SECONDS = max(
+    30.0,
+    _safe_float_env('RESELLER_LEVEL_PRESENTATION_LEASE_SECONDS', 300.0),
+)
+MONEY_QUANTUM = Decimal('0.01')
 
 
 def _safe_float(value, default=0.0):
@@ -44,6 +56,11 @@ def _safe_float(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _safe_nonnegative_float(value):
+    amount = _safe_float(value, 0.0)
+    return amount if math.isfinite(amount) and amount > 0 else 0.0
 
 
 def get_reseller_config_value(config):
@@ -73,16 +90,79 @@ def _reseller_config_total(record):
 def get_reseller_total_paid(record):
     data = record or {}
     if 'total_paid' in data:
-        return max(0.0, _safe_float(data.get('total_paid', 0.0)))
+        return _safe_nonnegative_float(data.get('total_paid', 0.0))
     debt = _safe_float(data.get('debt', 0.0))
-    return max(0.0, _reseller_config_total(data) - debt)
+    return _safe_nonnegative_float(_reseller_config_total(data) - debt)
+
+
+def get_reseller_level(total_paid):
+    paid_amount = _safe_nonnegative_float(total_paid)
+    paid_steps = int(paid_amount // RESELLER_TRUST_PAID_STEP)
+    return min(RESELLER_LEVEL_COUNT, paid_steps + 1)
+
+
+def get_reseller_discount_percent(total_paid):
+    level = get_reseller_level(total_paid)
+    return RESELLER_BASE_DISCOUNT_PERCENT + ((level - 1) * RESELLER_DISCOUNT_STEP_PERCENT)
 
 
 def get_reseller_trust_limit(total_paid):
-    paid_amount = max(0.0, _safe_float(total_paid, 0.0))
-    paid_steps = int(paid_amount // RESELLER_TRUST_PAID_STEP)
-    limit = RESELLER_TRUST_START_LIMIT + (paid_steps * RESELLER_TRUST_LIMIT_STEP)
+    level = get_reseller_level(total_paid)
+    limit = RESELLER_TRUST_START_LIMIT + ((level - 1) * RESELLER_TRUST_LIMIT_STEP)
     return min(RESELLER_TRUST_MAX_LIMIT, limit)
+
+
+def get_reseller_level_summary(record):
+    total_paid = get_reseller_total_paid(record)
+    level = get_reseller_level(total_paid)
+    discount_percent = get_reseller_discount_percent(total_paid)
+    trust_limit = get_reseller_trust_limit(total_paid)
+    current_threshold = (level - 1) * RESELLER_TRUST_PAID_STEP
+    next_threshold = (
+        level * RESELLER_TRUST_PAID_STEP
+        if level < RESELLER_LEVEL_COUNT
+        else None
+    )
+    if next_threshold is None:
+        progress_amount = RESELLER_TRUST_PAID_STEP
+        amount_to_next = 0.0
+        progress_fraction = 1.0
+    else:
+        progress_amount = min(
+            RESELLER_TRUST_PAID_STEP,
+            max(0.0, total_paid - current_threshold),
+        )
+        amount_to_next = max(0.0, next_threshold - total_paid)
+        progress_fraction = progress_amount / RESELLER_TRUST_PAID_STEP
+    progress_segments = min(10, max(0, int(progress_fraction * 10)))
+    return {
+        'level': level,
+        'level_count': RESELLER_LEVEL_COUNT,
+        'icon': RESELLER_LEVEL_ICONS[level - 1],
+        'discount_percent': discount_percent,
+        'trust_limit': trust_limit,
+        'total_paid': total_paid,
+        'current_threshold': current_threshold,
+        'next_level': level + 1 if next_threshold is not None else None,
+        'next_threshold': next_threshold,
+        'amount_to_next': round(amount_to_next, 2),
+        'progress_amount': round(progress_amount, 2),
+        'progress_fraction': progress_fraction,
+        'progress_segments': progress_segments,
+        'is_max_level': level == RESELLER_LEVEL_COUNT,
+    }
+
+
+def calculate_reseller_wholesale_price(list_price, record):
+    try:
+        amount = Decimal(str(list_price))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError('Invalid reseller list price')
+    if not amount.is_finite() or amount < 0:
+        raise ValueError('Invalid reseller list price')
+    discount = Decimal(str(get_reseller_level_summary(record)['discount_percent']))
+    wholesale = amount * (Decimal('1') - (discount / Decimal('100')))
+    return float(wholesale.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP))
 
 
 def get_reseller_available_credit(record):
@@ -216,6 +296,16 @@ def _ensure_reseller_defaults(record):
     data.setdefault('debt_last_reminded_at', None)
     data.setdefault('debt_last_admin_alert_level', 'none')
     data.setdefault('debt_last_admin_alert_at', None)
+    try:
+        presented_level = int(data.get('last_presented_reseller_level', 0) or 0)
+    except (TypeError, ValueError):
+        presented_level = 0
+    data['last_presented_reseller_level'] = min(
+        RESELLER_LEVEL_COUNT,
+        max(0, presented_level),
+    )
+    if not isinstance(data.get('reseller_level_presentation_claim'), dict):
+        data['reseller_level_presentation_claim'] = None
 
     if debt >= DEBT_SETTLEMENT_THRESHOLD and not data.get('debt_since'):
         data['debt_since'] = _now_str()
@@ -270,6 +360,92 @@ def get_all_resellers():
     for rid, data in resellers.items():
         normalized[str(rid)] = _ensure_reseller_defaults(data)
     return normalized
+
+
+def claim_reseller_level_presentation(user_id, lease_seconds=None):
+    user_id = str(user_id)
+    lease = max(
+        1.0,
+        _safe_float(
+            lease_seconds,
+            RESELLER_LEVEL_PRESENTATION_LEASE_SECONDS,
+        ),
+    )
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                if user_id not in resellers:
+                    return None
+                current = _ensure_reseller_defaults(resellers[user_id])
+                summary = get_reseller_level_summary(current)
+                presented_level = current.get('last_presented_reseller_level', 0)
+                if presented_level >= summary['level']:
+                    return None
+
+                existing_claim = current.get('reseller_level_presentation_claim')
+                if isinstance(existing_claim, dict):
+                    claimed_at = _parse_time(existing_claim.get('claimed_at'))
+                    claim_age = lease
+                    if claimed_at is not None:
+                        elapsed = (datetime.now() - claimed_at).total_seconds()
+                        claim_age = elapsed if elapsed >= 0 else lease
+                    try:
+                        existing_level = int(existing_claim.get('level', 0) or 0)
+                    except (TypeError, ValueError):
+                        existing_level = 0
+                    if claim_age < lease and existing_level >= summary['level']:
+                        return None
+
+                claim = {
+                    'id': uuid.uuid4().hex,
+                    'level': summary['level'],
+                    'from_level': presented_level,
+                    'kind': 'introduction' if presented_level == 0 else 'level_up',
+                    'claimed_at': _now_str(),
+                }
+                current['reseller_level_presentation_claim'] = claim
+                resellers[user_id] = current
+                _write_resellers_file(resellers)
+                return {**claim, 'summary': summary}
+        except Exception:
+            return None
+
+
+def complete_reseller_level_presentation(user_id, claim_id):
+    return _finish_reseller_level_presentation(user_id, claim_id, completed=True)
+
+
+def release_reseller_level_presentation(user_id, claim_id):
+    return _finish_reseller_level_presentation(user_id, claim_id, completed=False)
+
+
+def _finish_reseller_level_presentation(user_id, claim_id, completed):
+    user_id = str(user_id)
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                if user_id not in resellers:
+                    return False
+                current = _ensure_reseller_defaults(resellers[user_id])
+                claim = current.get('reseller_level_presentation_claim')
+                if not isinstance(claim, dict) or claim.get('id') != str(claim_id):
+                    return False
+                if completed:
+                    current['last_presented_reseller_level'] = max(
+                        current.get('last_presented_reseller_level', 0),
+                        min(
+                            RESELLER_LEVEL_COUNT,
+                            int(claim.get('level', 0) or 0),
+                        ),
+                    )
+                current['reseller_level_presentation_claim'] = None
+                resellers[user_id] = current
+                _write_resellers_file(resellers)
+                return True
+        except Exception:
+            return False
 
 
 def update_reseller_status(user_id, status, telegram_username=None, suspended_reason=None):
