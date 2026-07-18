@@ -620,23 +620,36 @@ class MultiServerAPI:
                     state["load_ratio"] = state["active_count"] / weight
                 break
 
-    def create_user_with_retry(self, username_allocator, creator, fallback_client: APIClient | None = None):
+    def create_user_with_retry(
+        self,
+        username_allocator,
+        creator,
+        fallback_client: APIClient | None = None,
+        on_username_allocated=None,
+        reuse_username_on_retry: bool = False,
+    ):
         with self.__class__._creation_write_lock:
             last_username = None
             last_client = None
 
             for attempt in range(2):
-                creation = self.prepare_new_user_creation(force_refresh=attempt > 0)
-                target_client = creation.get("client") or fallback_client
-                if target_client is None:
-                    return None, None, None
+                if attempt > 0 and reuse_username_on_retry and last_client is not None:
+                    target_client = last_client
+                    username = last_username
+                else:
+                    creation = self.prepare_new_user_creation(force_refresh=attempt > 0)
+                    target_client = creation.get("client") or fallback_client
+                    if target_client is None:
+                        return None, None, None
 
-                existing_usernames = set(creation.get("existing_usernames") or set())
-                if not existing_usernames and fallback_client is not None and target_client is fallback_client:
-                    users = fallback_client.get_users()
-                    existing_usernames = self.extract_usernames(users)
+                    existing_usernames = set(creation.get("existing_usernames") or set())
+                    if not existing_usernames and fallback_client is not None and target_client is fallback_client:
+                        users = fallback_client.get_users()
+                        existing_usernames = self.extract_usernames(users)
 
-                username = username_allocator(existing_usernames)
+                    username = username_allocator(existing_usernames)
+                if on_username_allocated is not None:
+                    on_username_allocated(username, target_client)
                 result = creator(target_client, username)
                 last_username = username
                 last_client = target_client

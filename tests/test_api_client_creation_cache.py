@@ -256,6 +256,56 @@ class MultiServerCreationCacheTests(unittest.TestCase):
         self.assertEqual(clients["s1"].get_users_calls, 2)
         self.assertEqual(clients["s2"].get_users_calls, 2)
 
+    def test_create_user_with_retry_persists_allocation_before_create(self):
+        clients = {"s1": FakeClient("s1", {})}
+        multi_api = self.make_multi_api(clients)
+        events = []
+
+        username, result, client = multi_api.create_user_with_retry(
+            lambda existing_usernames: "hs7",
+            lambda target_client, allocated: (
+                events.append(("create", allocated, target_client.server_id))
+                or target_client.add_user(allocated, 1, 30)
+            ),
+            on_username_allocated=lambda allocated, target_client: events.append(
+                ("persist", allocated, target_client.server_id)
+            ),
+        )
+
+        self.assertEqual(username, "hs7")
+        self.assertEqual(result, {"created": True})
+        self.assertEqual(client.server_id, "s1")
+        self.assertEqual(events, [
+            ("persist", "hs7", "s1"),
+            ("create", "hs7", "s1"),
+        ])
+
+    def test_create_user_with_retry_can_reuse_persisted_username(self):
+        clients = {
+            "s1": FakeClient("s1", {}, add_results=[None, {"created": True}]),
+        }
+        multi_api = self.make_multi_api(clients)
+        candidates = iter(("hs7", "hs7a"))
+        persisted = []
+
+        username, result, client = multi_api.create_user_with_retry(
+            lambda existing_usernames: next(candidates),
+            lambda target_client, allocated: target_client.add_user(allocated, 1, 30),
+            on_username_allocated=lambda allocated, target_client: persisted.append(
+                (allocated, target_client.server_id)
+            ),
+            reuse_username_on_retry=True,
+        )
+
+        self.assertEqual(username, "hs7")
+        self.assertEqual(result, {"created": True})
+        self.assertEqual(client.server_id, "s1")
+        self.assertEqual(
+            [call["username"] for call in clients["s1"].add_user_calls],
+            ["hs7", "hs7"],
+        )
+        self.assertEqual(persisted, [("hs7", "s1"), ("hs7", "s1")])
+
     def test_iter_all_users_can_exclude_disabled_servers_and_default_includes_them(self):
         clients = {
             "s1": FakeClient("s1", {"active": {"blocked": False}}),

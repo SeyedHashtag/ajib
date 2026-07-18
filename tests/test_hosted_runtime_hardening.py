@@ -130,6 +130,100 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
         self.assertIn("RuntimeError", detail)
         self.assertEqual(self.worker._tenant_payments()["payment"]["status"], "paid_provision_failed")
 
+    def test_paid_provisioning_persists_hs_allocation_before_vpn_creation(self):
+        record = {
+            "user_id": 100,
+            "telegram_username": "buyer",
+            "plan_gb": "30",
+            "days": 30,
+            "wholesale_price": 5,
+            "retail_price": 6,
+            "margin": 1,
+            "referral_reward": 0,
+        }
+        client = mock.Mock(server_id="server-1")
+
+        def create_user(plan, note, **kwargs):
+            self.assertEqual(note, "")
+            self.assertEqual(kwargs["customer_id"], 100)
+            self.assertEqual(kwargs["operation_id"], "order")
+            self.assertEqual(kwargs["username_prefix"], "hs")
+            kwargs["on_username_allocated"]("hs7", client)
+            pending = self.worker._tenant_payments()["order"]
+            self.assertEqual(pending["provisioned_username"], "hs7")
+            self.assertEqual(pending["provisioned_server_id"], "server-1")
+            return "hs7", {"created": True}, client
+
+        with (
+            mock.patch.object(self.worker, "get_reseller_data", return_value={"configs": []}),
+            mock.patch.object(self.worker, "_create_user", side_effect=create_user),
+            mock.patch.object(self.worker, "record_funded_reseller_config", return_value=True),
+            mock.patch.object(self.worker, "credit_crypto_sale", return_value=True),
+            mock.patch.object(self.worker, "_deliver_config_safely", return_value=True),
+        ):
+            success, username = self.worker._provision_payment("order", record, funded=True)
+
+        completed = self.worker._tenant_payments()["order"]
+        self.assertTrue(success)
+        self.assertEqual(username, "hs7")
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["provisioned_username"], "hs7")
+        self.assertEqual(completed["provisioned_server_id"], "server-1")
+
+    def test_stale_hosted_test_recovers_persisted_ht_allocation(self):
+        message = mock.Mock()
+        message.from_user.id = 100
+        message.chat.id = 100
+        client = mock.Mock(server_id="server-1")
+
+        def interrupted_create(plan, note, **kwargs):
+            self.assertEqual(note, "")
+            self.assertEqual(kwargs["customer_id"], 100)
+            self.assertEqual(kwargs["username_prefix"], "ht")
+            kwargs["on_username_allocated"]("ht7", client)
+            raise RuntimeError("simulated worker crash")
+
+        with (
+            mock.patch.object(self.worker, "_create_user", side_effect=interrupted_create),
+            mock.patch.object(self.worker.bot, "reply_to"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated worker crash"):
+                self.worker.free_test(message)
+
+        with self.worker.locked_json(self.worker.GLOBAL_TEST_FILE, {}) as tests:
+            pending = tests["100"]
+            self.assertEqual(pending["username"], "ht7")
+            self.assertEqual(pending["server_id"], "server-1")
+            pending["creation_pending_at"] = (
+                datetime.now()
+                - timedelta(seconds=self.worker.TEST_CREATION_LEASE_SECONDS + 1)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+
+        live = {"username": "ht7"}
+
+        class RecoveryMultiServerAPI:
+            def find_user(self, username, preferred_server_id=None):
+                self_test.assertEqual(username, "ht7")
+                self_test.assertEqual(preferred_server_id, "server-1")
+                return client, live
+
+        self_test = self
+        with (
+            mock.patch.object(self.worker, "MultiServerAPI", RecoveryMultiServerAPI),
+            mock.patch.object(self.worker, "_create_user") as create_user,
+            mock.patch.object(self.worker, "_deliver_config_safely") as deliver,
+            mock.patch.object(self.worker.bot, "reply_to"),
+        ):
+            self.worker.free_test(message)
+
+        create_user.assert_not_called()
+        deliver.assert_called_once_with(100, "ht7", client)
+        recovered = self.worker.read_json(self.worker.GLOBAL_TEST_FILE, {})["100"]
+        self.assertEqual(recovered["username"], "ht7")
+        self.assertEqual(recovered["server_id"], "server-1")
+        self.assertIsNone(recovered["creation_pending_at"])
+        self.assertTrue(recovered["used_at"])
+
     def test_renewal_tokens_survive_process_memory_and_are_user_bound(self):
         token = self.worker._store_renewal_token(100, {"username": "customer", "server_id": "a"})
 

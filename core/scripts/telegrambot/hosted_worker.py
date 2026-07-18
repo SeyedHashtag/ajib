@@ -593,30 +593,43 @@ def _credit_referral(order_id, customer_id, reward):
     return float(reward)
 
 
-def _operation_username(operation_id):
-    suffix = "".join(character for character in str(operation_id) if character.isalnum())[:12]
-    return f"h{OWNER_ID}{suffix}" if suffix else None
-
-
-def _create_user(plan, note, customer_id=None, operation_id=None):
+def _create_user(
+    plan,
+    note,
+    customer_id=None,
+    operation_id=None,
+    username_prefix="h",
+    on_username_allocated=None,
+    preferred_username=None,
+):
     multi = MultiServerAPI()
 
     def allocate(existing):
-        operation_username = _operation_username(operation_id) if operation_id else None
-        if operation_username:
-            return operation_username
-        return allocate_username("h", OWNER_ID, existing)
+        if preferred_username:
+            return str(preferred_username)
+        return allocate_username(username_prefix, OWNER_ID, existing)
 
     def create(client, username):
         note_parts = [str(note or "").strip()]
         if customer_id is not None:
-            note_parts.append(f"Telegram user ID: u{customer_id}")
-        note_text = " | ".join(part for part in note_parts if part)
+            note_parts.append(f"customer=u{customer_id}")
+        if operation_id is not None:
+            operation_fragment = "".join(
+                character for character in str(operation_id) if character.isalnum()
+            )[:12]
+            if operation_fragment:
+                note_parts.append(f"order={operation_fragment}")
+        note_text = "; ".join(part for part in note_parts if part)
         payload = build_user_note(username, plan["gb"], plan["days"], unlimited=plan.get("unlimited", False), note_text=note_text)
         result = client.add_user(username, int(plan["gb"]), int(plan["days"]), unlimited=plan.get("unlimited", False), note=payload)
-        return result if result is not None else client.add_user(username, int(plan["gb"]), int(plan["days"]), unlimited=plan.get("unlimited", False))
+        return result
 
-    return multi.create_user_with_retry(allocate, create)
+    return multi.create_user_with_retry(
+        allocate,
+        create,
+        on_username_allocated=on_username_allocated,
+        reuse_username_on_retry=True,
+    )
 
 
 def _deliver_config(chat_id, username, client, renewed=False):
@@ -693,17 +706,26 @@ def _provision_payment(payment_id, record, funded):
             client, live = MultiServerAPI().find_user(provisioned_username,
                                                        preferred_server_id=record.get("provisioned_server_id"))
             username = provisioned_username if client and live else None
-        operation_username = _operation_username(payment_id)
-        if not username and operation_username:
-            client, live = MultiServerAPI().find_user(operation_username)
-            username = operation_username if client and live else None
         if not username:
             plan = {"gb": record["plan_gb"], "days": record["days"], "unlimited": record.get("unlimited", False)}
+
+            def persist_allocation(allocated_username, allocated_client):
+                _save_payment(
+                    payment_id,
+                    {
+                        "provisioned_username": allocated_username,
+                        "provisioned_server_id": getattr(allocated_client, "server_id", None),
+                    },
+                )
+
             username, result, client = _create_user(
                 plan,
-                f"hosted reseller {OWNER_ID}",
+                "",
                 customer_id=customer_id,
                 operation_id=payment_id,
+                username_prefix="hs",
+                on_username_allocated=persist_allocation,
+                preferred_username=provisioned_username,
             )
             if result is None:
                 return False, "VPN user creation failed"
@@ -1245,6 +1267,8 @@ def downloads(message):
 @bot.message_handler(func=lambda m: m.text in _all_button_values("test_config", "🎁 Test Config"))
 def free_test(message):
     recovering_pending_test = False
+    pending_username = None
+    pending_server_id = None
     with locked_json(GLOBAL_TEST_FILE, {}) as tests:
         key = str(message.from_user.id)
         if key in tests:
@@ -1255,29 +1279,51 @@ def free_test(message):
                 and existing.get("creation_pending_at")
                 and (pending_at is None or (datetime.now() - pending_at).total_seconds() >= TEST_CREATION_LEASE_SECONDS)
                 and str(existing.get("reseller_id")) == str(OWNER_ID)
-                and not existing.get("username")
+                and not existing.get("used_at")
             )
             if not pending_is_stale:
                 bot.reply_to(message, "You have already used a free test on this infrastructure.")
                 return
             recovering_pending_test = True
-        tests[key] = {"telegram_id": message.from_user.id, "creation_pending_at": _now(),
-                      "origin_bot_id": os.getenv("AJIB_HOSTED_BOT_ID"), "reseller_id": str(OWNER_ID)}
+            pending_username = existing.get("username")
+            pending_server_id = existing.get("server_id")
+        tests[key] = {
+            **(dict(existing) if recovering_pending_test else {}),
+            "telegram_id": message.from_user.id,
+            "creation_pending_at": _now(),
+            "origin_bot_id": os.getenv("AJIB_HOSTED_BOT_ID"),
+            "reseller_id": str(OWNER_ID),
+        }
     plan = {"gb": 1, "days": 30, "unlimited": False}
-    operation_id = f"test{message.from_user.id}"
-    username = _operation_username(operation_id) if recovering_pending_test else None
-    client, live = MultiServerAPI().find_user(username) if username else (None, None)
+    username = pending_username
+    client, live = (
+        MultiServerAPI().find_user(username, preferred_server_id=pending_server_id)
+        if username
+        else (None, None)
+    )
     result = live if recovering_pending_test else None
     if not client or not live:
+        def persist_test_allocation(allocated_username, allocated_client):
+            with locked_json(GLOBAL_TEST_FILE, {}) as tests:
+                current = tests.get(str(message.from_user.id))
+                if not isinstance(current, dict) or not current.get("creation_pending_at"):
+                    raise RuntimeError("Hosted test creation claim is missing")
+                current["username"] = allocated_username
+                current["server_id"] = getattr(allocated_client, "server_id", None)
+
         username, result, client = _create_user(
             plan,
-            f"hosted test {OWNER_ID}",
+            "",
             customer_id=message.from_user.id,
-            operation_id=operation_id,
+            username_prefix="ht",
+            on_username_allocated=persist_test_allocation,
+            preferred_username=pending_username,
         )
     if result is None:
         with locked_json(GLOBAL_TEST_FILE, {}) as tests:
-            tests.pop(str(message.from_user.id), None)
+            current = tests.get(str(message.from_user.id))
+            if not isinstance(current, dict) or not current.get("username"):
+                tests.pop(str(message.from_user.id), None)
         bot.reply_to(message, "Test creation failed. Please try again later.")
         return
     with locked_json(GLOBAL_TEST_FILE, {}) as tests:

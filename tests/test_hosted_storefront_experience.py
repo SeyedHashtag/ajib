@@ -57,9 +57,23 @@ def _hosted_user_creator(existing_usernames, add_user_results=None):
     client = FakeClient()
 
     class FakeMultiServerAPI:
-        def create_user_with_retry(self, allocator, creator):
-            username = allocator(existing_usernames)
-            result = creator(client, username)
+        def create_user_with_retry(
+            self,
+            allocator,
+            creator,
+            on_username_allocated=None,
+            reuse_username_on_retry=False,
+        ):
+            result = None
+            username = None
+            for _attempt in range(2):
+                if username is None or not reuse_username_on_retry:
+                    username = allocator(existing_usernames)
+                if on_username_allocated is not None:
+                    on_username_allocated(username, client)
+                result = creator(client, username)
+                if result is not None:
+                    break
             return username, result, client
 
     def fake_build_user_note(username, traffic_limit, expiration_days, **kwargs):
@@ -136,29 +150,83 @@ class HostedStorefrontTranslationTests(unittest.TestCase):
 
 
 class HostedStorefrontParityTests(unittest.TestCase):
-    def test_hosted_usernames_are_owner_scoped_and_customer_id_moves_to_note(self):
-        base = "h5956844665"
+    def test_hosted_paid_usernames_are_reseller_scoped_and_audit_data_moves_to_note(self):
+        base = "hs5956844665"
         create_user, calls, note_texts = _hosted_user_creator({base, f"{base}a"})
+        allocations = []
 
         username, result, _client = create_user(
             {"gb": 30, "days": 30},
-            "hosted reseller 5956844665",
+            "",
             customer_id=124041600,
+            operation_id="550e8400-e29b-41d4-a716-446655440000",
+            username_prefix="hs",
+            on_username_allocated=lambda allocated, client: allocations.append(
+                (allocated, client.server_id)
+            ),
         )
 
         self.assertEqual(username, f"{base}b")
         self.assertNotIn("124041600", username)
         self.assertEqual(result, {"ok": True})
-        self.assertEqual(
-            note_texts,
-            ["hosted reseller 5956844665 | Telegram user ID: u124041600"],
-        )
+        self.assertEqual(note_texts, ["customer=u124041600; order=550e8400e29b"])
+        self.assertEqual(allocations, [(f"{base}b", "server-1")])
         self.assertEqual(calls[0][0], f"{base}b")
-        self.assertEqual(calls[0][3]["note"], "note:hosted reseller 5956844665 | Telegram user ID: u124041600")
+        self.assertEqual(
+            calls[0][3]["note"],
+            "note:customer=u124041600; order=550e8400e29b",
+        )
 
         suffixes = [""] + [chr(ord("a") + index) for index in range(26)]
         existing = {f"{base}{suffix}" for suffix in suffixes}
-        self.assertEqual(USERNAME_UTILS.allocate_username("h", 5956844665, existing), f"{base}aa")
+        self.assertEqual(USERNAME_UTILS.allocate_username("hs", 5956844665, existing), f"{base}aa")
+
+    def test_hosted_test_usernames_use_test_reseller_prefix_and_concise_note(self):
+        base = "ht5956844665"
+        create_user, calls, note_texts = _hosted_user_creator({base})
+
+        username, result, _client = create_user(
+            {"gb": 1, "days": 30},
+            "",
+            customer_id=124041600,
+            username_prefix="ht",
+        )
+
+        self.assertEqual(username, f"{base}a")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(note_texts, ["customer=u124041600"])
+        self.assertEqual(calls[0][3]["note"], "note:customer=u124041600")
+
+    def test_hosted_retry_reuses_its_previously_persisted_username(self):
+        create_user, calls, _note_texts = _hosted_user_creator({"hs5956844665"})
+
+        username, result, _client = create_user(
+            {"gb": 30, "days": 30},
+            "",
+            customer_id=124041600,
+            operation_id="550e8400-e29b-41d4-a716-446655440000",
+            username_prefix="hs",
+            preferred_username="hs5956844665",
+        )
+
+        self.assertEqual(username, "hs5956844665")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(calls[0][0], "hs5956844665")
+
+    def test_hosted_notes_keep_the_admin_edit_field_empty(self):
+        note = USERNAME_UTILS.build_user_note(
+            username="hs5956844665",
+            traffic_limit=30,
+            expiration_days=30,
+            note_text="customer=u124041600; order=550e8400e29b",
+            timestamp="2026-07-18 12:00",
+        )
+
+        self.assertEqual(
+            note,
+            "📅 2026-07-18 12:00 | 📝 customer=u124041600; "
+            "order=550e8400e29b | ✏️ ",
+        )
 
     def test_manual_hosted_user_keeps_label_without_customer_id(self):
         create_user, _calls, note_texts = _hosted_user_creator(set())
@@ -173,7 +241,7 @@ class HostedStorefrontParityTests(unittest.TestCase):
         self.assertEqual(note_texts, ["manual customer"])
         self.assertNotIn("Telegram user ID", note_texts[0])
 
-    def test_hosted_user_creation_preserves_no_note_fallback(self):
+    def test_hosted_user_creation_does_not_drop_note_after_a_failure(self):
         create_user, calls, note_texts = _hosted_user_creator(
             set(),
             add_user_results=[None, {"ok": True}],
@@ -181,15 +249,19 @@ class HostedStorefrontParityTests(unittest.TestCase):
 
         username, result, _client = create_user(
             {"gb": 1, "days": 30},
-            "hosted test 5956844665",
+            "",
             customer_id=124041600,
+            username_prefix="ht",
         )
 
-        self.assertEqual(username, "h5956844665")
+        self.assertEqual(username, "ht5956844665")
         self.assertEqual(result, {"ok": True})
-        self.assertEqual(note_texts, ["hosted test 5956844665 | Telegram user ID: u124041600"])
-        self.assertIn("note", calls[0][3])
-        self.assertNotIn("note", calls[1][3])
+        self.assertEqual(
+            note_texts,
+            ["customer=u124041600", "customer=u124041600"],
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all("note" in call[3] for call in calls))
 
     def test_hosted_customer_ids_are_passed_only_for_telegram_customer_flows(self):
         provision = ast.get_source_segment(WORKER_SOURCE, _worker_function("_provision_payment"))
@@ -197,8 +269,21 @@ class HostedStorefrontParityTests(unittest.TestCase):
         manual = ast.get_source_segment(WORKER_SOURCE, _worker_function("owner_generate_input"))
 
         self.assertIn("customer_id=customer_id", provision)
+        self.assertIn('username_prefix="hs"', provision)
+        self.assertIn("operation_id=payment_id", provision)
+        self.assertIn("preferred_username=provisioned_username", provision)
         self.assertIn("customer_id=message.from_user.id", free_test)
+        self.assertIn('username_prefix="ht"', free_test)
+        self.assertIn("preferred_username=pending_username", free_test)
+        self.assertNotIn("operation_id=", free_test)
         self.assertNotIn("customer_id=", manual)
+
+    def test_main_bot_username_prefixes_are_unchanged(self):
+        purchase_source = (BOT_DIR / "utils" / "purchase_plan.py").read_text(encoding="utf-8")
+        test_source = (BOT_DIR / "utils" / "test_config.py").read_text(encoding="utf-8")
+
+        self.assertIn('allocate_username("s", user_id', purchase_source)
+        self.assertIn('allocate_username("t", user_id', test_source)
 
     def test_checkout_keeps_main_bot_navigation_and_payment_context(self):
         source = (BOT_DIR / "hosted_worker.py").read_text(encoding="utf-8")
