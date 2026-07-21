@@ -174,6 +174,10 @@ def install_common_stubs(bot, payment_records):
     telegram_safe_stub.safe_reply_to = lambda bot_obj, *args, **kwargs: bot_obj.reply_to(*args, **kwargs)
     sys.modules["utils.telegram_safe"] = telegram_safe_stub
 
+    download_guidance_stub = types.ModuleType("utils.download_guidance")
+    download_guidance_stub.send_download_prompt_safely = lambda *args, **kwargs: None
+    sys.modules["utils.download_guidance"] = download_guidance_stub
+
     translations_stub = types.ModuleType("utils.translations")
     translations_stub.BUTTON_TRANSLATIONS = {"en": {}}
     translations_stub.get_button_text = lambda _language, key: key

@@ -18,6 +18,7 @@ from utils.username_utils import (
     build_user_note,
 )
 from utils.telegram_safe import safe_answer_callback_query, safe_edit_message_text, safe_send_message, safe_send_photo
+from utils.download_guidance import send_download_prompt_safely
 from utils import test_config_store
 
 TEST_CONFIGS_FILE = '/etc/ajib/core/scripts/telegrambot/test_configs.json'
@@ -439,6 +440,11 @@ def _send_created_test_config(chat_id, username, user_uri_data, is_automatic=Fal
             photo=bio,
             caption=success_message,
             parse_mode="Markdown"
+        )
+        send_download_prompt_safely(
+            bot,
+            chat_id,
+            get_user_language(chat_id),
         )
     else:
         safe_send_message(

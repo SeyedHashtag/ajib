@@ -126,6 +126,10 @@ def install_stubs():
     telegram_safe_stub.safe_send_photo = lambda bot, *args, **kwargs: bot.send_photo(*args, **kwargs)
     sys.modules["utils.telegram_safe"] = telegram_safe_stub
 
+    download_guidance_stub = types.ModuleType("utils.download_guidance")
+    download_guidance_stub.send_download_prompt_safely = lambda *args, **kwargs: None
+    sys.modules["utils.download_guidance"] = download_guidance_stub
+
     sys.modules["qrcode"] = types.SimpleNamespace(make=lambda *args, **kwargs: None)
 
 
@@ -231,6 +235,44 @@ class TestConfigQueueTests(unittest.TestCase):
 
         self.assertEqual(count, 1)
         self.assertFalse(test_config_module._has_used_test_config_from(test_config_module.load_test_configs(), 123))
+
+    def test_successful_test_config_sends_download_guidance(self):
+        class DummyQR:
+            def save(self, target, image_format):
+                target.write(b"qr")
+
+        calls = []
+        original_make = test_config_module.qrcode.make
+        original_guidance = test_config_module.send_download_prompt_safely
+        try:
+            test_config_module.qrcode.make = lambda value: DummyQR()
+            test_config_module.send_download_prompt_safely = (
+                lambda *args, **kwargs: calls.append((args, kwargs))
+            )
+            test_config_module._send_created_test_config(
+                456,
+                "t123",
+                {"normal_sub": "https://example.com/sub"},
+            )
+        finally:
+            test_config_module.qrcode.make = original_make
+            test_config_module.send_download_prompt_safely = original_guidance
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0][1:], (456, "en"))
+
+    def test_test_config_without_a_url_does_not_send_download_guidance(self):
+        calls = []
+        original_guidance = test_config_module.send_download_prompt_safely
+        try:
+            test_config_module.send_download_prompt_safely = (
+                lambda *args, **kwargs: calls.append((args, kwargs))
+            )
+            test_config_module._send_created_test_config(456, "t123", None)
+        finally:
+            test_config_module.send_download_prompt_safely = original_guidance
+
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

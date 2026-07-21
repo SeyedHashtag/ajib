@@ -115,6 +115,35 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(quote["reseller_level"], 6)
         self.assertEqual(quote["discount_percent"], 25)
 
+    def test_hosted_customer_config_guidance_is_success_only_and_owner_can_opt_out(self):
+        client = mock.Mock()
+        client.get_user_uri.return_value = {
+            "normal_sub": "https://example.com/sub",
+            "ipv4": "",
+        }
+
+        with (
+            mock.patch.object(self.worker.bot, "send_photo"),
+            mock.patch.object(self.worker.bot, "send_message"),
+            mock.patch.object(self.worker, "send_download_prompt_safely") as guidance,
+        ):
+            self.worker._deliver_config(100, "hs7", client)
+            guidance.assert_called_once_with(
+                self.worker.bot,
+                100,
+                "en",
+                callback_prefix="hb:download",
+            )
+
+            guidance.reset_mock()
+            self.worker._deliver_config(7, "h7", client, include_downloads=False)
+            guidance.assert_not_called()
+
+            guidance.reset_mock()
+            client.get_user_uri.return_value = None
+            self.worker._deliver_config(100, "hs7", client)
+            guidance.assert_not_called()
+
     def age_payment_claim(self, payment_id):
         path = self.hosted_bots.tenant_file("7", "payments.json")
         with self.worker.locked_json(path, {}) as payments:

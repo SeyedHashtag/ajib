@@ -51,6 +51,7 @@ from utils.username_utils import (
     format_username_timestamp,
 )
 from utils.telegram_safe import safe_answer_callback_query, safe_send_message
+from utils.download_guidance import send_download_prompt_safely
 
 # New: Global dictionary for user states
 user_data = {}
@@ -332,6 +333,7 @@ def _process_customer_renewal_payment(payment_id, payment_record, notify_chat_id
             caption=success_message,
             parse_mode="Markdown"
         )
+        send_download_prompt_safely(bot, notify_chat_id, language)
     else:
         bot.send_message(notify_chat_id, success_message, parse_mode="Markdown")
     return True
@@ -1548,6 +1550,7 @@ def _process_admin_approval_job(call, action, payment_id, payment_record, review
                         caption=success_message,
                         parse_mode="Markdown"
                     )
+                    send_download_prompt_safely(bot, user_to_notify, user_language)
                 else:
                     bot.send_message(user_to_notify, get_message_text(user_language, "payment_approved_no_url"))
                 _update_receipt_message_refs(
@@ -1759,6 +1762,7 @@ def _process_check_payment_job(call):
                     caption=success_message,
                     parse_mode="Markdown"
                 )
+                send_download_prompt_safely(bot, user_id, user_language)
             else:
                 bot.send_message(
                     user_id,
@@ -1935,6 +1939,7 @@ def process_payment_webhook(request_data):
                             user_id,
                             photo=bio
                         )
+                        send_download_prompt_safely(bot, user_id, user_language)
                     return True
                 else:
                     _record_crypto_sale_creation_failure(record_key, username=username, api_client=api_client)
@@ -2087,6 +2092,7 @@ def check_pending_payments():
                                         caption=success_message,
                                         parse_mode="Markdown"
                                     )
+                                    send_download_prompt_safely(bot, user_id, user_language)
                                 except Exception as e:
                                     print(f"Failed to send success message to user {user_id}: {e}")
                             else:

@@ -13,6 +13,7 @@ from utils.edit_plans import load_plans
 from utils.translations import BUTTON_TRANSLATIONS, get_message_text, get_button_text
 from utils.language import get_user_language
 from utils.telegram_safe import safe_answer_callback_query, safe_delete_message, safe_edit_message_text, safe_send_message, safe_send_photo
+from utils.download_guidance import send_download_prompt_safely
 
 MY_CONFIGS_CACHE_TTL_SECONDS = 300
 MY_CONFIGS_INFLIGHT_LOCK = threading.Lock()
@@ -473,6 +474,11 @@ def display_config(chat_id, username, user_data, api_client, is_callback=False, 
                 caption=caption,
                 parse_mode="Markdown"
             )
+        send_download_prompt_safely(
+            bot,
+            chat_id,
+            get_user_language(user_id or chat_id),
+        )
     except Exception as e:
         error_message = f"⚠️ Error displaying configuration: {str(e)}"
         print(f"Error in display_config: {str(e)}")

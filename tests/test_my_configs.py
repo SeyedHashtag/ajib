@@ -189,6 +189,10 @@ def install_stubs():
     telegram_safe_stub.safe_reply_to = lambda bot, *args, **kwargs: bot.reply_to(*args, **kwargs)
     sys.modules["utils.telegram_safe"] = telegram_safe_stub
 
+    download_guidance_stub = types.ModuleType("utils.download_guidance")
+    download_guidance_stub.send_download_prompt_safely = lambda *args, **kwargs: None
+    sys.modules["utils.download_guidance"] = download_guidance_stub
+
     sys.modules["qrcode"] = types.SimpleNamespace(make=lambda *args, **kwargs: None)
 
 
@@ -430,6 +434,58 @@ class MyConfigsTests(unittest.TestCase):
         sent_args, sent_kwargs = my_configs_module.bot.sent_messages[-1]
         self.assertIn("Renewal is not available for this config", sent_args[1])
         self.assertIsNone(sent_kwargs["reply_markup"])
+
+    def test_active_customer_config_sends_download_guidance_after_the_qr(self):
+        class DummyQR:
+            def save(self, target, image_format):
+                target.write(b"qr")
+
+        client = types.SimpleNamespace(
+            get_user_uri=lambda username: {"normal_sub": "https://example.com/sub"}
+        )
+        calls = []
+        original_make = my_configs_module.qrcode.make
+        original_guidance = my_configs_module.send_download_prompt_safely
+        my_configs_module.display_config = REAL_DISPLAY_CONFIG
+        try:
+            my_configs_module.qrcode.make = lambda value: DummyQR()
+            my_configs_module.send_download_prompt_safely = (
+                lambda *args, **kwargs: calls.append((args, kwargs))
+            )
+            my_configs_module.display_config(
+                456,
+                "s123a",
+                {"blocked": False, "expiration_days": 30},
+                client,
+                user_id=123,
+            )
+        finally:
+            my_configs_module.qrcode.make = original_make
+            my_configs_module.send_download_prompt_safely = original_guidance
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0][1:], (456, "en"))
+
+    def test_active_customer_config_without_a_url_does_not_send_download_guidance(self):
+        client = types.SimpleNamespace(get_user_uri=lambda username: None)
+        calls = []
+        original_guidance = my_configs_module.send_download_prompt_safely
+        my_configs_module.display_config = REAL_DISPLAY_CONFIG
+        try:
+            my_configs_module.send_download_prompt_safely = (
+                lambda *args, **kwargs: calls.append((args, kwargs))
+            )
+            my_configs_module.display_config(
+                456,
+                "s123a",
+                {"blocked": False, "expiration_days": 30},
+                client,
+                user_id=123,
+            )
+        finally:
+            my_configs_module.send_download_prompt_safely = original_guidance
+
+        self.assertEqual(calls, [])
 
     def test_my_configs_uses_stale_cached_snapshot_and_refreshes_in_background(self):
         enabled_client = FakeClient("enabled")

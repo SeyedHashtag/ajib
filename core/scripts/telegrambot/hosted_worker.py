@@ -30,6 +30,11 @@ from utils.hosted_bots import (
     update_settings,
 )
 from utils.hosted_translations import HOSTED_TRANSLATIONS, hosted_text
+from utils.download_guidance import (
+    render_download_callback,
+    send_download_prompt,
+    send_download_prompt_safely,
+)
 from utils.payments import CryptoPayment
 from utils.reseller import (
     calculate_reseller_wholesale_price, can_reseller_add_debt, get_reseller_data,
@@ -661,7 +666,7 @@ def _create_user(
     )
 
 
-def _deliver_config(chat_id, username, client, renewed=False):
+def _deliver_config(chat_id, username, client, renewed=False, include_downloads=True):
     uri = client.get_user_uri(username) if client else None
     action = _hosted_message(chat_id, "renewed" if renewed else "created")
     if not uri or not uri.get("normal_sub"):
@@ -676,6 +681,13 @@ def _deliver_config(chat_id, username, client, renewed=False):
                    caption=_hosted_message(chat_id, "config_ready", action=action, username=username,
                                            subscription=uri["normal_sub"]),
                    parse_mode="Markdown")
+    if include_downloads:
+        send_download_prompt_safely(
+            bot,
+            chat_id,
+            _language(chat_id),
+            callback_prefix="hb:download",
+        )
 
 
 def _deliver_config_safely(chat_id, username, client, renewed=False):
@@ -1306,19 +1318,35 @@ def language_set(call):
     bot.send_message(call.message.chat.id, "Menu updated.", reply_markup=_main_markup(call.from_user.id))
 
 
-DOWNLOADS = {
-    "iOS": "https://apps.apple.com/ca/app/karing/id6472431552",
-    "Android": "https://github.com/2dust/v2rayNG/releases",
-    "Windows": "https://github.com/2dust/v2rayN/releases",
-}
-
-
 @bot.message_handler(func=lambda m: m.text in _all_button_values("downloads", "⬇️ Downloads"))
 def downloads(message):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for name, url in DOWNLOADS.items():
-        markup.add(types.InlineKeyboardButton(name, url=url))
-    bot.reply_to(message, "Download a compatible client:", reply_markup=markup)
+    send_download_prompt(
+        bot,
+        message.chat.id,
+        _language(message.from_user.id),
+        callback_prefix="hb:download",
+        reply_to=message,
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("hb:download:"))
+def download_selection(call):
+    try:
+        render_download_callback(
+            bot,
+            call,
+            _language(call.from_user.id),
+            callback_prefix="hb:download",
+        )
+    except Exception:
+        try:
+            bot.answer_callback_query(
+                call.id,
+                text=_message(call.from_user.id, "download_error"),
+                show_alert=True,
+            )
+        except Exception:
+            pass
 
 
 @bot.message_handler(func=lambda m: m.text in _all_button_values("test_config", "🎁 Test Config"))
@@ -1749,7 +1777,7 @@ def owner_generate_input(message):
         client.delete_user(username)
         bot.reply_to(message, "Accounting failed; the VPN user was rolled back.")
         return
-    _deliver_config(message.chat.id, username, client)
+    _deliver_config(message.chat.id, username, client, include_downloads=False)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:plantoggle:"))
