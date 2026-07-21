@@ -186,7 +186,7 @@ class CheckerStatsPanelTests(unittest.TestCase):
         self.assertNotIn("Remaining Balance:", checker_text)
         self.assertNotIn("Regular Customer\nPending:", checker_text)
         self.assertNotIn("Reseller Settlement\nPending:", checker_text)
-        self.assertNotIn("Legacy USD Approved:", checker_text)
+        self.assertNotIn("Legacy USD", checker_text)
         self.assertNotIn("Legacy Estimated Receipts:", checker_text)
         self.assertIn("Paid (30 days): 30,000 T", checker_text)
         self.assertIn("Open Account: 1,500,000 T", checker_text)
@@ -201,8 +201,8 @@ class CheckerStatsPanelTests(unittest.TestCase):
         self.assertIn("Approved Total: 2,000,000 Tomans", admin_text)
         self.assertIn("Receipt Types", admin_text)
         self.assertLess(admin_text.index("Financial Summary"), admin_text.index("Receipt Types"))
-        self.assertIn("Legacy USD Approved: $50.00", admin_text)
-        self.assertIn("Legacy Estimated Receipts: 1", admin_text)
+        self.assertNotIn("Legacy USD", admin_text)
+        self.assertNotIn("Legacy Estimated Receipts:", admin_text)
         self.assertIn("Regular Customer\nPending: 0", admin_text)
         self.assertIn("Reseller Settlement\nPending: 0", admin_text)
         self.assertNotIn("Settlement\nApproved Total:", admin_text)
@@ -297,6 +297,13 @@ class CheckerStatsPanelTests(unittest.TestCase):
         payment_setup.build_receipt_checker_stats = lambda *args, **kwargs: self.sample_stats()
         payment_setup.get_checker_settlements = lambda _checker_id: [
             {
+                "id": "legacy-usd",
+                "amount": 7.0,
+                "admin_user_id": 1,
+                "created_at": "2026-05-31 10:00:00",
+                "unpaid_after": 3.0,
+            },
+            {
                 "id": "legacy",
                 "amount_toman": 50000,
                 "admin_user_id": 1,
@@ -327,6 +334,9 @@ class CheckerStatsPanelTests(unittest.TestCase):
         self.assertIn("Checker Payout: 100,000 Tomans", history_text)
         self.assertIn("ID: legacy", history_text)
         self.assertIn("Checker Payout: 50,000 Tomans", history_text)
+        self.assertIn("ID: legacy-usd", history_text)
+        self.assertIn("Amount: $7.00 (legacy USD)", history_text)
+        self.assertIn("Unpaid After: $3.00 (legacy USD)", history_text)
 
 
 if __name__ == "__main__":

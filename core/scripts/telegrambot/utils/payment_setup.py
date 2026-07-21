@@ -433,15 +433,6 @@ def _format_checker_stats_text(stats, title="📊 Receipt Checker Stats", includ
                 f"Checker Share: {_format_toman(item['checker_owed_total'])} Tomans\n\n"
             )
 
-        if stats.get('approved_total_usd') or stats.get('owed_total_usd') or stats.get('paid_total_usd'):
-            text += (
-                "Legacy USD\n"
-                f"Legacy USD Approved: ${_format_usd(stats.get('approved_total_usd'))}\n"
-                f"Legacy USD Owed: ${_format_usd(stats.get('owed_total_usd'))}\n"
-                f"Legacy USD Paid: ${_format_usd(stats.get('paid_total_usd'))}\n"
-            )
-        if stats.get('legacy_estimated_count'):
-            text += f"Legacy Estimated Receipts: {stats.get('legacy_estimated_count')}\n"
         text += "\n"
 
     latest_review = stats.get('latest_review')
