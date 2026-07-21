@@ -1,5 +1,6 @@
 import os
 import subprocess
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 from datetime import datetime, timedelta
 import json
@@ -163,6 +164,27 @@ def _format_bytes(value) -> str:
     if unit == "B":
         return f"{int(amount)}B"
     return f"{amount:.2f}{unit}"
+
+
+def _format_toman_amount(value) -> str:
+    try:
+        amount = Decimal(str(value or 0)).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError):
+        amount = Decimal('0')
+    return f"{amount:,}"
+
+
+def _format_usd_amount(value) -> str:
+    try:
+        amount = Decimal(str(value or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError):
+        amount = Decimal('0.00')
+    return f"{amount:.2f}"
+
+
+def _format_share_percent(value) -> str:
+    percent = _safe_float(value)
+    return str(int(percent)) if percent.is_integer() else f"{percent:.2f}"
 
 
 def build_online_users_from_userlist(vpn: dict) -> dict:
@@ -362,7 +384,18 @@ def _add_sold_config(traffic: dict, live_users: dict, seen: set, source: str, us
     traffic["total"]["used_bytes"] += used_bytes
 
 
-def _collect_sold_traffic_stats(payments: dict, live_users: dict, reseller_module=None) -> dict:
+def _load_resellers(reseller_module=None) -> dict:
+    try:
+        if reseller_module is None:
+            _ensure_telegram_utils_path()
+            from utils import reseller as reseller_module
+        resellers = reseller_module.get_all_resellers()
+    except Exception:
+        return {}
+    return resellers if isinstance(resellers, dict) else {}
+
+
+def _collect_sold_traffic_stats(payments: dict, live_users: dict, reseller_module=None, resellers=None) -> dict:
     traffic = _sold_traffic_snapshot()
     traffic["unavailable_servers"] = len(live_users.get("unavailable_servers", set()))
     seen = set()
@@ -380,13 +413,8 @@ def _collect_sold_traffic_stats(payments: dict, live_users: dict, reseller_modul
             server_id=record.get("server_id"),
         )
 
-    try:
-        if reseller_module is None:
-            _ensure_telegram_utils_path()
-            from utils import reseller as reseller_module
-        resellers = reseller_module.get_all_resellers()
-    except Exception:
-        resellers = {}
+    if resellers is None:
+        resellers = _load_resellers(reseller_module)
 
     if isinstance(resellers, dict):
         for reseller_data in resellers.values():
@@ -409,6 +437,37 @@ def _collect_sold_traffic_stats(payments: dict, live_users: dict, reseller_modul
     if traffic["total"]["sold_bytes"] > 0:
         traffic["total"]["usage_percent"] = (traffic["total"]["used_bytes"] / traffic["total"]["sold_bytes"]) * 100
     return traffic
+
+
+def _collect_checker_financials(payments: dict, receipt_checker_module=None) -> dict:
+    financials = {
+        "open_account_total": 0.0,
+        "unpaid_total": 0.0,
+        "share_percent": 0.0,
+    }
+    try:
+        if receipt_checker_module is None:
+            _ensure_telegram_utils_path()
+            from utils import receipt_checker as receipt_checker_module
+        stats = receipt_checker_module.build_receipt_checker_stats(payments)
+    except Exception:
+        return financials
+    if not isinstance(stats, dict):
+        return financials
+    return {
+        "open_account_total": _safe_float(stats.get("open_account_total", 0)),
+        "unpaid_total": _safe_float(stats.get("unpaid_total", 0)),
+        "share_percent": _safe_float(stats.get("share_percent", 0)),
+    }
+
+
+def _collect_reseller_financials(resellers: dict) -> dict:
+    outstanding_debt = sum(
+        _safe_float((reseller_data or {}).get("debt", 0))
+        for reseller_data in (resellers or {}).values()
+        if isinstance(reseller_data, dict)
+    )
+    return {"outstanding_debt": outstanding_debt}
 
 
 def _collect_customer_growth_stats(payments: dict, now: datetime) -> dict:
@@ -497,7 +556,7 @@ def _collect_language_stats(language_module, translations_module) -> dict:
 def build_server_info_snapshot(now=None) -> dict:
     '''Collects server information as structured data.'''
     _ensure_telegram_utils_path()
-    from utils import payment_records, referral, language, translations, api_client, reseller
+    from utils import payment_records, referral, language, translations, api_client, reseller, receipt_checker
 
     now = now or datetime.now()
     ram = psutil.virtual_memory()
@@ -506,13 +565,16 @@ def build_server_info_snapshot(now=None) -> dict:
     if not isinstance(payments, dict):
         payments = {}
 
+    resellers = _load_resellers(reseller)
     vpn, live_users = _collect_vpn_and_live_users(api_client)
-    traffic = _collect_sold_traffic_stats(payments, live_users, reseller)
+    traffic = _collect_sold_traffic_stats(payments, live_users, resellers=resellers)
     sales = _collect_payment_stats(payments, now)
     customers = _collect_customer_growth_stats(payments, now)
     online = build_online_users_from_userlist(vpn)
     referrals = _collect_referral_stats(referral)
     languages = _collect_language_stats(language, translations)
+    checker = _collect_checker_financials(payments, receipt_checker)
+    reseller_financials = _collect_reseller_financials(resellers)
 
     return {
         "generated_at": now,
@@ -532,6 +594,8 @@ def build_server_info_snapshot(now=None) -> dict:
         "customers": customers,
         "referrals": referrals,
         "languages": languages,
+        "checker": checker,
+        "resellers": reseller_financials,
     }
 
 
@@ -615,12 +679,20 @@ def _format_business_section(snapshot: dict) -> list[str]:
     sales = snapshot.get("sales", {})
     buckets = sales.get("buckets", {})
     referrals = snapshot.get("referrals", {})
+    checker = snapshot.get("checker", {})
+    resellers = snapshot.get("resellers", {})
     output = ["💰 **Business**"]
     output.append(f"Today: {_format_orders(buckets.get('today', _empty_order_bucket()))}")
     output.append(f"This Month: {_format_orders(buckets.get('month', _empty_order_bucket()))}")
     output.append(f"Last 30 Days: {_format_orders(buckets.get('last30', _empty_order_bucket()))}")
     output.append(f"All Time: {_format_orders(buckets.get('all', _empty_order_bucket()))}")
     output.append(f"AOV: ${sales.get('aov', {}).get('all', 0):,.2f} all • ${sales.get('aov', {}).get('last30', 0):,.2f} 30d")
+    output.append(f"Open Account Base: {_format_toman_amount(checker.get('open_account_total', 0))} Tomans")
+    output.append(
+        f"Checker Balance ({_format_share_percent(checker.get('share_percent', 0))}%): "
+        f"{_format_toman_amount(checker.get('unpaid_total', 0))} Tomans"
+    )
+    output.append(f"💸 Outstanding Debt: ${_format_usd_amount(resellers.get('outstanding_debt', 0))}")
     pending = buckets.get('all', {}).get('pending', 0)
     if pending:
         output.append(f"⚠️ Pending Payments: {pending}")

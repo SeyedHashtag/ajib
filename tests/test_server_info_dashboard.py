@@ -29,7 +29,7 @@ class FakeClient:
         return self.users
 
 
-def load_cli_api(payments=None, servers=None, clients=None, online_response=None, resellers=None):
+def load_cli_api(payments=None, servers=None, clients=None, online_response=None, resellers=None, checker_stats=None):
     for name in list(sys.modules):
         if name == "utils" or name.startswith("utils."):
             sys.modules.pop(name, None)
@@ -95,6 +95,10 @@ def load_cli_api(payments=None, servers=None, clients=None, online_response=None
     reseller_stub = types.ModuleType("utils.reseller")
     reseller_stub.get_all_resellers = lambda: resellers or {}
     sys.modules["utils.reseller"] = reseller_stub
+
+    receipt_checker_stub = types.ModuleType("utils.receipt_checker")
+    receipt_checker_stub.build_receipt_checker_stats = lambda _payments: checker_stats or {}
+    sys.modules["utils.receipt_checker"] = receipt_checker_stub
 
     spec = importlib.util.spec_from_file_location("cli_api_under_test", CLI_API_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -241,6 +245,42 @@ class ServerInfoDashboardTests(unittest.TestCase):
         self.assertIn("⚠️ **Alerts**", cli_api.format_server_info_section(snapshot, "alerts"))
         self.assertIn("📊 **Server Info**", cli_api.format_server_info_section(snapshot, "full"))
         self.assertIn("Pending payments: 1", cli_api.format_server_info_section(snapshot, "alerts"))
+
+    def test_business_section_includes_checker_financials_and_all_reseller_debt(self):
+        checker_stats = {
+            "open_account_total": 1500000,
+            "unpaid_total": 150000,
+            "share_percent": 10.0,
+        }
+        resellers = {
+            "approved": {"status": "approved", "debt": 100, "configs": []},
+            "banned": {"status": "banned", "debt": "23.45", "configs": []},
+            "pending": {"status": "pending", "debt": 0, "configs": []},
+        }
+        cli_api = load_cli_api(resellers=resellers, checker_stats=checker_stats)
+
+        snapshot = cli_api.build_server_info_snapshot(now=datetime(2026, 6, 4, 12, 0, 0))
+        business_text = cli_api.format_server_info_section(snapshot, "business")
+        full_text = cli_api.format_server_info_section(snapshot, "full")
+
+        self.assertEqual(snapshot["checker"], checker_stats)
+        self.assertEqual(snapshot["resellers"]["outstanding_debt"], 123.45)
+        self.assertIn("Open Account Base: 1,500,000 Tomans", business_text)
+        self.assertIn("Checker Balance (10%): 150,000 Tomans", business_text)
+        self.assertIn("💸 Outstanding Debt: $123.45", business_text)
+        self.assertNotIn("Open Account Base:", full_text)
+        self.assertNotIn("Checker Balance", full_text)
+        self.assertNotIn("Outstanding Debt", full_text)
+
+    def test_business_section_defaults_missing_financial_data_to_zero(self):
+        cli_api = load_cli_api()
+
+        snapshot = cli_api.build_server_info_snapshot(now=datetime(2026, 6, 4, 12, 0, 0))
+        business_text = cli_api.format_server_info_section(snapshot, "business")
+
+        self.assertIn("Open Account Base: 0 Tomans", business_text)
+        self.assertIn("Checker Balance (0%): 0 Tomans", business_text)
+        self.assertIn("💸 Outstanding Debt: $0.00", business_text)
 
     def test_online_userlist_count_excludes_blocked_and_disabled_servers(self):
         servers = [
