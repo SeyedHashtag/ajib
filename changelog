@@ -1,3 +1,10 @@
+## v1.17.1
+✨ Add contextual download guidance and refreshed client links across customer configuration flows
+✨ Show checker and reseller financial summaries in server dashboards with consistent Toman formatting
+🛠️ Include customer names in expired-account cleanup notices and remove legacy USD checker statistics
+⬆️ Update Pillow to 12.3.0 and pyTelegramBotAPI to 4.35.0
+✅ Add regression coverage for download guidance, cleanup notices, and financial dashboard summaries
+
 ## v1.17.0
 ✨ Add six reseller loyalty levels with increasing wholesale discounts, trust limits, and localized progress presentation
 🛠️ Persist hosted purchase and free-test usernames before provisioning so interrupted operations can recover safely
