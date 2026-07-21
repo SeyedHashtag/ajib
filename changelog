@@ -1,3 +1,8 @@
+## v1.17.2
+🛠️ Simplify the localized Karing iOS setup tutorial to tell customers to copy their config directly
+🐛 Remove the obsolete TLS security warning from Karing guidance in English, Persian, Russian, and Turkmen
+✅ Update regression coverage for the revised Karing iOS instructions
+
 ## v1.17.1
 ✨ Add contextual download guidance and refreshed client links across customer configuration flows
 ✨ Show checker and reseller financial summaries in server dashboards with consistent Toman formatting
