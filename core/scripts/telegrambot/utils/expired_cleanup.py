@@ -165,6 +165,7 @@ TEST_CLEANUP_METADATA_FIELDS = RESELLER_CLEANUP_METADATA_FIELDS + ('server_id',)
 RECOVERED_TEST_USERNAME_RE = re.compile(r'^t([1-9]\d*)([a-z]*)$', re.IGNORECASE)
 RECOVERED_TEST_NOTE_RE = re.compile(r'(?:^|\|\s*)📝\s*test_config\s*(?:\||$)', re.IGNORECASE)
 RECOVERED_TEST_NOTE_TIME_RE = re.compile(r'📅\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})(?::(\d{2}))?')
+RESELLER_CUSTOMER_NAME_RE = re.compile(r'^[a-zA-Z0-9]{1,8}$')
 MAX_TELEGRAM_USER_ID = (2 ** 63) - 1
 
 _cleanup_lock = threading.RLock()
@@ -1166,6 +1167,7 @@ def discover_cleanup_candidates(include_already_missing=False, include_deleted=F
                 candidates.append({
                     'source': 'reseller_customer',
                     'username': username,
+                    'customer_name': config.get('customer_name'),
                     'server_id': config.get('server_id'),
                     'reseller_id': str(reseller_id),
                     '_record_ref': ('reseller', str(reseller_id), index),
@@ -1676,6 +1678,30 @@ def _get_user_lookup(multi_api, username, preferred_server_id=None):
     return None, None, 'missing'
 
 
+def _valid_reseller_customer_name(value):
+    name = str(value or '').strip()
+    return name if RESELLER_CUSTOMER_NAME_RE.fullmatch(name) else ''
+
+
+def _extract_reseller_customer_name_from_note(note):
+    if not isinstance(note, str):
+        return ''
+    match = re.search(r'📝\s*([^|]+?)\s*\|', note)
+    if not match:
+        return ''
+    return _valid_reseller_customer_name(match.group(1))
+
+
+def _resolve_reseller_customer_name(candidate):
+    stored_name = _valid_reseller_customer_name(candidate.get('customer_name'))
+    if stored_name:
+        return stored_name
+    note_name = _extract_reseller_customer_name_from_note(
+        (candidate.get('_user_data') or {}).get('note')
+    )
+    return note_name or 'N/A'
+
+
 def _notify_candidate(candidate, grace_hours, last_state=None, missing=False):
     source = candidate.get('source')
     recipient_id = candidate.get('reseller_id') if source == 'reseller_customer' else candidate.get('telegram_user_id')
@@ -1691,6 +1717,11 @@ def _notify_candidate(candidate, grace_hours, last_state=None, missing=False):
         )
         message = get_message_text(language, key).format(
             username=candidate.get('username'),
+            customer_name=(
+                _resolve_reseller_customer_name(candidate)
+                if source == 'reseller_customer'
+                else ''
+            ),
             grace_hours=int(grace_hours),
             account_type=_account_type_label(source, language),
             state_summary=_format_state_summary(last_state, language, missing=missing),

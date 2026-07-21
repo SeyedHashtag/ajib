@@ -139,8 +139,10 @@ def load_module():
     sys.modules["utils.language"] = language_stub
 
     translations_stub = types.ModuleType("utils.translations")
-    translations_stub.get_message_text = (
-        lambda language, key: "{account_type}|{username}|{grace_hours}|{state_summary}"
+    translations_stub.get_message_text = lambda language, key: (
+        "{account_type}|{customer_name}|{username}|{grace_hours}|{state_summary}"
+        if key == "expired_cleanup_reseller_notice"
+        else "{account_type}|{username}|{grace_hours}|{state_summary}"
     )
     translations_stub.get_button_text = lambda language, key: "Renew Plan" if key == "renew_plan" else key
     sys.modules["utils.translations"] = translations_stub
@@ -255,6 +257,40 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(chat_id, 1988)
         callbacks = self.callback_data_from_markup(kwargs["reply_markup"])
         self.assertEqual(callbacks, ["renew_plan:renew-token"])
+
+    def test_reseller_cleanup_notice_includes_customer_name_and_renewal_button_when_eligible(self):
+        edit_plans_stub = types.ModuleType("utils.edit_plans")
+        edit_plans_stub.load_plans = lambda: {"5": {"price": 10.0, "days": 30, "unlimited": False}}
+        sys.modules["utils.edit_plans"] = edit_plans_stub
+
+        renewal_stub = types.ModuleType("utils.renewal")
+        renewal_stub.find_customer_renewal_offer = lambda *args, **kwargs: {"eligible": False}
+        renewal_stub.find_reseller_renewal_offer = lambda *args, **kwargs: {
+            "eligible": True,
+            "token": "renew-token",
+        }
+        sys.modules["utils.renewal"] = renewal_stub
+
+        error = self.cleanup._notify_candidate(
+            {
+                "source": "reseller_customer",
+                "reseller_id": "303",
+                "username": "r303",
+                "customer_name": "ali123",
+                "_record_ref": ("reseller", "303", 0),
+                "_api_client": object(),
+                "_user_data": self.expired_user(),
+            },
+            grace_hours=24,
+            last_state=self.expired_user(),
+        )
+
+        self.assertIsNone(error)
+        chat_id, message, kwargs = self.cleanup._test_bot.sent_messages[-1]
+        self.assertEqual(chat_id, 303)
+        self.assertIn("|ali123|r303|", message)
+        callbacks = self.callback_data_from_markup(kwargs["reply_markup"])
+        self.assertEqual(callbacks, ["reseller:renew:renew-token"])
 
     def test_user_must_be_blocked_to_be_expired_by_days_or_traffic(self):
         unblocked_expired_days = {
@@ -998,7 +1034,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.write_json(self.cleanup.TEST_CONFIGS_FILE, {})
         self.write_json(self.cleanup.PAYMENTS_FILE, {})
         self.write_json(self.cleanup.RESELLERS_FILE, {
-            "303": {"configs": [{"username": "r303", "server_id": "s1"}]}
+            "303": {"configs": [{"username": "r303", "customer_name": "ali123", "server_id": "s1"}]}
         })
         client = FakeClient("s1", {"r303": self.expired_user()})
 
@@ -1007,8 +1043,37 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(len(self.cleanup._test_bot.sent_messages), 1)
         self.assertEqual(self.cleanup._test_bot.sent_messages[0][0], 303)
         self.assertIn("your customer account", self.cleanup._test_bot.sent_messages[0][1])
+        self.assertIn("|ali123|r303|", self.cleanup._test_bot.sent_messages[0][1])
         saved_config = self.read_json(self.cleanup.RESELLERS_FILE)["303"]["configs"][0]
         self.assertEqual(saved_config["cleanup_last_state"]["status"], "expired")
+
+    def test_reseller_customer_notification_recovers_legacy_name_from_note(self):
+        self.write_json(self.cleanup.TEST_CONFIGS_FILE, {})
+        self.write_json(self.cleanup.PAYMENTS_FILE, {})
+        self.write_json(self.cleanup.RESELLERS_FILE, {
+            "303": {"configs": [{"username": "r303", "server_id": "s1"}]}
+        })
+        user_data = self.expired_user()
+        user_data["note"] = "📅 2026-05-30 07:01 | 📝 sara88 | ✏️ "
+        client = FakeClient("s1", {"r303": user_data})
+
+        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
+
+        self.assertEqual(len(self.cleanup._test_bot.sent_messages), 1)
+        self.assertIn("|sara88|r303|", self.cleanup._test_bot.sent_messages[0][1])
+
+    def test_reseller_customer_notification_uses_na_for_missing_or_invalid_name(self):
+        self.write_json(self.cleanup.TEST_CONFIGS_FILE, {})
+        self.write_json(self.cleanup.PAYMENTS_FILE, {})
+        self.write_json(self.cleanup.RESELLERS_FILE, {
+            "303": {"configs": [{"username": "r303", "customer_name": "too-long-name", "server_id": "s1"}]}
+        })
+        client = FakeClient("s1", {"r303": self.expired_user()})
+
+        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
+
+        self.assertEqual(len(self.cleanup._test_bot.sent_messages), 1)
+        self.assertIn("|N/A|r303|", self.cleanup._test_bot.sent_messages[0][1])
 
     def test_bot_record_missing_from_vpn_is_ignored_without_notification(self):
         self.write_json(self.cleanup.TEST_CONFIGS_FILE, {
@@ -2081,6 +2146,16 @@ class ExpiredCleanupTests(unittest.TestCase):
                 notice = messages[key].lower()
                 for term in renewal_terms:
                     self.assertNotIn(term, notice, f"{language}.{key} mentions renewal")
+
+    def test_reseller_expired_cleanup_translations_include_customer_and_config(self):
+        spec = importlib.util.spec_from_file_location("translations_under_test", TRANSLATIONS_PATH)
+        translations = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(translations)
+
+        for language, messages in translations.MESSAGE_TRANSLATIONS.items():
+            notice = messages["expired_cleanup_reseller_notice"]
+            self.assertIn("{customer_name}", notice, language)
+            self.assertIn("{username}", notice, language)
 
 
 if __name__ == "__main__":
