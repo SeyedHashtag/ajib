@@ -10,6 +10,9 @@ DOWNLOAD_LINKS = {
         "windows": "https://github.com/2dust/v2rayN/releases/download/7.23.4/v2rayN-windows-64.zip",
         "android": "https://github.com/2dust/v2rayNG/releases/download/2.2.6/v2rayNG_2.2.6_arm64-v8a.apk"
     },
+    "karing": {
+        "ios": "https://apps.apple.com/us/app/karing/id6472431552"
+    },
     "happ": {
         "ios": "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215"
     }
