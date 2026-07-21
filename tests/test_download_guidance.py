@@ -172,11 +172,11 @@ class DownloadCatalogTests(unittest.TestCase):
                 self.assertTrue(keys.issubset(TRANSLATIONS[language]))
                 self.assertTrue(all(TRANSLATIONS[language][key].strip() for key in keys))
 
-    def test_karing_tutorial_has_the_requested_order_and_security_warning(self):
+    def test_karing_tutorial_has_the_requested_order_without_security_warning(self):
         tutorial = GUIDANCE.get_app_details_text("en", "ios", "karing")
         steps = (
             "country or region where you actually live",
-            "Copy the subscription URL from Telegram",
+            "Copy the config from Telegram",
             "`Add Profile` → `Import From Clipboard`",
             "open `Settings`",
             "`Novice Mode`",
@@ -187,7 +187,11 @@ class DownloadCatalogTests(unittest.TestCase):
 
         positions = [tutorial.index(step) for step in steps]
         self.assertEqual(positions, sorted(positions))
-        self.assertIn("weakens TLS security", tutorial)
+
+        for language in ("en", "fa", "ru", "tk"):
+            with self.subTest(language=language):
+                localized_tutorial = GUIDANCE.get_app_details_text(language, "ios", "karing")
+                self.assertNotIn("⚠️", localized_tutorial)
 
 
 class DownloadNavigationTests(unittest.TestCase):
