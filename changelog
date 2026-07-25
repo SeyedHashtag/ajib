@@ -1,3 +1,10 @@
+## v1.18.0
+✨ Migrate mutable Telegram bot state from legacy JSON files to a shared SQLite database
+🛠️ Add validated SQLite backup, restore, migration, and archive flows with private database and token permissions
+🐛 Recover recorded usernames across customer, reseller, test-config, and hosted-bot provisioning flows
+⚡ Serialize multiprocess claims and reservations and support multiple hosted workers on one database
+✅ Add comprehensive regression coverage for SQLite migration, state operations, backup safety, and username recovery
+
 ## v1.17.3
 🛠️ Validate JSON state files during backup and restore so corrupt data is rejected before it can replace working state
 🐛 Persist payment completion, renewal, and expired-cleanup updates atomically without overwriting concurrent changes
