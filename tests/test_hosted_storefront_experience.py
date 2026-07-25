@@ -1,5 +1,6 @@
 import ast
 import importlib.util
+import logging
 import unittest
 from pathlib import Path
 
@@ -42,7 +43,12 @@ def _button_translations():
     raise AssertionError("Missing BUTTON_TRANSLATIONS")
 
 
-def _hosted_user_creator(existing_usernames, add_user_results=None):
+def _hosted_user_creator(
+    existing_usernames,
+    add_user_results=None,
+    recorded_usernames=None,
+    history_error=None,
+):
     calls = []
     note_texts = []
     results = list(add_user_results or [{"ok": True}])
@@ -80,11 +86,20 @@ def _hosted_user_creator(existing_usernames, add_user_results=None):
         note_texts.append(kwargs.get("note_text"))
         return f"note:{kwargs.get('note_text')}"
 
+    def load_recorded_usernames(**kwargs):
+        if history_error is not None:
+            raise USERNAME_UTILS.RecordedUsernameLoadError(history_error)
+        return set(recorded_usernames or set())
+
     namespace = {
         "MultiServerAPI": FakeMultiServerAPI,
         "OWNER_ID": 5956844665,
         "allocate_username": USERNAME_UTILS.allocate_username,
         "build_user_note": fake_build_user_note,
+        "load_recorded_usernames": load_recorded_usernames,
+        "RecordedUsernameLoadError": USERNAME_UTILS.RecordedUsernameLoadError,
+        "tenant_file": lambda owner_id, filename: f"/tenants/{owner_id}/{filename}",
+        "logging": logging,
     }
     module = ast.Module(body=[_worker_function("_create_user")], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "hosted_worker.py", "exec"), namespace)
@@ -197,8 +212,29 @@ class HostedStorefrontParityTests(unittest.TestCase):
         self.assertEqual(note_texts, ["customer=u124041600"])
         self.assertEqual(calls[0][3]["note"], "note:customer=u124041600")
 
+    def test_hosted_creation_skips_a_username_kept_in_local_records(self):
+        base = "hs5956844665"
+        create_user, calls, _note_texts = _hosted_user_creator(
+            set(),
+            recorded_usernames={base},
+        )
+
+        username, result, _client = create_user(
+            {"gb": 30, "days": 30},
+            "",
+            customer_id=124041600,
+            username_prefix="hs",
+        )
+
+        self.assertEqual(username, f"{base}a")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(calls[0][0], f"{base}a")
+
     def test_hosted_retry_reuses_its_previously_persisted_username(self):
-        create_user, calls, _note_texts = _hosted_user_creator({"hs5956844665"})
+        create_user, calls, _note_texts = _hosted_user_creator(
+            {"hs5956844665"},
+            recorded_usernames={"hs5956844665"},
+        )
 
         username, result, _client = create_user(
             {"gb": 30, "days": 30},
@@ -212,6 +248,22 @@ class HostedStorefrontParityTests(unittest.TestCase):
         self.assertEqual(username, "hs5956844665")
         self.assertEqual(result, {"ok": True})
         self.assertEqual(calls[0][0], "hs5956844665")
+
+    def test_hosted_history_failure_stops_before_vpn_creation(self):
+        create_user, calls, _note_texts = _hosted_user_creator(
+            set(),
+            history_error="damaged tenant payments",
+        )
+
+        result = create_user(
+            {"gb": 30, "days": 30},
+            "",
+            customer_id=124041600,
+            username_prefix="hs",
+        )
+
+        self.assertEqual(result, (None, None, None))
+        self.assertEqual(calls, [])
 
     def test_hosted_notes_keep_the_admin_edit_field_empty(self):
         note = USERNAME_UTILS.build_user_note(

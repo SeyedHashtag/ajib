@@ -2,6 +2,7 @@
 """Isolated polling worker for one reseller-owned Telegram bot."""
 
 import io
+import logging
 import math
 import os
 import threading
@@ -47,7 +48,12 @@ from utils.reseller_level_ui import (
     present_pending_reseller_level,
 )
 from utils.translations import BUTTON_TRANSLATIONS, LANGUAGES, get_button_text, get_message_text
-from utils.username_utils import allocate_username, build_user_note
+from utils.username_utils import (
+    allocate_username,
+    build_user_note,
+    load_recorded_usernames,
+    RecordedUsernameLoadError,
+)
 
 
 OWNER_ID = int(os.environ["AJIB_HOSTED_RESELLER_ID"])
@@ -636,12 +642,30 @@ def _create_user(
     on_username_allocated=None,
     preferred_username=None,
 ):
+    try:
+        recorded_usernames = load_recorded_usernames(
+            extra_paths=(tenant_file(OWNER_ID, "payments.json"),),
+        )
+    except RecordedUsernameLoadError as exc:
+        logging.getLogger("ajib.usernames").error(
+            "Hosted user creation blocked because username history could not be loaded. "
+            "owner_id=%s operation_id=%s error=%s",
+            OWNER_ID,
+            operation_id,
+            exc,
+        )
+        return preferred_username, None, None
+
     multi = MultiServerAPI()
 
     def allocate(existing):
         if preferred_username:
             return str(preferred_username)
-        return allocate_username(username_prefix, OWNER_ID, existing)
+        return allocate_username(
+            username_prefix,
+            OWNER_ID,
+            set(existing) | recorded_usernames,
+        )
 
     def create(client, username):
         note_parts = [str(note or "").strip()]

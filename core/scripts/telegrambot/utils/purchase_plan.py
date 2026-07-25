@@ -49,6 +49,8 @@ from utils.username_utils import (
     build_user_note,
     extract_existing_usernames,
     format_username_timestamp,
+    load_recorded_usernames,
+    RecordedUsernameLoadError,
 )
 from utils.telegram_safe import safe_answer_callback_query, safe_send_message
 from utils.download_guidance import send_download_prompt_safely
@@ -620,22 +622,37 @@ def _complete_sale_payment_or_notify(payment_id, user_id, username, api_client, 
 
 
 def create_sale_username(api_client, user_id):
+    recorded_usernames = load_recorded_usernames()
     if isinstance(api_client, set):
-        return allocate_username("s", user_id, api_client)
+        return allocate_username("s", user_id, set(api_client) | recorded_usernames)
     multi_api = MultiServerAPI()
     creation = multi_api.prepare_new_user_creation()
     usernames = creation.get("existing_usernames") or set()
     if not usernames and api_client is not None:
         users = api_client.get_users()
         usernames = extract_existing_usernames(users)
-    return allocate_username("s", user_id, usernames)
+    return allocate_username("s", user_id, set(usernames) | recorded_usernames)
 
 
 def create_sale_user_with_note(api_client, user_id, plan_gb, days, unlimited):
+    try:
+        recorded_usernames = load_recorded_usernames()
+    except RecordedUsernameLoadError as exc:
+        logging.getLogger("ajib.usernames").error(
+            "Sale user creation blocked because username history could not be loaded. user_id=%s error=%s",
+            user_id,
+            exc,
+        )
+        return None, None, None
+
     multi_api = MultiServerAPI()
 
     def allocate(existing_usernames):
-        return allocate_username("s", user_id, existing_usernames)
+        return allocate_username(
+            "s",
+            user_id,
+            set(existing_usernames) | recorded_usernames,
+        )
 
     def create(target_client, username):
         note_payload = build_user_note(

@@ -1,5 +1,82 @@
 import datetime
 import json
+import os
+
+
+BOT_STATE_DIR = os.getenv("AJIB_BOT_DIR", "/etc/ajib/core/scripts/telegrambot")
+DEFAULT_RECORDED_USERNAME_PATHS = (
+    os.path.join(BOT_STATE_DIR, "payments.json"),
+    os.path.join(BOT_STATE_DIR, "test_configs.json"),
+    os.path.join(BOT_STATE_DIR, "resellers.json"),
+    os.path.join(BOT_STATE_DIR, "expired_user_cleanup.json"),
+)
+RECORDED_USERNAME_FIELDS = {
+    "username",
+    "renewal_username",
+    "renew_username",
+    "provisioned_username",
+}
+
+
+class RecordedUsernameLoadError(RuntimeError):
+    """Raised when persisted username history cannot be read safely."""
+
+
+def extract_recorded_usernames(records):
+    """Collect VPN account usernames from nested persisted bot records."""
+    usernames = set()
+
+    def visit(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in RECORDED_USERNAME_FIELDS and isinstance(item, str):
+                    username = item.strip()
+                    if username:
+                        usernames.add(username)
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(records)
+    return usernames
+
+
+def load_recorded_usernames(record_paths=None, extra_paths=None):
+    """Load every recorded VPN username, failing closed on damaged state."""
+    paths = list(
+        DEFAULT_RECORDED_USERNAME_PATHS
+        if record_paths is None
+        else record_paths
+    )
+    paths.extend(extra_paths or ())
+
+    usernames = set()
+    seen_paths = set()
+    for raw_path in paths:
+        path = os.fspath(raw_path)
+        normalized_path = os.path.abspath(path)
+        if normalized_path in seen_paths:
+            continue
+        seen_paths.add(normalized_path)
+
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                records = json.load(handle)
+        except FileNotFoundError:
+            continue
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            raise RecordedUsernameLoadError(
+                f"Unable to read recorded username history from {path}: {exc}"
+            ) from exc
+
+        if not isinstance(records, dict):
+            raise RecordedUsernameLoadError(
+                f"Recorded username history in {path} must contain a JSON object"
+            )
+        usernames.update(extract_recorded_usernames(records))
+
+    return usernames
 
 
 def format_username_timestamp():

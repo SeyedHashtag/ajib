@@ -281,10 +281,12 @@ def install_stubs():
     sys.modules["utils.receipt_checker"] = receipt_checker_stub
 
     username_utils_stub = types.ModuleType("utils.username_utils")
+    username_utils_stub.RecordedUsernameLoadError = RuntimeError
     username_utils_stub.allocate_username = lambda prefix, user_id, existing: f"{prefix}{user_id}"
     username_utils_stub.build_user_note = lambda **kwargs: kwargs.get("note_text", "")
     username_utils_stub.extract_existing_usernames = lambda users: set()
     username_utils_stub.format_username_timestamp = lambda: "260531000000"
+    username_utils_stub.load_recorded_usernames = lambda *args, **kwargs: set()
     sys.modules["utils.username_utils"] = username_utils_stub
 
     sys.modules["qrcode"] = types.SimpleNamespace(make=lambda *args, **kwargs: None)

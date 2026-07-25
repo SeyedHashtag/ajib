@@ -326,10 +326,12 @@ def install_common_stubs(bot, payment_records):
     sys.modules["utils.receipt_checker"] = receipt_checker_stub
 
     username_utils_stub = types.ModuleType("utils.username_utils")
+    username_utils_stub.RecordedUsernameLoadError = RuntimeError
     username_utils_stub.allocate_username = lambda prefix, user_id, _existing: f"{prefix}{user_id}"
     username_utils_stub.build_user_note = lambda **kwargs: kwargs.get("note_text", "")
     username_utils_stub.extract_existing_usernames = lambda _users: set()
     username_utils_stub.format_username_timestamp = lambda: "260603000000"
+    username_utils_stub.load_recorded_usernames = lambda *args, **kwargs: set()
     sys.modules["utils.username_utils"] = username_utils_stub
 
 

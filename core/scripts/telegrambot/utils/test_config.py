@@ -16,6 +16,8 @@ import logging
 from utils.username_utils import (
     allocate_username,
     build_user_note,
+    load_recorded_usernames,
+    RecordedUsernameLoadError,
 )
 from utils.telegram_safe import safe_answer_callback_query, safe_edit_message_text, safe_send_message, safe_send_photo
 from utils.download_guidance import send_download_prompt_safely
@@ -531,13 +533,32 @@ def create_test_config(user_id, chat_id, is_automatic=False, language=None, tele
         return False
 
     try:
+        recorded_usernames = load_recorded_usernames()
         multi_api = MultiServerAPI()
+    except RecordedUsernameLoadError as exc:
+        logging.getLogger("ajib.usernames").error(
+            "Test user creation blocked because username history could not be loaded. user_id=%s error=%s",
+            user_id,
+            exc,
+        )
+        _release_test_config_creation(user_id)
+        if not is_automatic:
+            bot.send_message(
+                chat_id,
+                "❌ Failed to create test configuration. Please try again later or contact support.",
+                parse_mode="Markdown"
+            )
+        return False
     except Exception:
         _release_test_config_creation(user_id)
         raise
 
     def allocate(existing_usernames):
-        return allocate_username("t", user_id, existing_usernames)
+        return allocate_username(
+            "t",
+            user_id,
+            set(existing_usernames) | recorded_usernames,
+        )
 
     def create(api_client, username):
         note_payload = build_user_note(
@@ -600,7 +621,7 @@ def _safe_server_weight(value):
 
 def _build_bulk_test_config_state():
     multi_api = MultiServerAPI()
-    existing_usernames = set()
+    existing_usernames = load_recorded_usernames()
     server_states = []
 
     for index, (server, client) in enumerate(multi_api.iter_clients(include_disabled=True)):
@@ -886,7 +907,22 @@ def handle_waiting_chunk(call):
     state_changed = False
     if action == "create":
         test_configs = load_test_configs()
-        existing_usernames, server_states = _build_bulk_test_config_state()
+        try:
+            existing_usernames, server_states = _build_bulk_test_config_state()
+        except RecordedUsernameLoadError as exc:
+            logging.getLogger("ajib.usernames").error(
+                "Bulk test creation blocked because username history could not be loaded. error=%s",
+                exc,
+            )
+            text, markup = build_waiting_management_menu()
+            bot.edit_message_text(
+                f"❌ Local username history could not be read. No accounts were created.\n\n{text}",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=markup,
+                parse_mode="Markdown"
+            )
+            return
         if not server_states:
             text, markup = build_waiting_management_menu()
             bot.edit_message_text(

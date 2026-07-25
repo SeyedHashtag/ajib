@@ -115,8 +115,10 @@ def install_stubs():
     sys.modules["utils.language"] = language_stub
 
     username_utils_stub = types.ModuleType("utils.username_utils")
+    username_utils_stub.RecordedUsernameLoadError = RuntimeError
     username_utils_stub.allocate_username = lambda prefix, user_id, existing: f"{prefix}{user_id}"
     username_utils_stub.build_user_note = lambda **kwargs: ""
+    username_utils_stub.load_recorded_usernames = lambda *args, **kwargs: set()
     sys.modules["utils.username_utils"] = username_utils_stub
 
     telegram_safe_stub = types.ModuleType("utils.telegram_safe")
