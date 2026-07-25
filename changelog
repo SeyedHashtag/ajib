@@ -1,3 +1,7 @@
+## v1.18.1
+🐛 Run backup and restore scripts in explicit Bash subshells during upgrades and Telegram-triggered maintenance
+✅ Add regression coverage for safe Bash invocation of backup and restore scripts
+
 ## v1.18.0
 ✨ Migrate mutable Telegram bot state from legacy JSON files to a shared SQLite database
 🛠️ Add validated SQLite backup, restore, migration, and archive flows with private database and token permissions
