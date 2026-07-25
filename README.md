@@ -20,7 +20,7 @@ VPN panels through their HTTP APIs.
 - Host customer-facing Telegram bots for approved resellers on the same VPN infrastructure
 - Show customers their configurations and QR codes
 - Broadcast messages and provide operational dashboards to administrators
-- Back up bot configuration and JSON state
+- Persist transactional bot state in SQLite and create versioned backups
 
 ## Requirements
 
@@ -44,21 +44,25 @@ the bot configuration menu. Run `ajib` later to reopen that menu.
 bash <(curl -fsSL https://raw.githubusercontent.com/SeyedHashtag/ajib/main/upgrade.sh)
 ```
 
-Upgrades preserve `.env` and JSON state files in
-`/etc/ajib/core/scripts/telegrambot` and restart the bot only if it was already
-running.
+Upgrades preserve `.env`, static configuration, hosted receipt assets, and the
+SQLite state database in `/etc/ajib/core/scripts/telegrambot`. Existing JSON
+installations are migrated automatically before the service restarts.
 
 ## Runtime layout
 
 - `core/scripts/telegrambot/tbot.py`: bot entry point
 - `core/scripts/telegrambot/supervisor.py`: primary and hosted reseller bot supervisor
 - `core/scripts/telegrambot/hosted_worker.py`: isolated reseller storefront worker
+- `core/scripts/telegrambot/ajib.db`: private SQLite runtime state
+- `core/scripts/telegrambot/migrate_state.py`: idempotent legacy-state importer
 - `core/scripts/telegrambot/utils/`: Telegram handlers and external API client
 - `core/scripts/telegrambot/.env`: bot credentials and VPN server definitions
 - `core/cli.py`: bot lifecycle, backup, version, and dashboard commands
 - `menu.sh`: interactive bot configuration and service manager
 
-Do not commit `.env`, API tokens, payment details, or generated JSON state.
+Mutable state is stored in `ajib.db`; `plans.json` and `support_info.json`
+remain static configuration. Do not commit `.env`, the database, API tokens,
+payment details, receipts, logs, or generated backup archives.
 
 ## Hosted reseller bots
 

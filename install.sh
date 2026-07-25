@@ -57,6 +57,15 @@ git clone "$REPOSITORY" "$INSTALL_DIR"
 python3 -m venv "$INSTALL_DIR/ajib_venv"
 "$INSTALL_DIR/ajib_venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
 chmod +x "$INSTALL_DIR/menu.sh"
+AJIB_BOT_DIR="$INSTALL_DIR/core/scripts/telegrambot" \
+AJIB_DB_PATH="$INSTALL_DIR/core/scripts/telegrambot/ajib.db" \
+"$INSTALL_DIR/ajib_venv/bin/python" \
+    "$INSTALL_DIR/core/scripts/telegrambot/migrate_state.py" \
+    --legacy-root "$INSTALL_DIR/core/scripts/telegrambot" \
+    --database "$INSTALL_DIR/core/scripts/telegrambot/ajib.db" \
+    --archive-dir "/opt/ajib-backups" >/dev/null
+chmod 700 "$INSTALL_DIR/core/scripts/telegrambot"
+chmod 600 "$INSTALL_DIR/core/scripts/telegrambot/ajib.db"
 
 alias_line="alias ajib='source /etc/ajib/ajib_venv/bin/activate && /etc/ajib/menu.sh'"
 if ! grep -Fqx "$alias_line" "$HOME/.bashrc" 2>/dev/null; then

@@ -16,6 +16,16 @@ class TestConfigStoreError(RuntimeError):
 _store_lock = threading.RLock()
 
 
+def _sqlite_modules(path):
+    try:
+        from utils import database, state_store
+    except ImportError:
+        return None
+    if not state_store.is_managed_path(path):
+        return None
+    return database, state_store
+
+
 def _parent_dir(path):
     return os.path.dirname(os.path.abspath(path))
 
@@ -79,18 +89,48 @@ def _write_unlocked(path, configs):
 
 
 def load_test_configs(path):
+    sqlite_modules = _sqlite_modules(path)
+    if sqlite_modules:
+        _database, state_store = sqlite_modules
+        data = state_store.read_state(path, {})
+        if not isinstance(data, dict):
+            raise TestConfigStoreError("Test config database must contain a JSON object.")
+        return data
     with _store_lock:
         with _file_lock(path):
             return _read_unlocked(path)
 
 
 def save_test_configs(path, configs):
+    sqlite_modules = _sqlite_modules(path)
+    if sqlite_modules:
+        _database, state_store = sqlite_modules
+        if not isinstance(configs, dict):
+            raise TestConfigStoreError("Test config database must contain a JSON object.")
+        state_store.write_state(path, configs)
+        return
     with _store_lock:
         with _file_lock(path):
             _write_unlocked(path, configs)
 
 
 def update_test_configs(path, mutator):
+    sqlite_modules = _sqlite_modules(path)
+    if sqlite_modules:
+        database, state_store = sqlite_modules
+        descriptor = state_store.describe_path(path)
+        try:
+            with database.transaction() as connection:
+                configs = state_store.load_descriptor(connection, descriptor, {})
+                if not isinstance(configs, dict):
+                    raise TestConfigStoreError("Test config database must contain a JSON object.")
+                result = mutator(configs)
+                state_store.save_descriptor(connection, descriptor, configs)
+                return result
+        except TestConfigStoreError:
+            raise
+        except Exception as exc:
+            raise TestConfigStoreError(f"Failed to update test config database: {exc}") from exc
     with _store_lock:
         with _file_lock(path):
             configs = _read_unlocked(path)

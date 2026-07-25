@@ -42,16 +42,42 @@ def extract_recorded_usernames(records):
     return usernames
 
 
-def load_recorded_usernames(record_paths=None, extra_paths=None):
+def load_recorded_usernames(record_paths=None, extra_paths=None, scopes=None):
     """Load every recorded VPN username, failing closed on damaged state."""
-    paths = list(
-        DEFAULT_RECORDED_USERNAME_PATHS
-        if record_paths is None
-        else record_paths
-    )
-    paths.extend(extra_paths or ())
+    extra_paths = list(extra_paths or ())
+    if record_paths is None:
+        try:
+            from utils import state_store
+        except ImportError:
+            state_store = None
+        if state_store is not None and os.getenv("AJIB_SQLITE_ACTIVE") == "1":
+            query_scopes = list(scopes or ("main",))
+            remaining_extra_paths = []
+            for raw_path in extra_paths:
+                descriptor = state_store.describe_path(raw_path)
+                if descriptor is not None and descriptor.kind == "payments":
+                    if descriptor.scope not in query_scopes:
+                        query_scopes.append(descriptor.scope)
+                else:
+                    remaining_extra_paths.append(raw_path)
+            try:
+                usernames = set(state_store.query_recorded_usernames(query_scopes))
+            except Exception as exc:
+                raise RecordedUsernameLoadError(
+                    f"Unable to read recorded username history from SQLite: {exc}"
+                ) from exc
+            if not remaining_extra_paths:
+                return usernames
+            paths = remaining_extra_paths
+        else:
+            usernames = set()
+            paths = list(DEFAULT_RECORDED_USERNAME_PATHS)
+            paths.extend(extra_paths)
+    else:
+        usernames = set()
+        paths = list(record_paths)
+        paths.extend(extra_paths)
 
-    usernames = set()
     seen_paths = set()
     for raw_path in paths:
         path = os.fspath(raw_path)

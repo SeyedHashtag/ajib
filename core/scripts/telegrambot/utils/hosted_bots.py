@@ -1,11 +1,12 @@
 import hashlib
 import os
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from .atomic_store import locked_json, read_json
-from . import reseller as reseller_store
+from . import database, reseller as reseller_store
 
 
 BOT_DIR = os.getenv("AJIB_BOT_DIR", "/etc/ajib/core/scripts/telegrambot")
@@ -280,14 +281,16 @@ def register_bot(reseller_id, token, bot_info, main_bot_id=None):
 def disconnect_bot(reseller_id):
     key = _reseller_key(reseller_id)
     found = False
-    with locked_json(REGISTRY_FILE, {}) as registry:
-        if key in registry:
-            found = True
-            registry[key]["enabled"] = False
-            registry[key]["status"] = "disconnected"
-            registry[key]["updated_at"] = _now()
-    with locked_json(SECRETS_FILE, {}) as secrets:
-        secrets.pop(key, None)
+    outer = database.transaction() if os.getenv("AJIB_SQLITE_ACTIVE") == "1" else nullcontext()
+    with outer:
+        with locked_json(REGISTRY_FILE, {}) as registry:
+            if key in registry:
+                found = True
+                registry[key]["enabled"] = False
+                registry[key]["status"] = "disconnected"
+                registry[key]["updated_at"] = _now()
+        with locked_json(SECRETS_FILE, {}) as secrets:
+            secrets.pop(key, None)
     return found
 
 
@@ -474,12 +477,12 @@ def consume_renewal_credit(reseller_id, reservation_id, username, renewal_data, 
 
 
 def transfer_earnings_to_debt(reseller_id):
-    current = reseller_store.get_reseller_data(reseller_id) or {}
-    debt = _money(current.get("debt", 0))
-    if debt <= 0:
-        return False, "There is no debt to settle."
     path = tenant_file(reseller_id, "ledger.json")
     with locked_json(path, _default_ledger()) as ledger:
+        current = reseller_store.get_reseller_data(reseller_id) or {}
+        debt = _money(current.get("debt", 0))
+        if debt <= 0:
+            return False, "There is no debt to settle."
         amount = min(debt, _money(ledger.get("earnings_available", 0)))
         if amount <= 0:
             return False, "There are no available earnings."
@@ -492,13 +495,13 @@ def transfer_earnings_to_debt(reseller_id):
 
 
 def request_earnings_withdrawal(reseller_id, destination):
-    debt = _money((reseller_store.get_reseller_data(reseller_id) or {}).get("debt", 0))
-    if debt > 0:
-        return False, "All reseller debt must be settled first."
     clean_destination = str(destination or "").strip()
     if not clean_destination or len(clean_destination) > 500 or "\x00" in clean_destination:
         return False, "A payout destination is required."
     with locked_json(tenant_file(reseller_id, "ledger.json"), _default_ledger()) as ledger:
+        debt = _money((reseller_store.get_reseller_data(reseller_id) or {}).get("debt", 0))
+        if debt > 0:
+            return False, "All reseller debt must be settled first."
         if any(item.get("status") == "pending" for item in ledger.get("withdrawals", [])):
             return False, "A withdrawal is already pending."
         amount = _money(ledger.get("earnings_available", 0))

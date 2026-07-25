@@ -4,6 +4,8 @@ import threading
 from copy import deepcopy
 from contextlib import contextmanager
 
+from . import database, state_store
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback for tests
@@ -34,6 +36,17 @@ def locked_json(path, default=None, mode=0o600):
     locked mutation must never replace damaged state with an empty default.
     JSON and I/O errors therefore propagate before the caller can write.
     """
+    descriptor = state_store.describe_path(path)
+    if descriptor is not None:
+        operation = f"{descriptor.kind}:{descriptor.scope}"
+        with database.write_transaction(operation=operation) as connection:
+            data = state_store.load_descriptor(connection, descriptor, default)
+            original = deepcopy(data)
+            yield data
+            if data != original:
+                state_store.save_descriptor(connection, descriptor, data)
+        return
+
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
     lock_path = f"{path}.lock"
@@ -48,6 +61,10 @@ def locked_json(path, default=None, mode=0o600):
             try:
                 data = _read_json_for_update(path, default)
                 yield data
+                # Preserve the legacy contract for compatibility callers: a
+                # successful locked update materializes even an unchanged
+                # default. SQLite-managed state above can safely avoid this
+                # no-op write.
                 write_json(path, data, mode=mode)
             finally:
                 if fcntl is not None:
@@ -55,6 +72,8 @@ def locked_json(path, default=None, mode=0o600):
 
 
 def read_json(path, default=None):
+    if state_store.is_managed_path(path):
+        return state_store.read_state(path, default)
     try:
         with open(path, "r", encoding="utf-8") as handle:
             return json.load(handle)
@@ -63,6 +82,9 @@ def read_json(path, default=None):
 
 
 def write_json(path, data, mode=0o600):
+    if state_store.is_managed_path(path):
+        state_store.write_state(path, data)
+        return
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
     temporary = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"

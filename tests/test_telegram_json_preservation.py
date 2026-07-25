@@ -1,3 +1,4 @@
+import ast
 import re
 import unittest
 from pathlib import Path
@@ -8,6 +9,21 @@ MAINTENANCE_SCRIPTS = {
     REPO_ROOT / "upgrade.sh",
     REPO_ROOT / "core/scripts/ajib/backup.sh",
     REPO_ROOT / "core/scripts/ajib/restore.sh",
+}
+DIRECT_JSON_COMPATIBILITY_MODULES = {
+    "core/scripts/telegrambot/migrate_state.py",
+    "core/scripts/telegrambot/state_archive.py",
+    "core/scripts/telegrambot/utils/atomic_store.py",
+    "core/scripts/telegrambot/utils/broadcast.py",
+    "core/scripts/telegrambot/utils/receipt_checker.py",
+    "core/scripts/telegrambot/utils/referral.py",
+    "core/scripts/telegrambot/utils/reseller.py",
+    "core/scripts/telegrambot/utils/test_config.py",
+    "core/scripts/telegrambot/utils/test_config_store.py",
+    "core/scripts/telegrambot/utils/traffic_monitor.py",
+    "core/scripts/telegrambot/utils/username_utils.py",
+    "core/scripts/telegrambot/utils/edit_plans.py",
+    "core/scripts/telegrambot/utils/edit_support.py",
 }
 
 
@@ -33,7 +49,7 @@ def referenced_telegram_json_files():
 
 
 class TelegramJsonPreservationTests(unittest.TestCase):
-    def test_runtime_telegram_json_files_are_preserved_by_directory_patterns(self):
+    def test_maintenance_scripts_use_versioned_sqlite_state_archives(self):
         referenced_json_files = referenced_telegram_json_files()
         self.assertTrue(referenced_json_files)
 
@@ -41,20 +57,12 @@ class TelegramJsonPreservationTests(unittest.TestCase):
         backup_text = (REPO_ROOT / "core/scripts/ajib/backup.sh").read_text()
         restore_text = (REPO_ROOT / "core/scripts/ajib/restore.sh").read_text()
 
-        for script_text in (upgrade_text, backup_text):
-            self.assertIn('"$BOT_DIR"/*.env', script_text)
-            self.assertIn('"$BOT_DIR"/*.json', script_text)
-            self.assertNotIn("/etc/ajib/*.env", script_text)
-            self.assertNotIn("/etc/ajib/*.json", script_text)
-
-        self.assertIn('"$RESTORE_DIR/core/scripts/telegrambot"/*.env', restore_text)
-        self.assertIn('"$RESTORE_DIR/core/scripts/telegrambot"/*.json', restore_text)
-        self.assertNotIn(".configs.env", restore_text)
-
-        maintenance_text = "\n".join((upgrade_text, backup_text, restore_text))
-        for path in referenced_json_files:
-            self.assertNotIn(path, maintenance_text)
-            self.assertNotIn(path[len("/etc/ajib/"):], maintenance_text)
+        self.assertIn("state_archive.py", backup_text)
+        self.assertIn("prepare-restore", restore_text)
+        self.assertIn("prepare-restore", upgrade_text)
+        self.assertIn("ajib.db", restore_text)
+        self.assertIn("ajib.db", upgrade_text)
+        self.assertNotIn(".configs.env", "\n".join((upgrade_text, backup_text, restore_text)))
 
     def test_maintenance_scripts_do_not_manage_a_local_vpn_server(self):
         maintenance_text = "\n".join(path.read_text() for path in MAINTENANCE_SCRIPTS)
@@ -67,6 +75,25 @@ class TelegramJsonPreservationTests(unittest.TestCase):
             "config.yaml",
         ):
             self.assertNotIn(legacy_value, maintenance_text)
+
+    def test_direct_json_file_io_is_confined_to_compatibility_and_static_config(self):
+        runtime = REPO_ROOT / "core/scripts/telegrambot"
+        offenders = []
+        for path in runtime.rglob("*.py"):
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            if relative in DIRECT_JSON_COMPATIBILITY_MODULES:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "json"
+                    and node.func.attr in {"load", "dump"}
+                ):
+                    offenders.append(f"{relative}:{node.lineno}")
+        self.assertEqual(offenders, [])
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import os
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 
 os.environ["AJIB_BOT_ROLE"] = "hosted"
@@ -18,9 +19,16 @@ from dotenv import load_dotenv
 from telebot import types
 
 BOT_DIR = os.getenv("AJIB_BOT_DIR", "/etc/ajib/core/scripts/telegrambot")
+os.environ.setdefault("AJIB_BOT_DIR", BOT_DIR)
 load_dotenv(os.path.join(BOT_DIR, ".env"))
 
+if __name__ == "__main__":
+    from migrate_state import bootstrap_storage
+
+    bootstrap_storage(BOT_DIR)
+
 from utils.api_client import MultiServerAPI
+from utils import database
 from utils.atomic_store import locked_json, read_json
 from utils.currency_format import format_toman_amount, format_usd_amount
 from utils.hosted_bots import (
@@ -633,6 +641,39 @@ def _credit_referral(order_id, customer_id, reward):
     return float(reward)
 
 
+def _credit_sale_and_referral(
+    payment_id,
+    customer_id,
+    reward,
+    metadata,
+    *,
+    funded,
+    margin=0,
+):
+    transaction = (
+        database.write_transaction(operation="hosted_sale_referral_accounting")
+        if os.getenv("AJIB_SQLITE_ACTIVE") == "1"
+        else nullcontext()
+    )
+    with transaction:
+        if funded:
+            credit_crypto_sale(
+                OWNER_ID,
+                payment_id,
+                margin,
+                reward,
+                metadata,
+            )
+        else:
+            add_referral_liability(
+                OWNER_ID,
+                payment_id,
+                reward,
+                metadata,
+            )
+        return _credit_referral(payment_id, customer_id, reward)
+
+
 def _create_user(
     plan,
     note,
@@ -749,12 +790,16 @@ def _provision_payment(payment_id, record, funded):
         client, _ = MultiServerAPI().find_user(username, preferred_server_id=existing_config.get("server_id"))
         metadata = {"username": username, "server_id": existing_config.get("server_id"),
                     "retail_order_id": payment_id, "customer_telegram_id": customer_id}
-        if funded:
-            credit_crypto_sale(OWNER_ID, payment_id, record["margin"], record.get("referral_reward", 0), metadata)
-        else:
+        if not funded:
             release_credit(OWNER_ID, payment_id, kind="credit_recovered")
-            add_referral_liability(OWNER_ID, payment_id, record.get("referral_reward", 0), metadata)
-        _credit_referral(payment_id, customer_id, record.get("referral_reward", 0))
+        _credit_sale_and_referral(
+            payment_id,
+            customer_id,
+            record.get("referral_reward", 0),
+            metadata,
+            funded=funded,
+            margin=record.get("margin", 0),
+        )
         _save_payment(payment_id, {"status": "completed", "username": username,
                                    "server_id": existing_config.get("server_id")})
         _deliver_config_safely(customer_id, username, client, renewed=renewed)
@@ -832,11 +877,14 @@ def _provision_payment(payment_id, record, funded):
             _language(OWNER_ID),
             allow_introduction=False,
         )
-    if funded:
-        credit_crypto_sale(OWNER_ID, payment_id, record["margin"], record.get("referral_reward", 0), common)
-    else:
-        add_referral_liability(OWNER_ID, payment_id, record.get("referral_reward", 0), common)
-    _credit_referral(payment_id, customer_id, record.get("referral_reward", 0))
+    _credit_sale_and_referral(
+        payment_id,
+        customer_id,
+        record.get("referral_reward", 0),
+        common,
+        funded=funded,
+        margin=record.get("margin", 0),
+    )
     _save_payment(payment_id, {"status": "completed", "username": username, "server_id": server_id})
     _deliver_config_safely(customer_id, username, client, renewed=renewed)
     return True, username

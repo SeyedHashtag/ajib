@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import datetime
 
 from utils.atomic_store import locked_json, read_json
@@ -67,7 +68,7 @@ def update_payment_status(payment_id, status):
                 payment['updates'] = updates
             updates.append(update)
             return True
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, sqlite3.OperationalError):
         return False
 
 
@@ -83,7 +84,7 @@ def update_payment_record_fields(payment_id, fields):
             payments[payment_id].update(fields)
             payments[payment_id]['updated_at'] = _now()
             return True
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, sqlite3.OperationalError):
         return False
 
 
@@ -113,7 +114,7 @@ def complete_payment_record(payment_id, fields, status='completed'):
                 'previous_status': previous_status,
             })
             return True
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, sqlite3.OperationalError):
         return False
 
 
@@ -124,6 +125,18 @@ def claim_payment_for_processing(payment_id, allowed_statuses=None):
         allowed_statuses = {str(status) for status in allowed_statuses}
 
     try:
+        try:
+            from utils import state_store
+        except ImportError:
+            state_store = None
+
+        if state_store is not None and state_store.is_managed_path(PAYMENTS_FILE):
+            return state_store.claim_payment_for_processing(
+                PAYMENTS_FILE,
+                payment_id,
+                allowed_statuses,
+                _now(),
+            )
         with _payment_store() as payments:
             if not _valid_payments(payments):
                 return False
@@ -150,7 +163,7 @@ def claim_payment_for_processing(payment_id, allowed_statuses=None):
                 payment['updates'] = updates
             updates.append(update)
             return True
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, sqlite3.OperationalError):
         return False
 
 

@@ -8,12 +8,22 @@ from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 try:
+    from . import database, state_store
+except ImportError:  # Direct module loading in compatibility tests/tools.
+    database = None
+    state_store = None
+
+try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
 
 RESELLERS_FILE = '/etc/ajib/core/scripts/telegrambot/resellers.json'
 reseller_lock = threading.RLock()
+
+
+def _sqlite_managed():
+    return state_store is not None and state_store.is_managed_path(RESELLERS_FILE)
 
 
 def _safe_float_env(key, default):
@@ -199,6 +209,10 @@ def _resellers_lock_path():
 
 @contextmanager
 def _resellers_file_lock():
+    if _sqlite_managed():
+        with database.transaction():
+            yield
+        return
     os.makedirs(os.path.dirname(RESELLERS_FILE), exist_ok=True)
     lock_file = open(_resellers_lock_path(), 'a')
     try:
@@ -212,6 +226,9 @@ def _resellers_file_lock():
 
 
 def _read_resellers_file():
+    if _sqlite_managed():
+        data = state_store.read_state(RESELLERS_FILE, {})
+        return data if isinstance(data, dict) else {}
     if not os.path.exists(RESELLERS_FILE):
         return {}
     with open(RESELLERS_FILE, 'r') as f:
@@ -220,6 +237,12 @@ def _read_resellers_file():
 
 
 def _write_resellers_file(resellers):
+    if _sqlite_managed():
+        state_store.write_state(
+            RESELLERS_FILE,
+            resellers if isinstance(resellers, dict) else {},
+        )
+        return
     os.makedirs(os.path.dirname(RESELLERS_FILE), exist_ok=True)
     tmp_path = f"{RESELLERS_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
@@ -235,6 +258,10 @@ def _write_resellers_file(resellers):
                 os.remove(tmp_path)
         except OSError:
             pass
+
+
+def _resellers_store_exists():
+    return state_store.state_exists(RESELLERS_FILE) if _sqlite_managed() else os.path.exists(RESELLERS_FILE)
 
 
 def _is_removed_config(config):
@@ -482,7 +509,7 @@ def add_reseller_debt(user_id, amount, config_data):
     with reseller_lock:
         try:
             with _resellers_file_lock():
-                if not os.path.exists(RESELLERS_FILE):
+                if not _resellers_store_exists():
                     return False
                 resellers = _read_resellers_file()
 
@@ -616,7 +643,7 @@ def add_reseller_renewal_debt(user_id, username, amount, renewal_data, server_id
     with reseller_lock:
         try:
             with _resellers_file_lock():
-                if not os.path.exists(RESELLERS_FILE):
+                if not _resellers_store_exists():
                     return False
                 resellers = _read_resellers_file()
 
@@ -682,7 +709,7 @@ def clear_reseller_debt(user_id):
     with reseller_lock:
         try:
             with _resellers_file_lock():
-                if not os.path.exists(RESELLERS_FILE):
+                if not _resellers_store_exists():
                     return False
                 resellers = _read_resellers_file()
 
@@ -704,7 +731,7 @@ def set_reseller_debt(user_id, amount):
     with reseller_lock:
         try:
             with _resellers_file_lock():
-                if not os.path.exists(RESELLERS_FILE):
+                if not _resellers_store_exists():
                     return False
                 resellers = _read_resellers_file()
 
@@ -735,7 +762,7 @@ def delete_reseller(user_id):
     with reseller_lock:
         try:
             with _resellers_file_lock():
-                if not os.path.exists(RESELLERS_FILE):
+                if not _resellers_store_exists():
                     return False
                 resellers = _read_resellers_file()
 
@@ -790,7 +817,7 @@ def cleanup_banned_reseller_users(user_id, multi_api):
     with reseller_lock:
         try:
             with _resellers_file_lock():
-                if not os.path.exists(RESELLERS_FILE):
+                if not _resellers_store_exists():
                     return False, {'reason': 'Reseller not found'}
                 resellers = _read_resellers_file()
         except Exception:
@@ -887,7 +914,7 @@ def apply_reseller_payment(user_id, amount):
     with reseller_lock:
         try:
             with _resellers_file_lock():
-                if not os.path.exists(RESELLERS_FILE):
+                if not _resellers_store_exists():
                     return False, None
                 resellers = _read_resellers_file()
 
@@ -955,7 +982,7 @@ def evaluate_reseller_debt_policies():
     with reseller_lock:
         try:
             with _resellers_file_lock():
-                if not os.path.exists(RESELLERS_FILE):
+                if not _resellers_store_exists():
                     return []
                 resellers = _read_resellers_file()
 

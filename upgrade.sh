@@ -4,12 +4,14 @@ set -euo pipefail
 
 INSTALL_DIR="/etc/ajib"
 BOT_DIR="$INSTALL_DIR/core/scripts/telegrambot"
+BACKUP_DIR=${AJIB_BACKUP_DIR:-/opt/ajib-backups}
 REPOSITORY="https://github.com/SeyedHashtag/ajib"
 TEMP_DIR=$(mktemp -d)
 STATE_DIR="$TEMP_DIR/state"
 NEW_DIR="$TEMP_DIR/new"
 OLD_DIR="$TEMP_DIR/old"
 was_active=false
+service_stopped=false
 switched=false
 upgrade_succeeded=false
 
@@ -20,9 +22,9 @@ cleanup() {
         rm -rf "$INSTALL_DIR"
         mv "$OLD_DIR" "$INSTALL_DIR"
         systemctl daemon-reload
-        if [ "$was_active" = true ]; then
-            systemctl start ajib-telegram-bot.service
-        fi
+    fi
+    if [ "$service_stopped" = true ] && [ "$upgrade_succeeded" != true ]; then
+        systemctl start ajib-telegram-bot.service >/dev/null 2>&1 || true
     fi
     rm -rf "$TEMP_DIR"
     exit "$status"
@@ -39,42 +41,45 @@ if [ ! -d "$INSTALL_DIR" ]; then
     exit 1
 fi
 
-mkdir -p "$STATE_DIR"
-shopt -s nullglob dotglob
-state_files=("$BOT_DIR"/*.env "$BOT_DIR"/*.json)
-shopt -u nullglob dotglob
-for file in "${state_files[@]}"; do
-    cp -p "$file" "$STATE_DIR/"
-done
-if [ -d "$BOT_DIR/hosted_bots" ]; then
-    cp -a "$BOT_DIR/hosted_bots" "$STATE_DIR/"
-fi
-
 git clone "$REPOSITORY" "$NEW_DIR"
 
 if systemctl is-active --quiet ajib-telegram-bot.service; then
     was_active=true
     systemctl stop ajib-telegram-bot.service
+    service_stopped=true
 fi
+
+mkdir -p "$BACKUP_DIR" "$STATE_DIR"
+SAFETY_BACKUP=$(
+    AJIB_INSTALL_DIR="$INSTALL_DIR" AJIB_BACKUP_DIR="$BACKUP_DIR" \
+        "$INSTALL_DIR/core/scripts/ajib/backup.sh"
+)
+
+python3 "$NEW_DIR/core/scripts/telegrambot/state_archive.py" prepare-restore \
+    --archive "$SAFETY_BACKUP" \
+    --staging-dir "$STATE_DIR" >/dev/null
 
 mv "$INSTALL_DIR" "$OLD_DIR"
 switched=true
 mv "$NEW_DIR" "$INSTALL_DIR"
 
+STAGED_BOT_DIR="$STATE_DIR/core/scripts/telegrambot"
 mkdir -p "$BOT_DIR"
-shopt -s nullglob dotglob
-saved_files=("$STATE_DIR"/*)
-shopt -u nullglob dotglob
-for file in "${saved_files[@]}"; do
-    cp -a "$file" "$BOT_DIR/"
+for name in .env plans.json support_info.json ajib.db; do
+    if [ -f "$STAGED_BOT_DIR/$name" ]; then
+        cp -p "$STAGED_BOT_DIR/$name" "$BOT_DIR/$name"
+    fi
 done
+if [ -d "$STAGED_BOT_DIR/hosted_bots" ]; then
+    cp -a "$STAGED_BOT_DIR/hosted_bots" "$BOT_DIR/"
+fi
+chmod 700 "$BOT_DIR"
+chmod 600 "$BOT_DIR/ajib.db"
 
 python3 -m venv "$INSTALL_DIR/ajib_venv"
 "$INSTALL_DIR/ajib_venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
 chmod +x "$INSTALL_DIR/menu.sh"
 
-# Existing installations may still point systemd directly at tbot.py. Hosted
-# bots require the supervisor, which also runs and restarts the primary bot.
 service_file="/etc/systemd/system/ajib-telegram-bot.service"
 if [ -f "$service_file" ]; then
     sed -i 's#/etc/ajib/core/scripts/telegrambot/tbot.py#/etc/ajib/core/scripts/telegrambot/supervisor.py#g' "$service_file"

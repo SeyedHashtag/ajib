@@ -309,7 +309,7 @@ def _process_customer_renewal_payment(payment_id, payment_record, notify_chat_id
         fields=completion_fields,
     ):
         return False
-    add_referral_reward(user_id, payment_record.get('price', 0))
+    add_referral_reward(user_id, payment_record.get('price', 0), payment_id)
 
     send_admin_payment_notification(
         user_id,
@@ -1536,7 +1536,11 @@ def _process_admin_approval_job(call, action, payment_id, payment_record, review
                         text=get_message_text(language, "error_processing_payment").format(error="payment record update failed")
                     )
                     return
-                add_referral_reward(payment_record['user_id'], payment_record['price'])
+                add_referral_reward(
+                    payment_record['user_id'],
+                    payment_record['price'],
+                    payment_id,
+                )
                 
                 telegram_username = None
                 try:
@@ -1771,7 +1775,7 @@ def _process_check_payment_job(call):
                 server_name=getattr(api_client, 'server_name', None),
                 server_id=getattr(api_client, 'server_id', None),
             )
-            add_referral_reward(user_id, price)
+            add_referral_reward(user_id, price, payment_id)
             user_uri_data = api_client.get_user_uri(username)
             if user_uri_data and 'normal_sub' in user_uri_data:
                 sub_url = user_uri_data['normal_sub']
@@ -1944,7 +1948,7 @@ def process_payment_webhook(request_data):
                         server_name=getattr(api_client, 'server_name', None),
                         server_id=getattr(api_client, 'server_id', None),
                     )
-                    add_referral_reward(user_id, price)
+                    add_referral_reward(user_id, price, record_key)
                     
                     user_uri_data = api_client.get_user_uri(username)
                     sub_url = user_uri_data.get('normal_sub') if user_uri_data else None
@@ -2097,7 +2101,7 @@ def check_pending_payments():
                                 server_name=getattr(api_client, 'server_name', None),
                                 server_id=getattr(api_client, 'server_id', None),
                             )
-                            add_referral_reward(user_id, price)
+                            add_referral_reward(user_id, price, payment_id)
                             user_uri_data = api_client.get_user_uri(username)
 
                             user_language = get_user_language(user_id)

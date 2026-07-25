@@ -3,27 +3,24 @@ import json
 from telebot import types
 from utils.command import bot
 from utils.translations import LANGUAGES, BUTTON_TRANSLATIONS
+from utils.atomic_store import locked_json, read_json
 
 # Path to store user language preferences - using relative path for better compatibility
 LANGUAGE_PREFS_FILE = '/etc/ajib/core/scripts/telegrambot/user_languages.json'
 
 def load_user_languages():
     """Load user language preferences from file"""
-    if os.path.exists(LANGUAGE_PREFS_FILE):
-        try:
-            with open(LANGUAGE_PREFS_FILE, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    data = read_json(LANGUAGE_PREFS_FILE, {})
+    return data if isinstance(data, dict) else {}
 
 def save_user_languages(languages_data):
     """Save user language preferences to file"""
     try:
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(LANGUAGE_PREFS_FILE), exist_ok=True)
-        with open(LANGUAGE_PREFS_FILE, 'w') as f:
-            json.dump(languages_data, f, indent=2)
+        with locked_json(LANGUAGE_PREFS_FILE, {}) as stored:
+            if not isinstance(stored, dict):
+                raise ValueError("Language preference store must contain an object.")
+            stored.clear()
+            stored.update(languages_data if isinstance(languages_data, dict) else {})
     except Exception as e:
         print(f"Error saving language preferences: {e}")
 
@@ -38,9 +35,10 @@ def get_user_language(user_id):
 def set_user_language(user_id, language_code):
     """Set the language preference for a user"""
     user_id_str = str(user_id)
-    languages = load_user_languages()
-    languages[user_id_str] = language_code
-    save_user_languages(languages)
+    with locked_json(LANGUAGE_PREFS_FILE, {}) as languages:
+        if not isinstance(languages, dict):
+            raise ValueError("Language preference store must contain an object.")
+        languages[user_id_str] = language_code
 
 @bot.message_handler(func=lambda message: any(
     message.text == translations["language"] 

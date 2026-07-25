@@ -18,6 +18,14 @@ DEFAULT_RECEIPT_CHECKER_SHARE_PERCENT = 10.0
 checker_settlement_lock = threading.RLock()
 
 
+def _atomic_helpers():
+    try:
+        from utils.atomic_store import locked_json, read_json
+        return locked_json, read_json
+    except ImportError:
+        return None
+
+
 def reload_receipt_checker_env():
     load_dotenv(TELEGRAM_ENV_PATH, override=True)
 
@@ -149,10 +157,15 @@ def get_card_number_for_receipt_type(receipt_type):
 def load_checker_settlements():
     with checker_settlement_lock:
         try:
-            if os.path.exists(CHECKER_SETTLEMENTS_FILE):
-                with open(CHECKER_SETTLEMENTS_FILE, 'r') as f:
-                    data = json.load(f)
-                    return data if isinstance(data, list) else []
+            helpers = _atomic_helpers()
+            if helpers:
+                data = helpers[1](CHECKER_SETTLEMENTS_FILE, [])
+            elif os.path.exists(CHECKER_SETTLEMENTS_FILE):
+                with open(CHECKER_SETTLEMENTS_FILE, "r") as handle:
+                    data = json.load(handle)
+            else:
+                data = []
+            return data if isinstance(data, list) else []
         except Exception:
             pass
         return []
@@ -160,9 +173,17 @@ def load_checker_settlements():
 
 def save_checker_settlements(settlements):
     with checker_settlement_lock:
-        os.makedirs(os.path.dirname(CHECKER_SETTLEMENTS_FILE), exist_ok=True)
-        with open(CHECKER_SETTLEMENTS_FILE, 'w') as f:
-            json.dump(settlements, f, indent=4)
+        helpers = _atomic_helpers()
+        if helpers:
+            with helpers[0](CHECKER_SETTLEMENTS_FILE, []) as stored:
+                if not isinstance(stored, list):
+                    raise ValueError("Checker settlements must contain a JSON list.")
+                stored.clear()
+                stored.extend(settlements if isinstance(settlements, list) else [])
+        else:
+            os.makedirs(os.path.dirname(CHECKER_SETTLEMENTS_FILE), exist_ok=True)
+            with open(CHECKER_SETTLEMENTS_FILE, "w") as handle:
+                json.dump(settlements if isinstance(settlements, list) else [], handle, indent=4)
 
 
 def add_checker_settlement(amount, admin_user_id, stats_snapshot, checker_id=None, open_account_amount=None):
@@ -185,9 +206,16 @@ def add_checker_settlement(amount, admin_user_id, stats_snapshot, checker_id=Non
     if open_account_amount is not None:
         checkpoint['open_account_amount_toman'] = normalize_toman_amount(open_account_amount)
     with checker_settlement_lock:
-        settlements = load_checker_settlements()
-        settlements.append(checkpoint)
-        save_checker_settlements(settlements)
+        helpers = _atomic_helpers()
+        if helpers:
+            with helpers[0](CHECKER_SETTLEMENTS_FILE, []) as settlements:
+                if not isinstance(settlements, list):
+                    raise ValueError("Checker settlements must contain a JSON list.")
+                settlements.append(checkpoint)
+        else:
+            settlements = load_checker_settlements()
+            settlements.append(checkpoint)
+            save_checker_settlements(settlements)
     return checkpoint
 
 

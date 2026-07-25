@@ -17,22 +17,43 @@ ALERT_RESET_RATIO = 0.05
 _alerts_lock = threading.Lock()
 
 
+def _atomic_helpers():
+    try:
+        from utils.atomic_store import locked_json, read_json
+        return locked_json, read_json
+    except ImportError:
+        return None
+
+
 def _load_alerts():
     with _alerts_lock:
-        if os.path.exists(ALERTS_FILE):
-            try:
+        try:
+            helpers = _atomic_helpers()
+            if helpers:
+                data = helpers[1](ALERTS_FILE, {})
+            elif os.path.exists(ALERTS_FILE):
                 with open(ALERTS_FILE, 'r') as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-        return {}
+                    data = json.load(f)
+            else:
+                data = {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
 
 
 def _save_alerts(alerts):
     with _alerts_lock:
-        os.makedirs(os.path.dirname(ALERTS_FILE), exist_ok=True)
-        with open(ALERTS_FILE, 'w') as f:
-            json.dump(alerts, f, indent=2)
+        helpers = _atomic_helpers()
+        if helpers:
+            with helpers[0](ALERTS_FILE, {}) as stored:
+                if not isinstance(stored, dict):
+                    raise ValueError("Traffic alerts must contain a JSON object.")
+                stored.clear()
+                stored.update(alerts if isinstance(alerts, dict) else {})
+        else:
+            os.makedirs(os.path.dirname(ALERTS_FILE), exist_ok=True)
+            with open(ALERTS_FILE, 'w') as f:
+                json.dump(alerts, f, indent=2)
 
 
 def _extract_telegram_id(username):
@@ -109,6 +130,18 @@ def _get_reseller_config(reseller_id, username):
     Returns the matching config dict, or an empty dict if not found.
     """
     try:
+        try:
+            from utils import state_store
+            from utils.reseller import get_reseller_data
+        except ImportError:
+            state_store = None
+            get_reseller_data = None
+        if state_store and state_store.is_managed_path(RESELLERS_FILE):
+            record = get_reseller_data(reseller_id) or {}
+            for cfg in record.get("configs", []):
+                if isinstance(cfg, dict) and cfg.get("username") == username:
+                    return cfg
+            return {}
         if not os.path.exists(RESELLERS_FILE):
             return {}
         with open(RESELLERS_FILE, 'r') as f:

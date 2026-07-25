@@ -12,9 +12,11 @@ os.environ["AJIB_BOT_ROLE"] = "supervisor"
 
 
 BOT_DIR = os.getenv("AJIB_BOT_DIR", os.path.dirname(os.path.abspath(__file__)))
+os.environ.setdefault("AJIB_BOT_DIR", BOT_DIR)
 if BOT_DIR not in sys.path:
     sys.path.insert(0, BOT_DIR)
 
+from migrate_state import bootstrap_storage
 from utils.atomic_store import read_json
 from utils.hosted_bots import MAX_ACTIVE_BOTS, get_token, list_bots, set_bot_runtime_status
 
@@ -153,6 +155,11 @@ def _stop_signal(_signum, _frame):
 def main():
     signal.signal(signal.SIGTERM, _stop_signal)
     signal.signal(signal.SIGINT, _stop_signal)
+    try:
+        bootstrap_storage(BOT_DIR)
+    except Exception as error:
+        print(f"SQLite state bootstrap failed: {error}", file=sys.stderr, flush=True)
+        return 1
     main_env = dict(os.environ)
     main_env["AJIB_BOT_ROLE"] = "main"
     workers = {

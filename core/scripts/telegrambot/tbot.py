@@ -1,3 +1,14 @@
+import os
+
+os.environ.setdefault("AJIB_BOT_ROLE", "main")
+BOT_DIR = os.getenv("AJIB_BOT_DIR", os.path.dirname(os.path.abspath(__file__)))
+os.environ.setdefault("AJIB_BOT_DIR", BOT_DIR)
+
+if __name__ == "__main__":
+    from migrate_state import bootstrap_storage
+
+    bootstrap_storage(BOT_DIR)
+
 from telebot import types
 from utils import *
 from concurrent.futures import ThreadPoolExecutor

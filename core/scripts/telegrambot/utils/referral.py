@@ -4,10 +4,22 @@ import threading
 import random
 import string
 import uuid
+from copy import deepcopy
+from contextlib import contextmanager
 from datetime import datetime
 
 REFERRALS_FILE = '/etc/ajib/core/scripts/telegrambot/referrals.json'
 referral_lock = threading.RLock()
+
+
+def _atomic_helpers():
+    if not (__package__ or "").startswith("utils"):
+        return None
+    try:
+        from utils.atomic_store import locked_json, read_json
+        return locked_json, read_json
+    except ImportError:
+        return None
 
 # Configuration
 REFERRAL_REWARD_PERCENTAGE = 20  # 20% reward
@@ -21,6 +33,7 @@ def _default_referrals_data():
         "user_codes": {},  # user_id -> code
         "wallets": {},    # user_id -> wallet_address
         "referral_details": {},  # invited user_id -> invite metadata
+        "rewarded_orders": {},  # payment/order ID -> immutable reward record
         "pending_withdrawals": [],  # referral withdrawal requests awaiting admin payout
         "payouts": []     # paid referral payout audit records
     }
@@ -50,107 +63,133 @@ def _safe_int(value, default=0):
 def load_referrals():
     with referral_lock:
         try:
-            if os.path.exists(REFERRALS_FILE):
-                with open(REFERRALS_FILE, 'r') as f:
-                    data = json.load(f)
-                    return _ensure_referrals_shape(data)
+            helpers = _atomic_helpers()
+            if helpers:
+                data = helpers[1](REFERRALS_FILE, _default_referrals_data())
+            elif os.path.exists(REFERRALS_FILE):
+                with open(REFERRALS_FILE, "r") as handle:
+                    data = json.load(handle)
+            else:
+                data = _default_referrals_data()
+            if isinstance(data, dict):
+                return _ensure_referrals_shape(data)
         except Exception:
             pass
         return _default_referrals_data()
 
 def save_referrals(data):
     with referral_lock:
-        os.makedirs(os.path.dirname(REFERRALS_FILE), exist_ok=True)
-        with open(REFERRALS_FILE, 'w') as f:
-            json.dump(data, f, indent=4)
+        helpers = _atomic_helpers()
+        if helpers:
+            with helpers[0](REFERRALS_FILE, _default_referrals_data()) as stored:
+                if not isinstance(stored, dict):
+                    raise ValueError("Referral database must contain a JSON object.")
+                stored.clear()
+                stored.update(_ensure_referrals_shape(data))
+        else:
+            os.makedirs(os.path.dirname(REFERRALS_FILE), exist_ok=True)
+            with open(REFERRALS_FILE, "w") as handle:
+                json.dump(data, handle, indent=4)
+
+
+@contextmanager
+def _edit_referrals():
+    with referral_lock:
+        helpers = _atomic_helpers()
+        if helpers:
+            with helpers[0](REFERRALS_FILE, _default_referrals_data()) as data:
+                if not isinstance(data, dict):
+                    raise ValueError("Referral database must contain a JSON object.")
+                yield _ensure_referrals_shape(data)
+            return
+        data = load_referrals()
+        original = deepcopy(data)
+        yield data
+        if data != original:
+            save_referrals(data)
+
 
 def generate_unique_code():
     chars = string.ascii_letters + string.digits
     return ''.join(random.choice(chars) for _ in range(8))
 
 def get_or_create_referral_code(user_id):
-    data = load_referrals()
     user_id_str = str(user_id)
-    
-    if user_id_str in data["user_codes"]:
-        return data["user_codes"][user_id_str]
-    
-    # Generate new unique code
-    while True:
-        code = generate_unique_code()
-        if code not in data["codes"]:
-            break
-            
-    data["codes"][code] = user_id_str
-    data["user_codes"][user_id_str] = code
-    data["stats"][user_id_str] = data["stats"].get(user_id_str, {
-        "count": 0, 
-        "total_earnings": 0, 
-        "available_balance": 0
-    })
-    
-    save_referrals(data)
-    return code
+    with _edit_referrals() as data:
+        if user_id_str in data["user_codes"]:
+            return data["user_codes"][user_id_str]
+
+        while True:
+            code = generate_unique_code()
+            if code not in data["codes"]:
+                break
+
+        data["codes"][code] = user_id_str
+        data["user_codes"][user_id_str] = code
+        data["stats"][user_id_str] = data["stats"].get(user_id_str, {
+            "count": 0,
+            "total_earnings": 0,
+            "available_balance": 0
+        })
+        return code
 
 def process_referral(new_user_id, code, telegram_username=None, first_name=None, last_name=None):
-    data = load_referrals()
     new_user_id_str = str(new_user_id)
-    
-    # Check if user already referred
-    if new_user_id_str in data["referrals"]:
-        return False, "User already referred"
-        
-    # Check validity of code
-    if code not in data["codes"]:
-        return False, "Invalid referral code"
-        
-    referrer_id = data["codes"][code]
-    
-    # Prevent self-referral
-    if referrer_id == new_user_id_str:
-        return False, "Cannot refer yourself"
-        
-    data["referrals"][new_user_id_str] = referrer_id
-    data.setdefault("referral_details", {})[new_user_id_str] = {
-        "telegram_user_id": new_user_id,
-        "telegram_username": telegram_username,
-        "first_name": first_name,
-        "last_name": last_name,
-        "referral_code": code,
-        "referrer_id": referrer_id,
-        "invited_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    }
-    
-    # Update stats for referrer
-    if referrer_id not in data["stats"]:
-        data["stats"][referrer_id] = {"count": 0, "total_earnings": 0, "available_balance": 0}
-        
-    data["stats"][referrer_id]["count"] += 1
-    
-    save_referrals(data)
-    return True, referrer_id
+    with _edit_referrals() as data:
+        if new_user_id_str in data["referrals"]:
+            return False, "User already referred"
+        if code not in data["codes"]:
+            return False, "Invalid referral code"
 
-def add_referral_reward(user_id, purchase_amount):
+        referrer_id = data["codes"][code]
+        if referrer_id == new_user_id_str:
+            return False, "Cannot refer yourself"
+
+        data["referrals"][new_user_id_str] = referrer_id
+        data.setdefault("referral_details", {})[new_user_id_str] = {
+            "telegram_user_id": new_user_id,
+            "telegram_username": telegram_username,
+            "first_name": first_name,
+            "last_name": last_name,
+            "referral_code": code,
+            "referrer_id": referrer_id,
+            "invited_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        if referrer_id not in data["stats"]:
+            data["stats"][referrer_id] = {
+                "count": 0, "total_earnings": 0, "available_balance": 0
+            }
+        data["stats"][referrer_id]["count"] += 1
+        return True, referrer_id
+
+def add_referral_reward(user_id, purchase_amount, order_id=None):
     """
     Add reward to the referrer of user_id based on purchase_amount.
     """
-    data = load_referrals()
     user_id_str = str(user_id)
-    
-    if user_id_str not in data["referrals"]:
-        return False # No referrer for this user
-        
-    referrer_id = data["referrals"][user_id_str]
-    reward_amount = float(purchase_amount) * (REFERRAL_REWARD_PERCENTAGE / 100)
-    
-    if referrer_id not in data["stats"]:
-        data["stats"][referrer_id] = {"count": 0, "total_earnings": 0, "available_balance": 0}
-        
-    data["stats"][referrer_id]["total_earnings"] += reward_amount
-    data["stats"][referrer_id]["available_balance"] += reward_amount
-    
-    save_referrals(data)
-    return True, referrer_id, reward_amount
+    with _edit_referrals() as data:
+        if user_id_str not in data["referrals"]:
+            return False
+
+        referrer_id = data["referrals"][user_id_str]
+        order_key = str(order_id or "").strip()
+        rewarded_orders = data.setdefault("rewarded_orders", {})
+        if order_key and order_key in rewarded_orders:
+            return False
+        reward_amount = float(purchase_amount) * (REFERRAL_REWARD_PERCENTAGE / 100)
+        if referrer_id not in data["stats"]:
+            data["stats"][referrer_id] = {
+                "count": 0, "total_earnings": 0, "available_balance": 0
+            }
+        data["stats"][referrer_id]["total_earnings"] += reward_amount
+        data["stats"][referrer_id]["available_balance"] += reward_amount
+        if order_key:
+            rewarded_orders[order_key] = {
+                "referrer_id": referrer_id,
+                "amount": reward_amount,
+                "rewarded_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            }
+        return True, referrer_id, reward_amount
 
 def get_referral_stats(user_id):
     data = load_referrals()
@@ -162,14 +201,9 @@ def get_referrer(user_id):
     return data["referrals"].get(str(user_id))
 
 def set_wallet_address(user_id, address):
-    data = load_referrals()
     user_id_str = str(user_id)
-    
-    if "wallets" not in data:
-        data["wallets"] = {}
-        
-    data["wallets"][user_id_str] = address
-    save_referrals(data)
+    with _edit_referrals() as data:
+        data.setdefault("wallets", {})[user_id_str] = address
     return True
 
 def get_wallet_address(user_id):
@@ -202,8 +236,7 @@ def get_eligible_referral_users(min_balance=REFERRAL_MIN_PAYOUT_BALANCE):
     return eligible_users
 
 def mark_referral_payout_paid(user_id, admin_user_id):
-    with referral_lock:
-        data = load_referrals()
+    with _edit_referrals() as data:
         user_id_str = str(user_id)
         stats = data.get("stats", {}).get(user_id_str)
 
@@ -233,7 +266,6 @@ def mark_referral_payout_paid(user_id, admin_user_id):
 
         stats["available_balance"] = 0
         data.setdefault("payouts", []).append(payout)
-        save_referrals(data)
         return True, payout
 
 def _is_pending_withdrawal_request(request_data):
@@ -250,8 +282,7 @@ def get_pending_withdrawal_requests():
     return pending_requests
 
 def mark_withdrawal_request_paid(request_id, admin_user_id):
-    with referral_lock:
-        data = load_referrals()
+    with _edit_referrals() as data:
         request_id_str = str(request_id)
 
         for withdrawal_request in data.get("pending_withdrawals", []):
@@ -281,7 +312,6 @@ def mark_withdrawal_request_paid(request_id, admin_user_id):
             }
 
             data.setdefault("payouts", []).append(payout)
-            save_referrals(data)
             return True, payout
 
         return False, "Withdrawal request not found"
@@ -350,8 +380,7 @@ def build_withdrawal_audit_payload(user_id, telegram_username, withdrawal_data):
     }
 
 def process_withdrawal_request(user_id, telegram_username=None):
-    with referral_lock:
-        data = load_referrals()
+    with _edit_referrals() as data:
         user_id_str = str(user_id)
 
         if any(
@@ -389,5 +418,4 @@ def process_withdrawal_request(user_id, telegram_username=None):
 
         stats["available_balance"] = 0
         data.setdefault("pending_withdrawals", []).append(withdrawal_request)
-        save_referrals(data)
         return True, dict(withdrawal_request)

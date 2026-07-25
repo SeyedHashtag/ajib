@@ -15,12 +15,25 @@ BROADCAST_LOGS_DIR = "/etc/ajib/core/scripts/telegrambot/broadcast_logs"
 TEST_CONFIGS_FILE = "/etc/ajib/core/scripts/telegrambot/test_configs.json"
 
 
+def _state_helpers():
+    try:
+        from utils.atomic_store import locked_json, read_json
+        from utils.state_store import delete_state
+        return locked_json, read_json, delete_state
+    except ImportError:
+        return None
+
+
 def load_failed_broadcast_users():
     try:
-        if not os.path.exists(BROADCAST_FAILED_USERS_PATH):
-            return set()
-        with open(BROADCAST_FAILED_USERS_PATH, 'r') as f:
-            data = json.load(f)
+        helpers = _state_helpers()
+        if helpers:
+            data = helpers[1](BROADCAST_FAILED_USERS_PATH, [])
+        elif os.path.exists(BROADCAST_FAILED_USERS_PATH):
+            with open(BROADCAST_FAILED_USERS_PATH, "r") as handle:
+                data = json.load(handle)
+        else:
+            data = []
         if not isinstance(data, list):
             return set()
         return {str(user_id) for user_id in data}
@@ -31,16 +44,28 @@ def load_failed_broadcast_users():
 
 def save_failed_broadcast_users(user_ids):
     try:
-        os.makedirs(os.path.dirname(BROADCAST_FAILED_USERS_PATH), exist_ok=True)
-        with open(BROADCAST_FAILED_USERS_PATH, 'w') as f:
-            json.dump(sorted({str(user_id) for user_id in user_ids}), f)
+        values = sorted({str(user_id) for user_id in user_ids})
+        helpers = _state_helpers()
+        if helpers:
+            with helpers[0](BROADCAST_FAILED_USERS_PATH, []) as stored:
+                if not isinstance(stored, list):
+                    raise ValueError("Broadcast exclusions must contain a JSON list.")
+                stored.clear()
+                stored.extend(values)
+        else:
+            os.makedirs(os.path.dirname(BROADCAST_FAILED_USERS_PATH), exist_ok=True)
+            with open(BROADCAST_FAILED_USERS_PATH, "w") as handle:
+                json.dump(values, handle)
     except Exception as e:
         print(f"Failed to save broadcast failed users list: {str(e)}")
 
 
 def reset_failed_broadcast_users():
     try:
-        if os.path.exists(BROADCAST_FAILED_USERS_PATH):
+        helpers = _state_helpers()
+        if helpers:
+            helpers[2](BROADCAST_FAILED_USERS_PATH)
+        elif os.path.exists(BROADCAST_FAILED_USERS_PATH):
             os.remove(BROADCAST_FAILED_USERS_PATH)
     except Exception as e:
         print(f"Failed to reset broadcast failed users list: {str(e)}")

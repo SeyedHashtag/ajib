@@ -33,6 +33,14 @@ TEST_CONFIG_JOB_LOCK = threading.Lock()
 TEST_CONFIG_INFLIGHT = set()
 
 
+def _atomic_helpers():
+    try:
+        from utils.atomic_store import locked_json, read_json
+        return locked_json, read_json
+    except ImportError:
+        return None
+
+
 def _int_env(name, default, minimum=1):
     try:
         value = int(os.getenv(name, str(default)))
@@ -48,6 +56,10 @@ TEST_CONFIG_EXECUTOR = ThreadPoolExecutor(
 
 def load_test_settings():
     try:
+        helpers = _atomic_helpers()
+        if helpers:
+            data = helpers[1](TEST_SETTINGS_FILE, {})
+            return data if isinstance(data, dict) else {}
         if os.path.exists(TEST_SETTINGS_FILE):
             with open(TEST_SETTINGS_FILE, 'r') as f:
                 return json.load(f)
@@ -56,10 +68,18 @@ def load_test_settings():
     return {"creation_disabled": False}
 
 def save_test_settings(settings):
-    os.makedirs(os.path.dirname(TEST_SETTINGS_FILE), exist_ok=True)
     try:
-        with open(TEST_SETTINGS_FILE, 'w') as f:
-            json.dump(settings, f, indent=4)
+        helpers = _atomic_helpers()
+        if helpers:
+            with helpers[0](TEST_SETTINGS_FILE, {}) as stored:
+                if not isinstance(stored, dict):
+                    raise ValueError("Test settings must contain a JSON object.")
+                stored.clear()
+                stored.update(settings if isinstance(settings, dict) else {})
+        else:
+            os.makedirs(os.path.dirname(TEST_SETTINGS_FILE), exist_ok=True)
+            with open(TEST_SETTINGS_FILE, 'w') as f:
+                json.dump(settings, f, indent=4)
     except Exception:
         pass
 
@@ -75,6 +95,10 @@ def save_test_configs(configs):
 
 def load_waiting_users():
     try:
+        helpers = _atomic_helpers()
+        if helpers:
+            data = helpers[1](TEST_WAITING_LIST_FILE, {})
+            return data if isinstance(data, dict) else {}
         if os.path.exists(TEST_WAITING_LIST_FILE):
             with open(TEST_WAITING_LIST_FILE, 'r') as f:
                 return json.load(f)
@@ -84,9 +108,17 @@ def load_waiting_users():
     return {}
 
 def save_waiting_users(users):
-    os.makedirs(os.path.dirname(TEST_WAITING_LIST_FILE), exist_ok=True)
-    with open(TEST_WAITING_LIST_FILE, 'w') as f:
-        json.dump(users, f, indent=4)
+    helpers = _atomic_helpers()
+    if helpers:
+        with helpers[0](TEST_WAITING_LIST_FILE, {}) as stored:
+            if not isinstance(stored, dict):
+                raise ValueError("Test waiting list must contain a JSON object.")
+            stored.clear()
+            stored.update(users if isinstance(users, dict) else {})
+    else:
+        os.makedirs(os.path.dirname(TEST_WAITING_LIST_FILE), exist_ok=True)
+        with open(TEST_WAITING_LIST_FILE, 'w') as f:
+            json.dump(users, f, indent=4)
 
 def _parse_config_time(value):
     if not value:
@@ -145,11 +177,24 @@ def add_to_waiting_list(user_id, username=None, language=None):
     if has_used_test_config(user_id):
         return False
 
-    waiting_users = load_waiting_users()
     key = str(user_id)
+    helpers = _atomic_helpers()
+    if helpers:
+        with helpers[0](TEST_WAITING_LIST_FILE, {}) as waiting_users:
+            if not isinstance(waiting_users, dict):
+                raise ValueError("Test waiting list must contain a JSON object.")
+            if key in waiting_users:
+                return False
+            waiting_users[key] = {
+                "telegram_id": user_id,
+                "telegram_username": username,
+                "language": language,
+                "added_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            }
+            return True
+    waiting_users = load_waiting_users()
     if key in waiting_users:
         return False
-
     waiting_users[key] = {
         "telegram_id": user_id,
         "telegram_username": username,

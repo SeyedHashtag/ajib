@@ -3,7 +3,7 @@ import json
 import os
 from datetime import datetime, timedelta
 
-from utils.atomic_store import locked_json
+from utils.atomic_store import locked_json, read_json, write_json
 
 
 PAYMENTS_FILE = '/etc/ajib/core/scripts/telegrambot/payments.json'
@@ -18,19 +18,15 @@ DELETE_RESULTS = {'deleted', 'already_missing'}
 
 def _load_json_file(path, default):
     try:
-        if os.path.exists(path):
-            with open(path, 'r') as f:
-                data = json.load(f)
-                return data if data is not None else default
+        data = read_json(path, default)
+        return data if data is not None else default
     except Exception:
         pass
     return default
 
 
 def _save_json_file(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=4)
+    write_json(path, data)
 
 
 def _safe_int(value, default=None):
