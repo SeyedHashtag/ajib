@@ -709,6 +709,11 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         purchase_plan.get_payment_record = lambda _payment_id: payment_record
         purchase_plan.update_payment_status = lambda payment_id, status: statuses.append((payment_id, status))
         purchase_plan.update_payment_record_fields = lambda payment_id, fields: field_updates.append((payment_id, fields))
+        purchase_plan.complete_payment_record = lambda payment_id, fields, status="completed": (
+            field_updates.append((payment_id, fields)),
+            statuses.append((payment_id, status)),
+            True,
+        )[-1]
         admin_notifications = []
         purchase_plan.send_admin_payment_notification = lambda *args, **kwargs: admin_notifications.append((args, kwargs))
         purchase_plan.create_sale_user_with_note = lambda *args, **kwargs: self.fail("new user creation should not run for renewal payments")
@@ -721,6 +726,48 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         self.assertEqual(bot.sent_photos[-1][1]["caption"], "renewal success")
         self.assertEqual(admin_notifications[0][1]["server_name"], "Germany")
         self.assertEqual(admin_notifications[0][1]["server_id"], "s1")
+
+    def test_card_renewal_stops_delivery_when_completion_persistence_fails(self):
+        bot = DummyBot()
+        purchase_plan = load_purchase_plan(bot, [])
+        install_renewal_success_stub([])
+        store = {
+            "receipt-payment": {
+                "status": "pending_approval",
+                "type": "renewal",
+                "user_id": 1988,
+                "plan_gb": "40",
+                "days": 30,
+                "price": 100.0,
+                "payment_method": "Card to Card",
+                "renewal_username": "old-user",
+                "renewal_server_id": "s1",
+                "renewal_base_record_id": "base-1",
+            }
+        }
+        statuses, _field_updates, _claims = install_payment_store(purchase_plan, store)
+        purchase_plan.ADMIN_USER_IDS = [1]
+        purchase_plan.is_admin = lambda _user_id: True
+        purchase_plan.complete_payment_record = lambda *args, **kwargs: False
+        admin_success_notifications = []
+        referral_rewards = []
+        purchase_plan.send_admin_payment_notification = lambda *args, **kwargs: admin_success_notifications.append((args, kwargs))
+        purchase_plan.add_referral_reward = lambda *args, **kwargs: referral_rewards.append((args, kwargs))
+
+        purchase_plan.handle_admin_approval(make_receipt_approval_call("approve"))
+
+        self.assertEqual(store["receipt-payment"]["status"], "processing")
+        self.assertEqual(statuses, [("receipt-payment", "processing")])
+        self.assertIn(
+            "payment_completion_persistence_failed",
+            store["receipt-payment"]["processing_error"],
+        )
+        self.assertEqual(admin_success_notifications, [])
+        self.assertEqual(referral_rewards, [])
+        self.assertEqual(bot.sent_photos, [])
+        admin_messages = [args[1] for args, _kwargs in bot.sent_messages if args[0] == 1]
+        self.assertEqual(len(admin_messages), 1)
+        self.assertIn("Payment completion persistence failed.", admin_messages[0])
 
     def test_admin_approval_queues_claimed_payment_work(self):
         bot = DummyBot()

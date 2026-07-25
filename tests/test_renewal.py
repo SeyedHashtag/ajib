@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RENEWAL_PATH = ROOT / "core" / "scripts" / "telegrambot" / "utils" / "renewal.py"
+UTILS_DIR = RENEWAL_PATH.parent
 GB_BYTES = 1024 ** 3
 
 
@@ -61,7 +62,7 @@ def load_renewal_module():
             sys.modules.pop(name, None)
 
     utils_pkg = types.ModuleType("utils")
-    utils_pkg.__path__ = []
+    utils_pkg.__path__ = [str(UTILS_DIR)]
     sys.modules["utils"] = utils_pkg
 
     api_client_stub = types.ModuleType("utils.api_client")

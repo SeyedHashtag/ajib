@@ -1,21 +1,29 @@
 import importlib.util
 import json
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
 
+BOT_DIR = Path(__file__).resolve().parents[1] / "core" / "scripts" / "telegrambot"
+sys.path.insert(0, str(BOT_DIR))
 MODULE_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "core"
-    / "scripts"
-    / "telegrambot"
+    BOT_DIR
     / "utils"
     / "payment_records.py"
 )
 
 
 def load_module():
+    for name in list(sys.modules):
+        if name == "utils" or name.startswith("utils."):
+            sys.modules.pop(name, None)
+    utils_pkg = types.ModuleType("utils")
+    utils_pkg.__path__ = [str(BOT_DIR / "utils")]
+    sys.modules["utils"] = utils_pkg
+
     spec = importlib.util.spec_from_file_location("payment_records_under_test", MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -78,6 +86,30 @@ class PaymentRecordsTests(unittest.TestCase):
         self.assertEqual(record["status"], "expired")
         self.assertEqual(record["updates"][-1]["previous_status"], "pending")
         self.assertEqual(record["updates"][-1]["status"], "expired")
+
+    def test_failed_serialization_does_not_damage_existing_payment_database(self):
+        original = {"pay-1": {"status": "completed", "updates": []}}
+        self.write_payments(original)
+
+        with self.assertRaises(TypeError):
+            self.payment_records.add_payment_record(
+                "bad-payment",
+                {"status": "pending", "not_json": {1, 2, 3}},
+            )
+
+        self.assertEqual(self.read_payments(), original)
+
+    def test_corrupt_payment_database_is_not_replaced_during_mutation(self):
+        corrupt_contents = '{"pay-1": {"status": "processing"'
+        self.path.write_text(corrupt_contents, encoding="utf-8")
+
+        self.assertFalse(
+            self.payment_records.complete_payment_record(
+                "pay-1",
+                {"username": "s1988", "server_id": "server2"},
+            )
+        )
+        self.assertEqual(self.path.read_text(encoding="utf-8"), corrupt_contents)
 
 
 if __name__ == "__main__":

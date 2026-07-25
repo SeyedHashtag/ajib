@@ -18,6 +18,7 @@ MODULE_PATH = (
 )
 TRANSLATIONS_PATH = MODULE_PATH.with_name("translations.py")
 TEST_CONFIG_STORE_PATH = MODULE_PATH.with_name("test_config_store.py")
+UTILS_DIR = MODULE_PATH.parent
 
 
 class DummyBot:
@@ -116,7 +117,7 @@ def load_module():
 
     bot = DummyBot()
     utils_pkg = types.ModuleType("utils")
-    utils_pkg.__path__ = []
+    utils_pkg.__path__ = [str(UTILS_DIR)]
     sys.modules["utils"] = utils_pkg
 
     store_spec = importlib.util.spec_from_file_location("utils.test_config_store", TEST_CONFIG_STORE_PATH)
@@ -895,6 +896,42 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual([config["username"] for config in saved_configs], ["r303", "r303a"])
         self.assertEqual(saved_configs[0]["cleanup_status"], "notified")
         self.assertNotIn("cleanup_status", saved_configs[1])
+
+    def test_payment_cleanup_metadata_save_preserves_concurrent_payment_updates(self):
+        self.write_json(self.cleanup.TEST_CONFIGS_FILE, {})
+        self.write_json(self.cleanup.PAYMENTS_FILE, {
+            "pay1": {
+                "status": "completed",
+                "user_id": 202,
+                "username": "s202",
+                "server_id": "s1",
+            }
+        })
+        self.write_json(self.cleanup.RESELLERS_FILE, {})
+        client = FakeClient("s1", {"s202": self.expired_user()})
+
+        def add_concurrent_payment_update(*_args, **_kwargs):
+            payments = self.read_json(self.cleanup.PAYMENTS_FILE)
+            payments["pay1"]["accounting_marker"] = "preserve-me"
+            payments["pay2"] = {
+                "status": "processing",
+                "user_id": 303,
+            }
+            self.write_json(self.cleanup.PAYMENTS_FILE, payments)
+            return None
+
+        self.cleanup._notify_candidate = add_concurrent_payment_update
+
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now,
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        saved = self.read_json(self.cleanup.PAYMENTS_FILE)
+        self.assertEqual(saved["pay1"]["accounting_marker"], "preserve-me")
+        self.assertEqual(saved["pay1"]["cleanup_status"], "notified")
+        self.assertEqual(saved["pay2"]["status"], "processing")
+        self.assertNotIn("cleanup_status", saved["pay2"])
 
     def test_first_expired_detection_notifies_and_waits_to_delete(self):
         self.write_json(self.cleanup.TEST_CONFIGS_FILE, {

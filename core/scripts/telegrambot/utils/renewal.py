@@ -3,6 +3,8 @@ import json
 import os
 from datetime import datetime, timedelta
 
+from utils.atomic_store import locked_json
+
 
 PAYMENTS_FILE = '/etc/ajib/core/scripts/telegrambot/payments.json'
 RESELLERS_FILE = '/etc/ajib/core/scripts/telegrambot/resellers.json'
@@ -516,27 +518,29 @@ def reseller_renewal_record(offer, before_state, after_state):
 
 
 def _mark_cleanup_state_renewed(username, server_id):
-    state = _load_json_file(STATE_FILE, {})
-    if not isinstance(state, dict):
-        return
     key = _state_key(server_id, username)
-    if key in state:
-        state.pop(key, None)
-        _save_json_file(STATE_FILE, state)
+    try:
+        with locked_json(STATE_FILE, {}) as state:
+            if isinstance(state, dict):
+                state.pop(key, None)
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 def _mark_payment_record_renewed(record_id, after_state):
     if not record_id:
         return
-    payments = _load_json_file(PAYMENTS_FILE, {})
-    record = payments.get(str(record_id)) if isinstance(payments, dict) else None
-    if not isinstance(record, dict):
+    try:
+        with locked_json(PAYMENTS_FILE, {}) as payments:
+            record = payments.get(str(record_id)) if isinstance(payments, dict) else None
+            if not isinstance(record, dict):
+                return
+            record['cleanup_status'] = 'renewed'
+            record['cleanup_error'] = None
+            record['cleanup_last_state'] = after_state
+            record['updated_at'] = _now_str()
+    except (OSError, TypeError, ValueError):
         return
-    record['cleanup_status'] = 'renewed'
-    record['cleanup_error'] = None
-    record['cleanup_last_state'] = after_state
-    record['updated_at'] = _now_str()
-    _save_json_file(PAYMENTS_FILE, payments)
 
 
 def _execute_reset(username, server_id, plan_record, source, multi_api=None):

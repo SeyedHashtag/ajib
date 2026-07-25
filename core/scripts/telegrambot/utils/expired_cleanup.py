@@ -50,6 +50,7 @@ except ImportError:
     types = _Types()
 
 from utils.api_client import MultiServerAPI
+from utils.atomic_store import locked_json, read_json
 from utils.command import bot, is_admin
 from utils.language import get_user_language
 from utils.translations import get_button_text, get_message_text
@@ -162,6 +163,7 @@ RESELLER_CLEANUP_METADATA_FIELDS = (
     'cleanup_last_state',
 )
 TEST_CLEANUP_METADATA_FIELDS = RESELLER_CLEANUP_METADATA_FIELDS + ('server_id',)
+PAYMENT_CLEANUP_METADATA_FIELDS = TEST_CLEANUP_METADATA_FIELDS
 RECOVERED_TEST_USERNAME_RE = re.compile(r'^t([1-9]\d*)([a-z]*)$', re.IGNORECASE)
 RECOVERED_TEST_NOTE_RE = re.compile(r'(?:^|\|\s*)📝\s*test_config\s*(?:\||$)', re.IGNORECASE)
 RECOVERED_TEST_NOTE_TIME_RE = re.compile(r'📅\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})(?::(\d{2}))?')
@@ -289,20 +291,18 @@ def _format_time(value):
 
 
 def _load_json_file(path, default):
-    try:
-        if os.path.exists(path):
-            with open(path, 'r') as f:
-                data = json.load(f)
-                return data if data is not None else default
-    except Exception:
-        pass
-    return default
+    data = read_json(path, default)
+    return data if data is not None else default
 
 
 def _save_json_file(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=4)
+    if not isinstance(data, dict):
+        raise ValueError("JSON state must contain an object.")
+    with locked_json(path, {}) as current:
+        if not isinstance(current, dict):
+            raise ValueError("JSON state must contain an object.")
+        current.clear()
+        current.update(data)
 
 
 def _load_current_test_configs_for_cleanup():
@@ -335,6 +335,26 @@ def _save_test_cleanup_metadata(stale_configs, dirty_ids):
                     target.pop(field, None)
 
     test_config_store.update_test_configs(TEST_CONFIGS_FILE, mutate)
+
+
+def _save_payment_cleanup_metadata(stale_payments, dirty_ids):
+    dirty_ids = {str(payment_id) for payment_id in (dirty_ids or set())}
+    if not dirty_ids:
+        return
+
+    with locked_json(PAYMENTS_FILE, {}) as latest_payments:
+        if not isinstance(latest_payments, dict):
+            raise ValueError("Payment database must contain a JSON object.")
+        for payment_id in dirty_ids:
+            source = stale_payments.get(payment_id) if isinstance(stale_payments, dict) else None
+            target = latest_payments.get(payment_id)
+            if not isinstance(source, dict) or not isinstance(target, dict):
+                continue
+            for field in PAYMENT_CLEANUP_METADATA_FIELDS:
+                if field in source:
+                    target[field] = source[field]
+                else:
+                    target.pop(field, None)
 
 
 def _load_current_resellers_for_cleanup_save():
@@ -864,6 +884,7 @@ def _load_cleanup_record_stores():
         'resellers': _load_json_file(RESELLERS_FILE, {}),
         '_dirty': set(),
         '_test_dirty_ids': set(),
+        '_payment_dirty_ids': set(),
         '_reseller_dirty_refs': set(),
     }
 
@@ -878,7 +899,10 @@ def _save_dirty_cleanup_record_stores(stores):
             stores.get('_test_dirty_ids') or set(),
         )
     if 'payments' in dirty:
-        _save_json_file(PAYMENTS_FILE, stores.get('payments') if isinstance(stores.get('payments'), dict) else {})
+        _save_payment_cleanup_metadata(
+            stores.get('payments') if isinstance(stores.get('payments'), dict) else {},
+            stores.get('_payment_dirty_ids') or set(),
+        )
     if 'resellers' in dirty:
         _save_reseller_cleanup_metadata(
             stores.get('resellers') if isinstance(stores.get('resellers'), dict) else {},
@@ -887,6 +911,8 @@ def _save_dirty_cleanup_record_stores(stores):
     dirty.clear()
     if isinstance(stores.get('_test_dirty_ids'), set):
         stores['_test_dirty_ids'].clear()
+    if isinstance(stores.get('_payment_dirty_ids'), set):
+        stores['_payment_dirty_ids'].clear()
     if isinstance(stores.get('_reseller_dirty_refs'), set):
         stores['_reseller_dirty_refs'].clear()
 
@@ -914,6 +940,13 @@ def _mark_test_ref_dirty(stores, ref):
     _mark_store_dirty(stores, 'test_configs')
 
 
+def _mark_payment_ref_dirty(stores, ref):
+    if not isinstance(stores, dict) or len(ref) < 2:
+        return
+    stores.setdefault('_payment_dirty_ids', set()).add(str(ref[1]))
+    _mark_store_dirty(stores, 'payments')
+
+
 def _clear_candidate_delete_metadata(candidate, stores=None):
     ref = candidate.get('_record_ref') or ()
     if not ref:
@@ -939,9 +972,9 @@ def _clear_candidate_delete_metadata(candidate, stores=None):
             for key in ('cleanup_deleted_at', 'cleanup_delete_result', 'cleanup_error'):
                 entry.pop(key, None)
             if stores is not None:
-                _mark_store_dirty(stores, 'payments')
+                _mark_payment_ref_dirty(stores, ref)
             else:
-                _save_json_file(PAYMENTS_FILE, data)
+                _save_payment_cleanup_metadata(data, {ref[1]})
         return
 
     if kind == 'reseller':
@@ -1624,9 +1657,9 @@ def _update_candidate_record(candidate, fields, stores=None):
         if isinstance(entry, dict):
             _apply_fields(entry, fields)
             if stores is not None:
-                _mark_store_dirty(stores, 'payments')
+                _mark_payment_ref_dirty(stores, ref)
             else:
-                _save_json_file(PAYMENTS_FILE, data)
+                _save_payment_cleanup_metadata(data, {ref[1]})
         return
 
     if kind == 'reseller':

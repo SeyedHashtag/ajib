@@ -293,13 +293,20 @@ def _process_customer_renewal_payment(payment_id, payment_record, notify_chat_id
     plan_gb = payment_record.get('plan_gb')
     days = payment_record.get('days')
 
-    update_payment_record_fields(payment_id, {
+    completion_fields = {
         "username": username,
-        "server_id": result.get('server_id'),
+        "server_id": result.get('server_id') or getattr(api_client, 'server_id', None),
         "renewal_after_state": result.get('after_state'),
         "renewal_before_state": result.get('before_state', payment_record.get('renewal_before_state')),
-    })
-    update_payment_status(payment_id, 'completed')
+    }
+    if not _complete_sale_payment_or_notify(
+        payment_id,
+        user_id,
+        username,
+        api_client,
+        fields=completion_fields,
+    ):
+        return False
     add_referral_reward(user_id, payment_record.get('price', 0))
 
     send_admin_payment_notification(
@@ -581,7 +588,7 @@ def _notify_sale_completion_persistence_failure(payment_id, user_id, username, s
         f"User ID: {user_id}\n"
         f"Username: {username or 'N/A'}\n"
         f"Server ID: {server_id or 'N/A'}\n\n"
-        "The VPN user was created, but the payment record was not completed. "
+        "The VPN user was created or renewed, but the payment record was not completed. "
         "The record was left in processing for manual follow-up."
     )
     for admin_id in ADMIN_USER_IDS:
@@ -591,9 +598,12 @@ def _notify_sale_completion_persistence_failure(payment_id, user_id, username, s
             pass
 
 
-def _complete_sale_payment_or_notify(payment_id, user_id, username, api_client):
+def _complete_sale_payment_or_notify(payment_id, user_id, username, api_client, fields=None):
     server_id = getattr(api_client, 'server_id', None) if api_client is not None else None
-    if complete_payment_record(payment_id, {"username": username, "server_id": server_id}):
+    completion_fields = dict(fields or {})
+    completion_fields.setdefault("username", username)
+    completion_fields.setdefault("server_id", server_id)
+    if complete_payment_record(payment_id, completion_fields):
         return True
 
     error = f"payment_completion_persistence_failed username={username} server_id={server_id}"

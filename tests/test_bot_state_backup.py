@@ -65,6 +65,43 @@ class BotStateBackupTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Unsupported backup entry", result.stderr)
 
+    def test_backup_rejects_corrupt_json_state(self):
+        (self.bot_dir / ".env").write_text("API_TOKEN=secret\n")
+        (self.bot_dir / "payments.json").write_text('{"payment":')
+
+        result = subprocess.run(
+            ["bash", str(BACKUP_SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Backup failed: invalid JSON state file", result.stderr)
+        self.assertEqual(list(self.backup_dir.glob("*.zip")), [])
+
+    def test_restore_rejects_corrupt_json_before_replacing_state(self):
+        payments_path = self.bot_dir / "payments.json"
+        payments_path.write_text('{"payment": 1}')
+        archive_path = Path(self.temp_dir.name) / "corrupt-state.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(
+                "core/scripts/telegrambot/payments.json",
+                '{"payment":',
+            )
+
+        result = subprocess.run(
+            ["bash", str(RESTORE_SCRIPT), str(archive_path)],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Invalid JSON backup entry", result.stderr)
+        self.assertEqual(payments_path.read_text(), '{"payment": 1}')
+        self.assertEqual(list(self.backup_dir.glob("restore_pre_backup_*")), [])
+
     def test_restore_replaces_bot_state_and_keeps_safety_copy(self):
         (self.bot_dir / ".env").write_text("API_TOKEN=old\n")
         archive_path = Path(self.temp_dir.name) / "bot.zip"

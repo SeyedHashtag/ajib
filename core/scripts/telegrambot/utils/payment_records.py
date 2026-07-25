@@ -1,178 +1,163 @@
-import json
-import os
-import threading
 from datetime import datetime
 
+from utils.atomic_store import locked_json, read_json
+
+
 PAYMENTS_FILE = '/etc/ajib/core/scripts/telegrambot/payments.json'
-payment_lock = threading.Lock()
+
+
+def _now():
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _payment_store():
+    return locked_json(PAYMENTS_FILE, {})
+
+
+def _valid_payments(payments):
+    return isinstance(payments, dict)
+
 
 def load_payments():
-    with payment_lock:
-        try:
-            if os.path.exists(PAYMENTS_FILE):
-                with open(PAYMENTS_FILE, 'r') as f:
-                    return json.load(f)
-        except Exception:
-            pass
-        return {}
+    payments = read_json(PAYMENTS_FILE, {})
+    return payments if _valid_payments(payments) else {}
+
 
 def save_payments(payments):
-    with payment_lock:
-        os.makedirs(os.path.dirname(PAYMENTS_FILE), exist_ok=True)
-        with open(PAYMENTS_FILE, 'w') as f:
-            json.dump(payments, f, indent=4)
+    if not _valid_payments(payments):
+        raise ValueError("Payment database must contain a JSON object.")
+
+    with _payment_store() as current:
+        if not _valid_payments(current):
+            raise ValueError("Payment database must contain a JSON object.")
+        current.clear()
+        current.update(payments)
+
 
 def add_payment_record(payment_id, data):
-    # Load and save handle locking, but we need to ensure atomicity of read-modify-write
-    with payment_lock:
-        try:
-            if os.path.exists(PAYMENTS_FILE):
-                with open(PAYMENTS_FILE, 'r') as f:
-                    payments = json.load(f)
-            else:
-                payments = {}
-        except Exception:
-            payments = {}
-            
-        data['created_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        data['updates'] = []  # Add history tracking
+    if not isinstance(data, dict):
+        raise ValueError("Payment record must contain a JSON object.")
+
+    with _payment_store() as payments:
+        if not _valid_payments(payments):
+            raise ValueError("Payment database must contain a JSON object.")
+        data['created_at'] = _now()
+        data['updates'] = []
         payments[payment_id] = data
-        
-        os.makedirs(os.path.dirname(PAYMENTS_FILE), exist_ok=True)
-        with open(PAYMENTS_FILE, 'w') as f:
-            json.dump(payments, f, indent=4)
+
 
 def update_payment_status(payment_id, status):
-    with payment_lock:
-        try:
-            if os.path.exists(PAYMENTS_FILE):
-                with open(PAYMENTS_FILE, 'r') as f:
-                    payments = json.load(f)
-            else:
+    try:
+        with _payment_store() as payments:
+            if not _valid_payments(payments) or payment_id not in payments:
                 return False
-        except Exception:
-            return False
 
-        if payment_id in payments:
-            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            # Add update to history
+            current_time = _now()
+            payment = payments[payment_id]
             update = {
                 'status': status,
                 'timestamp': current_time,
-                'previous_status': payments[payment_id].get('status', 'unknown')
+                'previous_status': payment.get('status', 'unknown'),
             }
-            
-            payments[payment_id]['status'] = status
-            payments[payment_id]['updated_at'] = current_time
-            updates = payments[payment_id].setdefault('updates', [])
+            payment['status'] = status
+            payment['updated_at'] = current_time
+            updates = payment.setdefault('updates', [])
             if not isinstance(updates, list):
                 updates = []
-                payments[payment_id]['updates'] = updates
+                payment['updates'] = updates
             updates.append(update)
-            
-            with open(PAYMENTS_FILE, 'w') as f:
-                json.dump(payments, f, indent=4)
             return True
+    except (OSError, TypeError, ValueError):
         return False
 
+
 def update_payment_record_fields(payment_id, fields):
-    with payment_lock:
-        try:
-            if os.path.exists(PAYMENTS_FILE):
-                with open(PAYMENTS_FILE, 'r') as f:
-                    payments = json.load(f)
-            else:
+    if not isinstance(fields, dict):
+        return False
+
+    try:
+        with _payment_store() as payments:
+            if not _valid_payments(payments) or payment_id not in payments:
                 return False
-        except Exception:
-            return False
 
-        if payment_id not in payments or not isinstance(fields, dict):
-            return False
+            payments[payment_id].update(fields)
+            payments[payment_id]['updated_at'] = _now()
+            return True
+    except (OSError, TypeError, ValueError):
+        return False
 
-        payments[payment_id].update(fields)
-        payments[payment_id]['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        with open(PAYMENTS_FILE, 'w') as f:
-            json.dump(payments, f, indent=4)
-        return True
 
 def complete_payment_record(payment_id, fields, status='completed'):
-    with payment_lock:
-        try:
-            if os.path.exists(PAYMENTS_FILE):
-                with open(PAYMENTS_FILE, 'r') as f:
-                    payments = json.load(f)
-            else:
+    if not isinstance(fields, dict):
+        return False
+
+    try:
+        with _payment_store() as payments:
+            if not _valid_payments(payments) or payment_id not in payments:
                 return False
-        except Exception:
-            return False
 
-        if payment_id not in payments or not isinstance(fields, dict):
-            return False
+            payment = payments[payment_id]
+            current_time = _now()
+            previous_status = payment.get('status', 'unknown')
+            payment.update(fields)
+            payment['status'] = status
+            payment['updated_at'] = current_time
 
-        payment = payments[payment_id]
-        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        previous_status = payment.get('status', 'unknown')
-        payment.update(fields)
-        payment['status'] = status
-        payment['updated_at'] = current_time
+            updates = payment.setdefault('updates', [])
+            if not isinstance(updates, list):
+                updates = []
+                payment['updates'] = updates
+            updates.append({
+                'status': status,
+                'timestamp': current_time,
+                'previous_status': previous_status,
+            })
+            return True
+    except (OSError, TypeError, ValueError):
+        return False
 
-        updates = payment.setdefault('updates', [])
-        if not isinstance(updates, list):
-            updates = []
-            payment['updates'] = updates
-        updates.append({
-            'status': status,
-            'timestamp': current_time,
-            'previous_status': previous_status
-        })
-
-        os.makedirs(os.path.dirname(PAYMENTS_FILE), exist_ok=True)
-        with open(PAYMENTS_FILE, 'w') as f:
-            json.dump(payments, f, indent=4)
-        return True
 
 def claim_payment_for_processing(payment_id, allowed_statuses=None):
-    with payment_lock:
-        try:
-            if os.path.exists(PAYMENTS_FILE):
-                with open(PAYMENTS_FILE, 'r') as f:
-                    payments = json.load(f)
-            else:
+    if allowed_statuses is None:
+        allowed_statuses = {'pending'}
+    else:
+        allowed_statuses = {str(status) for status in allowed_statuses}
+
+    try:
+        with _payment_store() as payments:
+            if not _valid_payments(payments):
                 return False
-        except Exception:
-            return False
 
-        payment = payments.get(payment_id)
-        if not payment:
-            return False
+            payment = payments.get(payment_id)
+            if not payment:
+                return False
 
-        if allowed_statuses is None:
-            allowed_statuses = {'pending'}
-        else:
-            allowed_statuses = {str(s) for s in allowed_statuses}
+            current_status = str(payment.get('status', ''))
+            if current_status not in allowed_statuses:
+                return False
 
-        current_status = str(payment.get('status', ''))
-        if current_status not in allowed_statuses:
-            return False
+            current_time = _now()
+            update = {
+                'status': 'processing',
+                'timestamp': current_time,
+                'previous_status': current_status,
+            }
+            payment['status'] = 'processing'
+            payment['updated_at'] = current_time
+            updates = payment.setdefault('updates', [])
+            if not isinstance(updates, list):
+                updates = []
+                payment['updates'] = updates
+            updates.append(update)
+            return True
+    except (OSError, TypeError, ValueError):
+        return False
 
-        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        update = {
-            'status': 'processing',
-            'timestamp': current_time,
-            'previous_status': current_status
-        }
-        payment['status'] = 'processing'
-        payment['updated_at'] = current_time
-        payment.setdefault('updates', []).append(update)
-
-        with open(PAYMENTS_FILE, 'w') as f:
-            json.dump(payments, f, indent=4)
-        return True
 
 def get_payment_record(payment_id):
     payments = load_payments()
     return payments.get(payment_id)
+
 
 def get_user_payments(user_id):
     payments = load_payments()

@@ -17,6 +17,7 @@ shopt -u nullglob dotglob
 
 python3 - "$BACKUP_FILE" "$INSTALL_DIR" <<'PY'
 import pathlib
+import json
 import sys
 import zipfile
 
@@ -35,6 +36,16 @@ for path in bot_dir.rglob("*"):
 
 if not files:
     raise SystemExit("Backup failed: no Telegram bot state files were found.")
+
+for path in files:
+    if path.suffix.lower() != ".json":
+        continue
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        relative = path.relative_to(install_dir).as_posix()
+        raise SystemExit(f"Backup failed: invalid JSON state file: {relative}: {error}")
 
 with zipfile.ZipFile(backup_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
     for path in files:

@@ -19,6 +19,8 @@ if [ -z "$BACKUP_FILE" ] || [ ! -f "$BACKUP_FILE" ]; then
 fi
 
 python3 - "$BACKUP_FILE" "$RESTORE_DIR" <<'PY'
+import io
+import json
 import pathlib
 import sys
 import zipfile
@@ -47,6 +49,13 @@ with zipfile.ZipFile(archive_path) as archive:
     if not members:
         raise SystemExit("Backup contains no Telegram bot state files.")
     for info in members:
+        if pathlib.PurePosixPath(info.filename).suffix.lower() == ".json":
+            try:
+                with archive.open(info) as raw:
+                    with io.TextIOWrapper(raw, encoding="utf-8") as handle:
+                        json.load(handle)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise SystemExit(f"Invalid JSON backup entry: {info.filename}: {error}")
         archive.extract(info, restore_dir)
 PY
 
