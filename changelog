@@ -1,3 +1,9 @@
+## v1.17.3
+🛠️ Validate JSON state files during backup and restore so corrupt data is rejected before it can replace working state
+🐛 Persist payment completion, renewal, and expired-cleanup updates atomically without overwriting concurrent changes
+🐛 Keep completed renewals in processing and alert admins when payment completion cannot be safely persisted
+✅ Add regression coverage for backup validation, atomic payment storage, cleanup metadata merging, and renewal persistence failures
+
 ## v1.17.2
 🛠️ Simplify the localized Karing iOS setup tutorial to tell customers to copy their config directly
 🐛 Remove the obsolete TLS security warning from Karing guidance in English, Persian, Russian, and Turkmen
