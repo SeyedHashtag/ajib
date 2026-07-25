@@ -52,7 +52,7 @@ fi
 mkdir -p "$BACKUP_DIR" "$STATE_DIR"
 SAFETY_BACKUP=$(
     AJIB_INSTALL_DIR="$INSTALL_DIR" AJIB_BACKUP_DIR="$BACKUP_DIR" \
-        "$INSTALL_DIR/core/scripts/ajib/backup.sh"
+        bash "$INSTALL_DIR/core/scripts/ajib/backup.sh"
 )
 
 python3 "$NEW_DIR/core/scripts/telegrambot/state_archive.py" prepare-restore \

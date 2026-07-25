@@ -60,6 +60,8 @@ class TelegramJsonPreservationTests(unittest.TestCase):
         self.assertIn("state_archive.py", backup_text)
         self.assertIn("prepare-restore", restore_text)
         self.assertIn("prepare-restore", upgrade_text)
+        self.assertIn('bash "$INSTALL_DIR/core/scripts/ajib/backup.sh"', upgrade_text)
+        self.assertIn('safety_backup=$(bash "$BACKUP_SCRIPT")', restore_text)
         self.assertIn("ajib.db", restore_text)
         self.assertIn("ajib.db", upgrade_text)
         self.assertNotIn(".configs.env", "\n".join((upgrade_text, backup_text, restore_text)))

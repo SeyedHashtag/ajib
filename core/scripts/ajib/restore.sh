@@ -114,7 +114,7 @@ if [ "${AJIB_SKIP_SERVICE_RESTART:-0}" != "1" ] && \
 fi
 
 mkdir -p "$BACKUP_DIR" "$BOT_DIR"
-safety_backup=$("$BACKUP_SCRIPT")
+safety_backup=$(bash "$BACKUP_SCRIPT")
 
 STAGED_BOT_DIR="$RESTORE_DIR/core/scripts/telegrambot"
 state_changed=true
