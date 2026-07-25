@@ -14,6 +14,7 @@ was_active=false
 service_stopped=false
 switched=false
 upgrade_succeeded=false
+SYSTEM_PYTHON=${AJIB_SYSTEM_PYTHON:-/usr/bin/python3}
 
 cleanup() {
     status=$?
@@ -41,6 +42,11 @@ if [ ! -d "$INSTALL_DIR" ]; then
     exit 1
 fi
 
+if [ ! -x "$SYSTEM_PYTHON" ]; then
+    echo "A system Python 3 interpreter is required for upgrades."
+    exit 1
+fi
+
 git clone "$REPOSITORY" "$NEW_DIR"
 
 if systemctl is-active --quiet ajib-telegram-bot.service; then
@@ -55,7 +61,7 @@ SAFETY_BACKUP=$(
         bash "$INSTALL_DIR/core/scripts/ajib/backup.sh"
 )
 
-python3 "$NEW_DIR/core/scripts/telegrambot/state_archive.py" prepare-restore \
+"$SYSTEM_PYTHON" "$NEW_DIR/core/scripts/telegrambot/state_archive.py" prepare-restore \
     --archive "$SAFETY_BACKUP" \
     --staging-dir "$STATE_DIR" >/dev/null
 
@@ -76,7 +82,7 @@ fi
 chmod 700 "$BOT_DIR"
 chmod 600 "$BOT_DIR/ajib.db"
 
-python3 -m venv "$INSTALL_DIR/ajib_venv"
+"$SYSTEM_PYTHON" -m venv "$INSTALL_DIR/ajib_venv"
 "$INSTALL_DIR/ajib_venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
 chmod +x "$INSTALL_DIR/menu.sh"
 
