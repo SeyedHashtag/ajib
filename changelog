@@ -1,3 +1,8 @@
+## v1.18.2
+🛠️ Use the configurable Ajib system Python interpreter for upgrade state restoration and virtual-environment creation
+🐛 Stop upgrades early with a clear error when the configured Python interpreter is unavailable
+✅ Add regression coverage for configurable Python usage during upgrades
+
 ## v1.18.1
 🐛 Run backup and restore scripts in explicit Bash subshells during upgrades and Telegram-triggered maintenance
 ✅ Add regression coverage for safe Bash invocation of backup and restore scripts
