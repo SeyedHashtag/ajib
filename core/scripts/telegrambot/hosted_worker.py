@@ -31,6 +31,7 @@ from utils.api_client import MultiServerAPI
 from utils import database
 from utils.atomic_store import locked_json, read_json
 from utils.currency_format import format_toman_amount, format_usd_amount
+from utils.exchange_rate import get_exchange_rate
 from utils.hosted_bots import (
     add_referral_liability, calculate_quote, consume_credit,
     consume_renewal_credit, credit_crypto_sale, get_ledger, get_settings, get_token,
@@ -958,7 +959,7 @@ def _purchase_options(chat_id, user_id, plan_id, renewal=None, message_id=None):
         bot.send_message(chat_id, _message(user_id, "no_payment_methods"))
         return
     markup.add(types.InlineKeyboardButton(get_button_text(language, "back"), callback_data="hb:plans"))
-    exchange_rate = float(settings.get("exchange_rate", 1) or 1)
+    exchange_rate = get_exchange_rate()
     unlimited_text = get_button_text(language, "yes" if plan.get("unlimited", False) else "no")
     text = _message(user_id, "plan_details")
     text += _message(user_id, "data").format(plan_gb=plan_id)
@@ -1073,7 +1074,7 @@ def payment_method(call):
             bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "credit_unavailable"),
                                       show_alert=True)
             return
-        exchange_rate = float(settings.get("exchange_rate", 1) or 1)
+        exchange_rate = get_exchange_rate()
         toman_price = quote["retail"] * exchange_rate
         record.update({"status": "waiting_receipt", "reservation_id": order_id,
                        "exchange_rate": exchange_rate, "converted_amount": toman_price,
@@ -1576,13 +1577,13 @@ def referral_resolve(call):
 OWNER_MENU_ROWS = (
     ("generate", "customers"),
     ("debt", "markup"),
-    ("card", "rate"),
-    ("support", "welcome"),
-    ("refpercent", "plans"),
-    ("crypto", "earnings"),
-    ("referrals", "back"),
+    ("card", "support"),
+    ("welcome", "refpercent"),
+    ("plans", "crypto"),
+    ("earnings", "referrals"),
+    ("back",),
 )
-OWNER_SETTING_KEYS = ("markup", "card", "rate", "support", "welcome", "refpercent")
+OWNER_SETTING_KEYS = ("markup", "card", "support", "welcome", "refpercent")
 
 
 def _owner_menu_command(text):
@@ -1669,13 +1670,13 @@ def owner_setting_input(message):
     field = state["field"]
     raw = (message.text or "").strip()
     try:
-        if field in {"markup", "rate", "refpercent"}:
+        if field in {"markup", "refpercent"}:
             value = float(raw)
-            if value < 0 or (field == "refpercent" and value > 100) or (field == "rate" and value <= 0):
+            if value < 0 or (field == "refpercent" and value > 100):
                 raise ValueError
         else:
             value = raw
-        key = {"markup": "markup_percent", "card": "card_number", "rate": "exchange_rate",
+        key = {"markup": "markup_percent", "card": "card_number",
                "support": "support_text", "welcome": "welcome_text", "refpercent": "referral_margin_percent"}[field]
         update_settings(OWNER_ID, {key: value})
         bot.reply_to(message, _hosted_message(OWNER_ID, "setting_updated"))

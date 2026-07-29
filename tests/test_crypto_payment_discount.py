@@ -311,6 +311,10 @@ def install_common_stubs(bot, payment_records):
     currency_stub.format_usd_amount = lambda value: f"{float(value):.2f}"
     sys.modules["utils.currency_format"] = currency_stub
 
+    exchange_rate_stub = types.ModuleType("utils.exchange_rate")
+    exchange_rate_stub.get_exchange_rate = lambda: 1.0
+    sys.modules["utils.exchange_rate"] = exchange_rate_stub
+
     receipt_checker_stub = types.ModuleType("utils.receipt_checker")
     receipt_checker_stub.RECEIPT_TYPE_REGULAR = "regular"
     receipt_checker_stub.RECEIPT_TYPE_SETTLEMENT = "settlement"

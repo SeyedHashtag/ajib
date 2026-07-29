@@ -398,19 +398,22 @@ class HostedStorefrontParityTests(unittest.TestCase):
             (
                 ("generate", "customers"),
                 ("debt", "markup"),
-                ("card", "rate"),
-                ("support", "welcome"),
-                ("refpercent", "plans"),
-                ("crypto", "earnings"),
-                ("referrals", "back"),
+                ("card", "support"),
+                ("welcome", "refpercent"),
+                ("plans", "crypto"),
+                ("earnings", "referrals"),
+                ("back",),
             ),
         )
-        self.assertTrue(all(len(row) == 2 for row in menu_rows))
+        self.assertTrue(all(len(row) == 2 for row in menu_rows[:-1]))
+        self.assertEqual(menu_rows[-1], ("back",))
         self.assertEqual(
             set(setting_keys),
-            {"markup", "card", "rate", "support", "welcome", "refpercent"},
+            {"markup", "card", "support", "welcome", "refpercent"},
         )
         for language, catalog in HOSTED_TRANSLATIONS.items():
+            self.assertNotIn("rate", catalog)
+            self.assertNotIn("prompt_rate", catalog)
             for key in action_keys:
                 with self.subTest(language=language, action=key):
                     self.assertEqual(command_for(catalog[key]), ("action", key))
@@ -419,6 +422,15 @@ class HostedStorefrontParityTests(unittest.TestCase):
                     self.assertEqual(command_for(catalog[key]), ("setting", key))
             with self.subTest(language=language, action="back"):
                 self.assertEqual(command_for(button_translations[language]["back"]), ("back", None))
+
+    def test_hosted_checkout_uses_the_shared_main_exchange_rate(self):
+        purchase_options = ast.get_source_segment(WORKER_SOURCE, _worker_function("_purchase_options"))
+        payment_method = ast.get_source_segment(WORKER_SOURCE, _worker_function("payment_method"))
+
+        self.assertIn("from utils.exchange_rate import get_exchange_rate", WORKER_SOURCE)
+        self.assertIn("exchange_rate = get_exchange_rate()", purchase_options)
+        self.assertIn("exchange_rate = get_exchange_rate()", payment_method)
+        self.assertNotIn('settings.get("exchange_rate"', WORKER_SOURCE)
 
     def test_owner_back_restores_main_menu_and_legacy_callbacks_remain(self):
         owner_menu = ast.get_source_segment(WORKER_SOURCE, _worker_function("owner_menu_action"))

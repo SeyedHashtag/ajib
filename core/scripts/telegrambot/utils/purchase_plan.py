@@ -22,6 +22,7 @@ from utils.language import get_user_language
 from utils.referral import add_referral_reward, get_pending_withdrawal_requests
 from utils.reseller import evaluate_reseller_debt_policies, DEBT_WARNING_THRESHOLD, DEBT_SUSPEND_THRESHOLD
 from utils.currency_format import format_toman_amount, format_usd_amount
+from utils.exchange_rate import get_exchange_rate
 from utils.receipt_checker import (
     RECEIPT_TYPE_REGULAR,
     RECEIPT_TYPE_SETTLEMENT,
@@ -118,14 +119,6 @@ def get_crypto_discount_button_text(language):
     return get_message_text(language, "crypto_discount_button").format(
         percent=CRYPTO_PAYMENT_DISCOUNT_PERCENT
     )
-
-
-def get_exchange_rate():
-    load_dotenv(TELEGRAM_ENV_PATH, override=True)
-    try:
-        return float(os.getenv('EXCHANGE_RATE', '1'))
-    except (TypeError, ValueError):
-        return 1.0
 
 
 def _queue_payment_job(job_key, target, *args, **kwargs):

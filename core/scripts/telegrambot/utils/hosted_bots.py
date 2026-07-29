@@ -71,7 +71,6 @@ def default_settings():
         "markup_percent": 20.0,
         "enabled_plan_ids": [],
         "plan_selection_configured": False,
-        "exchange_rate": 1.0,
         "card_number": "",
         "welcome_text": "Welcome!",
         "support_text": "Contact the reseller for support.",
@@ -93,8 +92,6 @@ def _finite_setting(value, name, minimum, maximum):
 def _validate_setting(key, value):
     if key == "markup_percent":
         return _finite_setting(value, "markup percentage", 0, 1000)
-    if key == "exchange_rate":
-        return _finite_setting(value, "exchange rate", 0.000001, 1_000_000_000_000)
     if key == "referral_margin_percent":
         return _finite_setting(value, "referral percentage", 0, 100)
     if key in {"crypto_enabled", "plan_selection_configured"}:

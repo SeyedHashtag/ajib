@@ -166,17 +166,25 @@ class HostedBotStateTests(unittest.TestCase):
         self.assertFalse(ledger["credit_reservations"])
         self.assertIn("stale-release:orphan", {item["id"] for item in ledger["transactions"]})
 
-    def test_settings_reject_non_finite_values_and_sanitize_bad_persisted_values(self):
+    def test_settings_reject_non_finite_values_and_drop_legacy_exchange_rate(self):
         with self.assertRaises(ValueError):
             hosted_bots.update_settings("7", {"markup_percent": float("nan")})
-        Path(hosted_bots.tenant_file("7", "settings.json")).write_text(
-            json.dumps({"markup_percent": "invalid", "exchange_rate": -10}), encoding="utf-8"
+        settings_path = Path(hosted_bots.tenant_file("7", "settings.json"))
+        settings_path.write_text(
+            json.dumps({"markup_percent": "invalid", "exchange_rate": 75000, "card_number": "1234"}),
+            encoding="utf-8",
         )
 
         settings = hosted_bots.get_settings("7")
 
         self.assertEqual(settings["markup_percent"], 20.0)
-        self.assertEqual(settings["exchange_rate"], 1.0)
+        self.assertEqual(settings["card_number"], "1234")
+        self.assertNotIn("exchange_rate", settings)
+
+        hosted_bots.update_settings("7", {"welcome_text": "Hello"})
+        persisted = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertNotIn("exchange_rate", persisted)
+        self.assertEqual(persisted["welcome_text"], "Hello")
 
     def test_tenant_paths_cannot_escape_private_reseller_directory(self):
         with self.assertRaises(ValueError):
