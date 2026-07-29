@@ -11,7 +11,7 @@ BOT_DIR = ROOT / "core" / "scripts" / "telegrambot"
 sys.path.insert(0, str(BOT_DIR))
 os.environ.setdefault("AJIB_BOT_ROLE", "supervisor")
 
-from utils import exchange_rate
+from utils import exchange_rate, translations
 
 
 class ExchangeRateTests(unittest.TestCase):
@@ -49,6 +49,15 @@ class ExchangeRateTests(unittest.TestCase):
     def test_purchase_plan_keeps_the_compatible_shared_export(self):
         source = (BOT_DIR / "utils" / "purchase_plan.py").read_text(encoding="utf-8")
         self.assertIn("from utils.exchange_rate import get_exchange_rate", source)
+
+    def test_card_payment_does_not_repeat_exchange_rate(self):
+        for language, messages in translations.MESSAGE_TRANSLATIONS.items():
+            with self.subTest(language=language):
+                payment_message = messages["card_to_card_payment"]
+                self.assertNotIn("{exchange_rate}", payment_message)
+                self.assertIn("{price}", payment_message)
+                self.assertIn("{card_number}", payment_message)
+                self.assertIn("{exchange_rate}", messages["exchange_rate"])
 
 
 if __name__ == "__main__":
