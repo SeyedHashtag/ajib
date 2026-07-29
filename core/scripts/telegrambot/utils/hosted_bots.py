@@ -25,6 +25,11 @@ def _positive_int_env(name, default):
 MAX_ACTIVE_BOTS = _positive_int_env("AJIB_MAX_HOSTED_BOTS", 50)
 CRYPTO_DISCOUNT_PERCENT = Decimal("5")
 MINIMUM_PAYOUT = Decimal("2.00")
+SETUP_VERSION = 1
+SETUP_REQUIRED_STEPS = ("pricing", "payments", "plans")
+SETUP_CONFIRMABLE_STEPS = {"pricing", "plans", "messages"}
+LEGACY_WELCOME_TEXT = "Welcome!"
+LEGACY_SUPPORT_TEXT = "Contact the reseller for support."
 
 
 def _now():
@@ -72,10 +77,12 @@ def default_settings():
         "enabled_plan_ids": [],
         "plan_selection_configured": False,
         "card_number": "",
-        "welcome_text": "Welcome!",
-        "support_text": "Contact the reseller for support.",
+        "welcome_text": "",
+        "support_text": "",
         "referral_margin_percent": 20.0,
         "crypto_enabled": False,
+        "setup_version": 0,
+        "setup_completed_steps": [],
     }
 
 
@@ -98,6 +105,21 @@ def _validate_setting(key, value):
         if not isinstance(value, bool):
             raise ValueError(f"Invalid {key}")
         return value
+    if key == "setup_version":
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= SETUP_VERSION:
+            raise ValueError("Invalid setup version")
+        return value
+    if key == "setup_completed_steps":
+        if not isinstance(value, (list, tuple, set)):
+            raise ValueError("Invalid setup progress")
+        normalized = []
+        for item in value:
+            step = str(item).strip()
+            if step not in SETUP_CONFIRMABLE_STEPS:
+                raise ValueError("Invalid setup progress")
+            if step not in normalized:
+                normalized.append(step)
+        return normalized
     if key == "enabled_plan_ids":
         if not isinstance(value, (list, tuple, set)):
             raise ValueError("Invalid plan selection")
@@ -135,6 +157,11 @@ def _normalized_settings(stored):
             settings[key] = default
     if stored.get("updated_at"):
         settings["updated_at"] = str(stored["updated_at"])
+    if settings["setup_version"] == 0:
+        if settings["welcome_text"] == LEGACY_WELCOME_TEXT:
+            settings["welcome_text"] = ""
+        if settings["support_text"] == LEGACY_SUPPORT_TEXT:
+            settings["support_text"] = ""
     return settings
 
 
@@ -157,6 +184,65 @@ def update_settings(reseller_id, updates):
         settings.update(normalized)
         settings["updated_at"] = _now()
         return dict(settings)
+
+
+def get_setup_status(reseller_id, settings=None, crypto_available=True, plans_available=True):
+    """Return advisory owner-setup progress without mutating legacy state."""
+    current = dict(settings or get_settings(reseller_id))
+    version = int(current.get("setup_version", 0) or 0)
+    if version == 0:
+        completed = {"pricing", "plans"}
+        if current.get("welcome_text") or current.get("support_text"):
+            completed.add("messages")
+    else:
+        completed = {
+            step for step in current.get("setup_completed_steps", [])
+            if step in SETUP_CONFIRMABLE_STEPS
+        }
+    payment_ready = bool(
+        current.get("card_number")
+        or (current.get("crypto_enabled") and crypto_available)
+    )
+    steps = {
+        "pricing": "pricing" in completed,
+        "payments": payment_ready,
+        "plans": "plans" in completed and bool(plans_available),
+    }
+    completed_required = sum(1 for step in SETUP_REQUIRED_STEPS if steps[step])
+    next_step = next((step for step in SETUP_REQUIRED_STEPS if not steps[step]), None)
+    return {
+        "version": version,
+        "steps": steps,
+        "messages_complete": "messages" in completed,
+        "completed": completed_required,
+        "total": len(SETUP_REQUIRED_STEPS),
+        "ready": completed_required == len(SETUP_REQUIRED_STEPS),
+        "next_step": next_step,
+    }
+
+
+def mark_setup_step(reseller_id, step, completed=True):
+    """Confirm an owner-reviewed setup step, lazily upgrading legacy progress."""
+    if step not in SETUP_CONFIRMABLE_STEPS:
+        raise ValueError("Invalid setup step")
+    current = get_settings(reseller_id)
+    if int(current.get("setup_version", 0) or 0) == 0:
+        confirmed = {"pricing", "plans"}
+        if current.get("welcome_text") or current.get("support_text"):
+            confirmed.add("messages")
+    else:
+        confirmed = set(current.get("setup_completed_steps", []))
+    if completed:
+        confirmed.add(step)
+    else:
+        confirmed.discard(step)
+    return update_settings(
+        reseller_id,
+        {
+            "setup_version": SETUP_VERSION,
+            "setup_completed_steps": sorted(confirmed),
+        },
+    )
 
 
 def calculate_quote(
@@ -271,7 +357,13 @@ def register_bot(reseller_id, token, bot_info, main_bot_id=None):
             "updated_at": _now(),
             "last_error": None,
         }
-    update_settings(reseller_key, {})
+    if previous:
+        update_settings(reseller_key, {})
+    else:
+        update_settings(
+            reseller_key,
+            {"setup_version": SETUP_VERSION, "setup_completed_steps": []},
+        )
     return True, get_bot(reseller_key)
 
 

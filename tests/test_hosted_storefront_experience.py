@@ -125,8 +125,22 @@ class HostedStorefrontTranslationTests(unittest.TestCase):
                     language, "receipt_owner_caption", user_id=7, plan_gb=30, days=30,
                     toman_price="1,250,000",
                 )
+                setup = hosted_text(
+                    language,
+                    "setup_dashboard",
+                    completed=2,
+                    total=3,
+                    pricing="✅",
+                    payments="✅",
+                    plans="⬜",
+                    next_step=hosted_text(language, "setup_next_plans"),
+                )
+                connection = hosted_text(language, "connected_success", username="shopbot")
                 self.assertIn("25", summary)
                 self.assertIn("1,250,000", receipt)
+                self.assertIn("2", setup)
+                self.assertIn("3", setup)
+                self.assertIn("shopbot", connection)
 
     def test_non_english_owner_guides_are_translated(self):
         english = HOSTED_TRANSLATIONS["en"]["owner_guide"]
@@ -369,22 +383,33 @@ class HostedStorefrontParityTests(unittest.TestCase):
 
         self.assertIn("types.ReplyKeyboardMarkup(resize_keyboard=True)", owner_markup)
         self.assertNotIn("types.InlineKeyboardMarkup", owner_markup)
-        self.assertIn("for row in OWNER_MENU_ROWS", owner_markup)
+        self.assertIn("for row in rows", owner_markup)
         self.assertIn('_button(user_id, "back", "🔙 Back")', owner_menu_text)
-        for callback in ("hb:ogen:", "hb:plantoggle:", "hb:earn:", "hb:refresolve:"):
+        for callback in (
+            "hb:ogen:", "hb:plantoggle:", "hb:plansdone", "hb:payment:",
+            "hb:messages:", "hb:earn:", "hb:refresolve:",
+        ):
             with self.subTest(callback=callback):
                 self.assertIn(callback, WORKER_SOURCE)
 
     def test_owner_reply_commands_map_every_localized_label(self):
         menu_rows = _worker_constant("OWNER_MENU_ROWS")
+        setup_rows = _worker_constant("OWNER_SETUP_ROWS")
+        customer_rows = _worker_constant("OWNER_CUSTOMER_ROWS")
+        money_rows = _worker_constant("OWNER_MONEY_ROWS")
+        legacy_rows = _worker_constant("LEGACY_OWNER_MENU_ROWS")
         setting_keys = _worker_constant("OWNER_SETTING_KEYS")
-        menu_keys = tuple(key for row in menu_rows for key in row)
-        action_keys = tuple(key for key in menu_keys if key not in setting_keys and key != "back")
+        group_keys = _worker_constant("OWNER_GROUP_KEYS")
         button_translations = _button_translations()
         namespace = {
             "HOSTED_TRANSLATIONS": HOSTED_TRANSLATIONS,
             "OWNER_MENU_ROWS": menu_rows,
+            "OWNER_SETUP_ROWS": setup_rows,
+            "OWNER_CUSTOMER_ROWS": customer_rows,
+            "OWNER_MONEY_ROWS": money_rows,
+            "LEGACY_OWNER_MENU_ROWS": legacy_rows,
             "OWNER_SETTING_KEYS": setting_keys,
+            "OWNER_GROUP_KEYS": group_keys,
             "_all_button_values": lambda key, fallback: {
                 catalog.get(key, fallback) for catalog in button_translations.values()
             },
@@ -396,17 +421,11 @@ class HostedStorefrontParityTests(unittest.TestCase):
         self.assertEqual(
             menu_rows,
             (
-                ("generate", "customers"),
-                ("debt", "markup"),
-                ("card", "support"),
-                ("welcome", "refpercent"),
-                ("plans", "crypto"),
-                ("earnings", "referrals"),
-                ("back",),
+                ("owner_setup", "owner_customers"),
+                ("owner_money", "customer_view"),
             ),
         )
-        self.assertTrue(all(len(row) == 2 for row in menu_rows[:-1]))
-        self.assertEqual(menu_rows[-1], ("back",))
+        self.assertTrue(all(len(row) == 2 for row in menu_rows))
         self.assertEqual(
             set(setting_keys),
             {"markup", "card", "support", "welcome", "refpercent"},
@@ -414,14 +433,36 @@ class HostedStorefrontParityTests(unittest.TestCase):
         for language, catalog in HOSTED_TRANSLATIONS.items():
             self.assertNotIn("rate", catalog)
             self.assertNotIn("prompt_rate", catalog)
-            for key in action_keys:
+            for key in {"generate", "customers", "debt", "payment_methods", "plans", "messages", "earnings", "referrals", "crypto"}:
                 with self.subTest(language=language, action=key):
                     self.assertEqual(command_for(catalog[key]), ("action", key))
             for key in setting_keys:
                 with self.subTest(language=language, setting=key):
                     self.assertEqual(command_for(catalog[key]), ("setting", key))
+            for key in group_keys:
+                with self.subTest(language=language, group=key):
+                    self.assertEqual(command_for(catalog[key]), ("group", key))
+            self.assertEqual(command_for(catalog["owner_home"]), ("home", None))
+            self.assertEqual(command_for(catalog["customer_view"]), ("customer_view", None))
             with self.subTest(language=language, action="back"):
-                self.assertEqual(command_for(button_translations[language]["back"]), ("back", None))
+                self.assertEqual(command_for(button_translations[language]["back"]), ("customer_view", None))
+
+    def test_owner_setup_deep_link_is_reserved_from_referrals(self):
+        start = ast.get_source_segment(WORKER_SOURCE, _worker_function("start"))
+
+        self.assertIn('start_payload == "owner_setup"', start)
+        self.assertIn("message.from_user.id == OWNER_ID", start)
+        self.assertIn('start_payload != "owner_setup"', start)
+        self.assertIn("_show_owner_dashboard", start)
+
+    def test_main_bot_connection_hands_management_to_the_hosted_bot(self):
+        source = (BOT_DIR / "utils" / "hosted_bot_handlers.py").read_text(encoding="utf-8")
+
+        self.assertIn('?start=owner_setup', source)
+        self.assertIn('from utils.hosted_translations import hosted_text', source)
+        self.assertIn('callback_data="hosted:disconnect:confirm"', source)
+        self.assertIn('callback_data="hosted:disconnect:cancel"', source)
+        self.assertNotIn("Configure markup, payments, support, referrals, and earnings", source)
 
     def test_hosted_checkout_uses_the_shared_main_exchange_rate(self):
         purchase_options = ast.get_source_segment(WORKER_SOURCE, _worker_function("_purchase_options"))

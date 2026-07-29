@@ -64,6 +64,66 @@ class HostedBotStateTests(unittest.TestCase):
         settings = hosted_bots.get_settings("7")
         self.assertFalse(settings["crypto_enabled"])
         self.assertFalse(settings["plan_selection_configured"])
+        self.assertEqual(settings["setup_version"], 0)
+        self.assertEqual(settings["setup_completed_steps"], [])
+
+    def test_new_bot_setup_progress_requires_explicit_pricing_payment_and_plans(self):
+        success, _record = hosted_bots.register_bot(
+            "7", "123:secret", SimpleNamespace(id=123, username="shopbot"), main_bot_id=999
+        )
+
+        self.assertTrue(success)
+        status = hosted_bots.get_setup_status("7")
+        self.assertEqual(status["steps"], {"pricing": False, "payments": False, "plans": False})
+        self.assertEqual(status["next_step"], "pricing")
+
+        hosted_bots.mark_setup_step("7", "pricing")
+        hosted_bots.update_settings("7", {"card_number": "1234"})
+        hosted_bots.mark_setup_step("7", "plans")
+
+        status = hosted_bots.get_setup_status("7")
+        self.assertTrue(status["ready"])
+        self.assertEqual(status["completed"], 3)
+
+    def test_legacy_setup_is_inferred_without_preserving_old_english_defaults(self):
+        settings_path = Path(hosted_bots.tenant_file("7", "settings.json"))
+        settings_path.write_text(json.dumps({
+            "markup_percent": 20,
+            "card_number": "1234",
+            "welcome_text": "Welcome!",
+            "support_text": "Contact the reseller for support.",
+        }), encoding="utf-8")
+
+        settings = hosted_bots.get_settings("7")
+        status = hosted_bots.get_setup_status("7", settings=settings)
+
+        self.assertEqual(settings["welcome_text"], "")
+        self.assertEqual(settings["support_text"], "")
+        self.assertTrue(status["ready"])
+        self.assertEqual(status["version"], 0)
+
+    def test_setup_readiness_reflects_runtime_payment_and_plan_availability(self):
+        hosted_bots.update_settings("7", {
+            "crypto_enabled": True,
+            "setup_version": 1,
+            "setup_completed_steps": ["pricing", "plans"],
+        })
+
+        self.assertFalse(hosted_bots.get_setup_status("7", crypto_available=False)["steps"]["payments"])
+        self.assertFalse(hosted_bots.get_setup_status("7", plans_available=False)["steps"]["plans"])
+
+    def test_replacing_a_connected_bot_preserves_setup_progress(self):
+        hosted_bots.register_bot(
+            "7", "123:secret", SimpleNamespace(id=123, username="shopbot"), main_bot_id=999
+        )
+        hosted_bots.mark_setup_step("7", "pricing")
+
+        success, _record = hosted_bots.register_bot(
+            "7", "456:secret", SimpleNamespace(id=456, username="newshopbot"), main_bot_id=999
+        )
+
+        self.assertTrue(success)
+        self.assertIn("pricing", hosted_bots.get_settings("7")["setup_completed_steps"])
 
     def test_registration_separates_secret_and_rejects_duplicates(self):
         success, record = hosted_bots.register_bot(
