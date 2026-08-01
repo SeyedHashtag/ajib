@@ -1,3 +1,8 @@
+## v1.18.4
+✨ Show hosted-bot owners per-plan cost, customer price, gross profit, referral payout, and net profit
+🌐 Replace ambiguous retail-markup wording with localized Pricing & Profit guidance
+✅ Add regression coverage for per-plan profit previews, deductions, fallbacks, and message chunking
+
 ## v1.18.3
 ✨ Add a localized guided setup checklist and task-based menus to hosted-bot owner panels
 🛠️ Simplify hosted-bot connection, status, handoff, retry, and confirmed-disconnection flows
