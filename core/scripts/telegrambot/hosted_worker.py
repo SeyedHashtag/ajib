@@ -96,6 +96,7 @@ CREDIT_RESERVATION_MAX_AGE_SECONDS = _positive_int_env(
 MAX_RECEIPT_BYTES = _positive_int_env("AJIB_HOSTED_MAX_RECEIPT_BYTES", 10 * 1024 * 1024, 1024)
 INPUT_STATE_TTL_SECONDS = _positive_int_env("AJIB_HOSTED_INPUT_STATE_TTL_SECONDS", 3600, 60)
 MAX_INPUT_STATES = _positive_int_env("AJIB_HOSTED_MAX_INPUT_STATES", 5000, 100)
+TELEGRAM_SAFE_TEXT_LIMIT = 3800
 
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=4)
 
@@ -1621,6 +1622,14 @@ LEGACY_OWNER_MENU_ROWS = (
 )
 OWNER_SETTING_KEYS = ("markup", "card", "support", "welcome", "refpercent")
 OWNER_GROUP_KEYS = {"owner_setup", "owner_customers", "owner_money"}
+LEGACY_OWNER_LABELS = {
+    "markup": {
+        "📈 Retail Markup",
+        "📈 درصد سود فروش",
+        "📈 Розничная наценка",
+        "📈 Bölek goşma baha",
+    },
+}
 
 
 def _owner_menu_command(text):
@@ -1629,6 +1638,8 @@ def _owner_menu_command(text):
         for key in row:
             if key == "back" and text in _all_button_values("back", "🔙 Back"):
                 return "customer_view", None
+            if text in LEGACY_OWNER_LABELS.get(key, set()):
+                return "setting", key
             if any(catalog.get(key) == text for catalog in HOSTED_TRANSLATIONS.values()):
                 if key in OWNER_GROUP_KEYS:
                     return "group", key
@@ -1689,21 +1700,104 @@ def _setup_progress_text():
     return text
 
 
-def _pricing_overview():
+def _pricing_plan_items(settings):
+    visible = _sellable_plans()
+    if visible or settings.get("plan_selection_configured"):
+        return sorted(visible.items(), key=lambda item: int(item[0]))
+    plans = _load_plans()
+    return [
+        (plan_id, plans[plan_id])
+        for plan_id in sorted(_owner_plan_ids(), key=int)
+    ]
+
+
+def _split_message_blocks(blocks, max_length=TELEGRAM_SAFE_TEXT_LIMIT):
+    if max_length <= 0:
+        raise ValueError("Message length must be positive")
+    chunks = []
+    current = ""
+    for raw_block in blocks:
+        block = str(raw_block or "").strip()
+        if not block:
+            continue
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= max_length:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        while len(block) > max_length:
+            split_at = block.rfind("\n", 0, max_length + 1)
+            if split_at <= 0:
+                split_at = max_length
+            chunks.append(block[:split_at].rstrip())
+            block = block[split_at:].lstrip()
+        current = block
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _pricing_overview(max_length=TELEGRAM_SAFE_TEXT_LIMIT):
     settings = get_settings(OWNER_ID)
-    candidates = list(_sellable_plans().values())
-    if not candidates:
-        plans = _load_plans()
-        candidates = [plans[plan_id] for plan_id in sorted(_owner_plan_ids(), key=int)]
-    base = float(candidates[0].get("price", 0)) if candidates else 0.0
-    retail = base * (1 + float(settings["markup_percent"]) / 100)
-    return _hosted_message(
-        OWNER_ID,
-        "pricing_current",
-        markup=f"{float(settings['markup_percent']):g}",
-        base=format_usd_amount(base),
-        retail=format_usd_amount(retail),
-    )
+    referral_percent = float(settings["referral_margin_percent"])
+    markup_percent = float(settings["markup_percent"])
+    blocks = [
+        _hosted_message(
+            OWNER_ID,
+            "pricing_current",
+            markup=f"{markup_percent:g}",
+            referral=f"{referral_percent:g}",
+        )
+    ]
+    plan_items = _pricing_plan_items(settings)
+    if not plan_items:
+        blocks.append(_hosted_message(OWNER_ID, "pricing_no_plans"))
+    for plan_id, plan in plan_items:
+        quote = _hosted_plan_quote(
+            plan,
+            settings,
+            referral_percent,
+            referred=True,
+        )
+        if quote["crypto_supported"]:
+            crypto = _hosted_message(
+                OWNER_ID,
+                "pricing_crypto",
+                crypto_price=format_usd_amount(quote["crypto_collected"]),
+                crypto_profit=format_usd_amount(quote["crypto_margin"]),
+                crypto_referral=format_usd_amount(quote["crypto_referral_reward"]),
+                crypto_net=format_usd_amount(
+                    quote["crypto_margin"] - quote["crypto_referral_reward"]
+                ),
+            )
+        else:
+            crypto = _hosted_message(
+                OWNER_ID,
+                "pricing_crypto_unavailable",
+                crypto_price=format_usd_amount(quote["crypto_collected"]),
+                cost=format_usd_amount(quote["wholesale"]),
+            )
+        blocks.append(
+            _hosted_message(
+                OWNER_ID,
+                "pricing_plan",
+                plan_gb=plan.get("gb", plan_id),
+                days=plan.get("days", 30),
+                catalog=format_usd_amount(quote["retail_base"]),
+                cost=format_usd_amount(quote["wholesale"]),
+                card_price=format_usd_amount(quote["retail"]),
+                card_profit=format_usd_amount(quote["card_margin"]),
+                card_referral=format_usd_amount(quote["card_referral_reward"]),
+                card_net=format_usd_amount(
+                    quote["card_margin"] - quote["card_referral_reward"]
+                ),
+                crypto=crypto,
+            )
+        )
+    blocks.append(_hosted_message(OWNER_ID, "pricing_accounting"))
+    return _split_message_blocks(blocks, max_length=max_length)
 
 
 def _show_owner_dashboard(chat_id, reply_to=None):
@@ -1713,10 +1807,10 @@ def _show_owner_dashboard(chat_id, reply_to=None):
     summary = _hosted_message(
         OWNER_ID,
         "owner_summary",
-        markup=settings["markup_percent"],
+        markup=f"{float(settings['markup_percent']):g}",
         crypto=_hosted_message(OWNER_ID, "enabled" if settings["crypto_enabled"] else "disabled"),
         card=settings["card_number"] or _hosted_message(OWNER_ID, "not_set"),
-        referral=settings["referral_margin_percent"],
+        referral=f"{float(settings['referral_margin_percent']):g}",
     )
     text = (
         f"{_hosted_message(OWNER_ID, 'owner_title')}\n\n"
@@ -1752,7 +1846,6 @@ def owner_panel(message):
 
 def _begin_owner_setting(chat_id, field):
     _set_input_state(OWNER_ID, {"kind": "owner_setting", "field": field})
-    prefix = f"{_pricing_overview()}\n\n" if field == "markup" else ""
     markup = None
     if field == "markup":
         markup = types.InlineKeyboardMarkup()
@@ -1760,9 +1853,22 @@ def _begin_owner_setting(chat_id, field):
             _hosted_message(OWNER_ID, "pricing_keep"),
             callback_data="hb:setup:keeppricing",
         ))
+        prompt = f"{_hosted_message(OWNER_ID, 'prompt_markup')}\n\n/cancel"
+        overview_limit = max(1, TELEGRAM_SAFE_TEXT_LIMIT - len(prompt) - 2)
+        chunks = _pricing_overview(max_length=overview_limit)
+        for chunk in chunks[:-1]:
+            bot.send_message(chat_id, chunk, parse_mode="Markdown")
+        final_text = f"{chunks[-1]}\n\n{prompt}" if chunks else prompt
+        bot.send_message(
+            chat_id,
+            final_text,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+        return
     bot.send_message(
         chat_id,
-        f"{prefix}{_hosted_message(OWNER_ID, f'prompt_{field}')}\n\n/cancel",
+        f"{_hosted_message(OWNER_ID, f'prompt_{field}')}\n\n/cancel",
         parse_mode="Markdown",
         reply_markup=markup,
     )

@@ -3,6 +3,7 @@ import importlib.util
 import logging
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -106,6 +107,54 @@ def _hosted_user_creator(
     return namespace["_create_user"], calls, note_texts
 
 
+def _pricing_preview(settings, visible_plans, all_plans=None):
+    all_plans = dict(all_plans or visible_plans)
+
+    def quote(plan, current_settings, referral_margin_percent=0, referred=False):
+        catalog = round(float(plan["price"]), 2)
+        wholesale = round(float(plan["wholesale"]), 2)
+        retail = round(catalog * (1 + float(current_settings["markup_percent"]) / 100), 2)
+        crypto_collected = round(retail * 0.95, 2)
+        card_margin = round(retail - wholesale, 2)
+        crypto_margin = round(crypto_collected - wholesale, 2)
+        referral_rate = float(referral_margin_percent) if referred else 0
+        card_referral = round(max(0, card_margin) * referral_rate / 100, 2)
+        crypto_referral = round(max(0, crypto_margin) * referral_rate / 100, 2)
+        return {
+            "wholesale": wholesale,
+            "retail_base": catalog,
+            "retail": retail,
+            "crypto_collected": crypto_collected,
+            "crypto_margin": crypto_margin,
+            "card_margin": card_margin,
+            "crypto_referral_reward": crypto_referral,
+            "card_referral_reward": card_referral,
+            "crypto_supported": crypto_collected >= wholesale,
+        }
+
+    namespace = {
+        "OWNER_ID": 7,
+        "TELEGRAM_SAFE_TEXT_LIMIT": 3800,
+        "get_settings": lambda owner_id: dict(settings),
+        "_sellable_plans": lambda: dict(visible_plans),
+        "_load_plans": lambda: dict(all_plans),
+        "_owner_plan_ids": lambda: set(all_plans),
+        "_hosted_plan_quote": quote,
+        "_hosted_message": lambda owner_id, key, **values: hosted_text("en", key, **values),
+        "format_usd_amount": lambda value: f"{float(value):.2f}",
+    }
+    module = ast.Module(
+        body=[
+            _worker_function("_pricing_plan_items"),
+            _worker_function("_split_message_blocks"),
+            _worker_function("_pricing_overview"),
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), "hosted_worker.py", "exec"), namespace)
+    return namespace
+
+
 class HostedStorefrontTranslationTests(unittest.TestCase):
     def test_every_supported_language_has_the_complete_hosted_catalog(self):
         expected = set(HOSTED_TRANSLATIONS["en"])
@@ -135,11 +184,45 @@ class HostedStorefrontTranslationTests(unittest.TestCase):
                     plans="⬜",
                     next_step=hosted_text(language, "setup_next_plans"),
                 )
+                pricing = hosted_text(
+                    language,
+                    "pricing_current",
+                    markup=20,
+                    referral=20,
+                )
+                crypto = hosted_text(
+                    language,
+                    "pricing_crypto",
+                    crypto_price="114.00",
+                    crypto_profit="34.00",
+                    crypto_referral="6.80",
+                    crypto_net="27.20",
+                )
+                plan = hosted_text(
+                    language,
+                    "pricing_plan",
+                    plan_gb=30,
+                    days=30,
+                    catalog="100.00",
+                    cost="80.00",
+                    card_price="120.00",
+                    card_profit="40.00",
+                    card_referral="8.00",
+                    card_net="32.00",
+                    crypto=crypto,
+                )
                 connection = hosted_text(language, "connected_success", username="shopbot")
                 self.assertIn("25", summary)
                 self.assertIn("1,250,000", receipt)
                 self.assertIn("2", setup)
                 self.assertIn("3", setup)
+                self.assertIn("20", pricing)
+                self.assertIn("100.00", plan)
+                self.assertIn("80.00", plan)
+                self.assertIn("120.00", plan)
+                self.assertIn("114.00", plan)
+                self.assertIn("32.00", plan)
+                self.assertIn("27.20", plan)
                 self.assertIn("shopbot", connection)
 
     def test_non_english_owner_guides_are_translated(self):
@@ -377,6 +460,130 @@ class HostedStorefrontParityTests(unittest.TestCase):
         self.assertNotIn("Contact the reseller for support", source)
         self.assertNotIn("by the reseller", source)
 
+    def test_owner_pricing_preview_explains_cost_prices_profit_and_referrals(self):
+        settings = {
+            "markup_percent": 20,
+            "referral_margin_percent": 20,
+            "plan_selection_configured": True,
+        }
+        plans = {
+            "30": {"price": 100, "wholesale": 80, "gb": 30, "days": 30},
+        }
+        namespace = _pricing_preview(settings, plans)
+
+        chunks = namespace["_pricing_overview"]()
+        text = "\n".join(chunks)
+
+        for value in (
+            "$100.00",  # Catalog price.
+            "$80.00",   # Level-discounted owner cost.
+            "$120.00",  # Card customer price.
+            "$40.00",   # Card gross profit.
+            "$8.00",    # Card referral payout.
+            "$32.00",   # Card owner net.
+            "$114.00",  # Crypto customer payment after 5% discount.
+            "$34.00",   # Crypto gross profit.
+            "$6.80",    # Crypto referral payout.
+            "$27.20",   # Crypto owner net.
+        ):
+            with self.subTest(value=value):
+                self.assertIn(value, text)
+        self.assertIn("Card payments reach your card", text)
+        self.assertIn("credit gross profit to Earnings", text)
+        self.assertIn("separate liability", text)
+
+    def test_owner_pricing_preview_handles_zero_increase_and_plan_fallbacks(self):
+        settings = {
+            "markup_percent": 0,
+            "referral_margin_percent": 0,
+            "plan_selection_configured": False,
+        }
+        fallback_plans = {
+            "10": {"price": 100, "wholesale": 100, "gb": 10, "days": 30},
+        }
+        namespace = _pricing_preview(settings, {}, all_plans=fallback_plans)
+
+        text = "\n".join(namespace["_pricing_overview"]())
+
+        self.assertIn("Customer price increase: *0%*", text)
+        self.assertIn("*10 GB · 30 days*", text)
+        self.assertIn("Card: customer pays *$100.00* · Gross profit *$0.00*", text)
+        self.assertIn("Crypto: *unavailable at this price*", text)
+        self.assertIn("*$95.00*", text)
+        self.assertIn("*$100.00* cost", text)
+
+        configured = dict(settings, plan_selection_configured=True)
+        empty_namespace = _pricing_preview(configured, {}, all_plans=fallback_plans)
+        empty_text = "\n".join(empty_namespace["_pricing_overview"]())
+        self.assertIn("No eligible plans are available", empty_text)
+        self.assertNotIn("*10 GB · 30 days*", empty_text)
+
+    def test_owner_pricing_preview_splits_large_plan_catalogs_safely(self):
+        settings = {
+            "markup_percent": 20,
+            "referral_margin_percent": 20,
+            "plan_selection_configured": True,
+        }
+        plans = {
+            str(plan_id): {
+                "price": plan_id * 10,
+                "wholesale": plan_id * 8,
+                "gb": plan_id,
+                "days": 30,
+            }
+            for plan_id in range(1, 41)
+        }
+        namespace = _pricing_preview(settings, plans)
+
+        chunks = namespace["_pricing_overview"](max_length=500)
+        text = "\n".join(chunks)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk) <= 500 for chunk in chunks))
+        self.assertIn("*1 GB · 30 days*", text)
+        self.assertIn("*40 GB · 30 days*", text)
+        self.assertIn("*Where the money goes*", text)
+
+    def test_owner_pricing_prompt_and_keyboard_are_only_on_the_final_chunk(self):
+        sent = []
+        states = []
+
+        class DummyMarkup:
+            def __init__(self):
+                self.buttons = []
+
+            def add(self, button):
+                self.buttons.append(button)
+
+        namespace = {
+            "OWNER_ID": 7,
+            "TELEGRAM_SAFE_TEXT_LIMIT": 3800,
+            "_set_input_state": lambda owner_id, state: states.append((owner_id, state)),
+            "_hosted_message": lambda owner_id, key: {
+                "pricing_keep": "Keep",
+                "prompt_markup": "Send the customer price increase.",
+            }.get(key, key),
+            "_pricing_overview": lambda max_length: ["first chunk", "last chunk"],
+            "types": SimpleNamespace(
+                InlineKeyboardMarkup=DummyMarkup,
+                InlineKeyboardButton=lambda text, callback_data: (text, callback_data),
+            ),
+            "bot": SimpleNamespace(
+                send_message=lambda *args, **kwargs: sent.append((args, kwargs)),
+            ),
+        }
+        module = ast.Module(body=[_worker_function("_begin_owner_setting")], type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), "hosted_worker.py", "exec"), namespace)
+
+        namespace["_begin_owner_setting"](99, "markup")
+
+        self.assertEqual(states, [(7, {"kind": "owner_setting", "field": "markup"})])
+        self.assertEqual(len(sent), 2)
+        self.assertNotIn("reply_markup", sent[0][1])
+        self.assertEqual(sent[0][0][1], "first chunk")
+        self.assertIn("last chunk\n\nSend the customer price increase.\n\n/cancel", sent[1][0][1])
+        self.assertEqual(sent[1][1]["reply_markup"].buttons, [("Keep", "hb:setup:keeppricing")])
+
     def test_owner_panel_uses_reply_keyboard_and_keeps_dynamic_controls_inline(self):
         owner_markup = ast.get_source_segment(WORKER_SOURCE, _worker_function("_owner_markup"))
         owner_menu_text = ast.get_source_segment(WORKER_SOURCE, _worker_function("_owner_menu_text"))
@@ -400,6 +607,7 @@ class HostedStorefrontParityTests(unittest.TestCase):
         legacy_rows = _worker_constant("LEGACY_OWNER_MENU_ROWS")
         setting_keys = _worker_constant("OWNER_SETTING_KEYS")
         group_keys = _worker_constant("OWNER_GROUP_KEYS")
+        legacy_labels = _worker_constant("LEGACY_OWNER_LABELS")
         button_translations = _button_translations()
         namespace = {
             "HOSTED_TRANSLATIONS": HOSTED_TRANSLATIONS,
@@ -410,6 +618,7 @@ class HostedStorefrontParityTests(unittest.TestCase):
             "LEGACY_OWNER_MENU_ROWS": legacy_rows,
             "OWNER_SETTING_KEYS": setting_keys,
             "OWNER_GROUP_KEYS": group_keys,
+            "LEGACY_OWNER_LABELS": legacy_labels,
             "_all_button_values": lambda key, fallback: {
                 catalog.get(key, fallback) for catalog in button_translations.values()
             },
@@ -446,6 +655,9 @@ class HostedStorefrontParityTests(unittest.TestCase):
             self.assertEqual(command_for(catalog["customer_view"]), ("customer_view", None))
             with self.subTest(language=language, action="back"):
                 self.assertEqual(command_for(button_translations[language]["back"]), ("customer_view", None))
+        for label in legacy_labels["markup"]:
+            with self.subTest(legacy_markup_label=label):
+                self.assertEqual(command_for(label), ("setting", "markup"))
 
     def test_owner_setup_deep_link_is_reserved_from_referrals(self):
         start = ast.get_source_segment(WORKER_SOURCE, _worker_function("start"))

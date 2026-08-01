@@ -69,9 +69,10 @@ payment details, receipts, logs, or generated backup archives.
 An approved reseller can open **Reseller Panel → My Hosted Bot** and submit a
 BotFather token. The token is validated and stored separately from public bot
 metadata. The systemd supervisor starts one isolated polling worker per active
-reseller bot (up to 50 per installation). Resellers configure their markup
-over catalog prices, visible wholesale plans, card details, optional operator crypto checkout,
-support text, referrals, and earnings inside their own bot's owner panel.
+reseller bot (up to 50 per installation). Resellers configure the customer
+price increase over catalog prices, visible wholesale plans, card details,
+optional operator crypto checkout, support text, referrals, and earnings inside
+their own bot's owner panel.
 
 The main bot provides localized connection status and a direct link into the
 hosted bot's owner setup. Inside the hosted bot, an advisory checklist guides
@@ -80,9 +81,17 @@ store setup, customer operations, and payouts separate. Existing storefronts
 infer setup progress from their saved configuration and continue selling while
 owners review any remaining steps.
 
+The localized **Pricing & Profit** view breaks down every visible plan into its
+catalog price, the owner's level-discounted cost, the card and crypto customer
+prices, gross profit, referral payout, and the amount the owner keeps. Card
+revenue reaches the owner's payment card while wholesale cost becomes reseller
+debt. Operator-collected crypto sales credit gross profit to hosted-bot
+earnings, and referral payouts remain a separate liability.
+
 Wholesale costs follow the reseller's six-level loyalty discount (20% at
 Level 1 through 25% at Level 6). Higher levels increase reseller margin while
-the customer-facing catalog price and configured markup remain stable.
+the catalog price, configured customer price increase, and resulting customer
+price remain stable.
 
 Hosted bots use the operator's VPN servers and never expose panel credentials.
 New hosted bots start with crypto disabled. The existing 5% crypto discount is
