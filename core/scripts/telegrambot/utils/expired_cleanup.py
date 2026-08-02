@@ -1735,6 +1735,39 @@ def _resolve_reseller_customer_name(candidate):
     return note_name or 'N/A'
 
 
+def _candidate_has_reserved_renewal(candidate, stores=None):
+    try:
+        from utils.renewal import find_customer_reservation, find_reseller_reservation
+
+        source = candidate.get('source')
+        if source == 'customer':
+            payments = (
+                stores.get('payments')
+                if isinstance(stores, dict) and isinstance(stores.get('payments'), dict)
+                else _load_json_file(PAYMENTS_FILE, {})
+            )
+            return bool(find_customer_reservation(
+                candidate.get('telegram_user_id'),
+                candidate.get('username'),
+                server_id=candidate.get('server_id'),
+                payments=payments,
+            ))
+        if source == 'reseller_customer':
+            ref = candidate.get('_record_ref') or ()
+            resellers = (
+                stores.get('resellers')
+                if isinstance(stores, dict) and isinstance(stores.get('resellers'), dict)
+                else _load_json_file(RESELLERS_FILE, {})
+            )
+            reseller = resellers.get(str(candidate.get('reseller_id')), {})
+            configs = reseller.get('configs', []) if isinstance(reseller, dict) else []
+            config = configs[int(ref[2])] if len(ref) >= 3 and int(ref[2]) < len(configs) else None
+            return bool(find_reseller_reservation(config))
+    except (ImportError, IndexError, TypeError, ValueError):
+        return False
+    return False
+
+
 def _notify_candidate(candidate, grace_hours, last_state=None, missing=False):
     source = candidate.get('source')
     recipient_id = candidate.get('reseller_id') if source == 'reseller_customer' else candidate.get('telegram_user_id')
@@ -1956,6 +1989,17 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
                 )
             key = _state_key(candidate.get('server_id'), username)
             entry = state.get(key) if isinstance(state.get(key), dict) else None
+            if _candidate_has_reserved_renewal(candidate, stores=record_stores):
+                if entry:
+                    entry['cleanup_status'] = 'renewal_reserved'
+                    entry['cleanup_error'] = None
+                    entry['last_checked_at'] = now_value
+                _update_candidate_record(
+                    candidate,
+                    {'cleanup_status': 'renewal_reserved', 'cleanup_error': None},
+                    stores=record_stores,
+                )
+                continue
             if entry and entry.get('source') == 'server_user' and entry.get('cleanup_status') == 'notified':
                 _convert_server_user_to_manual_review(entry, now_value)
 

@@ -294,6 +294,115 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.assertEqual(saved["total_paid"], 8.0)
         self.assertEqual(saved["trust_limit"], 5.0)
 
+    def test_fifo_settlement_pays_legacy_and_older_charges_before_reserved_renewal(self):
+        self.write_resellers({
+            "1988": {
+                "status": "approved",
+                "debt": 5.0,
+                "total_paid": 20.0,
+                "configs": [{"username": "customer1", "server_id": "s1", "price": 5.0}],
+            }
+        })
+        self.assertTrue(self.reseller.add_reseller_debt(
+            "1988", 3.0, {"username": "customer2", "server_id": "s1"}
+        ))
+        reserved, reservation = self.reseller.reserve_reseller_renewal(
+            "1988",
+            "customer1",
+            4.0,
+            {
+                "reservation_id": "reserved-1",
+                "renewal_baseline": {"status": "active"},
+                "renewal_plan_snapshot": {"plan_gb": "5", "days": 30, "price": 4.0},
+            },
+            server_id="s1",
+        )
+        self.assertTrue(reserved)
+
+        success, debt = self.reseller.apply_reseller_payment("1988", 6.0, payment_id="partial-1")
+        saved = self.read_resellers()["1988"]
+        legacy, config_charge, renewal_charge = saved["debt_charges"]
+
+        self.assertTrue(success)
+        self.assertEqual(debt, 6.0)
+        self.assertEqual(legacy["kind"], "legacy_balance")
+        self.assertEqual(legacy["outstanding_amount"], 0.0)
+        self.assertEqual(config_charge["outstanding_amount"], 2.0)
+        self.assertEqual(renewal_charge["outstanding_amount"], 4.0)
+        self.assertFalse(
+            self.reseller.is_reseller_debt_charge_paid(saved, reservation["debt_charge_id"])
+        )
+
+        self.reseller.apply_reseller_payment("1988", 2.0, payment_id="partial-2")
+        saved = self.read_resellers()["1988"]
+        self.assertFalse(
+            self.reseller.is_reseller_debt_charge_paid(saved, reservation["debt_charge_id"])
+        )
+        self.reseller.apply_reseller_payment("1988", 4.0, payment_id="partial-3")
+        saved = self.read_resellers()["1988"]
+        self.assertTrue(
+            self.reseller.is_reseller_debt_charge_paid(saved, reservation["debt_charge_id"])
+        )
+        self.assertEqual(saved["debt"], 0.0)
+
+    def test_reserved_renewal_credit_check_and_duplicate_are_atomic(self):
+        self.write_resellers({
+            "1988": {
+                "status": "approved",
+                "debt": 1.0,
+                "total_paid": 0.0,
+                "configs": [{"username": "customer1", "server_id": "s1", "price": 4.0}],
+            }
+        })
+        record = {
+            "reservation_id": "reserved-atomic",
+            "renewal_plan_snapshot": {"plan_gb": "5", "days": 30, "price": 4.0},
+        }
+
+        rejected, reason = self.reseller.reserve_reseller_renewal(
+            "1988", "customer1", 4.01, record, server_id="s1"
+        )
+        self.assertFalse(rejected)
+        self.assertEqual(reason["reason"], "credit_unavailable")
+        self.assertEqual(self.read_resellers()["1988"]["debt"], 1.0)
+
+        created, reservation = self.reseller.reserve_reseller_renewal(
+            "1988", "customer1", 4.0, record, server_id="s1"
+        )
+        duplicate, duplicate_record = self.reseller.reserve_reseller_renewal(
+            "1988", "customer1", 4.0, record, server_id="s1"
+        )
+        saved = self.read_resellers()["1988"]
+        self.assertTrue(created)
+        self.assertTrue(duplicate)
+        self.assertEqual(duplicate_record["reservation_id"], reservation["reservation_id"])
+        self.assertEqual(saved["debt"], 5.0)
+        self.assertEqual(len(saved["configs"][0]["renewals"]), 1)
+        self.assertEqual(len(saved["debt_charges"]), 2)
+
+    def test_admin_debt_adjustments_use_the_fifo_ledger(self):
+        self.write_resellers({
+            "1988": {
+                "status": "approved",
+                "debt": 2.0,
+                "total_paid": 0.0,
+                "configs": [],
+            }
+        })
+
+        self.assertTrue(self.reseller.set_reseller_debt("1988", 5.0))
+        increased = self.read_resellers()["1988"]
+        self.assertEqual([item["outstanding_amount"] for item in increased["debt_charges"]], [2.0, 3.0])
+
+        self.assertTrue(self.reseller.set_reseller_debt("1988", 1.0))
+        reduced = self.read_resellers()["1988"]
+        self.assertEqual([item["outstanding_amount"] for item in reduced["debt_charges"]], [0.0, 1.0])
+
+        self.assertTrue(self.reseller.clear_reseller_debt("1988"))
+        cleared = self.read_resellers()["1988"]
+        self.assertEqual(cleared["debt"], 0.0)
+        self.assertTrue(all(item["outstanding_amount"] == 0.0 for item in cleared["debt_charges"]))
+
     def test_manual_payment_validation_rejects_overpayment(self):
         valid, normalized, reason = self.reseller.validate_reseller_manual_payment_amount(20.0, 8.0)
 

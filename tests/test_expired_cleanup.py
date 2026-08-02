@@ -155,6 +155,22 @@ def load_module():
     renewal_stub = types.ModuleType("utils.renewal")
     renewal_stub.find_customer_renewal_offer = lambda *args, **kwargs: {"eligible": False}
     renewal_stub.find_reseller_renewal_offer = lambda *args, **kwargs: {"eligible": False}
+    renewal_stub.find_customer_reservation = lambda user_id, username, server_id=None, payments=None: next((
+        {"payment_id": payment_id, **record}
+        for payment_id, record in (payments or {}).items()
+        if isinstance(record, dict)
+        and str(record.get("user_id")) == str(user_id)
+        and str(record.get("renewal_username") or record.get("username") or "").lower() == str(username).lower()
+        and record.get("renewal_mode") == "reserved"
+        and record.get("renewal_status") in {"reserved", "processing", "attention"}
+    ), None)
+    renewal_stub.find_reseller_reservation = lambda config: next((
+        record
+        for record in (config or {}).get("renewals", [])
+        if isinstance(record, dict)
+        and record.get("renewal_mode") == "reserved"
+        and record.get("renewal_status") in {"reserved", "processing", "attention"}
+    ), None)
     sys.modules["utils.renewal"] = renewal_stub
 
     spec = importlib.util.spec_from_file_location("expired_cleanup_under_test", MODULE_PATH)
@@ -932,6 +948,34 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(saved["pay1"]["cleanup_status"], "notified")
         self.assertEqual(saved["pay2"]["status"], "processing")
         self.assertNotIn("cleanup_status", saved["pay2"])
+
+    def test_reserved_customer_renewal_is_protected_from_expired_cleanup(self):
+        self.write_json(self.cleanup.TEST_CONFIGS_FILE, {})
+        self.write_json(self.cleanup.PAYMENTS_FILE, {
+            "reserved-payment": {
+                "status": "completed",
+                "type": "renewal",
+                "user_id": 202,
+                "username": "s202",
+                "server_id": "s1",
+                "renewal_username": "s202",
+                "renewal_server_id": "s1",
+                "renewal_mode": "reserved",
+                "renewal_status": "reserved",
+            }
+        })
+        self.write_json(self.cleanup.RESELLERS_FILE, {})
+        client = FakeClient("s1", {"s202": self.expired_user()})
+
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now,
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        saved = self.read_json(self.cleanup.PAYMENTS_FILE)["reserved-payment"]
+        self.assertEqual(saved["cleanup_status"], "renewal_reserved")
+        self.assertEqual(client.deleted, [])
+        self.assertEqual(self.cleanup._test_bot.sent_messages, [])
 
     def test_first_expired_detection_notifies_and_waits_to_delete(self):
         self.write_json(self.cleanup.TEST_CONFIGS_FILE, {

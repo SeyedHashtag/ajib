@@ -205,6 +205,16 @@ class HostedBotStateTests(unittest.TestCase):
 
         self.assertTrue(success)
         self.assertEqual(result["remaining_debt"], 0.0)
+        saved_reseller = reseller.get_reseller_data("7")
+        self.assertEqual(saved_reseller["debt_allocations"][0]["kind"], "earnings_transfer")
+        transfer = next(
+            item for item in hosted_bots.get_ledger("7")["transactions"]
+            if item["type"] == "earnings_to_debt"
+        )
+        self.assertEqual(
+            transfer["metadata"]["debt_allocation_id"],
+            saved_reseller["debt_allocations"][0]["id"],
+        )
         self.assertTrue(requested)
         self.assertEqual(withdrawal["amount"], 2.0)
         rejected, _ = hosted_bots.resolve_earnings_withdrawal(

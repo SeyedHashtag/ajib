@@ -22,6 +22,7 @@ class DummyBot:
         self.sent_messages = []
         self.edited_messages = []
         self.callback_answers = []
+        self.sent_photos = []
 
     def message_handler(self, *args, **kwargs):
         return lambda func: func
@@ -50,6 +51,7 @@ class DummyBot:
         return None
 
     def send_photo(self, *args, **kwargs):
+        self.sent_photos.append((args, kwargs))
         return None
 
 
@@ -215,6 +217,7 @@ class MyConfigsTests(unittest.TestCase):
         my_configs_module.bot.sent_messages = []
         my_configs_module.bot.edited_messages = []
         my_configs_module.bot.callback_answers = []
+        my_configs_module.bot.sent_photos = []
         my_configs_module.MY_CONFIGS_REFRESH_INFLIGHT.clear()
         my_configs_module.MY_CONFIGS_INFLIGHT.clear()
         my_configs_module.SHOW_CONFIG_INFLIGHT.clear()
@@ -465,6 +468,39 @@ class MyConfigsTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0][1:], (456, "en"))
+
+    def test_active_customer_config_offers_one_reserved_renewal(self):
+        class DummyQR:
+            def save(self, target, image_format):
+                target.write(b"qr")
+
+        client = types.SimpleNamespace(
+            get_user_uri=lambda username: {"normal_sub": "https://example.com/sub"}
+        )
+        original = self.install_renewal_stub({
+            "eligible": True,
+            "token": "reserve-token",
+            "source": "customer",
+            "renewal_mode": "reserved",
+        })
+        original_make = my_configs_module.qrcode.make
+        my_configs_module.display_config = REAL_DISPLAY_CONFIG
+        try:
+            my_configs_module.qrcode.make = lambda value: DummyQR()
+            my_configs_module.display_config(
+                456,
+                "s123a",
+                {"blocked": False, "expiration_days": 30},
+                client,
+                user_id=123,
+            )
+        finally:
+            my_configs_module.qrcode.make = original_make
+            self.restore_renewal_stub(original)
+
+        markup = my_configs_module.bot.sent_photos[-1][1]["reply_markup"]
+        self.assertEqual(len(markup.buttons), 1)
+        self.assertEqual(markup.buttons[0].callback_data, "renew_plan:reserve-token")
 
     def test_active_customer_config_without_a_url_does_not_send_download_guidance(self):
         client = types.SimpleNamespace(get_user_uri=lambda username: None)

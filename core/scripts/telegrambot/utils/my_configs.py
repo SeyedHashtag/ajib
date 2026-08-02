@@ -437,6 +437,37 @@ def display_config(chat_id, username, user_data, api_client, is_callback=False, 
             return
         sub_url = user_uri_data['normal_sub']
         ipv4_url = user_uri_data.get('ipv4', '')
+        renewal_markup = None
+        caption_status = None
+        try:
+            from utils.renewal import find_customer_renewal_offer
+
+            active_offer = find_customer_renewal_offer(
+                user_id or chat_id,
+                username,
+                api_client,
+                user_data,
+                load_plans(),
+                allow_reservation=True,
+            )
+            if active_offer.get('eligible') and active_offer.get('renewal_mode') == 'reserved':
+                renewal_markup = types.InlineKeyboardMarkup()
+                renewal_markup.add(types.InlineKeyboardButton(
+                    get_button_text(get_user_language(user_id or chat_id), 'reserve_renewal') or 'Reserve renewal',
+                    callback_data=f"renew_plan:{active_offer['token']}",
+                ))
+            elif active_offer.get('reason') == 'renewal_already_reserved':
+                caption_status = get_message_text(
+                    get_user_language(user_id or chat_id),
+                    'renewal_reserved_status',
+                )
+                if caption_status == 'renewal_reserved_status':
+                    caption_status = 'A renewal is reserved for this config.'
+            else:
+                caption_status = None
+        except Exception as renewal_error:
+            print(f"Error building active renewal reservation for {username}: {renewal_error}")
+            caption_status = None
         
         # Create QR code for IPv4 URL when available.
         qr_code = qrcode.make(ipv4_url or sub_url)
@@ -450,6 +481,8 @@ def display_config(chat_id, username, user_data, api_client, is_callback=False, 
             caption += f"IPv4 URL: `{ipv4_url}`\n\n"
             
         caption += f"Subscription URL:\n{sub_url}"
+        if caption_status:
+            caption += f"\n\n{caption_status}"
         caption = _append_my_configs_cache_notice(
             caption,
             get_user_language(user_id or chat_id),
@@ -464,7 +497,8 @@ def display_config(chat_id, username, user_data, api_client, is_callback=False, 
                 chat_id,
                 photo=bio,
                 caption=caption,
-                parse_mode="Markdown"
+                parse_mode="Markdown",
+                reply_markup=renewal_markup,
             )
         else:
             safe_send_photo(
@@ -472,7 +506,8 @@ def display_config(chat_id, username, user_data, api_client, is_callback=False, 
                 chat_id,
                 photo=bio,
                 caption=caption,
-                parse_mode="Markdown"
+                parse_mode="Markdown",
+                reply_markup=renewal_markup,
             )
         send_download_prompt_safely(
             bot,

@@ -177,7 +177,15 @@ def _apply_reseller_settlement_payment(user_id, payment_record):
     from utils.reseller import apply_reseller_payment
 
     credited_amount = _settlement_credit_amount(payment_record)
-    result = apply_reseller_payment(user_id, credited_amount)
+    try:
+        result = apply_reseller_payment(
+            user_id,
+            credited_amount,
+            payment_id=payment_record.get('payment_id') or payment_record.get('order_id'),
+        )
+    except TypeError:
+        # Compatibility for integrations that still expose the legacy two-argument helper.
+        result = apply_reseller_payment(user_id, credited_amount)
     success = bool(result[0]) if isinstance(result, tuple) and result else bool(result)
     if success:
         try:
@@ -266,6 +274,43 @@ def _process_customer_renewal_payment(payment_id, payment_record, notify_chat_id
     language = get_user_language(user_id)
     notify_chat_id = notify_chat_id or user_id
     payment_method = payment_method or payment_record.get('payment_method', 'Card to Card')
+
+    if payment_record.get('renewal_mode') == 'reserved':
+        from utils.renewal import mark_payment_renewal_reserved
+        import utils.payment_records as payment_records_store
+
+        username = payment_record.get('renewal_username')
+        server_id = payment_record.get('renewal_server_id')
+        if not mark_payment_renewal_reserved(
+            payment_id,
+            payments_file=getattr(payment_records_store, 'PAYMENTS_FILE', None),
+            fields={
+                'username': username,
+                'server_id': server_id,
+                'renewal_before_state': payment_record.get('renewal_before_state'),
+            },
+        ):
+            _notify_sale_completion_persistence_failure(payment_id, user_id, username, server_id)
+            return False
+        add_referral_reward(user_id, payment_record.get('price', 0), payment_id)
+        send_admin_payment_notification(
+            user_id,
+            username,
+            payment_record.get('plan_gb'),
+            payment_record.get('price', 0),
+            payment_id,
+            payment_method,
+            telegram_username=telegram_username,
+            converted_amount=payment_record.get('converted_amount'),
+            converted_currency=payment_record.get('converted_currency'),
+            exchange_rate=payment_record.get('exchange_rate'),
+            server_id=server_id,
+        )
+        reserved_text = get_message_text(language, 'renewal_reserved_success')
+        if reserved_text == 'renewal_reserved_success':
+            reserved_text = 'Your renewal is paid and reserved. It will be applied automatically when this config expires.'
+        bot.send_message(notify_chat_id, reserved_text, parse_mode='Markdown')
+        return True
 
     result = execute_customer_renewal(payment_record)
     if not result.get('success'):
@@ -1979,8 +2024,238 @@ def process_payment_webhook(request_data):
         print(f"Error processing webhook: {str(e)}")
         return False
 
+def _reserved_renewal_review_markup(kind, event):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    reason = event.get('reason')
+    if kind == 'p':
+        identity = event['payment_id']
+        prefix = f"rr:p"
+    else:
+        identity = f"{event['reseller_id']}:{event['reservation_id']}"
+        prefix = "rr:r"
+    if reason == 'external_renewal':
+        markup.add(
+            types.InlineKeyboardButton('Keep for next expiry', callback_data=f"{prefix}:wait:{identity}"),
+            types.InlineKeyboardButton('Apply now', callback_data=f"{prefix}:apply:{identity}"),
+        )
+    else:
+        markup.add(
+            types.InlineKeyboardButton('Retry now', callback_data=f"{prefix}:retry:{identity}"),
+            types.InlineKeyboardButton('Apply now', callback_data=f"{prefix}:apply:{identity}"),
+        )
+    return markup
+
+
+def _deliver_reserved_renewal(event, recipient_id):
+    from utils.renewal import format_renewal_success
+
+    result = event.get('result') or {}
+    record = event.get('record') or {}
+    api_client = event.get('api_client') or result.get('api_client')
+    username = result.get('username') or record.get('renewal_username') or record.get('username')
+    plan = record.get('renewal_plan_snapshot') or {}
+    plan_gb = plan.get('plan_gb') or record.get('plan_gb') or record.get('gb')
+    days = plan.get('days') or record.get('days')
+    language = get_user_language(recipient_id)
+    uri_data = api_client.get_user_uri(username) if api_client and username else None
+    sub_url = uri_data.get('normal_sub') if uri_data else None
+    ipv4_url = uri_data.get('ipv4', '') if uri_data else ''
+    message = format_renewal_success(
+        language,
+        result,
+        plan_gb,
+        days,
+        sub_url=sub_url,
+        ipv4_url=ipv4_url,
+    )
+    if sub_url:
+        qr = qrcode.make(ipv4_url or sub_url)
+        bio = io.BytesIO()
+        qr.save(bio, 'PNG')
+        bio.seek(0)
+        bot.send_photo(recipient_id, photo=bio, caption=message, parse_mode='Markdown')
+        send_download_prompt_safely(bot, recipient_id, language)
+    else:
+        bot.send_message(recipient_id, message, parse_mode='Markdown')
+
+
+def _notify_reserved_renewal_attention(kind, event, recipient_id):
+    from utils.renewal import mark_payment_renewal_alerted
+    from utils.reseller import mark_reseller_renewal_alerted
+
+    if not event.get('alert_due'):
+        return
+    record = event.get('record') or {}
+    username = record.get('renewal_username') or record.get('username') or 'unknown'
+    reason = event.get('reason') or 'renewal_reset_failed'
+    user_language = get_user_language(recipient_id)
+    reason_text = _renewal_reason_text(user_language, reason)
+    user_text = get_message_text(user_language, 'renewal_reserved_attention')
+    if user_text == 'renewal_reserved_attention':
+        user_text = f"Your reserved renewal for `{username}` needs attention: {reason_text}"
+    else:
+        user_text = user_text.format(username=username, reason=reason_text)
+    try:
+        bot.send_message(recipient_id, user_text, parse_mode='Markdown')
+    except Exception:
+        pass
+
+    markup = _reserved_renewal_review_markup(kind, event)
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            bot.send_message(
+                admin_id,
+                f"Reserved renewal needs attention.\nUser: `{recipient_id}`\nConfig: `{username}`\nReason: {reason}",
+                reply_markup=markup,
+                parse_mode='Markdown',
+            )
+        except Exception:
+            pass
+    if kind == 'p':
+        mark_payment_renewal_alerted(event['payment_id'])
+    else:
+        mark_reseller_renewal_alerted(event['reseller_id'], event['reservation_id'])
+
+
+def process_main_reserved_renewals(now=None):
+    from utils.renewal import (
+        list_payment_renewal_ids,
+        process_payment_renewal_reservation,
+        process_reseller_renewal_reservation,
+    )
+    from utils.reseller import list_reseller_renewal_reservations
+
+    events = []
+    for payment_id in list_payment_renewal_ids():
+        try:
+            event = process_payment_renewal_reservation(payment_id, now=now)
+            if not event:
+                continue
+            events.append(event)
+            record = event.get('record') or {}
+            recipient_id = record.get('user_id')
+            if event.get('status') == 'applied' and recipient_id is not None:
+                _deliver_reserved_renewal(event, recipient_id)
+            elif event.get('status') == 'attention' and recipient_id is not None:
+                _notify_reserved_renewal_attention('p', event, recipient_id)
+        except Exception as error:
+            logging.getLogger('ajib.renewals').exception(
+                'Failed to process payment renewal reservation %s: %s', payment_id, error
+            )
+
+    for item in list_reseller_renewal_reservations():
+        reservation = item.get('reservation') or {}
+        if reservation.get('renewal_source') == 'hosted_customer':
+            continue
+        reseller_id = item.get('reseller_id')
+        reservation_id = reservation.get('reservation_id')
+        if not reservation_id:
+            continue
+        try:
+            event = process_reseller_renewal_reservation(
+                reseller_id,
+                reservation_id,
+                now=now,
+            )
+            if not event:
+                continue
+            events.append(event)
+            if event.get('status') == 'applied':
+                _deliver_reserved_renewal(event, int(reseller_id))
+            elif event.get('status') == 'attention':
+                _notify_reserved_renewal_attention('r', event, int(reseller_id))
+        except Exception as error:
+            logging.getLogger('ajib.renewals').exception(
+                'Failed to process reseller renewal reservation %s/%s: %s',
+                reseller_id,
+                reservation_id,
+                error,
+            )
+    return events
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('rr:'))
+def handle_reserved_renewal_review(call):
+    if not is_admin(call.from_user.id):
+        safe_answer_callback_query(bot, call.id, text='Admin access required.', show_alert=True)
+        return
+    parts = call.data.split(':')
+    if len(parts) not in {4, 5} or parts[1] not in {'p', 'r'} or parts[2] not in {'wait', 'apply', 'retry'}:
+        safe_answer_callback_query(bot, call.id, text='Invalid renewal review action.', show_alert=True)
+        return
+    kind, action = parts[1], parts[2]
+    try:
+        from utils.renewal import (
+            capture_user_state,
+            process_payment_renewal_reservation,
+            process_reseller_renewal_reservation,
+            refresh_payment_renewal_baseline,
+        )
+        from utils.reseller import get_reseller_renewal_reservation, refresh_reseller_renewal_baseline
+
+        if kind == 'p':
+            payment_id = parts[3]
+            record = get_payment_record(payment_id) or {}
+            if action == 'wait':
+                client, live = MultiServerAPI().find_user(
+                    record.get('renewal_username'),
+                    preferred_server_id=record.get('renewal_server_id'),
+                )
+                success = bool(live) and refresh_payment_renewal_baseline(payment_id, live)
+                event = None
+            else:
+                event = process_payment_renewal_reservation(
+                    payment_id,
+                    force=True,
+                    force_apply=action == 'apply',
+                )
+                success = bool(event)
+                if event and event.get('status') == 'applied':
+                    _deliver_reserved_renewal(event, (event.get('record') or {}).get('user_id'))
+        else:
+            reseller_id, reservation_id = parts[3], parts[4]
+            item = get_reseller_renewal_reservation(reseller_id, reservation_id) or {}
+            if action == 'wait':
+                config = item.get('config') or {}
+                client, live = MultiServerAPI().find_user(
+                    config.get('username'),
+                    preferred_server_id=config.get('server_id'),
+                )
+                success = bool(live) and refresh_reseller_renewal_baseline(
+                    reseller_id,
+                    reservation_id,
+                    capture_user_state(live),
+                )
+                event = None
+            else:
+                event = process_reseller_renewal_reservation(
+                    reseller_id,
+                    reservation_id,
+                    force=True,
+                    force_apply=action == 'apply',
+                )
+                success = bool(event)
+                if event and event.get('status') == 'applied':
+                    _deliver_reserved_renewal(event, int(reseller_id))
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            text='Renewal reservation updated.' if success else 'Renewal reservation could not be updated.',
+            show_alert=True,
+        )
+    except Exception as error:
+        logging.getLogger('ajib.renewals').exception('Renewal review failed: %s', error)
+        safe_answer_callback_query(bot, call.id, text='Renewal review failed.', show_alert=True)
+
+
 def check_pending_payments():
     try:
+        try:
+            process_main_reserved_renewals()
+        except (ImportError, AttributeError):
+            # Rolling upgrades and isolated compatibility tests may load only
+            # the legacy renewal surface.
+            pass
         payments = load_payments()
         payment_handler = CryptoPayment()
         

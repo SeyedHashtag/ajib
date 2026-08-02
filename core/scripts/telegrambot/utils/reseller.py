@@ -59,6 +59,7 @@ RESELLER_LEVEL_PRESENTATION_LEASE_SECONDS = max(
     _safe_float_env('RESELLER_LEVEL_PRESENTATION_LEASE_SECONDS', 300.0),
 )
 MONEY_QUANTUM = Decimal('0.01')
+DEBT_CHARGE_EPSILON = 0.005
 
 
 def _safe_float(value, default=0.0):
@@ -71,6 +72,193 @@ def _safe_float(value, default=0.0):
 def _safe_nonnegative_float(value):
     amount = _safe_float(value, 0.0)
     return amount if math.isfinite(amount) and amount > 0 else 0.0
+
+
+def _money_value(value):
+    """Return a finite, cent-rounded, non-negative amount."""
+    try:
+        amount = Decimal(str(value if value is not None else 0))
+    except (InvalidOperation, TypeError, ValueError):
+        return 0.0
+    if not amount.is_finite() or amount <= 0:
+        return 0.0
+    return float(amount.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP))
+
+
+def _charge_outstanding(charge):
+    if not isinstance(charge, dict):
+        return 0.0
+    return _money_value(charge.get('outstanding_amount', charge.get('amount', 0.0)))
+
+
+def _debt_charge_total(record):
+    charges = (record or {}).get('debt_charges', [])
+    if not isinstance(charges, list):
+        return 0.0
+    return round(sum(_charge_outstanding(charge) for charge in charges), 2)
+
+
+def _next_debt_charge_sequence(record):
+    try:
+        current = int((record or {}).get('debt_charge_sequence', 0) or 0)
+    except (TypeError, ValueError):
+        current = 0
+    for charge in (record or {}).get('debt_charges', []):
+        if not isinstance(charge, dict):
+            continue
+        try:
+            current = max(current, int(charge.get('sequence', 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    current += 1
+    record['debt_charge_sequence'] = current
+    return current
+
+
+def _new_debt_charge(record, amount, kind, reference_id=None, metadata=None, charged_at=None):
+    amount_value = _money_value(amount)
+    if amount_value <= 0:
+        return None
+    reference = str(reference_id or '').strip()
+    charge_id = reference or uuid.uuid4().hex
+    existing = next(
+        (
+            charge
+            for charge in record.get('debt_charges', [])
+            if isinstance(charge, dict) and str(charge.get('id') or '') == charge_id
+        ),
+        None,
+    )
+    if existing is not None:
+        return existing
+    charge = {
+        'id': charge_id,
+        'sequence': _next_debt_charge_sequence(record),
+        'kind': str(kind or 'debt'),
+        'reference_id': reference or None,
+        'original_amount': amount_value,
+        'outstanding_amount': amount_value,
+        'charged_at': charged_at or _now_str(),
+        'metadata': dict(metadata or {}),
+    }
+    record.setdefault('debt_charges', []).append(charge)
+    return charge
+
+
+def _record_debt_allocation(record, amount, allocations, kind, reference_id=None):
+    amount_value = _money_value(amount)
+    if amount_value <= 0:
+        return
+    record.setdefault('debt_allocations', []).append({
+        'id': str(reference_id or uuid.uuid4().hex),
+        'kind': str(kind or 'settlement'),
+        'amount': amount_value,
+        'allocations': allocations,
+        'created_at': _now_str(),
+    })
+
+
+def _allocate_debt_fifo(record, amount, kind='settlement', reference_id=None):
+    remaining = Decimal(str(_money_value(amount)))
+    if remaining <= 0:
+        return 0.0
+    allocations = []
+    charges = [charge for charge in record.get('debt_charges', []) if isinstance(charge, dict)]
+    def charge_order(charge):
+        try:
+            sequence = int(charge.get('sequence', 0) or 0)
+        except (TypeError, ValueError):
+            sequence = 0
+        charged_at = _parse_time(charge.get('charged_at'))
+        return (
+            0 if charged_at is not None else 1,
+            charged_at or datetime.min,
+            sequence,
+            str(charge.get('id') or ''),
+        )
+
+    charges.sort(key=charge_order)
+    for charge in charges:
+        outstanding = Decimal(str(_charge_outstanding(charge)))
+        if outstanding <= 0:
+            continue
+        applied = min(outstanding, remaining)
+        if applied <= 0:
+            break
+        charge['outstanding_amount'] = float(
+            (outstanding - applied).quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+        )
+        if charge['outstanding_amount'] <= DEBT_CHARGE_EPSILON:
+            charge['outstanding_amount'] = 0.0
+            charge['paid_at'] = _now_str()
+        allocations.append({'charge_id': charge.get('id'), 'amount': float(applied)})
+        remaining -= applied
+        if remaining <= 0:
+            break
+    applied_total = _money_value(Decimal(str(_money_value(amount))) - remaining)
+    _record_debt_allocation(record, applied_total, allocations, kind, reference_id=reference_id)
+    return applied_total
+
+
+def _ensure_debt_charge_ledger(record):
+    """Lazily reconcile legacy aggregate debt into the itemized FIFO ledger."""
+    charges = record.get('debt_charges')
+    if not isinstance(charges, list):
+        charges = []
+    record['debt_charges'] = [charge for charge in charges if isinstance(charge, dict)]
+    debt = _money_value(record.get('debt', 0.0))
+    tracked = _debt_charge_total(record)
+    if debt > tracked + DEBT_CHARGE_EPSILON:
+        difference = round(debt - tracked, 2)
+        _new_debt_charge(
+            record,
+            difference,
+            'legacy_balance' if not record['debt_charges'] else 'balance_adjustment',
+            reference_id=f"legacy-{uuid.uuid4().hex}",
+            metadata={'synthetic': True},
+            charged_at=record.get('debt_since') or record.get('created_at') or _now_str(),
+        )
+    elif tracked > debt + DEBT_CHARGE_EPSILON:
+        _allocate_debt_fifo(record, tracked - debt, kind='balance_reconciliation')
+    return record['debt_charges']
+
+
+def _add_debt_charge(record, amount, kind, reference_id=None, metadata=None):
+    amount_value = _money_value(amount)
+    if amount_value <= 0:
+        return None
+    _ensure_debt_charge_ledger(record)
+    reference = str(reference_id or '').strip()
+    if reference:
+        existing = get_reseller_debt_charge(record, reference)
+        if existing is not None:
+            return existing
+    charge = _new_debt_charge(
+        record,
+        amount_value,
+        kind,
+        reference_id=reference,
+        metadata=metadata,
+    )
+    if charge is None:
+        return None
+    record['debt'] = round(_safe_float(record.get('debt', 0.0)) + amount_value, 2)
+    return charge
+
+
+def get_reseller_debt_charge(record, charge_id):
+    target = str(charge_id or '')
+    if not target:
+        return None
+    for charge in (record or {}).get('debt_charges', []):
+        if isinstance(charge, dict) and str(charge.get('id') or '') == target:
+            return dict(charge)
+    return None
+
+
+def is_reseller_debt_charge_paid(record, charge_id):
+    charge = get_reseller_debt_charge(record, charge_id)
+    return bool(charge) and _charge_outstanding(charge) <= DEBT_CHARGE_EPSILON
 
 
 def get_reseller_config_value(config):
@@ -314,6 +502,10 @@ def _ensure_reseller_defaults(record):
     debt = _safe_float(data.get('debt', 0.0))
     data['debt'] = debt
     data.setdefault('configs', [])
+    if not isinstance(data.get('debt_charges'), list):
+        data['debt_charges'] = []
+    if not isinstance(data.get('debt_allocations'), list):
+        data['debt_allocations'] = []
     total_paid = get_reseller_total_paid(data)
     data['total_paid'] = total_paid
     data['trust_limit'] = get_reseller_trust_limit(total_paid)
@@ -522,13 +714,30 @@ def add_reseller_debt(user_id, amount, config_data):
                     ):
                         return True
                     before = _safe_float(current.get('debt', 0.0))
-                    amount_value = _safe_float(amount, 0.0)
-                    current['debt'] = before + amount_value
+                    amount_value = _money_value(amount)
+                    if amount_value <= 0:
+                        return False
 
                     if 'configs' not in current:
                         current['configs'] = []
 
+                    config_data = dict(config_data or {})
+                    charge_id = order_id or f"config-{uuid.uuid4().hex}"
+                    config_data['debt_charge_id'] = charge_id
                     config_data['timestamp'] = _now_str()
+                    charge = _add_debt_charge(
+                        current,
+                        amount_value,
+                        'config',
+                        reference_id=charge_id,
+                        metadata={
+                            'username': config_data.get('username'),
+                            'server_id': config_data.get('server_id'),
+                            'retail_order_id': order_id or None,
+                        },
+                    )
+                    if charge is None:
+                        return False
                     current['configs'].append(config_data)
                     if before < DEBT_SETTLEMENT_THRESHOLD and current['debt'] >= DEBT_SETTLEMENT_THRESHOLD:
                         current['debt_since'] = _now_str()
@@ -678,11 +887,28 @@ def add_reseller_renewal_debt(user_id, username, amount, renewal_data, server_id
                     return True
 
                 before = _safe_float(current.get('debt', 0.0))
-                amount_value = _safe_float(amount, 0.0)
-                current['debt'] = before + amount_value
+                amount_value = _money_value(amount)
+                if amount_value <= 0:
+                    return False
                 renewal_record = dict(renewal_data or {})
                 renewal_record.setdefault('timestamp', _now_str())
                 renewal_record.setdefault('price', amount_value)
+                charge_id = order_id or str(renewal_record.get('reservation_id') or f"renewal-{uuid.uuid4().hex}")
+                renewal_record['debt_charge_id'] = charge_id
+                charge = _add_debt_charge(
+                    current,
+                    amount_value,
+                    'renewal',
+                    reference_id=charge_id,
+                    metadata={
+                        'username': username,
+                        'server_id': server_id,
+                        'retail_order_id': order_id or None,
+                        'reservation_id': renewal_record.get('reservation_id'),
+                    },
+                )
+                if charge is None:
+                    return False
                 configs[target_index].setdefault('renewals', [])
                 if not isinstance(configs[target_index]['renewals'], list):
                     configs[target_index]['renewals'] = []
@@ -704,6 +930,339 @@ def add_reseller_renewal_debt(user_id, username, amount, renewal_data, server_id
             return False
 
 
+def reserve_reseller_renewal(
+    user_id,
+    username,
+    amount,
+    renewal_data,
+    server_id=None,
+    funded=False,
+    enforce_credit=True,
+):
+    """Atomically record one future renewal and its debt or funded charge."""
+    user_id = str(user_id)
+    target_username = str(username or '').strip().lower()
+    amount_value = _money_value(amount)
+    if not target_username or amount_value <= 0:
+        return False, {'reason': 'renewal_ineligible_missing'}
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                if not _resellers_store_exists():
+                    return False, {'reason': 'reseller_missing'}
+                resellers = _read_resellers_file()
+                if user_id not in resellers:
+                    return False, {'reason': 'reseller_missing'}
+                current = _ensure_reseller_defaults(resellers[user_id])
+                configs = current.get('configs', [])
+                target_index = None
+                for index, config in enumerate(configs if isinstance(configs, list) else []):
+                    if not isinstance(config, dict) or _is_removed_config(config):
+                        continue
+                    if str(config.get('username') or '').strip().lower() != target_username:
+                        continue
+                    if server_id and config.get('server_id') and str(config.get('server_id')) != str(server_id):
+                        continue
+                    target_index = index
+                    break
+                if target_index is None:
+                    return False, {'reason': 'renewal_ineligible_missing'}
+                renewals = configs[target_index].setdefault('renewals', [])
+                if not isinstance(renewals, list):
+                    renewals = []
+                    configs[target_index]['renewals'] = renewals
+                active = next(
+                    (
+                        item
+                        for item in renewals
+                        if isinstance(item, dict)
+                        and item.get('renewal_mode') == 'reserved'
+                        and item.get('renewal_status') in {'reserved', 'processing', 'attention'}
+                    ),
+                    None,
+                )
+                if active is not None:
+                    requested_id = str((renewal_data or {}).get('reservation_id') or (renewal_data or {}).get('retail_order_id') or '')
+                    if requested_id and str(active.get('reservation_id') or '') == requested_id:
+                        return True, dict(active)
+                    return False, {'reason': 'renewal_already_reserved', 'reservation': dict(active)}
+
+                record = dict(renewal_data or {})
+                reservation_id = str(record.get('reservation_id') or record.get('retail_order_id') or uuid.uuid4().hex)
+                record['reservation_id'] = reservation_id
+                record.setdefault('retail_order_id', reservation_id if record.get('origin_bot_id') else None)
+                record.setdefault('timestamp', _now_str())
+                record.setdefault('renewal_reserved_at', record['timestamp'])
+                record.setdefault('price', amount_value)
+                record['renewal_mode'] = 'reserved'
+                record['renewal_status'] = 'reserved'
+                record.setdefault('renewal_attempts', 0)
+
+                if funded:
+                    record['funded_at_checkout'] = True
+                    current['total_paid'] = get_reseller_total_paid(current) + amount_value
+                    current['last_payment_at'] = _now_str()
+                else:
+                    if enforce_credit:
+                        can_add, trust_limit, available = can_reseller_add_debt(current, amount_value)
+                        if not can_add:
+                            return False, {
+                                'reason': 'credit_unavailable',
+                                'trust_limit': trust_limit,
+                                'available_credit': available,
+                            }
+                    before = _safe_float(current.get('debt', 0.0))
+                    charge_id = str(record.get('debt_charge_id') or f"renewal-{reservation_id}")
+                    record['debt_charge_id'] = charge_id
+                    charge = _add_debt_charge(
+                        current,
+                        amount_value,
+                        'reserved_renewal',
+                        reference_id=charge_id,
+                        metadata={
+                            'reservation_id': reservation_id,
+                            'username': username,
+                            'server_id': server_id,
+                            'retail_order_id': record.get('retail_order_id'),
+                        },
+                    )
+                    if charge is None:
+                        return False, {'reason': 'renewal_accounting_failed'}
+                    if before < DEBT_SETTLEMENT_THRESHOLD and current['debt'] >= DEBT_SETTLEMENT_THRESHOLD:
+                        current['debt_since'] = _now_str()
+
+                renewals.append(record)
+                current = _ensure_reseller_defaults(current)
+                resellers[user_id] = current
+                _write_resellers_file(resellers)
+                return True, dict(record)
+        except Exception:
+            return False, {'reason': 'renewal_accounting_failed'}
+
+
+def get_reseller_renewal_reservation(user_id, reservation_id):
+    reseller_data = get_reseller_data(user_id) or {}
+    for config_index, config in enumerate(reseller_data.get('configs', [])):
+        if not isinstance(config, dict):
+            continue
+        for renewal_index, renewal in enumerate(config.get('renewals', [])):
+            if isinstance(renewal, dict) and str(renewal.get('reservation_id') or '') == str(reservation_id):
+                return {
+                    'reseller_id': str(user_id),
+                    'config_index': config_index,
+                    'renewal_index': renewal_index,
+                    'config': dict(config),
+                    'reservation': dict(renewal),
+                    'reseller': reseller_data,
+                }
+    return None
+
+
+def list_reseller_renewal_reservations():
+    result = []
+    for reseller_id, reseller_data in get_all_resellers().items():
+        for config_index, config in enumerate(reseller_data.get('configs', [])):
+            if not isinstance(config, dict) or _is_removed_config(config):
+                continue
+            for renewal_index, renewal in enumerate(config.get('renewals', [])):
+                if not isinstance(renewal, dict):
+                    continue
+                if renewal.get('renewal_mode') != 'reserved':
+                    continue
+                if renewal.get('renewal_status') not in {'reserved', 'processing', 'attention'}:
+                    continue
+                result.append({
+                    'reseller_id': str(reseller_id),
+                    'config_index': config_index,
+                    'renewal_index': renewal_index,
+                    'config': dict(config),
+                    'reservation': dict(renewal),
+                    'reseller': reseller_data,
+                })
+    return result
+
+
+def claim_reseller_renewal_reservation(
+    user_id,
+    reservation_id,
+    now=None,
+    force=False,
+    lease_seconds=600,
+):
+    user_id = str(user_id)
+    current_time = now or datetime.now()
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                current = _ensure_reseller_defaults(resellers.get(user_id, {}))
+                for config in current.get('configs', []):
+                    if not isinstance(config, dict):
+                        continue
+                    for reservation in config.get('renewals', []):
+                        if not isinstance(reservation, dict) or str(reservation.get('reservation_id') or '') != str(reservation_id):
+                            continue
+                        status = reservation.get('renewal_status')
+                        if status == 'processing':
+                            claimed_at = _parse_time(reservation.get('renewal_claimed_at'))
+                            if claimed_at is not None and 0 <= (current_time - claimed_at).total_seconds() < lease_seconds:
+                                return None
+                        elif status == 'attention':
+                            next_attempt = _parse_time(reservation.get('renewal_next_attempt_at'))
+                            if not force and (
+                                reservation.get('renewal_attention_reason') == 'external_renewal'
+                                or (next_attempt is not None and next_attempt > current_time)
+                            ):
+                                return None
+                        elif status != 'reserved':
+                            return None
+                        claim_id = uuid.uuid4().hex
+                        reservation['renewal_processing_from'] = status
+                        reservation['renewal_status'] = 'processing'
+                        reservation['renewal_claim_id'] = claim_id
+                        reservation['renewal_claimed_at'] = current_time.strftime('%Y-%m-%d %H:%M:%S')
+                        resellers[user_id] = _ensure_reseller_defaults(current)
+                        _write_resellers_file(resellers)
+                        return {'claim_id': claim_id, 'reservation': dict(reservation), 'config': dict(config), 'reseller': current}
+                return None
+        except Exception:
+            return None
+
+
+def finish_reseller_renewal_reservation(
+    user_id,
+    reservation_id,
+    claim_id,
+    status,
+    fields=None,
+    now=None,
+    retry=False,
+):
+    if status not in {'reserved', 'attention', 'applied'}:
+        return False
+    user_id = str(user_id)
+    current_time = now or datetime.now()
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                current = _ensure_reseller_defaults(resellers.get(user_id, {}))
+                for config in current.get('configs', []):
+                    if not isinstance(config, dict):
+                        continue
+                    for reservation in config.get('renewals', []):
+                        if not isinstance(reservation, dict) or str(reservation.get('reservation_id') or '') != str(reservation_id):
+                            continue
+                        if reservation.get('renewal_claim_id') != str(claim_id):
+                            return False
+                        reservation.update(dict(fields or {}))
+                        reservation['renewal_status'] = status
+                        reservation.pop('renewal_claim_id', None)
+                        reservation.pop('renewal_claimed_at', None)
+                        reservation.pop('renewal_processing_from', None)
+                        if status == 'applied':
+                            reservation['renewal_applied_at'] = current_time.strftime('%Y-%m-%d %H:%M:%S')
+                            reservation.pop('renewal_attention_reason', None)
+                            reservation.pop('renewal_last_error', None)
+                            reservation.pop('renewal_next_attempt_at', None)
+                            config['cleanup_status'] = 'renewed'
+                            config['cleanup_error'] = None
+                            if reservation.get('after_state') is not None:
+                                config['cleanup_last_state'] = reservation.get('after_state')
+                        elif status == 'reserved':
+                            reservation.pop('renewal_attention_reason', None)
+                            reservation.pop('renewal_last_error', None)
+                            reservation.pop('renewal_next_attempt_at', None)
+                        elif retry:
+                            reservation['renewal_attempts'] = int(reservation.get('renewal_attempts', 0) or 0) + 1
+                            reservation['renewal_next_attempt_at'] = (
+                                current_time + timedelta(hours=1)
+                            ).strftime('%Y-%m-%d %H:%M:%S')
+                        resellers[user_id] = _ensure_reseller_defaults(current)
+                        _write_resellers_file(resellers)
+                        return True
+                return False
+        except Exception:
+            return False
+
+
+def refresh_reseller_renewal_baseline(user_id, reservation_id, user_data):
+    user_id = str(user_id)
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                current = _ensure_reseller_defaults(resellers.get(user_id, {}))
+                for config in current.get('configs', []):
+                    for reservation in config.get('renewals', []) if isinstance(config, dict) else []:
+                        if isinstance(reservation, dict) and str(reservation.get('reservation_id') or '') == str(reservation_id):
+                            reservation['renewal_baseline'] = dict(user_data or {})
+                            reservation['renewal_status'] = 'reserved'
+                            reservation['renewal_reviewed_at'] = _now_str()
+                            reservation.pop('renewal_attention_reason', None)
+                            reservation.pop('renewal_last_error', None)
+                            reservation.pop('renewal_next_attempt_at', None)
+                            resellers[user_id] = _ensure_reseller_defaults(current)
+                            _write_resellers_file(resellers)
+                            return True
+                return False
+        except Exception:
+            return False
+
+
+def mark_reseller_renewal_alerted(user_id, reservation_id, now=None):
+    user_id = str(user_id)
+    timestamp = (now or datetime.now()).strftime('%Y-%m-%d %H:%M:%S')
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                current = _ensure_reseller_defaults(resellers.get(user_id, {}))
+                for config in current.get('configs', []):
+                    for reservation in config.get('renewals', []) if isinstance(config, dict) else []:
+                        if isinstance(reservation, dict) and str(reservation.get('reservation_id') or '') == str(reservation_id):
+                            reservation['renewal_last_alert_at'] = timestamp
+                            resellers[user_id] = _ensure_reseller_defaults(current)
+                            _write_resellers_file(resellers)
+                            return True
+                return False
+        except Exception:
+            return False
+
+
+def sync_reseller_renewal_reservation(user_id, reservation_id, status, fields=None):
+    """Idempotently mirror hosted payment fulfillment into reseller history."""
+    if status not in {'reserved', 'attention', 'applied'}:
+        return False
+    user_id = str(user_id)
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                current = _ensure_reseller_defaults(resellers.get(user_id, {}))
+                for config in current.get('configs', []):
+                    for reservation in config.get('renewals', []) if isinstance(config, dict) else []:
+                        if not isinstance(reservation, dict) or str(reservation.get('reservation_id') or '') != str(reservation_id):
+                            continue
+                        reservation.update(dict(fields or {}))
+                        reservation['renewal_status'] = status
+                        if status == 'applied':
+                            reservation.setdefault('renewal_applied_at', _now_str())
+                            reservation.pop('renewal_attention_reason', None)
+                            reservation.pop('renewal_last_error', None)
+                            reservation.pop('renewal_next_attempt_at', None)
+                            config['cleanup_status'] = 'renewed'
+                            config['cleanup_error'] = None
+                            if reservation.get('after_state') is not None:
+                                config['cleanup_last_state'] = reservation.get('after_state')
+                        resellers[user_id] = _ensure_reseller_defaults(current)
+                        _write_resellers_file(resellers)
+                        return True
+                return False
+        except Exception:
+            return False
+
+
 def clear_reseller_debt(user_id):
     user_id = str(user_id)
     with reseller_lock:
@@ -715,6 +1274,12 @@ def clear_reseller_debt(user_id):
 
                 if user_id in resellers:
                     current = _ensure_reseller_defaults(resellers[user_id])
+                    _ensure_debt_charge_ledger(current)
+                    _allocate_debt_fifo(
+                        current,
+                        current.get('debt', 0.0),
+                        kind='admin_clear',
+                    )
                     current['debt'] = 0.0
                     current = _restore_auto_suspended_if_debt_cleared(current)
                     current = _ensure_reseller_defaults(current)
@@ -738,8 +1303,22 @@ def set_reseller_debt(user_id, amount):
                 if user_id in resellers:
                     current = _ensure_reseller_defaults(resellers[user_id])
                     previous_debt = _safe_float(current.get('debt', 0.0))
-                    new_debt = _safe_float(amount, 0.0)
-                    current['debt'] = max(0.0, new_debt)
+                    new_debt = _money_value(amount)
+                    _ensure_debt_charge_ledger(current)
+                    if new_debt > previous_debt:
+                        _add_debt_charge(
+                            current,
+                            new_debt - previous_debt,
+                            'admin_adjustment',
+                            reference_id=f"admin-adjustment-{uuid.uuid4().hex}",
+                        )
+                    elif new_debt < previous_debt:
+                        _allocate_debt_fifo(
+                            current,
+                            previous_debt - new_debt,
+                            kind='admin_adjustment_credit',
+                        )
+                    current['debt'] = new_debt
 
                     if previous_debt < DEBT_SETTLEMENT_THRESHOLD and current['debt'] >= DEBT_SETTLEMENT_THRESHOLD:
                         current['debt_since'] = _now_str()
@@ -883,7 +1462,15 @@ def cleanup_banned_reseller_users(user_id, multi_api):
                 current['configs'].append(_mark_config_removed(config, tagged_status_by_index[index]))
             else:
                 current['configs'].append(config)
-        current['debt'] = max(failed_value, _safe_float(current.get('debt', 0.0)) - removed_value)
+        previous_debt = _safe_float(current.get('debt', 0.0))
+        target_debt = max(failed_value, previous_debt - removed_value)
+        _ensure_debt_charge_ledger(current)
+        _allocate_debt_fifo(
+            current,
+            max(0.0, previous_debt - target_debt),
+            kind='banned_cleanup_writeoff',
+        )
+        current['debt'] = target_debt
         if not had_explicit_total_paid:
             current.pop('total_paid', None)
             current.pop('trust_limit', None)
@@ -909,7 +1496,7 @@ def cleanup_banned_reseller_users(user_id, multi_api):
         }
 
 
-def apply_reseller_payment(user_id, amount):
+def apply_reseller_payment(user_id, amount, payment_id=None, allocation_kind='settlement'):
     user_id = str(user_id)
     with reseller_lock:
         try:
@@ -921,19 +1508,28 @@ def apply_reseller_payment(user_id, amount):
                 if user_id not in resellers:
                     return False, None
 
-                try:
-                    paid_amount = float(amount)
-                except (TypeError, ValueError):
+                paid_amount = _money_value(amount)
+                if paid_amount <= 0:
                     return False, None
 
                 current = _ensure_reseller_defaults(resellers[user_id])
                 current_debt = _safe_float(current.get('debt', 0.0))
                 credited_amount = max(0.0, min(paid_amount, current_debt))
-                new_debt = max(0.0, current_debt - paid_amount)
+                new_debt = round(max(0.0, current_debt - paid_amount), 2)
+                _ensure_debt_charge_ledger(current)
+                _allocate_debt_fifo(
+                    current,
+                    credited_amount,
+                    kind=allocation_kind,
+                    reference_id=payment_id,
+                )
                 current['debt'] = new_debt
 
                 if credited_amount > 0:
-                    current['total_paid'] = get_reseller_total_paid(current) + credited_amount
+                    current['total_paid'] = round(
+                        get_reseller_total_paid(current) + credited_amount,
+                        2,
+                    )
                     current['last_payment_at'] = _now_str()
                 if new_debt < DEBT_SETTLEMENT_THRESHOLD:
                     current['debt_since'] = None

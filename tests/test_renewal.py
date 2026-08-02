@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -256,6 +257,51 @@ class RenewalTests(unittest.TestCase):
         )
         self.assertEqual(quota_mismatch_offer["reason"], "renewal_ineligible_plan_mismatch")
 
+    def test_active_customer_offer_is_reservable_and_duplicate_is_rejected(self):
+        active_user = {
+            "blocked": False,
+            "expiration_days": 12,
+            "upload_bytes": GB_BYTES,
+            "download_bytes": 2 * GB_BYTES,
+            "max_download_bytes": 5 * GB_BYTES,
+            "status": "active",
+        }
+        client = FakeClient("s1", {"alice": active_user})
+        payments = {"base-1": self.base_payment()}
+
+        offer = self.renewal.find_customer_renewal_offer(
+            123,
+            "alice",
+            client,
+            active_user,
+            self.plans,
+            payments=payments,
+            allow_reservation=True,
+        )
+
+        self.assertTrue(offer["eligible"])
+        self.assertEqual(offer["renewal_mode"], "reserved")
+        self.assertEqual(offer["before_state"]["gb_used"], 3.0)
+
+        payments["reservation-1"] = {
+            **self.base_payment(type="renewal"),
+            "renewal_mode": "reserved",
+            "renewal_status": "reserved",
+            "renewal_username": "alice",
+            "renewal_server_id": "s1",
+        }
+        duplicate = self.renewal.find_customer_renewal_offer(
+            123,
+            "alice",
+            client,
+            active_user,
+            self.plans,
+            payments=payments,
+            allow_reservation=True,
+        )
+        self.assertFalse(duplicate["eligible"])
+        self.assertEqual(duplicate["reason"], "renewal_already_reserved")
+
     def test_customer_offer_rejects_reseller_only_plan(self):
         plans = {
             "1": {"price": 2.0, "days": 7, "unlimited": False, "target": "reseller"},
@@ -460,6 +506,296 @@ class RenewalTests(unittest.TestCase):
 
         self.assertTrue(offer["eligible"])
         self.assertAlmostEqual(offer["price"], 1.6)
+
+    def test_reserved_payment_waits_then_applies_once_from_locked_snapshot(self):
+        active_user = {
+            "blocked": False,
+            "expiration_days": 12,
+            "upload_bytes": GB_BYTES,
+            "download_bytes": 2 * GB_BYTES,
+            "max_download_bytes": 5 * GB_BYTES,
+            "status": "active",
+        }
+        client = FakeClient("s1", {"alice": active_user})
+        baseline = self.renewal.capture_user_state(active_user)
+        payment = {
+            **self.base_payment(type="renewal", price=12.0),
+            "renewal_source": "customer",
+            "renewal_username": "alice",
+            "renewal_server_id": "s1",
+            "renewal_base_record_id": "base-1",
+            "renewal_mode": "reserved",
+            "renewal_status": "reserved",
+            "renewal_baseline": baseline,
+            "renewal_plan_snapshot": {
+                "plan_gb": "5",
+                "days": 30,
+                "unlimited": False,
+                "price": 12.0,
+            },
+        }
+        self.write_json(self.renewal.PAYMENTS_FILE, {
+            "base-1": self.base_payment(),
+            "reservation-1": payment,
+        })
+        multi_api = FakeMultiAPI({"s1": client})
+
+        waiting = self.renewal.process_payment_renewal_reservation(
+            "reservation-1", payments_file=self.renewal.PAYMENTS_FILE, multi_api=multi_api
+        )
+        self.assertEqual(waiting["status"], "waiting")
+        self.assertEqual(client.reset_calls, [])
+
+        active_user.update({"blocked": True, "expiration_days": 0, "status": "expired"})
+        applied = self.renewal.process_payment_renewal_reservation(
+            "reservation-1", payments_file=self.renewal.PAYMENTS_FILE, multi_api=multi_api
+        )
+        duplicate = self.renewal.process_payment_renewal_reservation(
+            "reservation-1", payments_file=self.renewal.PAYMENTS_FILE, multi_api=multi_api
+        )
+
+        self.assertEqual(applied["status"], "applied")
+        self.assertIsNone(duplicate)
+        self.assertEqual(client.reset_calls, ["alice"])
+        saved = self.read_json(self.renewal.PAYMENTS_FILE)
+        self.assertEqual(saved["reservation-1"]["status"], "completed")
+        self.assertEqual(saved["reservation-1"]["renewal_status"], "applied")
+        self.assertEqual(saved["reservation-1"]["renewal_plan_snapshot"]["price"], 12.0)
+
+    def test_settlement_atomically_rejects_a_second_reservation_for_the_same_config(self):
+        self.write_json(self.renewal.PAYMENTS_FILE, {
+            "reservation-1": {
+                **self.base_payment(type="renewal"),
+                "renewal_username": "alice",
+                "renewal_server_id": "s1",
+                "renewal_mode": "reserved",
+                "renewal_status": "reserved",
+            },
+            "reservation-2": {
+                **self.base_payment(type="renewal", status="processing"),
+                "renewal_username": "alice",
+                "renewal_server_id": "s1",
+                "renewal_mode": "reserved",
+            },
+        })
+
+        settled = self.renewal.mark_payment_renewal_reserved(
+            "reservation-2", payments_file=self.renewal.PAYMENTS_FILE
+        )
+
+        saved = self.read_json(self.renewal.PAYMENTS_FILE)
+        self.assertFalse(settled)
+        self.assertEqual(saved["reservation-2"]["status"], "processing")
+        self.assertNotIn("renewal_status", saved["reservation-2"])
+
+    def test_external_renewal_requires_review_and_keep_refreshes_baseline(self):
+        active_user = {
+            "blocked": False,
+            "expiration_days": 12,
+            "upload_bytes": GB_BYTES,
+            "download_bytes": 2 * GB_BYTES,
+            "max_download_bytes": 5 * GB_BYTES,
+            "status": "active",
+        }
+        baseline = self.renewal.capture_user_state(active_user)
+        payment = {
+            **self.base_payment(type="renewal"),
+            "renewal_source": "customer",
+            "renewal_username": "alice",
+            "renewal_server_id": "s1",
+            "renewal_mode": "reserved",
+            "renewal_status": "reserved",
+            "renewal_baseline": baseline,
+            "renewal_plan_snapshot": {"plan_gb": "5", "days": 30, "unlimited": False},
+        }
+        self.write_json(self.renewal.PAYMENTS_FILE, {"reservation-1": payment})
+        active_user.update({"upload_bytes": 0, "download_bytes": 0, "expiration_days": 30})
+        client = FakeClient("s1", {"alice": active_user})
+
+        attention = self.renewal.process_payment_renewal_reservation(
+            "reservation-1",
+            payments_file=self.renewal.PAYMENTS_FILE,
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+        self.assertEqual(attention["status"], "attention")
+        self.assertEqual(attention["reason"], "external_renewal")
+        self.assertEqual(client.reset_calls, [])
+        self.assertIsNone(self.renewal.claim_payment_renewal(
+            "reservation-1", payments_file=self.renewal.PAYMENTS_FILE
+        ))
+
+        self.assertTrue(self.renewal.refresh_payment_renewal_baseline(
+            "reservation-1", active_user, payments_file=self.renewal.PAYMENTS_FILE
+        ))
+        saved = self.read_json(self.renewal.PAYMENTS_FILE)["reservation-1"]
+        self.assertEqual(saved["renewal_status"], "reserved")
+        self.assertEqual(saved["renewal_baseline"]["gb_used"], 0.0)
+
+    def test_external_expiration_extension_is_detected_without_a_usage_reset(self):
+        active_user = {
+            "blocked": False,
+            "expiration_days": 12,
+            "upload_bytes": GB_BYTES,
+            "download_bytes": GB_BYTES,
+            "max_download_bytes": 5 * GB_BYTES,
+            "status": "active",
+        }
+        record = {"renewal_baseline": self.renewal.capture_user_state(active_user)}
+        extended = {**active_user, "expiration_days": 30}
+
+        self.assertTrue(self.renewal.reservation_generation_changed(record, extended))
+
+    def test_apply_now_consumes_reservation_after_an_external_plan_change(self):
+        active_changed_plan = {
+            "blocked": False,
+            "expiration_days": 30,
+            "upload_bytes": 0,
+            "download_bytes": 0,
+            "max_download_bytes": 10 * GB_BYTES,
+            "status": "active",
+        }
+        client = FakeClient("s1", {"alice": active_changed_plan})
+        record = {
+            "renewal_username": "alice",
+            "renewal_server_id": "s1",
+            "renewal_plan_snapshot": {"plan_gb": "5", "days": 30, "unlimited": False},
+        }
+
+        result = self.renewal.execute_reserved_renewal(
+            record,
+            multi_api=FakeMultiAPI({"s1": client}),
+            force=True,
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(client.reset_calls, ["alice"])
+
+    def test_keep_for_next_expiry_honors_reviewed_external_plan_change(self):
+        expired_changed_plan = {
+            "blocked": True,
+            "expiration_days": 0,
+            "upload_bytes": 10 * GB_BYTES,
+            "download_bytes": 0,
+            "max_download_bytes": 10 * GB_BYTES,
+            "status": "expired",
+        }
+        client = FakeClient("s1", {"alice": expired_changed_plan})
+        record = {
+            "renewal_username": "alice",
+            "renewal_server_id": "s1",
+            "renewal_reviewed_at": "2026-08-02 12:00:00",
+            "renewal_plan_snapshot": {"plan_gb": "5", "days": 30, "unlimited": False},
+        }
+
+        result = self.renewal.execute_reserved_renewal(
+            record,
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(client.reset_calls, ["alice"])
+
+    def test_retry_failure_uses_hourly_lease_and_recovers_stale_claim(self):
+        now = datetime(2026, 8, 2, 12, 0, 0)
+        payment = {
+            **self.base_payment(type="renewal"),
+            "renewal_source": "customer",
+            "renewal_username": "missing",
+            "renewal_server_id": "s1",
+            "renewal_mode": "reserved",
+            "renewal_status": "reserved",
+            "renewal_baseline": {},
+            "renewal_plan_snapshot": {"plan_gb": "5", "days": 30, "unlimited": False},
+        }
+        self.write_json(self.renewal.PAYMENTS_FILE, {"reservation-1": payment})
+
+        failed = self.renewal.process_payment_renewal_reservation(
+            "reservation-1",
+            payments_file=self.renewal.PAYMENTS_FILE,
+            multi_api=FakeMultiAPI({}),
+            now=now,
+        )
+        too_soon = self.renewal.process_payment_renewal_reservation(
+            "reservation-1",
+            payments_file=self.renewal.PAYMENTS_FILE,
+            multi_api=FakeMultiAPI({}),
+            now=now + timedelta(minutes=59),
+        )
+        retry = self.renewal.process_payment_renewal_reservation(
+            "reservation-1",
+            payments_file=self.renewal.PAYMENTS_FILE,
+            multi_api=FakeMultiAPI({}),
+            now=now + timedelta(hours=1),
+        )
+        self.assertEqual(failed["status"], "attention")
+        self.assertTrue(failed["alert_due"])
+        self.assertIsNone(too_soon)
+        self.assertEqual(retry["status"], "attention")
+
+        self.write_json(self.renewal.PAYMENTS_FILE, {
+            "reservation-2": {
+                **payment,
+                "renewal_status": "processing",
+                "renewal_claim_id": "dead-worker",
+                "renewal_claimed_at": (now - timedelta(minutes=11)).strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        })
+        recovered = self.renewal.claim_payment_renewal(
+            "reservation-2", payments_file=self.renewal.PAYMENTS_FILE, now=now
+        )
+        self.assertIsNotNone(recovered)
+        self.assertNotEqual(recovered["claim_id"], "dead-worker")
+
+    def test_attention_reminders_are_limited_to_once_per_day(self):
+        now = datetime(2026, 8, 2, 12, 0, 0)
+        record = {"renewal_last_alert_at": now.strftime("%Y-%m-%d %H:%M:%S")}
+
+        self.assertFalse(self.renewal.reservation_alert_due(
+            record, now=now + timedelta(hours=23, minutes=59)
+        ))
+        self.assertTrue(self.renewal.reservation_alert_due(
+            record, now=now + timedelta(days=1)
+        ))
+
+    def test_restricted_reseller_requires_its_linked_charge_to_be_paid(self):
+        expired = self.expired_user()
+        client = FakeClient("s1", {"bob": expired})
+        reseller_stub = sys.modules["utils.reseller"]
+        finished = []
+
+        def run(charge_paid):
+            reservation = {
+                "reservation_id": "reserved-1",
+                "renewal_mode": "reserved",
+                "renewal_status": "reserved",
+                "renewal_baseline": self.renewal.capture_user_state(expired),
+                "renewal_plan_snapshot": {"plan_gb": "5", "days": 30, "unlimited": False},
+                "debt_charge_id": "charge-1",
+            }
+            reseller_stub.claim_reseller_renewal_reservation = lambda *args, **kwargs: {
+                "claim_id": "claim-1",
+                "reservation": reservation,
+                "config": {"username": "bob", "server_id": "s1"},
+                "reseller": {"status": "suspended"},
+            }
+            reseller_stub.finish_reseller_renewal_reservation = (
+                lambda *args, **kwargs: finished.append((args, kwargs)) or True
+            )
+            reseller_stub.is_reseller_debt_charge_paid = lambda *_args: charge_paid
+            return self.renewal.process_reseller_renewal_reservation(
+                "1988",
+                "reserved-1",
+                multi_api=FakeMultiAPI({"s1": client}),
+            )
+
+        unpaid = run(False)
+        self.assertEqual(unpaid["status"], "attention")
+        self.assertEqual(unpaid["reason"], "reseller_debt_review")
+        self.assertEqual(client.reset_calls, [])
+
+        paid = run(True)
+        self.assertEqual(paid["status"], "applied")
+        self.assertEqual(client.reset_calls, ["bob"])
 
 
 if __name__ == "__main__":

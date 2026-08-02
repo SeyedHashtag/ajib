@@ -973,6 +973,67 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
         ]
         self.assertIn("reseller:renew:renew-token", callbacks)
 
+    def test_active_reseller_customer_config_shows_reserve_button(self):
+        original_multi_api = reseller_handlers.MultiServerAPI
+        original_renewal = self.install_renewal_stub({
+            "eligible": True,
+            "token": "reserve-token",
+            "source": "reseller_customer",
+            "renewal_mode": "reserved",
+        })
+
+        class FakeClient:
+            server_id = "s1"
+
+            def get_user_uri(self, username):
+                return {"normal_sub": f"https://sub.example/{username}", "ipv4": ""}
+
+        class FakeMultiServerAPI:
+            def find_user(self, username, preferred_server_id=None):
+                return FakeClient(), {
+                    "blocked": False,
+                    "upload_bytes": 0,
+                    "download_bytes": 0,
+                    "max_download_bytes": 1 * 1024 ** 3,
+                    "expiration_days": 7,
+                    "account_creation_date": "2026-06-24",
+                    "status": "active",
+                }
+
+        try:
+            reseller_handlers.MultiServerAPI = FakeMultiServerAPI
+            call = types.SimpleNamespace(
+                id="call-1",
+                data="reseller:cfg:r1988a:active:0",
+                from_user=types.SimpleNamespace(id=1988),
+                message=types.SimpleNamespace(chat=types.SimpleNamespace(id=100), message_id=200),
+            )
+            reseller_handlers._render_reseller_customer_config_job(
+                call,
+                1988,
+                "en",
+                {
+                    "status": "approved",
+                    "configs": [{
+                        "username": "r1988a",
+                        "server_id": "s1",
+                        "gb": "1",
+                        "days": 7,
+                        "unlimited": False,
+                    }],
+                },
+                "r1988a",
+                "active",
+                0,
+            )
+        finally:
+            reseller_handlers.MultiServerAPI = original_multi_api
+            self.restore_renewal_stub(original_renewal)
+
+        markup = reseller_handlers.bot.sent_messages[-1][1]["reply_markup"]
+        callbacks = [button.callback_data for button in markup.buttons]
+        self.assertIn("reseller:renew:reserve-token", callbacks)
+
     def test_duplicate_reseller_callbacks_renew_the_exact_selected_record(self):
         original_multi_api = reseller_handlers.MultiServerAPI
         original_get_reseller_data = reseller_handlers.get_reseller_data

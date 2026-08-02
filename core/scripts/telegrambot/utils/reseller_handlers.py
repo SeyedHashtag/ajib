@@ -1849,10 +1849,45 @@ def _render_reseller_customer_config_job(
     sub_url = user_uri_data['normal_sub']
     ipv4_url = user_uri_data.get('ipv4', '')
 
+    reservation_status = None
+    try:
+        active_offer = {}
+        if not _is_reseller_suspended(reseller_data):
+            from utils.renewal import find_reseller_renewal_offer
+
+            active_offer = find_reseller_renewal_offer(
+                user_id,
+                matched_config_index,
+                api_client,
+                user_config,
+                load_plans(),
+                reseller_data=reseller_data,
+                allow_reservation=True,
+            )
+        if active_offer.get('eligible') and active_offer.get('renewal_mode') == 'reserved':
+            reserve_markup = types.InlineKeyboardMarkup()
+            reserve_markup.add(types.InlineKeyboardButton(
+                get_button_text(language, 'reserve_renewal') or 'Reserve renewal',
+                callback_data=f"reseller:renew:{active_offer['token']}",
+            ))
+            reserve_markup.add(types.InlineKeyboardButton(
+                get_button_text(language, "reseller_back_to_customers"),
+                callback_data=f"reseller:my_customers:{return_category}:{return_page}",
+            ))
+            back_markup = reserve_markup
+        elif active_offer.get('reason') == 'renewal_already_reserved':
+            reservation_status = get_message_text(language, 'renewal_reserved_status')
+            if reservation_status == 'renewal_reserved_status':
+                reservation_status = 'A renewal is reserved for this config.'
+    except Exception as renewal_error:
+        print(f"Error building reseller renewal reservation for {username}: {renewal_error}")
+
     caption = f"{formatted_details}\n\n"
     if ipv4_url:
         caption += f"IPv4 URL: `{ipv4_url}`\n\n"
     caption += f"Subscription URL:\n{sub_url}"
+    if reservation_status:
+        caption += f"\n\n{reservation_status}"
 
     try:
         qr_code = qrcode.make(ipv4_url or sub_url)
@@ -2025,6 +2060,70 @@ def _process_reseller_renewal_confirm_job(call, user_id, language, token):
     can_add, trust_limit, available_credit = can_reseller_add_debt(reseller_data, price)
     if not can_add:
         _show_reseller_trust_limit_block(call, language, current_debt, price, trust_limit, available_credit)
+        return
+
+    if offer.get('renewal_mode') == 'reserved':
+        from utils.renewal import reserved_renewal_record
+        from utils.reseller import reserve_reseller_renewal
+
+        reservation = reserved_renewal_record(offer)
+        reservation.update({
+            'renewal_source': 'reseller_customer',
+            'reseller_id': str(user_id),
+            'config_index': offer.get('config_index'),
+        })
+        reserved, reservation_result = reserve_reseller_renewal(
+            user_id,
+            offer.get('username'),
+            price,
+            reservation,
+            server_id=offer.get('server_id'),
+            funded=False,
+            enforce_credit=True,
+        )
+        if not reserved:
+            reason = (reservation_result or {}).get('reason')
+            if reason == 'credit_unavailable':
+                latest_trust_limit = float((reservation_result or {}).get('trust_limit', trust_limit))
+                latest_available_credit = float((reservation_result or {}).get('available_credit', available_credit))
+                latest_debt = max(0.0, latest_trust_limit - latest_available_credit)
+                _show_reseller_trust_limit_block(
+                    call,
+                    language,
+                    latest_debt,
+                    price,
+                    latest_trust_limit,
+                    latest_available_credit,
+                )
+                return
+            safe_edit_message_text(
+                bot,
+                get_message_text(language, 'renewal_unavailable').format(
+                    reason=_renewal_reason_text(language, reason)
+                ),
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode='Markdown',
+            )
+            return
+        reserved_text = get_message_text(language, 'renewal_reserved_reseller_success')
+        if reserved_text == 'renewal_reserved_reseller_success':
+            reserved_text = (
+                f"Renewal reserved for `{offer.get('username')}`. "
+                f"${format_usd_amount(price)} was added to your debt and the renewal will apply automatically at expiry."
+            )
+        else:
+            reserved_text = reserved_text.format(
+                username=offer.get('username'),
+                price=format_usd_amount(price),
+            )
+        safe_edit_message_text(
+            bot,
+            reserved_text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='Markdown',
+        )
         return
 
     from utils.renewal import execute_reseller_renewal, format_renewal_success, reseller_renewal_record

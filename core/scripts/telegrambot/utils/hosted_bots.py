@@ -575,11 +575,23 @@ def transfer_earnings_to_debt(reseller_id):
         amount = min(debt, _money(ledger.get("earnings_available", 0)))
         if amount <= 0:
             return False, "There are no available earnings."
-        success, remaining = reseller_store.apply_reseller_payment(reseller_id, float(amount))
+        transfer_id = f"earnings-{uuid.uuid4().hex}"
+        try:
+            success, remaining = reseller_store.apply_reseller_payment(
+                reseller_id,
+                float(amount),
+                payment_id=transfer_id,
+                allocation_kind="earnings_transfer",
+            )
+        except TypeError:
+            success, remaining = reseller_store.apply_reseller_payment(reseller_id, float(amount))
         if not success:
             return False, "Debt settlement failed."
         ledger["earnings_available"] = float(_money(ledger.get("earnings_available", 0)) - amount)
-        _append_transaction(ledger, "earnings_to_debt", -amount, {"remaining_debt": remaining})
+        _append_transaction(ledger, "earnings_to_debt", -amount, {
+            "remaining_debt": remaining,
+            "debt_allocation_id": transfer_id,
+        })
         return True, {"amount": float(amount), "remaining_debt": remaining}
 
 

@@ -64,6 +64,10 @@ HOSTED_TRANSLATIONS = {
         "config_no_url": "✅ {action} `{username}`, but its subscription URL is not available yet. Please contact support.",
         "created": "Your config is ready!",
         "renewed": "Your config was renewed!",
+        "renewal_reservation_available": "This config is still active. You can pay now and reserve its next renewal.",
+        "renewal_reserved_status": "🗓 Renewal reserved — it will apply automatically when this config expires.",
+        "renewal_reserved_success": "✅ Renewal reserved. Your payment is complete, and the config will renew automatically at time or traffic expiry.",
+        "renewal_reserved_attention": "⚠️ Reserved renewal for `{username}` needs review: {reason}.",
         "main_reseller_guide": "\n\n*Panel buttons*\n⚡ Generate Config — create a customer config.\n📦 My Customers — view and manage your configs.\n🏅 Level & Stats — review your level, discount, and sales totals.\n💰 My Debt — inspect or settle your balance.\n🤖 My Hosted Bot — connect and manage your own customer-facing bot.",
     },
     "fa": {
@@ -103,6 +107,10 @@ HOSTED_TRANSLATIONS = {
         "config_ready": "✅ {action}\n\n📱 نام کاربری: `{username}`\n\nلینک اشتراک:\n`{subscription}`",
         "config_no_url": "✅ {action} `{username}`، اما لینک اشتراک هنوز در دسترس نیست. با پشتیبانی تماس بگیرید.",
         "created": "کانفیگ شما آماده است!", "renewed": "کانفیگ شما تمدید شد!",
+        "renewal_reservation_available": "این کانفیگ هنوز فعال است. می‌توانید اکنون پرداخت کنید و تمدید بعدی را رزرو کنید.",
+        "renewal_reserved_status": "🗓 تمدید رزرو شده است و پس از انقضای کانفیگ به‌طور خودکار اعمال می‌شود.",
+        "renewal_reserved_success": "✅ تمدید رزرو شد. پرداخت کامل است و کانفیگ پس از پایان زمان یا ترافیک به‌طور خودکار تمدید می‌شود.",
+        "renewal_reserved_attention": "⚠️ تمدید رزروشده `{username}` نیاز به بررسی دارد: {reason}.",
         "main_reseller_guide": "\n\n*راهنمای دکمه‌ها*\n⚡ ساخت کانفیگ — ساخت کانفیگ مشتری.\n📦 مشتریان من — مشاهده و مدیریت کانفیگ‌ها.\n🏅 سطح و آمار — مشاهده سطح، تخفیف و آمار فروش.\n💰 بدهی من — مشاهده یا تسویه بدهی.\n🤖 ربات فروشگاهی من — اتصال و مدیریت ربات مشتریان شما.",
     },
     "ru": {
@@ -137,6 +145,10 @@ HOSTED_TRANSLATIONS = {
         "config_ready": "✅ {action}\n\n📱 Имя пользователя: `{username}`\n\nURL подписки:\n`{subscription}`",
         "config_no_url": "✅ {action} `{username}`, но URL подписки пока недоступен. Обратитесь в поддержку.",
         "created": "Ваш конфиг готов!", "renewed": "Ваш конфиг продлён!",
+        "renewal_reservation_available": "Этот конфиг ещё активен. Вы можете оплатить сейчас и зарезервировать следующее продление.",
+        "renewal_reserved_status": "🗓 Продление зарезервировано — оно применится автоматически после истечения конфига.",
+        "renewal_reserved_success": "✅ Продление зарезервировано. Платёж завершён, и конфиг автоматически продлится после окончания срока или трафика.",
+        "renewal_reserved_attention": "⚠️ Зарезервированное продление для `{username}` требует проверки: {reason}.",
         "main_reseller_guide": "\n\n*Кнопки панели*\n⚡ Создать конфиг — создать конфиг клиента.\n📦 Мои клиенты — просмотр и управление конфигами.\n🏅 Уровень и статистика — уровень, скидка и продажи.\n💰 Мой долг — просмотр или погашение долга.\n🤖 Мой магазин — подключение собственного клиентского бота.",
     },
     "tk": {
@@ -171,6 +183,10 @@ HOSTED_TRANSLATIONS = {
         "config_ready": "✅ {action}\n\n📱 Ulanyjy ady: `{username}`\n\nAbuna URL:\n`{subscription}`",
         "config_no_url": "✅ {action} `{username}`, ýöne abuna URL entek ýok. Goldaw bilen habarlaşyň.",
         "created": "Sazlamaňyz taýýar!", "renewed": "Sazlamaňyz täzelendi!",
+        "renewal_reservation_available": "Bu sazlama heniz işjeň. Indi töläp, indiki täzelemäni öňünden belläp bilersiňiz.",
+        "renewal_reserved_status": "🗓 Täzeleme öňünden bellenildi — sazlamanyň möhleti gutaranda awtomatiki ulanylar.",
+        "renewal_reserved_success": "✅ Täzeleme bellenildi. Töleg tamamlandy, wagt ýa-da trafik gutaranda sazlama awtomatiki täzelener.",
+        "renewal_reserved_attention": "⚠️ `{username}` üçin bellenen täzeleme barlag talap edýär: {reason}.",
         "main_reseller_guide": "\n\n*Panel düwmeleri*\n⚡ Sazlama döret — müşderi sazlamasyny döretmek.\n📦 Müşderilerim — sazlamalary görmek we dolandyrmak.\n🏅 Dereje we statistika — dereje, arzanladyş we satuwlar.\n💰 Bergim — bergini görmek ýa-da üzmek.\n🤖 Dükan botum — müşderi botuňyzy birikdirmek.",
     },
 }

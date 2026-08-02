@@ -733,6 +733,47 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         self.assertEqual(admin_notifications[0][1]["server_name"], "Germany")
         self.assertEqual(admin_notifications[0][1]["server_id"], "s1")
 
+    def test_reserved_card_and_crypto_renewals_settle_without_resetting(self):
+        bot = DummyBot()
+        purchase_plan = load_purchase_plan(bot, [])
+        execute_calls = []
+        renewal_stub = install_renewal_success_stub(execute_calls)
+        reserved_calls = []
+        renewal_stub.mark_payment_renewal_reserved = lambda payment_id, **kwargs: (
+            reserved_calls.append((payment_id, kwargs)) or True
+        )
+        referral_rewards = []
+        admin_notifications = []
+        purchase_plan.add_referral_reward = lambda *args, **kwargs: referral_rewards.append((args, kwargs))
+        purchase_plan.send_admin_payment_notification = lambda *args, **kwargs: admin_notifications.append((args, kwargs))
+
+        for method in ("Card to Card", "Crypto"):
+            payment_id = method.lower().replace(" ", "-")
+            result = purchase_plan._process_customer_renewal_payment(
+                payment_id,
+                {
+                    "status": "processing",
+                    "type": "renewal",
+                    "renewal_mode": "reserved",
+                    "user_id": 1988,
+                    "plan_gb": "40",
+                    "days": 30,
+                    "price": 95.0,
+                    "payment_method": method,
+                    "renewal_username": "active-user",
+                    "renewal_server_id": "s1",
+                    "renewal_before_state": {"status": "active"},
+                },
+                payment_method=method,
+            )
+            self.assertTrue(result)
+
+        self.assertEqual(execute_calls, [])
+        self.assertEqual([item[0] for item in reserved_calls], ["card-to-card", "crypto"])
+        self.assertEqual(len(referral_rewards), 2)
+        self.assertEqual(len(admin_notifications), 2)
+        self.assertTrue(all(item[1]["fields"]["renewal_before_state"] == {"status": "active"} for item in reserved_calls))
+
     def test_card_renewal_stops_delivery_when_completion_persistence_fails(self):
         bot = DummyBot()
         purchase_plan = load_purchase_plan(bot, [])

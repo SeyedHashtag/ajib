@@ -227,6 +227,127 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(completed["provisioned_username"], "hs7")
         self.assertEqual(completed["provisioned_server_id"], "server-1")
 
+    def test_reserved_renewal_settles_finances_without_resetting_the_live_config(self):
+        Path(self.reseller.RESELLERS_FILE).write_text(
+            json.dumps({
+                "7": {
+                    "status": "approved",
+                    "debt": 0,
+                    "total_paid": 0,
+                    "configs": [{
+                        "username": "customer1",
+                        "server_id": "server-1",
+                        "gb": "5",
+                        "days": 30,
+                        "price": 4,
+                    }],
+                }
+            }),
+            encoding="utf-8",
+        )
+        record = {
+            "user_id": 100,
+            "telegram_username": "buyer",
+            "renew_username": "customer1",
+            "server_id": "server-1",
+            "plan_gb": "5",
+            "days": 30,
+            "unlimited": False,
+            "wholesale_price": 4,
+            "retail_price": 5,
+            "list_price": 5,
+            "reseller_level": 1,
+            "discount_percent": 20,
+            "margin": 1,
+            "referral_reward": 0,
+            "renewal_mode": "reserved",
+            "renewal_baseline": {"status": "active", "gb_used": 1},
+            "renewal_plan_snapshot": {"plan_gb": "5", "days": 30, "price": 4},
+            "status": "processing",
+        }
+        self.worker._save_payment("order", record)
+
+        with (
+            mock.patch.object(self.worker, "_credit_sale_and_referral") as credit_sale,
+            mock.patch.object(self.worker, "release_credit", return_value=True) as release_credit,
+            mock.patch.object(self.worker.bot, "send_message"),
+        ):
+            success, username = self.worker._settle_hosted_reserved_renewal(
+                "order", record, funded=False
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(username, "customer1")
+        release_credit.assert_called_once_with(7, "order", kind="renewal_credit_consumed")
+        credit_sale.assert_called_once()
+        payment = self.worker._tenant_payments()["order"]
+        reseller = self.reseller.get_reseller_data("7")
+        reservation = reseller["configs"][0]["renewals"][0]
+        self.assertEqual(payment["status"], "completed")
+        self.assertEqual(payment["renewal_status"], "reserved")
+        self.assertEqual(reservation["renewal_status"], "reserved")
+        self.assertEqual(reseller["debt"], 4.0)
+        self.assertEqual(reservation["debt_charge_id"], reseller["debt_charges"][0]["id"])
+
+    def test_funded_hosted_reservation_records_paid_wholesale_without_debt(self):
+        Path(self.reseller.RESELLERS_FILE).write_text(
+            json.dumps({
+                "7": {
+                    "status": "approved",
+                    "debt": 0,
+                    "total_paid": 0,
+                    "configs": [{
+                        "username": "customer1",
+                        "server_id": "server-1",
+                        "gb": "5",
+                        "days": 30,
+                        "price": 4,
+                    }],
+                }
+            }),
+            encoding="utf-8",
+        )
+        record = {
+            "user_id": 100,
+            "telegram_username": "buyer",
+            "renew_username": "customer1",
+            "server_id": "server-1",
+            "plan_gb": "5",
+            "days": 30,
+            "unlimited": False,
+            "wholesale_price": 4,
+            "retail_price": 5,
+            "list_price": 5,
+            "reseller_level": 1,
+            "discount_percent": 20,
+            "margin": 1,
+            "referral_reward": 0,
+            "renewal_mode": "reserved",
+            "renewal_baseline": {"status": "active", "gb_used": 1},
+            "status": "processing",
+        }
+        self.worker._save_payment("crypto-order", record)
+
+        with (
+            mock.patch.object(self.worker, "_credit_sale_and_referral") as credit_sale,
+            mock.patch.object(self.worker, "present_pending_reseller_level") as present_level,
+            mock.patch.object(self.worker.bot, "send_message"),
+        ):
+            success, username = self.worker._settle_hosted_reserved_renewal(
+                "crypto-order", record, funded=True
+            )
+
+        reseller = self.reseller.get_reseller_data("7")
+        reservation = reseller["configs"][0]["renewals"][0]
+        self.assertTrue(success)
+        self.assertEqual(username, "customer1")
+        self.assertEqual(reseller["debt"], 0.0)
+        self.assertEqual(reseller["total_paid"], 4.0)
+        self.assertTrue(reservation["funded_at_checkout"])
+        self.assertNotIn("debt_charge_id", reservation)
+        credit_sale.assert_called_once()
+        present_level.assert_called_once()
+
     def test_stale_hosted_test_recovers_persisted_ht_allocation(self):
         message = mock.Mock()
         message.from_user.id = 100
@@ -291,6 +412,50 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(renewal, {"username": "customer", "server_id": "a"})
         self.assertIsNone(self.worker._consume_renewal_token(second, 100))
 
+    def test_hosted_renewal_is_revalidated_and_becomes_immediate_if_now_expired(self):
+        reseller_data = {
+            "status": "approved",
+            "debt": 0,
+            "total_paid": 0,
+            "configs": [{
+                "username": "customer",
+                "server_id": "s1",
+                "customer_telegram_id": 100,
+                "gb": "5",
+                "days": 30,
+                "unlimited": False,
+                "price": 4,
+            }],
+        }
+        live = {
+            "blocked": True,
+            "expiration_days": 0,
+            "upload_bytes": 5 * 1024 ** 3,
+            "download_bytes": 0,
+            "max_download_bytes": 5 * 1024 ** 3,
+            "status": "expired",
+        }
+        client = mock.Mock(server_id="s1")
+        multi_api = mock.Mock()
+        multi_api.find_user.return_value = client, live
+
+        with (
+            mock.patch.object(self.worker, "get_reseller_data", return_value=reseller_data),
+            mock.patch.object(self.worker, "MultiServerAPI", return_value=multi_api),
+            mock.patch.object(self.worker, "_sellable_plans", return_value={
+                "5": {"price": 5, "days": 30, "unlimited": False, "target": "both"}
+            }),
+        ):
+            renewal, error = self.worker._resolve_hosted_renewal_checkout(
+                100,
+                "5",
+                {"username": "customer", "server_id": "s1", "config_index": 0},
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(renewal["renewal_mode"], "immediate")
+        self.assertEqual(renewal["renewal_baseline"]["status"], "expired")
+
     def test_multiple_live_checkouts_can_be_created_per_customer(self):
         record = {"user_id": 100, "payment_method": "crypto"}
 
@@ -328,6 +493,29 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(duplicate, (False, "one"))
         self.assertEqual(retry, (True, "two"))
         self.assertEqual(independent, (True, "three"))
+
+    def test_reserved_checkout_is_unique_per_active_config_across_messages(self):
+        record = {
+            "user_id": 100,
+            "payment_method": "crypto",
+            "checkout_source": "100:50:crypto:10",
+            "renewal_mode": "reserved",
+            "renew_username": "active-config",
+            "server_id": "s1",
+        }
+
+        first = self.worker._start_checkout("one", record)
+        duplicate = self.worker._start_checkout(
+            "two", {**record, "checkout_source": "100:51:card:10", "payment_method": "card"}
+        )
+        self.worker._save_payment("one", {"status": "completed", "renewal_status": "applied"})
+        next_cycle = self.worker._start_checkout(
+            "two", {**record, "checkout_source": "100:52:crypto:10"}
+        )
+
+        self.assertEqual(first, (True, "one"))
+        self.assertEqual(duplicate, (False, "one"))
+        self.assertEqual(next_cycle, (True, "two"))
 
     def test_multiple_card_receipts_use_active_latest_or_replied_checkout(self):
         for payment_id, message_id in (("one", 11), ("two", 22)):
