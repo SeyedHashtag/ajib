@@ -41,6 +41,7 @@ from utils.hosted_bots import (
     update_settings,
 )
 from utils.hosted_translations import HOSTED_TRANSLATIONS, hosted_text
+from utils.hosted_stats import build_hosted_stats
 from utils.download_guidance import (
     render_download_callback,
     send_download_prompt,
@@ -97,6 +98,10 @@ MAX_RECEIPT_BYTES = _positive_int_env("AJIB_HOSTED_MAX_RECEIPT_BYTES", 10 * 1024
 INPUT_STATE_TTL_SECONDS = _positive_int_env("AJIB_HOSTED_INPUT_STATE_TTL_SECONDS", 3600, 60)
 MAX_INPUT_STATES = _positive_int_env("AJIB_HOSTED_MAX_INPUT_STATES", 5000, 100)
 TELEGRAM_SAFE_TEXT_LIMIT = 3800
+OWNER_STATS_SEND_HOUR = 0
+OWNER_STATS_SEND_MINUTE = 5
+OWNER_STATS_CLAIM_LEASE_SECONDS = 600
+OWNER_STATS_MONITOR_INTERVAL_SECONDS = 60
 
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=4)
 
@@ -261,12 +266,15 @@ def _tenant_payments():
 def _save_payment(payment_id, record):
     with locked_json(tenant_file(OWNER_ID, "payments.json"), {}) as payments:
         current = payments.get(payment_id, {})
+        timestamp = _now()
         current.update(record)
+        if record.get("status") == "completed":
+            current.setdefault("completed_at", timestamp)
         if record.get("status") and record.get("status") != "processing":
             current.pop("processing_started_at", None)
             current.pop("processing_from_status", None)
-        current.setdefault("created_at", _now())
-        current["updated_at"] = _now()
+        current.setdefault("created_at", timestamp)
+        current["updated_at"] = timestamp
         payments[payment_id] = current
         return dict(current)
 
@@ -1609,6 +1617,7 @@ OWNER_CUSTOMER_ROWS = (
 OWNER_MONEY_ROWS = (
     ("debt", "earnings"),
     ("refpercent", "referrals"),
+    ("stats",),
     ("owner_home",),
 )
 LEGACY_OWNER_MENU_ROWS = (
@@ -1737,6 +1746,162 @@ def _split_message_blocks(blocks, max_length=TELEGRAM_SAFE_TEXT_LIMIT):
     if current:
         chunks.append(current)
     return chunks
+
+
+def _stats_period_text(label, bucket):
+    methods = bucket.get("methods", {})
+    card = methods.get("card", {})
+    crypto = methods.get("crypto", {})
+    other = methods.get("other", {})
+    return _hosted_message(
+        OWNER_ID,
+        "stats_period",
+        label=label,
+        started=bucket.get("started", 0),
+        completed=bucket.get("completed", 0),
+        open=bucket.get("open", 0),
+        attention=bucket.get("attention", 0),
+        failed=bucket.get("failed", 0),
+        expired=bucket.get("expired", 0),
+        buyers=bucket.get("unique_buyers", 0),
+        new_configs=bucket.get("new_configs", 0),
+        renewals=bucket.get("renewals", 0),
+        manual_configs=bucket.get("manual_configs", 0),
+        card_count=card.get("completed", 0),
+        card_revenue=format_usd_amount(card.get("revenue", 0)),
+        crypto_count=crypto.get("completed", 0),
+        crypto_revenue=format_usd_amount(crypto.get("revenue", 0)),
+        other_count=other.get("completed", 0),
+        other_revenue=format_usd_amount(other.get("revenue", 0)),
+        revenue=format_usd_amount(bucket.get("revenue", 0)),
+        gross=format_usd_amount(bucket.get("gross_profit", 0)),
+        referrals=format_usd_amount(bucket.get("referral_payouts", 0)),
+        net=format_usd_amount(bucket.get("net_profit", 0)),
+    )
+
+
+def _owner_stats_chunks(end_date=None, scheduled=False):
+    report_end = end_date or datetime.now().date()
+    reseller = get_reseller_data(OWNER_ID) or {}
+    snapshot = build_hosted_stats(
+        _tenant_payments(),
+        reseller.get("configs", []),
+        end_date=report_end,
+        origin_bot_id=os.getenv("AJIB_HOSTED_BOT_ID"),
+    )
+    blocks = [
+        _hosted_message(
+            OWNER_ID,
+            "stats_scheduled_title" if scheduled else "stats_live_title",
+        ),
+        _hosted_message(
+            OWNER_ID,
+            "stats_window",
+            start_date=snapshot["start_date"],
+            end_date=snapshot["end_date"],
+        ),
+        _hosted_message(OWNER_ID, "stats_usd_note"),
+        _hosted_message(OWNER_ID, "stats_daily_section"),
+    ]
+    blocks.extend(_stats_period_text(day["date"], day) for day in snapshot["days"])
+    blocks.extend([
+        _hosted_message(OWNER_ID, "stats_last30_section"),
+        _stats_period_text(
+            _hosted_message(
+                OWNER_ID,
+                "stats_last30_label",
+                start_date=snapshot["last30_start_date"],
+                end_date=snapshot["last30_end_date"],
+            ),
+            snapshot["last30"],
+        ),
+    ])
+    return _split_message_blocks(blocks)
+
+
+def _send_owner_stats(chat_id, end_date=None, scheduled=False):
+    chunks = _owner_stats_chunks(end_date=end_date, scheduled=scheduled)
+    for chunk in chunks:
+        bot.send_message(chat_id, chunk, parse_mode="Markdown")
+    return len(chunks)
+
+
+def _owner_stats_report_end(now=None):
+    current = now or datetime.now()
+    due_at = current.replace(
+        hour=OWNER_STATS_SEND_HOUR,
+        minute=OWNER_STATS_SEND_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    return current.date() - timedelta(days=1) if current >= due_at else None
+
+
+def _claim_owner_stats_report(report_end, now=None):
+    current = now or datetime.now()
+    report_key = report_end.isoformat()
+    with locked_json(tenant_file(OWNER_ID, "notifications.json"), {}) as notifications:
+        state = notifications.get("owner_daily_stats", {})
+        if not isinstance(state, dict):
+            state = {}
+        if state.get("last_sent_for") == report_key:
+            return None
+        claimed_at = _parse_time(state.get("claimed_at"))
+        claim_age = (current - claimed_at).total_seconds() if claimed_at is not None else None
+        claim_is_live = (
+            state.get("claim_for") == report_key
+            and claim_age is not None
+            and 0 <= claim_age < OWNER_STATS_CLAIM_LEASE_SECONDS
+        )
+        if claim_is_live:
+            return None
+        claim_id = uuid.uuid4().hex
+        notifications["owner_daily_stats"] = {
+            **state,
+            "claim_for": report_key,
+            "claim_id": claim_id,
+            "claimed_at": current.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        return claim_id
+
+
+def _finish_owner_stats_report(report_end, claim_id, success, now=None):
+    current = now or datetime.now()
+    with locked_json(tenant_file(OWNER_ID, "notifications.json"), {}) as notifications:
+        state = notifications.get("owner_daily_stats", {})
+        if not isinstance(state, dict) or state.get("claim_id") != claim_id:
+            return False
+        state.pop("claim_for", None)
+        state.pop("claim_id", None)
+        state.pop("claimed_at", None)
+        if success:
+            state["last_sent_for"] = report_end.isoformat()
+            state["last_sent_at"] = current.strftime("%Y-%m-%d %H:%M:%S")
+        notifications["owner_daily_stats"] = state
+        return True
+
+
+def _run_due_owner_stats(now=None):
+    current = now or datetime.now()
+    report_end = _owner_stats_report_end(current)
+    if report_end is None:
+        return False
+    claim_id = _claim_owner_stats_report(report_end, now=current)
+    if not claim_id:
+        return False
+    success = False
+    try:
+        _send_owner_stats(OWNER_ID, end_date=report_end, scheduled=True)
+        success = True
+        return True
+    except Exception as error:
+        print(
+            f"Hosted owner stats delivery failed for reseller {OWNER_ID}: {type(error).__name__}",
+            flush=True,
+        )
+        return False
+    finally:
+        _finish_owner_stats_report(report_end, claim_id, success, now=current)
 
 
 def _pricing_overview(max_length=TELEGRAM_SAFE_TEXT_LIMIT):
@@ -1985,6 +2150,9 @@ def _owner_plans_markup(settings=None):
 
 def _handle_owner_action(chat_id, action, feedback):
     settings = get_settings(OWNER_ID)
+    if action == "stats":
+        _send_owner_stats(chat_id)
+        return
     if action == "generate":
         if not _reseller(active_only=True):
             feedback(_hosted_message(OWNER_ID, "generation_suspended"))
@@ -2471,6 +2639,18 @@ def _customer_notification_monitor():
         time.sleep(7200)
 
 
+def _owner_stats_monitor():
+    while True:
+        try:
+            _run_due_owner_stats()
+        except Exception as error:
+            print(
+                f"Hosted owner stats monitor failed for reseller {OWNER_ID}: {type(error).__name__}",
+                flush=True,
+            )
+        time.sleep(OWNER_STATS_MONITOR_INTERVAL_SECONDS)
+
+
 def run():
     try:
         bot.get_me()
@@ -2483,6 +2663,7 @@ def run():
     _reconcile_credit_reservations()
     threading.Thread(target=_crypto_monitor, daemon=True, name="hosted-crypto").start()
     threading.Thread(target=_customer_notification_monitor, daemon=True, name="hosted-notifications").start()
+    threading.Thread(target=_owner_stats_monitor, daemon=True, name="hosted-owner-stats").start()
     retry = 3
     while True:
         try:
