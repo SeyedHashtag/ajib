@@ -1,7 +1,12 @@
 ## v1.18.4
 ✨ Show hosted-bot owners per-plan cost, customer price, gross profit, referral payout, and net profit
+✨ Add localized sales statistics for reseller storefronts with payment and financial summaries
+✨ Let customers reserve active configurations for renewal through card, crypto, and reseller payment flows
 🌐 Replace ambiguous retail-markup wording with localized Pricing & Profit guidance
-✅ Add regression coverage for per-plan profit previews, deductions, fallbacks, and message chunking
+🛠️ Keep reserved renewals safe from expired cleanup and settle reseller renewal debt in FIFO order
+🐛 Distinguish missing accounts from unavailable servers, retry safely, and alert buyers and operators separately
+🐛 Improve reseller debt-state transitions and notify customers when reseller availability changes
+✅ Add regression coverage for pricing previews, sales statistics, reserved renewals, server outages, and reseller debt handling
 
 ## v1.18.3
 ✨ Add a localized guided setup checklist and task-based menus to hosted-bot owner panels
