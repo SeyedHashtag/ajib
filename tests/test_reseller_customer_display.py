@@ -137,6 +137,7 @@ def install_stubs():
         "reseller_suspended_notification": "Suspended notice",
         "reseller_banned_notification": "Banned notice",
         "reseller_unbanned_notification": "Unbanned notice",
+        "reseller_access_restored_notification": "Access restored notice",
         "reseller_approved_notification": "Approved notice",
         "reseller_rejected_notification": "Rejected notice",
         "debt_state_active": "Active",
@@ -1356,6 +1357,42 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
             reseller_handlers.is_admin = original_is_admin
             reseller_handlers.get_reseller_data = original_get_reseller_data
             reseller_handlers.update_reseller_status = original_update_status
+
+    def test_unban_notification_reports_approved_final_status(self):
+        original_get_reseller_data = reseller_handlers.get_reseller_data
+        try:
+            reseller_handlers.bot.sent_messages.clear()
+            reseller_handlers.get_reseller_data = lambda _user_id: {
+                "status": "approved",
+                "debt": 0.0,
+            }
+
+            reseller_handlers._send_reseller_status_notification("1988", "unban", "en")
+
+            self.assertEqual(
+                reseller_handlers.bot.sent_messages[-1][0],
+                (1988, "Access restored notice"),
+            )
+        finally:
+            reseller_handlers.get_reseller_data = original_get_reseller_data
+
+    def test_unban_notification_reports_grace_for_positive_debt(self):
+        original_get_reseller_data = reseller_handlers.get_reseller_data
+        try:
+            reseller_handlers.bot.sent_messages.clear()
+            reseller_handlers.get_reseller_data = lambda _user_id: {
+                "status": "suspended",
+                "debt": 5.0,
+            }
+
+            reseller_handlers._send_reseller_status_notification("1988", "unban", "en")
+
+            self.assertEqual(
+                reseller_handlers.bot.sent_messages[-1][0],
+                (1988, "Unbanned notice"),
+            )
+        finally:
+            reseller_handlers.get_reseller_data = original_get_reseller_data
 
     def test_status_action_silent_updates_status_without_reseller_message(self):
         original_is_admin = reseller_handlers.is_admin

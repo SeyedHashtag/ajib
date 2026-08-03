@@ -887,7 +887,7 @@ def handle_reseller_debt(call):
     debt_since = reseller_data.get('debt_since') or 'N/A'
     last_payment_at = reseller_data.get('last_payment_at') or 'N/A'
     trust_limit = get_reseller_trust_limit(get_reseller_total_paid(reseller_data))
-    unlock_amount = get_reseller_unlock_amount(debt) if debt_state == 'suspended' else 0.0
+    unlock_amount = get_reseller_unlock_amount(debt) if _is_reseller_suspended(reseller_data) else 0.0
     
     markup = types.InlineKeyboardMarkup()
     if debt > 0:
@@ -2679,7 +2679,11 @@ def _render_admin_reseller_action_confirm(call, reseller_id, target_action):
 def _send_reseller_status_notification(reseller_id, action, fallback_language):
     if not str(reseller_id).isdigit():
         return
-    key = _reseller_status_notification_key(action)
+    reseller_data = get_reseller_data(reseller_id) or {}
+    if action in {"suspend", "unban"} and reseller_data.get("status") == "approved":
+        key = "reseller_access_restored_notification"
+    else:
+        key = _reseller_status_notification_key(action)
     if not key:
         return
     target_language = get_user_language(int(reseller_id)) if str(reseller_id).isdigit() else fallback_language

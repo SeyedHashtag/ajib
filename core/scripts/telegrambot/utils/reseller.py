@@ -85,6 +85,10 @@ def _money_value(value):
     return float(amount.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP))
 
 
+def _is_debt_fully_settled(debt):
+    return _money_value(debt) == 0.0
+
+
 def _charge_outstanding(charge):
     if not isinstance(charge, dict):
         return 0.0
@@ -526,9 +530,10 @@ def _ensure_reseller_defaults(record):
     if not isinstance(data.get('reseller_level_presentation_claim'), dict):
         data['reseller_level_presentation_claim'] = None
 
-    if debt >= DEBT_SETTLEMENT_THRESHOLD and not data.get('debt_since'):
+    debt_fully_settled = _is_debt_fully_settled(debt)
+    if not debt_fully_settled and debt >= DEBT_SETTLEMENT_THRESHOLD and not data.get('debt_since'):
         data['debt_since'] = _now_str()
-    if debt < DEBT_SETTLEMENT_THRESHOLD:
+    if debt_fully_settled or debt < DEBT_SETTLEMENT_THRESHOLD:
         data['debt_since'] = None
         data['debt_last_reminded_at'] = None
         data['debt_last_admin_alert_level'] = 'none'
@@ -537,11 +542,10 @@ def _ensure_reseller_defaults(record):
     return data
 
 
-def _restore_auto_suspended_if_debt_cleared(data):
+def _restore_suspended_if_debt_fully_settled(data):
     if (
-        _safe_float(data.get('debt', 0.0)) < DEBT_SETTLEMENT_THRESHOLD
+        _is_debt_fully_settled(data.get('debt', 0.0))
         and data.get('status') == 'suspended'
-        and data.get('suspended_reason') == SUSPENDED_REASON_DEBT
     ):
         data['status'] = 'approved'
         data['suspended_reason'] = None
@@ -685,6 +689,7 @@ def update_reseller_status(user_id, status, telegram_username=None, suspended_re
                 else:
                     current['suspended_reason'] = None
                     current['suspended_at'] = None
+                current = _restore_suspended_if_debt_fully_settled(current)
                 if telegram_username is not None:
                     username_clean = str(telegram_username).strip().lstrip('@')
                     current['telegram_username'] = username_clean or None
@@ -1298,7 +1303,7 @@ def clear_reseller_debt(user_id):
                         kind='admin_clear',
                     )
                     current['debt'] = 0.0
-                    current = _restore_auto_suspended_if_debt_cleared(current)
+                    current = _restore_suspended_if_debt_fully_settled(current)
                     current = _ensure_reseller_defaults(current)
                     resellers[user_id] = current
                     _write_resellers_file(resellers)
@@ -1339,9 +1344,9 @@ def set_reseller_debt(user_id, amount):
 
                     if previous_debt < DEBT_SETTLEMENT_THRESHOLD and current['debt'] >= DEBT_SETTLEMENT_THRESHOLD:
                         current['debt_since'] = _now_str()
-                    if current['debt'] < DEBT_SETTLEMENT_THRESHOLD:
+                    if _is_debt_fully_settled(current['debt']) or current['debt'] < DEBT_SETTLEMENT_THRESHOLD:
                         current['debt_since'] = None
-                        current = _restore_auto_suspended_if_debt_cleared(current)
+                    current = _restore_suspended_if_debt_fully_settled(current)
 
                     current = _ensure_reseller_defaults(current)
                     resellers[user_id] = current
@@ -1548,9 +1553,9 @@ def apply_reseller_payment(user_id, amount, payment_id=None, allocation_kind='se
                         2,
                     )
                     current['last_payment_at'] = _now_str()
-                if new_debt < DEBT_SETTLEMENT_THRESHOLD:
+                if _is_debt_fully_settled(new_debt) or new_debt < DEBT_SETTLEMENT_THRESHOLD:
                     current['debt_since'] = None
-                    current = _restore_auto_suspended_if_debt_cleared(current)
+                current = _restore_suspended_if_debt_fully_settled(current)
 
                 current = _ensure_reseller_defaults(current)
                 resellers[user_id] = current
@@ -1568,7 +1573,7 @@ def _compute_debt_state_with_deadline(debt, debt_since, now):
     """
     debt_amount = _safe_float(debt, 0.0)
     
-    if debt_amount < DEBT_SETTLEMENT_THRESHOLD:
+    if _is_debt_fully_settled(debt_amount) or debt_amount < DEBT_SETTLEMENT_THRESHOLD:
         return 'active', False, False
     
     # Calculate time since debt started
@@ -1606,12 +1611,14 @@ def evaluate_reseller_debt_policies():
 
                 for user_id, record in resellers.items():
                     current = _ensure_reseller_defaults(record)
+                    current = _restore_suspended_if_debt_fully_settled(current)
                     debt = _safe_float(current.get('debt', 0.0))
+                    debt_fully_settled = _is_debt_fully_settled(debt)
                     
                     # Track original status before any automatic changes
                     original_status = current.get('status', 'pending')
                     
-                    if debt >= DEBT_SETTLEMENT_THRESHOLD and not current.get('debt_since'):
+                    if not debt_fully_settled and debt >= DEBT_SETTLEMENT_THRESHOLD and not current.get('debt_since'):
                         current['debt_since'] = _now_str()
 
                     # Compute debt state with deadline consideration
@@ -1627,7 +1634,7 @@ def evaluate_reseller_debt_policies():
                     debt_suspended = current.get('suspended_reason') == SUSPENDED_REASON_DEBT
                     unban_grace_suspended = current.get('suspended_reason') == SUSPENDED_REASON_UNBAN_GRACE
 
-                    if original_status == 'suspended' and unban_grace_suspended:
+                    if not debt_fully_settled and original_status == 'suspended' and unban_grace_suspended:
                         suspended_at = _parse_time(current.get('suspended_at'))
                         if suspended_at and (now - suspended_at) >= timedelta(hours=UNBAN_GRACE_BAN_DEADLINE_HOURS):
                             current['status'] = 'banned'
@@ -1636,7 +1643,7 @@ def evaluate_reseller_debt_policies():
                             auto_banned = True
                             changed = True
                     
-                    if debt >= DEBT_SETTLEMENT_THRESHOLD and original_status in {'approved', 'suspended'}:
+                    if not debt_fully_settled and debt >= DEBT_SETTLEMENT_THRESHOLD and original_status in {'approved', 'suspended'}:
                         if ban_deadline_passed:
                             if original_status == 'approved' or debt_suspended:
                                 current['status'] = 'banned'
@@ -1652,20 +1659,9 @@ def evaluate_reseller_debt_policies():
                                 auto_suspended = True
                                 changed = True
                     
-                    # If debt is cleared (below threshold), restore approved status if it was auto-suspended
-                    if (
-                        debt < DEBT_SETTLEMENT_THRESHOLD
-                        and current.get('status') == 'suspended'
-                        and current.get('suspended_reason') == SUSPENDED_REASON_DEBT
-                    ):
-                        current['status'] = 'approved'
-                        current['suspended_reason'] = None
-                        current['suspended_at'] = None
-                        changed = True
-
                     # Reminder logic
                     remind_due = False
-                    if debt >= DEBT_SETTLEMENT_THRESHOLD and debt_state in {'warning', 'suspended'} and current.get('status') in {'approved', 'suspended'}:
+                    if not debt_fully_settled and debt >= DEBT_SETTLEMENT_THRESHOLD and debt_state in {'warning', 'suspended'} and current.get('status') in {'approved', 'suspended'}:
                         last_reminded_at = _parse_time(current.get('debt_last_reminded_at'))
                         if not last_reminded_at or (now - last_reminded_at) >= reminder_delta:
                             remind_due = True
@@ -1674,7 +1670,7 @@ def evaluate_reseller_debt_policies():
 
                     # Admin alert logic
                     alert_level = 'none'
-                    if debt >= DEBT_SETTLEMENT_THRESHOLD:
+                    if not debt_fully_settled and debt >= DEBT_SETTLEMENT_THRESHOLD:
                         if current.get('status') == 'banned':
                             alert_level = 'banned'
                         elif debt_state == 'warning':
@@ -1691,7 +1687,7 @@ def evaluate_reseller_debt_policies():
                         current['debt_last_admin_alert_at'] = _now_str()
                         changed = True
 
-                    if debt < DEBT_SETTLEMENT_THRESHOLD and previous_alert_level != 'none':
+                    if (debt_fully_settled or debt < DEBT_SETTLEMENT_THRESHOLD) and previous_alert_level != 'none':
                         current['debt_last_admin_alert_level'] = 'none'
                         current['debt_last_admin_alert_at'] = _now_str()
                         changed = True

@@ -218,6 +218,12 @@ def install_common_stubs(bot, payment_records):
         "reseller_debt_threshold_crossed_admin": "ADMIN THRESHOLD {reseller_id} {debt_state}",
         "debt_state_warning": "Warning",
         "debt_state_suspended": "Suspended",
+        "current_debt": "Current debt: ${debt}",
+        "reseller_trust_limit_line": "Trust limit: ${trust_limit:.2f}",
+        "reseller_debt_status_line": "Debt status: {debt_state}",
+        "reseller_oldest_unpaid_date_line": "Oldest debt: {debt_since}",
+        "reseller_last_payment_date_line": "Last payment: {last_payment_at}",
+        "reseller_amount_due_to_unlock_line": "Unlock amount: ${unlock_amount:.2f}",
         "card_to_card_payment": "Transfer {price} at {exchange_rate} to {card_number}",
         "reseller_suspended_due_debt": "Account suspended due to debt (${debt:.2f}); unlock ${unlock_amount:.2f}",
         "renewal_failed": "Renewal failed: {reason}",
@@ -1607,6 +1613,23 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
 
         self.assertIn("unlock $14.36", bot.callback_answers[-1][0][1])
         self.assertNotIn("unlock $0.00", bot.callback_answers[-1][0][1])
+
+    def test_suspended_sub_threshold_debt_screen_shows_full_unlock_amount(self):
+        bot = DummyBot()
+        purchase_plan = load_purchase_plan(bot, [])
+        reseller_handlers = load_reseller_handlers(purchase_plan)
+        reseller_handlers.get_reseller_data = lambda _user_id: {
+            "status": "suspended",
+            "debt": 0.50,
+            "debt_state": "active",
+            "total_paid": 0.0,
+        }
+
+        reseller_handlers.handle_reseller_debt(make_call("reseller:debt"))
+
+        message = bot.edited_messages[-1][0][0]
+        self.assertIn("Unlock amount: $0.50", message)
+        self.assertNotIn("Unlock amount: $0.00", message)
 
     def test_rapid_second_reseller_customer_name_does_not_create_duplicate_config(self):
         bot = DummyBot()

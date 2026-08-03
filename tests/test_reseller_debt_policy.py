@@ -536,7 +536,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.assertEqual(first_saved["debt_last_admin_alert_level"], "none")
         self.assertEqual(second_saved["debt_last_admin_alert_level"], "none")
 
-    def test_unbanned_reseller_auto_bans_after_grace_deadline(self):
+    def test_zero_debt_unban_grace_is_repaired_to_approved_after_deadline(self):
         self.write_resellers({
             "1988": {
                 "status": "suspended",
@@ -550,12 +550,51 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         events = self.reseller.evaluate_reseller_debt_policies()
         saved = self.read_resellers()["1988"]
 
+        self.assertEqual(saved["status"], "approved")
+        self.assertIsNone(saved["suspended_reason"])
+        self.assertIsNone(saved["suspended_at"])
+        self.assertEqual(events, [])
+
+    def test_positive_debt_unban_grace_auto_bans_after_deadline(self):
+        self.write_resellers({
+            "1988": {
+                "status": "suspended",
+                "suspended_reason": self.reseller.SUSPENDED_REASON_UNBAN_GRACE,
+                "suspended_at": self.hours_ago(25),
+                "debt": 0.50,
+                "configs": [],
+            }
+        })
+
+        events = self.reseller.evaluate_reseller_debt_policies()
+        saved = self.read_resellers()["1988"]
+
         self.assertEqual(saved["status"], "banned")
         self.assertIsNone(saved["suspended_reason"])
         self.assertIsNone(saved["suspended_at"])
         self.assertTrue(any(event["auto_banned"] for event in events))
 
-    def test_unban_status_change_moves_banned_reseller_to_temporary_suspended(self):
+    def test_unban_with_positive_debt_moves_banned_reseller_to_temporary_suspended(self):
+        self.write_resellers({
+            "1988": {
+                "status": "banned",
+                "debt": 5.0,
+                "configs": [],
+            }
+        })
+
+        self.reseller.update_reseller_status(
+            "1988",
+            "suspended",
+            suspended_reason=self.reseller.SUSPENDED_REASON_UNBAN_GRACE,
+        )
+        saved = self.read_resellers()["1988"]
+
+        self.assertEqual(saved["status"], "suspended")
+        self.assertEqual(saved["suspended_reason"], self.reseller.SUSPENDED_REASON_UNBAN_GRACE)
+        self.assertIsNotNone(saved["suspended_at"])
+
+    def test_unban_with_zero_debt_approves_immediately(self):
         self.write_resellers({
             "1988": {
                 "status": "banned",
@@ -571,9 +610,43 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         )
         saved = self.read_resellers()["1988"]
 
-        self.assertEqual(saved["status"], "suspended")
-        self.assertEqual(saved["suspended_reason"], self.reseller.SUSPENDED_REASON_UNBAN_GRACE)
-        self.assertIsNotNone(saved["suspended_at"])
+        self.assertEqual(saved["status"], "approved")
+        self.assertIsNone(saved["suspended_reason"])
+        self.assertIsNone(saved["suspended_at"])
+
+    def test_explicit_suspension_with_zero_debt_stays_approved(self):
+        self.write_resellers({
+            "1988": {
+                "status": "approved",
+                "debt": 0.0,
+                "configs": [],
+            }
+        })
+
+        self.reseller.update_reseller_status("1988", "suspended")
+        saved = self.read_resellers()["1988"]
+
+        self.assertEqual(saved["status"], "approved")
+        self.assertIsNone(saved["suspended_reason"])
+        self.assertIsNone(saved["suspended_at"])
+
+    def test_suspension_restoration_uses_cent_rounded_zero(self):
+        for debt, expected_status in ((0.004, "approved"), (0.005, "suspended")):
+            with self.subTest(debt=debt):
+                self.write_resellers({
+                    "1988": {
+                        "status": "suspended",
+                        "suspended_reason": None,
+                        "suspended_at": self.hours_ago(1),
+                        "debt": debt,
+                        "configs": [],
+                    }
+                })
+
+                self.reseller.evaluate_reseller_debt_policies()
+                saved = self.read_resellers()["1988"]
+
+                self.assertEqual(saved["status"], expected_status)
 
     def test_cleared_auto_suspension_restores_approved_status(self):
         self.write_resellers({
@@ -597,7 +670,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.assertIsNotNone(saved["last_payment_at"])
         self.assertIsNone(saved["suspended_reason"])
 
-    def test_manual_suspension_is_not_auto_restored_when_debt_is_cleared(self):
+    def test_manual_suspension_is_restored_when_debt_is_cleared(self):
         self.write_resellers({
             "1988": {
                 "status": "suspended",
@@ -613,8 +686,93 @@ class ResellerDebtPolicyTests(unittest.TestCase):
 
         self.assertTrue(success)
         self.assertEqual(new_debt, 0.0)
-        self.assertEqual(saved["status"], "suspended")
+        self.assertEqual(saved["status"], "approved")
         self.assertIsNone(saved["suspended_reason"])
+
+    def test_sub_threshold_positive_debt_keeps_reseller_suspended(self):
+        self.write_resellers({
+            "1988": {
+                "status": "suspended",
+                "suspended_reason": self.reseller.SUSPENDED_REASON_UNBAN_GRACE,
+                "suspended_at": self.hours_ago(1),
+                "debt": 1.50,
+                "configs": [],
+            }
+        })
+
+        success, new_debt = self.reseller.apply_reseller_payment("1988", 1.0)
+        saved = self.read_resellers()["1988"]
+
+        self.assertTrue(success)
+        self.assertEqual(new_debt, 0.50)
+        self.assertEqual(saved["status"], "suspended")
+        self.assertEqual(saved["suspended_reason"], self.reseller.SUSPENDED_REASON_UNBAN_GRACE)
+        self.assertIsNotNone(saved["suspended_at"])
+
+    def test_full_payment_restores_unban_grace_suspension(self):
+        self.write_resellers({
+            "1988": {
+                "status": "suspended",
+                "suspended_reason": self.reseller.SUSPENDED_REASON_UNBAN_GRACE,
+                "suspended_at": self.hours_ago(1),
+                "debt": 5.0,
+                "configs": [],
+            }
+        })
+
+        success, new_debt = self.reseller.apply_reseller_payment("1988", 5.0)
+        saved = self.read_resellers()["1988"]
+
+        self.assertTrue(success)
+        self.assertEqual(new_debt, 0.0)
+        self.assertEqual(saved["status"], "approved")
+        self.assertIsNone(saved["suspended_reason"])
+        self.assertIsNone(saved["suspended_at"])
+
+    def test_full_payment_restoration_does_not_depend_on_settlement_threshold(self):
+        self.reseller.DEBT_SETTLEMENT_THRESHOLD = 0.0
+        self.write_resellers({
+            "1988": {
+                "status": "suspended",
+                "suspended_reason": self.reseller.SUSPENDED_REASON_UNBAN_GRACE,
+                "suspended_at": self.hours_ago(1),
+                "debt_since": self.hours_ago(2),
+                "debt": 5.0,
+                "configs": [],
+            }
+        })
+
+        success, new_debt = self.reseller.apply_reseller_payment("1988", 5.0)
+        saved = self.read_resellers()["1988"]
+
+        self.assertTrue(success)
+        self.assertEqual(new_debt, 0.0)
+        self.assertEqual(saved["status"], "approved")
+        self.assertIsNone(saved["debt_since"])
+
+    def test_clear_and_zero_adjustment_restore_suspended_resellers(self):
+        for operation in ("clear", "adjust"):
+            with self.subTest(operation=operation):
+                self.write_resellers({
+                    "1988": {
+                        "status": "suspended",
+                        "suspended_reason": None,
+                        "suspended_at": self.hours_ago(1),
+                        "debt": 5.0,
+                        "configs": [],
+                    }
+                })
+
+                if operation == "clear":
+                    self.assertTrue(self.reseller.clear_reseller_debt("1988"))
+                else:
+                    self.assertTrue(self.reseller.set_reseller_debt("1988", 0.0))
+
+                saved = self.read_resellers()["1988"]
+                self.assertEqual(saved["debt"], 0.0)
+                self.assertEqual(saved["status"], "approved")
+                self.assertIsNone(saved["suspended_reason"])
+                self.assertIsNone(saved["suspended_at"])
 
     def test_cleanup_candidates_include_only_configs_after_last_payment(self):
         candidates = self.reseller.get_banned_reseller_cleanup_candidates({
