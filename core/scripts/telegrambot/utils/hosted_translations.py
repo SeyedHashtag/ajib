@@ -68,6 +68,7 @@ HOSTED_TRANSLATIONS = {
         "renewal_reserved_status": "🗓 Renewal reserved — it will apply automatically when this config expires.",
         "renewal_reserved_success": "✅ Renewal reserved. Your payment is complete, and the config will renew automatically at time or traffic expiry.",
         "renewal_reserved_attention": "⚠️ Reserved renewal for `{username}` needs review: {reason}.",
+        "renewal_reserved_server_unavailable": "⚠️ Your reserved renewal for `{username}` is safe, but its server is temporarily unavailable. We will keep retrying automatically.",
         "main_reseller_guide": "\n\n*Panel buttons*\n⚡ Generate Config — create a customer config.\n📦 My Customers — view and manage your configs.\n🏅 Level & Stats — review your level, discount, and sales totals.\n💰 My Debt — inspect or settle your balance.\n🤖 My Hosted Bot — connect and manage your own customer-facing bot.",
     },
     "fa": {
@@ -111,6 +112,7 @@ HOSTED_TRANSLATIONS = {
         "renewal_reserved_status": "🗓 تمدید رزرو شده است و پس از انقضای کانفیگ به‌طور خودکار اعمال می‌شود.",
         "renewal_reserved_success": "✅ تمدید رزرو شد. پرداخت کامل است و کانفیگ پس از پایان زمان یا ترافیک به‌طور خودکار تمدید می‌شود.",
         "renewal_reserved_attention": "⚠️ تمدید رزروشده `{username}` نیاز به بررسی دارد: {reason}.",
+        "renewal_reserved_server_unavailable": "⚠️ تمدید رزروشده `{username}` محفوظ است، اما سرور آن موقتاً در دسترس نیست. تلاش خودکار ادامه خواهد داشت.",
         "main_reseller_guide": "\n\n*راهنمای دکمه‌ها*\n⚡ ساخت کانفیگ — ساخت کانفیگ مشتری.\n📦 مشتریان من — مشاهده و مدیریت کانفیگ‌ها.\n🏅 سطح و آمار — مشاهده سطح، تخفیف و آمار فروش.\n💰 بدهی من — مشاهده یا تسویه بدهی.\n🤖 ربات فروشگاهی من — اتصال و مدیریت ربات مشتریان شما.",
     },
     "ru": {
@@ -149,6 +151,7 @@ HOSTED_TRANSLATIONS = {
         "renewal_reserved_status": "🗓 Продление зарезервировано — оно применится автоматически после истечения конфига.",
         "renewal_reserved_success": "✅ Продление зарезервировано. Платёж завершён, и конфиг автоматически продлится после окончания срока или трафика.",
         "renewal_reserved_attention": "⚠️ Зарезервированное продление для `{username}` требует проверки: {reason}.",
+        "renewal_reserved_server_unavailable": "⚠️ Зарезервированное продление для `{username}` сохранено, но его сервер временно недоступен. Мы продолжим автоматические попытки.",
         "main_reseller_guide": "\n\n*Кнопки панели*\n⚡ Создать конфиг — создать конфиг клиента.\n📦 Мои клиенты — просмотр и управление конфигами.\n🏅 Уровень и статистика — уровень, скидка и продажи.\n💰 Мой долг — просмотр или погашение долга.\n🤖 Мой магазин — подключение собственного клиентского бота.",
     },
     "tk": {
@@ -187,6 +190,7 @@ HOSTED_TRANSLATIONS = {
         "renewal_reserved_status": "🗓 Täzeleme öňünden bellenildi — sazlamanyň möhleti gutaranda awtomatiki ulanylar.",
         "renewal_reserved_success": "✅ Täzeleme bellenildi. Töleg tamamlandy, wagt ýa-da trafik gutaranda sazlama awtomatiki täzelener.",
         "renewal_reserved_attention": "⚠️ `{username}` üçin bellenen täzeleme barlag talap edýär: {reason}.",
+        "renewal_reserved_server_unavailable": "⚠️ `{username}` üçin bellenen täzeleme howpsuz saklanýar, ýöne onuň serweri wagtlaýyn elýeterli däl. Awtomatiki synanyşyklar dowam eder.",
         "main_reseller_guide": "\n\n*Panel düwmeleri*\n⚡ Sazlama döret — müşderi sazlamasyny döretmek.\n📦 Müşderilerim — sazlamalary görmek we dolandyrmak.\n🏅 Dereje we statistika — dereje, arzanladyş we satuwlar.\n💰 Bergim — bergini görmek ýa-da üzmek.\n🤖 Dükan botum — müşderi botuňyzy birikdirmek.",
     },
 }

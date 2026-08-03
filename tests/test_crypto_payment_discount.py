@@ -514,6 +514,54 @@ def install_payment_store(purchase_plan, store):
 
 
 class CryptoPaymentDiscountTests(unittest.TestCase):
+    def test_main_outage_alerts_operator_before_buyer_and_only_offers_retry(self):
+        bot = DummyBot()
+        purchase_plan = load_purchase_plan(bot, [])
+        purchase_plan.ADMIN_USER_IDS = [1]
+        payment_marks = []
+        reseller_marks = []
+        renewal_stub = types.ModuleType("utils.renewal")
+        renewal_stub.mark_payment_renewal_alerted = lambda *args, **kwargs: payment_marks.append((args, kwargs))
+        sys.modules["utils.renewal"] = renewal_stub
+        sys.modules["utils.reseller"].mark_reseller_renewal_alerted = (
+            lambda *args, **kwargs: reseller_marks.append((args, kwargs))
+        )
+        event = {
+            "payment_id": "reservation-1",
+            "status": "attention",
+            "reason": "server_unavailable",
+            "operator_alert_due": True,
+            "buyer_alert_due": False,
+            "alert_due": True,
+            "record": {
+                "user_id": 1988,
+                "renewal_username": "alice",
+                "renewal_server_id": "s1",
+            },
+        }
+
+        purchase_plan._notify_reserved_renewal_attention("p", event, 1988)
+
+        self.assertEqual(len(bot.sent_messages), 1)
+        self.assertEqual(bot.sent_messages[0][0][0], 1)
+        self.assertIn("Server: `s1`", bot.sent_messages[0][0][1])
+        markup = bot.sent_messages[0][1]["reply_markup"]
+        self.assertEqual(
+            [button.kwargs["callback_data"] for button in markup.buttons],
+            ["rr:p:retry:reservation-1"],
+        )
+        self.assertEqual(payment_marks[-1][1]["audience"], "operator")
+        self.assertEqual(reseller_marks, [])
+
+        bot.sent_messages.clear()
+        event.update({"operator_alert_due": False, "buyer_alert_due": True})
+        purchase_plan._notify_reserved_renewal_attention("p", event, 1988)
+
+        self.assertEqual(len(bot.sent_messages), 1)
+        self.assertEqual(bot.sent_messages[0][0][0], 1988)
+        self.assertIn("server is temporarily unavailable", bot.sent_messages[0][0][1])
+        self.assertEqual(payment_marks[-1][1]["audience"], "buyer")
+
     def test_admin_payment_notification_formats_and_escapes_server(self):
         bot = DummyBot()
         purchase_plan = load_purchase_plan(bot, [])

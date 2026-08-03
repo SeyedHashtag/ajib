@@ -348,6 +348,86 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
         credit_sale.assert_called_once()
         present_level.assert_called_once()
 
+    def test_hosted_outage_alerts_owner_before_customer_and_marks_audiences_separately(self):
+        renewal = importlib.import_module("utils.renewal")
+        payment_marks = []
+        reseller_marks = []
+        self.worker.bot = mock.Mock()
+        self.worker._sync_hosted_renewal_event = mock.Mock(return_value=True)
+        self.worker._message = lambda _user_id, key: key
+        self.worker._hosted_message = lambda _user_id, key, **values: (
+            f"{key}:{values.get('username')}"
+        )
+        event = {
+            "payment_id": "reservation-1",
+            "status": "attention",
+            "reason": "server_unavailable",
+            "operator_alert_due": True,
+            "buyer_alert_due": False,
+            "alert_due": True,
+            "record": {
+                "user_id": 99,
+                "renew_username": "alice",
+                "server_id": "s1",
+            },
+        }
+
+        with mock.patch.object(
+            renewal,
+            "mark_payment_renewal_alerted",
+            side_effect=lambda *args, **kwargs: payment_marks.append((args, kwargs)),
+        ), mock.patch.object(
+            self.reseller,
+            "mark_reseller_renewal_alerted",
+            side_effect=lambda *args, **kwargs: reseller_marks.append((args, kwargs)),
+        ):
+            self.worker._handle_hosted_renewal_event(event)
+            first_calls = list(self.worker.bot.send_message.call_args_list)
+            self.assertEqual(len(first_calls), 1)
+            self.assertEqual(first_calls[0].args[0], self.worker.OWNER_ID)
+            self.assertIn("Server: `s1`", first_calls[0].args[1])
+            markup = first_calls[0].kwargs["reply_markup"]
+            buttons = getattr(markup, "buttons", None)
+            if buttons is None:
+                buttons = [button for row in markup.keyboard for button in row]
+            callbacks = [
+                getattr(button, "callback_data", None) or getattr(button, "kwargs", {}).get("callback_data")
+                for button in buttons
+            ]
+            self.assertEqual(callbacks, ["hb:rr:retry:reservation-1"])
+            self.assertEqual(payment_marks[-1][1]["audience"], "operator")
+            self.assertEqual(reseller_marks[-1][1]["audience"], "operator")
+
+            self.worker.bot.reset_mock()
+            event.update({"operator_alert_due": False, "buyer_alert_due": True})
+            self.worker._handle_hosted_renewal_event(event)
+
+        second_calls = list(self.worker.bot.send_message.call_args_list)
+        self.assertEqual(len(second_calls), 1)
+        self.assertEqual(second_calls[0].args[0], 99)
+        self.assertIn("renewal_reserved_server_unavailable", second_calls[0].args[1])
+        self.assertEqual(payment_marks[-1][1]["audience"], "buyer")
+        self.assertEqual(reseller_marks[-1][1]["audience"], "buyer")
+
+    def test_hosted_outage_recovery_syncs_the_reseller_mirror_back_to_reserved(self):
+        with mock.patch.object(
+            self.worker,
+            "sync_reseller_renewal_reservation",
+            return_value=True,
+        ) as sync:
+            result = self.worker._sync_hosted_renewal_event({
+                "payment_id": "reservation-1",
+                "status": "waiting",
+            })
+
+        self.assertTrue(result)
+        sync.assert_called_once_with(
+            self.worker.OWNER_ID,
+            "reservation-1",
+            "reserved",
+            fields={},
+        )
+
     def test_stale_hosted_test_recovers_persisted_ht_allocation(self):
         message = mock.Mock()
         message.from_user.id = 100

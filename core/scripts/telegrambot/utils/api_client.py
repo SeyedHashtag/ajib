@@ -5,9 +5,9 @@ This is the single source of truth for all HTTP communication with the ajib
 backend. Import ``APIClient`` from here instead of from individual handler
 modules (adduser, edituser, deleteuser, …).
 
-All public methods return parsed JSON data (dict / list / str) on success,
-or ``None`` on any failure (network error, 4xx, 5xx).  Callers should check
-``if result is None`` to detect failures.
+Legacy public methods return parsed JSON data (dict / list / str) on success,
+or ``None`` on failure. Structured lookup/reset methods additionally expose
+whether the target was missing or its assigned server was unavailable.
 """
 
 import json
@@ -213,6 +213,31 @@ class APIClient:
             print(f"[APIClient] GET {url} failed: {e}")
             return None
 
+    @staticmethod
+    def _http_status(response) -> int | None:
+        try:
+            return int(getattr(response, "status_code", None))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _request_error_code(error) -> str:
+        if isinstance(error, requests.exceptions.Timeout):
+            return "timeout"
+        if isinstance(error, requests.exceptions.ConnectionError):
+            return "connection_error"
+        return "request_error"
+
+    @staticmethod
+    def _http_error_code(status_code: int | None) -> str:
+        if status_code == 429:
+            return "rate_limited"
+        if status_code is not None and status_code >= 500:
+            return "server_error"
+        if status_code == 408:
+            return "timeout"
+        return "http_error"
+
     def _post(self, url: str, data: dict):
         try:
             response = self._request("POST", url, data=data, headers={'Content-Type': 'application/json'}, timeout=get_api_write_timeout_seconds())
@@ -261,7 +286,63 @@ class APIClient:
 
     def get_user(self, username: str):
         """Return a single user's detail dict, or ``None`` if not found / on failure."""
-        return self._get(f"{self.users_endpoint}{username}")
+        result = self.get_user_result(username)
+        return result.get("data") if result.get("status") == "found" else None
+
+    def get_user_result(self, username: str) -> dict:
+        """Return a structured user lookup result without conflating 404 and outages."""
+        url = f"{self.users_endpoint}{username}"
+        try:
+            response = self._request("GET", url, timeout=get_api_read_timeout_seconds())
+        except requests.exceptions.RequestException as error:
+            print(f"[APIClient] GET {url} failed: {error}")
+            return {
+                "status": "unavailable",
+                "data": None,
+                "http_status": None,
+                "error": self._request_error_code(error),
+            }
+
+        status_code = self._http_status(response)
+        if status_code == 404:
+            return {
+                "status": "missing",
+                "data": None,
+                "http_status": status_code,
+                "error": "not_found",
+            }
+        try:
+            response.raise_for_status()
+        except requests.exceptions.RequestException as error:
+            print(f"[APIClient] GET {url} failed: {error}")
+            return {
+                "status": "unavailable",
+                "data": None,
+                "http_status": status_code,
+                "error": self._http_error_code(status_code),
+            }
+        try:
+            data = response.json()
+        except (TypeError, ValueError):
+            return {
+                "status": "unavailable",
+                "data": None,
+                "http_status": status_code,
+                "error": "invalid_response",
+            }
+        if not isinstance(data, dict):
+            return {
+                "status": "unavailable",
+                "data": None,
+                "http_status": status_code,
+                "error": "invalid_response",
+            }
+        return {
+            "status": "found",
+            "data": data,
+            "http_status": status_code,
+            "error": None,
+        }
 
     def add_user(self, username: str, traffic_limit: int, expiration_days: int, unlimited: bool = False, note: str | None = None):
         """Create a new user. Returns response data or ``None`` on failure."""
@@ -287,18 +368,47 @@ class APIClient:
 
     def reset_user(self, username: str):
         """Reset a user through the panel reset endpoint."""
+        result = self.reset_user_result(username)
+        return result.get("data") if result.get("status") == "succeeded" else None
+
+    def reset_user_result(self, username: str) -> dict:
+        """Reset a user and classify transient API unavailability separately."""
         url = f"{self.users_endpoint}{username}/reset"
         try:
             response = self._request("GET", url, timeout=get_api_write_timeout_seconds())
+        except requests.exceptions.RequestException as error:
+            print(f"[APIClient] GET {url} failed: {error}")
+            return {
+                "status": "unavailable",
+                "data": None,
+                "http_status": None,
+                "error": self._request_error_code(error),
+            }
+
+        status_code = self._http_status(response)
+        try:
             response.raise_for_status()
-            MultiServerAPI.invalidate_all_caches()
-            try:
-                return response.json()
-            except ValueError:
-                return {"message": "Reset successfully."}
-        except requests.exceptions.RequestException as e:
-            print(f"[APIClient] GET {url} failed: {e}")
-            return None
+        except requests.exceptions.RequestException as error:
+            print(f"[APIClient] GET {url} failed: {error}")
+            unavailable = status_code in {408, 429} or (status_code is not None and status_code >= 500)
+            return {
+                "status": "unavailable" if unavailable else "failed",
+                "data": None,
+                "http_status": status_code,
+                "error": self._http_error_code(status_code),
+            }
+
+        MultiServerAPI.invalidate_all_caches()
+        try:
+            data = response.json()
+        except ValueError:
+            data = {"message": "Reset successfully."}
+        return {
+            "status": "succeeded",
+            "data": data,
+            "http_status": status_code,
+            "error": None,
+        }
 
     def delete_user(self, username: str):
         """Delete a user. Returns response data or ``None`` on failure."""
@@ -745,6 +855,37 @@ class MultiServerAPI:
             if user is not None:
                 return client, user
         return None, None
+
+    def find_user_on_server(self, username: str, server_id: str):
+        """Look up a user only on the exact recorded server.
+
+        Returns ``(client, user_data, result)`` where result contains the
+        structured ``found``, ``missing``, or ``unavailable`` status.
+        """
+        target_server_id = str(server_id or "").strip()
+        if not target_server_id:
+            result = {
+                "status": "unavailable",
+                "data": None,
+                "http_status": None,
+                "error": "server_id_missing",
+            }
+            return None, None, result
+
+        for server in self.servers:
+            if str(server.get("id")) != target_server_id:
+                continue
+            client = APIClient(server)
+            result = client.get_user_result(username)
+            return client, result.get("data"), result
+
+        result = {
+            "status": "unavailable",
+            "data": None,
+            "http_status": None,
+            "error": "server_not_configured",
+        }
+        return None, None, result
 
     def iter_all_users(
         self,

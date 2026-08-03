@@ -648,7 +648,7 @@ def _find_customer_configs(user_id):
 
 
 def _resolve_hosted_renewal_checkout(user_id, plan_id, renewal):
-    from utils.renewal import find_reseller_renewal_offer
+    from utils.renewal import find_reseller_renewal_offer, lookup_renewal_user
 
     reseller = get_reseller_data(OWNER_ID) or {}
     configs = reseller.get("configs", [])
@@ -665,9 +665,10 @@ def _resolve_hosted_renewal_checkout(user_id, plan_id, renewal):
         or str(config.get("plan_gb") or config.get("gb") or "") != str(plan_id)
     ):
         return None, "renewal_ineligible_missing"
-    client, live = MultiServerAPI().find_user(
+    client, live, lookup_result = lookup_renewal_user(
+        MultiServerAPI(),
         config.get("username"),
-        preferred_server_id=config.get("server_id"),
+        server_id=config.get("server_id"),
     )
     offer = find_reseller_renewal_offer(
         OWNER_ID,
@@ -677,6 +678,7 @@ def _resolve_hosted_renewal_checkout(user_id, plan_id, renewal):
         _sellable_plans(),
         reseller_data=reseller,
         allow_reservation=True,
+        lookup_result=lookup_result,
     )
     if not offer.get("eligible"):
         return None, offer.get("reason") or "renewal_ineligible_missing"
@@ -1001,8 +1003,19 @@ def _provision_payment(payment_id, record, funded):
             )
         return True, username
     if renewed:
-        client, live = MultiServerAPI().find_user(username, preferred_server_id=record.get("server_id"))
-        if not client or not live or client.reset_user(username) is None:
+        from utils.renewal import lookup_renewal_user
+
+        client, live, _lookup_result = lookup_renewal_user(
+            MultiServerAPI(),
+            username,
+            server_id=record.get("server_id"),
+        )
+        reset_method = getattr(client, "reset_user_result", None) if client and live else None
+        if callable(reset_method):
+            reset_succeeded = reset_method(username).get("status") == "succeeded"
+        else:
+            reset_succeeded = bool(client and live and client.reset_user(username) is not None)
+        if not client or not live or not reset_succeeded:
             return False, "VPN renewal failed"
         _save_payment(payment_id, {"provisioned_username": username,
                                    "provisioned_server_id": getattr(client, "server_id", None)})
@@ -1555,14 +1568,18 @@ def config_detail(call):
     except (IndexError, ValueError):
         bot.answer_callback_query(call.id, "Config not found", show_alert=True)
         return
-    client, live = MultiServerAPI().find_user(config.get("username"), preferred_server_id=config.get("server_id"))
+    from utils.renewal import find_reseller_renewal_offer, find_reseller_reservation, lookup_renewal_user
+
+    client, live, lookup_result = lookup_renewal_user(
+        MultiServerAPI(),
+        config.get("username"),
+        server_id=config.get("server_id"),
+    )
     if not client or not live:
         bot.answer_callback_query(call.id, "Config unavailable", show_alert=True)
         return
     bot.answer_callback_query(call.id)
     _deliver_config(call.message.chat.id, config["username"], client)
-    from utils.renewal import find_reseller_renewal_offer, find_reseller_reservation
-
     existing = find_reseller_reservation(config) or _matching_reserved_checkout(
         _tenant_payments(),
         call.from_user.id,
@@ -1589,6 +1606,7 @@ def config_detail(call):
         plans,
         reseller_data=reseller_data,
         allow_reservation=True,
+        lookup_result=lookup_result,
     )
     if plan_id in plans and offer.get("eligible"):
         renewal_mode = offer.get("renewal_mode", "immediate")
@@ -2809,12 +2827,15 @@ def earnings_destination(message):
 def _sync_hosted_renewal_event(event):
     status = event.get("status")
     if status == "waiting":
-        return True
+        status = "reserved"
     fields = {}
     if status == "attention":
+        lookup_result = event.get("lookup_result") or (event.get("result") or {}).get("lookup_result") or {}
         fields = {
             "renewal_attention_reason": event.get("reason"),
             "renewal_last_error": event.get("reason"),
+            "renewal_api_error": lookup_result.get("error"),
+            "renewal_api_http_status": lookup_result.get("http_status"),
         }
     elif status == "applied":
         result = event.get("result") or {}
@@ -2836,6 +2857,10 @@ def _hosted_renewal_review_markup(payment_id, reason):
         markup.add(
             types.InlineKeyboardButton("Keep for next expiry", callback_data=f"hb:rr:wait:{payment_id}"),
             types.InlineKeyboardButton("Apply now", callback_data=f"hb:rr:apply:{payment_id}"),
+        )
+    elif reason == "server_unavailable":
+        markup.add(
+            types.InlineKeyboardButton("Retry now", callback_data=f"hb:rr:retry:{payment_id}"),
         )
     else:
         markup.add(
@@ -2863,42 +2888,60 @@ def _handle_hosted_renewal_event(event):
             renewed=True,
         )
         return
-    if event.get("status") != "attention" or not event.get("alert_due"):
+    buyer_alert_due = event.get("buyer_alert_due", event.get("alert_due", False))
+    operator_alert_due = event.get("operator_alert_due", event.get("alert_due", False))
+    if event.get("status") != "attention" or (not buyer_alert_due and not operator_alert_due):
         return
     reason = event.get("reason") or "renewal_reset_failed"
     username = record.get("renew_username") or record.get("username") or "unknown"
     customer_reason = _message(int(customer_id), reason) if customer_id is not None else reason
     if customer_reason == reason:
         customer_reason = reason
-    try:
-        message = _hosted_message(
-            int(customer_id),
-            "renewal_reserved_attention",
-            username=username,
-            reason=customer_reason,
+    if buyer_alert_due:
+        try:
+            message_key = "renewal_reserved_server_unavailable" if reason == "server_unavailable" else "renewal_reserved_attention"
+            message = _hosted_message(
+                int(customer_id),
+                message_key,
+                username=username,
+                reason=customer_reason,
+            )
+            if message == message_key:
+                message = (
+                    f"Your reserved renewal for `{username}` is safe, but its server is temporarily unavailable. "
+                    "We will keep retrying automatically."
+                    if reason == "server_unavailable"
+                    else f"Your reserved renewal for `{username}` needs attention: {reason}"
+                )
+            bot.send_message(int(customer_id), message, parse_mode="Markdown")
+        except Exception:
+            pass
+        mark_payment_renewal_alerted(
+            event["payment_id"],
+            payments_file=tenant_file(OWNER_ID, "payments.json"),
+            audience="buyer",
         )
-        if message == "renewal_reserved_attention":
-            message = f"Your reserved renewal for `{username}` needs attention: {reason}"
-        bot.send_message(int(customer_id), message, parse_mode="Markdown")
-    except Exception:
-        pass
-    try:
-        owner_reason = _message(OWNER_ID, reason)
-        if owner_reason == reason:
-            owner_reason = reason
-        bot.send_message(
-            OWNER_ID,
-            f"Reserved renewal needs attention.\nCustomer: `{customer_id}`\nConfig: `{username}`\nReason: {owner_reason}",
-            reply_markup=_hosted_renewal_review_markup(event["payment_id"], reason),
-            parse_mode="Markdown",
+        mark_reseller_renewal_alerted(OWNER_ID, event["payment_id"], audience="buyer")
+    if operator_alert_due:
+        try:
+            owner_reason = _message(OWNER_ID, reason)
+            if owner_reason == reason:
+                owner_reason = reason
+            server_id = record.get("server_id") or record.get("renewal_server_id") or "unknown"
+            bot.send_message(
+                OWNER_ID,
+                f"Reserved renewal needs attention.\nCustomer: `{customer_id}`\nConfig: `{username}`\nServer: `{server_id}`\nReason: {owner_reason}",
+                reply_markup=_hosted_renewal_review_markup(event["payment_id"], reason),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        mark_payment_renewal_alerted(
+            event["payment_id"],
+            payments_file=tenant_file(OWNER_ID, "payments.json"),
+            audience="operator",
         )
-    except Exception:
-        pass
-    mark_payment_renewal_alerted(
-        event["payment_id"],
-        payments_file=tenant_file(OWNER_ID, "payments.json"),
-    )
-    mark_reseller_renewal_alerted(OWNER_ID, event["payment_id"])
+        mark_reseller_renewal_alerted(OWNER_ID, event["payment_id"], audience="operator")
 
 
 def _process_hosted_reserved_renewals(now=None):
@@ -2952,6 +2995,7 @@ def hosted_renewal_review(call):
     try:
         from utils.renewal import (
             capture_user_state,
+            lookup_renewal_user,
             process_payment_renewal_reservation,
             refresh_payment_renewal_baseline,
         )
@@ -2960,9 +3004,10 @@ def hosted_renewal_review(call):
         payments_file = tenant_file(OWNER_ID, "payments.json")
         record = _tenant_payments().get(payment_id, {})
         if action == "wait":
-            client, live = MultiServerAPI().find_user(
+            client, live, _lookup_result = lookup_renewal_user(
+                MultiServerAPI(),
                 record.get("renew_username"),
-                preferred_server_id=record.get("server_id"),
+                server_id=record.get("server_id"),
             )
             success = bool(live) and refresh_payment_renewal_baseline(
                 payment_id,

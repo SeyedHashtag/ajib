@@ -215,6 +215,56 @@ def _record_server_id(record):
     return record.get('renewal_server_id') or record.get('server_id')
 
 
+def lookup_renewal_user(multi_api, username, server_id=None):
+    """Resolve a renewal target without falling through to another server."""
+    if server_id:
+        strict_lookup = getattr(multi_api, 'find_user_on_server', None)
+        if callable(strict_lookup):
+            strict_result = strict_lookup(username, server_id)
+            if isinstance(strict_result, tuple) and len(strict_result) == 3:
+                api_client, user_data, result = strict_result
+                result = result if isinstance(result, dict) else {}
+                return api_client, user_data, {
+                    'status': result.get('status') or ('found' if user_data is not None else 'unavailable'),
+                    'http_status': result.get('http_status'),
+                    'error': result.get('error'),
+                }
+
+        # Compatibility for injected clients used by older integrations. A
+        # result from a different server is never accepted.
+        api_client, user_data = multi_api.find_user(username, preferred_server_id=server_id)
+        returned_server_id = getattr(api_client, 'server_id', None) if api_client else None
+        if api_client and str(returned_server_id) == str(server_id) and user_data is not None:
+            return api_client, user_data, {'status': 'found', 'http_status': None, 'error': None}
+        return api_client, None, {
+            'status': 'unavailable' if api_client is None else 'missing',
+            'http_status': None,
+            'error': 'strict_lookup_unavailable' if api_client is None else 'not_found',
+        }
+
+    api_client, user_data = multi_api.find_user(username)
+    return api_client, user_data, {
+        'status': 'found' if user_data is not None else 'missing',
+        'http_status': None,
+        'error': None if user_data is not None else 'not_found',
+    }
+
+
+def _lookup_failure_reason(lookup_result):
+    if isinstance(lookup_result, dict) and lookup_result.get('status') == 'unavailable':
+        return 'server_unavailable'
+    return 'renewal_ineligible_missing'
+
+
+def _lookup_failure_fields(lookup_result):
+    if not isinstance(lookup_result, dict):
+        return {}
+    return {
+        'renewal_api_error': lookup_result.get('error'),
+        'renewal_api_http_status': lookup_result.get('http_status'),
+    }
+
+
 def customer_renewal_token(user_id, record_id, username, server_id):
     return _token('customer', user_id, record_id, server_id or 'primary', username)
 
@@ -269,11 +319,12 @@ def _build_offer(
     extra=None,
     reseller_data=None,
     allow_reservation=False,
+    lookup_result=None,
 ):
     if not api_client or not user_data:
         return {
             'eligible': False,
-            'reason': 'renewal_ineligible_missing',
+            'reason': _lookup_failure_reason(lookup_result),
             'source': source,
             'username': username,
             'server_id': server_id,
@@ -487,7 +538,11 @@ def resolve_customer_renewal_token(
         server_id = _record_server_id(record)
         if customer_renewal_token(user_id, record_id, username, server_id) != token:
             continue
-        api_client, user_data = multi_api.find_user(username, preferred_server_id=server_id)
+        api_client, user_data, lookup_result = lookup_renewal_user(
+            multi_api,
+            username,
+            server_id=server_id,
+        )
         return _build_offer(
             record,
             'customer',
@@ -502,6 +557,7 @@ def resolve_customer_renewal_token(
                 'base_record': record,
             },
             allow_reservation=allow_reservation,
+            lookup_result=lookup_result,
         )
     return {'eligible': False, 'reason': 'renewal_ineligible_missing', 'source': 'customer'}
 
@@ -524,6 +580,7 @@ def find_reseller_renewal_offer(
     plans,
     reseller_data=None,
     allow_reservation=False,
+    lookup_result=None,
 ):
     configs = dict(_iter_reseller_configs(reseller_id, reseller_data=reseller_data))
     config = configs.get(config_index)
@@ -560,6 +617,7 @@ def find_reseller_renewal_offer(
         },
         reseller_data=reseller_data,
         allow_reservation=allow_reservation,
+        lookup_result=lookup_result,
     )
 
 
@@ -585,7 +643,11 @@ def resolve_reseller_renewal_token(
         server_id = config.get('server_id')
         if reseller_renewal_token(reseller_id, config_index, username, server_id) != token:
             continue
-        api_client, user_data = multi_api.find_user(username, preferred_server_id=server_id)
+        api_client, user_data, lookup_result = lookup_renewal_user(
+            multi_api,
+            username,
+            server_id=server_id,
+        )
         return find_reseller_renewal_offer(
             reseller_id,
             config_index,
@@ -594,6 +656,7 @@ def resolve_reseller_renewal_token(
             plans,
             reseller_data=reseller_data,
             allow_reservation=allow_reservation,
+            lookup_result=lookup_result,
         )
 
     return {'eligible': False, 'reason': 'renewal_ineligible_missing', 'source': 'reseller_customer'}
@@ -802,10 +865,14 @@ def finish_payment_renewal(
             record.pop('renewal_next_attempt_at', None)
             record.pop('renewal_attention_reason', None)
             record.pop('renewal_last_error', None)
+            record.pop('renewal_api_error', None)
+            record.pop('renewal_api_http_status', None)
         elif status == 'reserved':
             record.pop('renewal_next_attempt_at', None)
             record.pop('renewal_attention_reason', None)
             record.pop('renewal_last_error', None)
+            record.pop('renewal_api_error', None)
+            record.pop('renewal_api_http_status', None)
         elif retry:
             attempts = max(0, _safe_int(record.get('renewal_attempts'), 0) or 0) + 1
             record['renewal_attempts'] = attempts
@@ -856,9 +923,13 @@ def reservation_generation_changed(record, user_data):
     return live_used < baseline_used
 
 
-def inspect_reserved_renewal(record, user_data, force_apply=False):
+def inspect_reserved_renewal(record, user_data, force_apply=False, lookup_result=None):
     if not isinstance(user_data, dict):
-        return {'action': 'attention', 'reason': 'renewal_ineligible_missing', 'retry': True}
+        return {
+            'action': 'attention',
+            'reason': _lookup_failure_reason(lookup_result),
+            'retry': True,
+        }
     if force_apply:
         return {'action': 'apply'}
     if reservation_generation_changed(record, user_data):
@@ -868,10 +939,40 @@ def inspect_reserved_renewal(record, user_data, force_apply=False):
     return {'action': 'wait'}
 
 
-def reservation_alert_due(record, now=None, reminder_seconds=86400):
+def reservation_expected_time_expired(record, now=None):
+    baseline = record.get('renewal_baseline') or record.get('renewal_before_state') or {}
+    if not isinstance(baseline, dict):
+        return False
     current = now or datetime.now()
-    last_alert = _parse_time(record.get('renewal_last_alert_at'))
+    deadline = _parse_time(baseline.get('expiration_deadline'))
+    if deadline is not None:
+        return current >= deadline
+    captured_at = _parse_time(baseline.get('captured_at'))
+    days_remaining = _safe_int(baseline.get('days_remaining'))
+    if captured_at is None or days_remaining is None or days_remaining < 0:
+        return False
+    return current >= captured_at + timedelta(days=days_remaining)
+
+
+def reservation_alert_due(record, now=None, reminder_seconds=86400, audience=None):
+    current = now or datetime.now()
+    field = f'renewal_last_{audience}_alert_at' if audience in {'operator', 'buyer'} else 'renewal_last_alert_at'
+    last_value = record.get(field)
+    if last_value is None and audience in {'operator', 'buyer'}:
+        last_value = record.get('renewal_last_alert_at')
+    last_alert = _parse_time(last_value)
     return last_alert is None or (current - last_alert).total_seconds() >= reminder_seconds
+
+
+def reservation_alert_flags(record, reason, now=None):
+    operator_due = reservation_alert_due(record, now=now, audience='operator')
+    buyer_allowed = reason != 'server_unavailable' or reservation_expected_time_expired(record, now=now)
+    buyer_due = buyer_allowed and reservation_alert_due(record, now=now, audience='buyer')
+    return {
+        'operator_alert_due': operator_due,
+        'buyer_alert_due': buyer_due,
+        'alert_due': bool(operator_due or buyer_due),
+    }
 
 
 def refresh_payment_renewal_baseline(payment_id, user_data, payments_file=None):
@@ -890,14 +991,19 @@ def refresh_payment_renewal_baseline(payment_id, user_data, payments_file=None):
         return True
 
 
-def mark_payment_renewal_alerted(payment_id, payments_file=None, now=None):
+def mark_payment_renewal_alerted(payment_id, payments_file=None, now=None, audience=None):
     path = payments_file or PAYMENTS_FILE
     timestamp = (now or datetime.now()).strftime(TIMESTAMP_FORMAT)
     with locked_json(path, {}) as payments:
         record = payments.get(str(payment_id)) if isinstance(payments, dict) else None
         if not isinstance(record, dict):
             return False
-        record['renewal_last_alert_at'] = timestamp
+        if audience in {'operator', 'buyer'}:
+            record[f'renewal_last_{audience}_alert_at'] = timestamp
+        else:
+            record['renewal_last_alert_at'] = timestamp
+            record['renewal_last_operator_alert_at'] = timestamp
+            record['renewal_last_buyer_alert_at'] = timestamp
         record['updated_at'] = timestamp
         return True
 
@@ -926,8 +1032,17 @@ def process_payment_renewal_reservation(
     username = _record_username(record)
     server_id = _record_server_id(record)
     multi_api = multi_api or MultiServerAPI()
-    api_client, user_data = multi_api.find_user(username, preferred_server_id=server_id)
-    inspection = inspect_reserved_renewal(record, user_data, force_apply=force_apply)
+    api_client, user_data, lookup_result = lookup_renewal_user(
+        multi_api,
+        username,
+        server_id=server_id,
+    )
+    inspection = inspect_reserved_renewal(
+        record,
+        user_data,
+        force_apply=force_apply,
+        lookup_result=lookup_result,
+    )
     if inspection['action'] == 'wait':
         finish_payment_renewal(
             payment_id,
@@ -939,7 +1054,7 @@ def process_payment_renewal_reservation(
         return {'payment_id': str(payment_id), 'status': 'waiting', 'record': record}
     if inspection['action'] == 'attention':
         reason = inspection.get('reason')
-        alert_due = reservation_alert_due(record, now=current)
+        alert_flags = reservation_alert_flags(record, reason, now=current)
         finish_payment_renewal(
             payment_id,
             claim['claim_id'],
@@ -951,6 +1066,7 @@ def process_payment_renewal_reservation(
                 'renewal_attention_reason': reason,
                 'renewal_last_error': reason,
                 'renewal_live_state': capture_user_state(user_data) if user_data else None,
+                **_lookup_failure_fields(lookup_result),
             },
         )
         return {
@@ -958,15 +1074,16 @@ def process_payment_renewal_reservation(
             'status': 'attention',
             'reason': reason,
             'retry': bool(inspection.get('retry')),
-            'alert_due': alert_due,
+            **alert_flags,
             'record': record,
             'user_data': user_data,
+            'lookup_result': lookup_result,
         }
 
     result = execute_reserved_renewal(record, multi_api=multi_api, force=force_apply)
     if not result.get('success'):
         reason = result.get('reason') or 'renewal_reset_failed'
-        alert_due = reservation_alert_due(record, now=current)
+        alert_flags = reservation_alert_flags(record, reason, now=current)
         finish_payment_renewal(
             payment_id,
             claim['claim_id'],
@@ -978,6 +1095,7 @@ def process_payment_renewal_reservation(
                 'renewal_attention_reason': reason,
                 'renewal_last_error': reason,
                 'renewal_before_state': result.get('before_state', record.get('renewal_before_state')),
+                **_lookup_failure_fields(result.get('lookup_result')),
             },
         )
         return {
@@ -985,7 +1103,7 @@ def process_payment_renewal_reservation(
             'status': 'attention',
             'reason': reason,
             'retry': True,
-            'alert_due': alert_due,
+            **alert_flags,
             'record': record,
             'result': result,
         }
@@ -1047,11 +1165,17 @@ def process_reseller_renewal_reservation(
         'renewal_source': reservation.get('renewal_source') or 'reseller_customer',
     }
     multi_api = multi_api or MultiServerAPI()
-    api_client, user_data = multi_api.find_user(
+    api_client, user_data, lookup_result = lookup_renewal_user(
+        multi_api,
         record['renewal_username'],
-        preferred_server_id=record.get('renewal_server_id'),
+        server_id=record.get('renewal_server_id'),
     )
-    inspection = inspect_reserved_renewal(record, user_data, force_apply=force_apply)
+    inspection = inspect_reserved_renewal(
+        record,
+        user_data,
+        force_apply=force_apply,
+        lookup_result=lookup_result,
+    )
     if inspection['action'] == 'wait':
         finish_reseller_renewal_reservation(
             reseller_id,
@@ -1063,7 +1187,7 @@ def process_reseller_renewal_reservation(
         return {'reservation_id': str(reservation_id), 'reseller_id': str(reseller_id), 'status': 'waiting', 'record': record}
     if inspection['action'] == 'attention':
         reason = inspection.get('reason')
-        alert_due = reservation_alert_due(reservation, now=current)
+        alert_flags = reservation_alert_flags(reservation, reason, now=current)
         finish_reseller_renewal_reservation(
             reseller_id,
             reservation_id,
@@ -1075,6 +1199,7 @@ def process_reseller_renewal_reservation(
                 'renewal_attention_reason': reason,
                 'renewal_last_error': reason,
                 'renewal_live_state': capture_user_state(user_data) if user_data else None,
+                **_lookup_failure_fields(lookup_result),
             },
         )
         return {
@@ -1083,9 +1208,10 @@ def process_reseller_renewal_reservation(
             'status': 'attention',
             'reason': reason,
             'retry': bool(inspection.get('retry')),
-            'alert_due': alert_due,
+            **alert_flags,
             'record': record,
             'user_data': user_data,
+            'lookup_result': lookup_result,
         }
 
     restricted = reseller_data.get('status') != 'approved'
@@ -1094,7 +1220,7 @@ def process_reseller_renewal_reservation(
     charge_paid = funded or is_reseller_debt_charge_paid(reseller_data, charge_id)
     if restricted and not charge_paid and not force_apply:
         reason = 'reseller_debt_review'
-        alert_due = reservation_alert_due(reservation, now=current)
+        alert_flags = reservation_alert_flags(reservation, reason, now=current)
         finish_reseller_renewal_reservation(
             reseller_id,
             reservation_id,
@@ -1114,14 +1240,14 @@ def process_reseller_renewal_reservation(
             'status': 'attention',
             'reason': reason,
             'retry': True,
-            'alert_due': alert_due,
+            **alert_flags,
             'record': record,
         }
 
     result = execute_reserved_renewal(record, multi_api=multi_api, force=force_apply)
     if not result.get('success'):
         reason = result.get('reason') or 'renewal_reset_failed'
-        alert_due = reservation_alert_due(reservation, now=current)
+        alert_flags = reservation_alert_flags(reservation, reason, now=current)
         finish_reseller_renewal_reservation(
             reseller_id,
             reservation_id,
@@ -1133,6 +1259,7 @@ def process_reseller_renewal_reservation(
                 'renewal_attention_reason': reason,
                 'renewal_last_error': reason,
                 'before_state': result.get('before_state', reservation.get('before_state')),
+                **_lookup_failure_fields(result.get('lookup_result')),
             },
         )
         return {
@@ -1141,7 +1268,7 @@ def process_reseller_renewal_reservation(
             'status': 'attention',
             'reason': reason,
             'retry': True,
-            'alert_due': alert_due,
+            **alert_flags,
             'record': record,
             'result': result,
         }
@@ -1205,9 +1332,17 @@ def _execute_reset(
     from utils.api_client import MultiServerAPI
 
     multi_api = multi_api or MultiServerAPI()
-    api_client, user_data = multi_api.find_user(username, preferred_server_id=server_id)
+    api_client, user_data, lookup_result = lookup_renewal_user(
+        multi_api,
+        username,
+        server_id=server_id,
+    )
     if not api_client or not user_data:
-        return {'success': False, 'reason': 'renewal_ineligible_missing'}
+        return {
+            'success': False,
+            'reason': _lookup_failure_reason(lookup_result),
+            'lookup_result': lookup_result,
+        }
 
     before_state = capture_user_state(user_data)
     if require_expired and not is_user_expired(user_data):
@@ -1219,9 +1354,27 @@ def _execute_reset(
     ):
         return {'success': False, 'reason': 'renewal_ineligible_plan_mismatch', 'before_state': before_state}
 
-    result = api_client.reset_user(username)
-    if result is None:
-        return {'success': False, 'reason': 'renewal_reset_failed', 'before_state': before_state}
+    reset_result_method = getattr(api_client, 'reset_user_result', None)
+    if callable(reset_result_method):
+        reset_outcome = reset_result_method(username)
+        result = reset_outcome.get('data') if isinstance(reset_outcome, dict) else None
+        reset_status = reset_outcome.get('status') if isinstance(reset_outcome, dict) else None
+        if reset_status != 'succeeded':
+            reason = 'server_unavailable' if reset_status == 'unavailable' else 'renewal_reset_failed'
+            return {
+                'success': False,
+                'reason': reason,
+                'before_state': before_state,
+                'lookup_result': {
+                    'status': 'unavailable' if reset_status == 'unavailable' else 'failed',
+                    'http_status': reset_outcome.get('http_status') if isinstance(reset_outcome, dict) else None,
+                    'error': reset_outcome.get('error') if isinstance(reset_outcome, dict) else 'reset_failed',
+                },
+            }
+    else:
+        result = api_client.reset_user(username)
+        if result is None:
+            return {'success': False, 'reason': 'renewal_reset_failed', 'before_state': before_state}
 
     after_user = api_client.get_user(username) or user_data
     after_state = capture_user_state(after_user)

@@ -640,6 +640,145 @@ class APIClientPoolingTests(unittest.TestCase):
         self.assertIsNone(api_client.MultiServerAPI._creation_cache)
         self.assertEqual(api_client.MultiServerAPI._user_snapshot_cache, {})
 
+    def test_structured_user_lookup_distinguishes_found_missing_and_unavailable(self):
+        server = {"id": "s1", "name": "s1", "url": "https://s1.test", "token": "token", "enabled": True}
+        client = api_client.APIClient(server)
+
+        class FakeResponse:
+            def __init__(self, status_code, payload=None, malformed=False):
+                self.status_code = status_code
+                self.payload = payload
+                self.malformed = malformed
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise api_client.requests.exceptions.HTTPError("request failed", response=self)
+
+            def json(self):
+                if self.malformed:
+                    raise ValueError("invalid json")
+                return self.payload
+
+        cases = [
+            (FakeResponse(200, {"username": "alice"}), "found", None),
+            (FakeResponse(404), "missing", "not_found"),
+            (FakeResponse(429), "unavailable", "rate_limited"),
+            (FakeResponse(503), "unavailable", "server_error"),
+            (FakeResponse(200, []), "unavailable", "invalid_response"),
+            (FakeResponse(200, malformed=True), "unavailable", "invalid_response"),
+        ]
+        for response, expected_status, expected_error in cases:
+            with self.subTest(status_code=response.status_code, malformed=response.malformed):
+                client._request = lambda *_args, **_kwargs: response
+                result = client.get_user_result("alice")
+                self.assertEqual(result["status"], expected_status)
+                self.assertEqual(result["error"], expected_error)
+
+        for error, expected_code in [
+            (api_client.requests.exceptions.Timeout("slow"), "timeout"),
+            (api_client.requests.exceptions.ConnectionError("down"), "connection_error"),
+        ]:
+            with self.subTest(error=expected_code):
+                def fail(*_args, **_kwargs):
+                    raise error
+
+                client._request = fail
+                result = client.get_user_result("alice")
+                self.assertEqual(result["status"], "unavailable")
+                self.assertEqual(result["error"], expected_code)
+                self.assertIsNone(client.get_user("alice"))
+
+    def test_structured_reset_classifies_transient_and_permanent_failures(self):
+        server = {"id": "s1", "name": "s1", "url": "https://s1.test", "token": "token", "enabled": True}
+        client = api_client.APIClient(server)
+
+        class FakeResponse:
+            def __init__(self, status_code, payload=None):
+                self.status_code = status_code
+                self.payload = payload
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise api_client.requests.exceptions.HTTPError("request failed", response=self)
+
+            def json(self):
+                return self.payload
+
+        for response, expected in [
+            (FakeResponse(200, {"ok": True}), "succeeded"),
+            (FakeResponse(400), "failed"),
+            (FakeResponse(429), "unavailable"),
+            (FakeResponse(500), "unavailable"),
+        ]:
+            with self.subTest(status_code=response.status_code):
+                client._request = lambda *_args, **_kwargs: response
+                self.assertEqual(client.reset_user_result("alice")["status"], expected)
+
+        def timeout(*_args, **_kwargs):
+            raise api_client.requests.exceptions.Timeout("slow")
+
+        client._request = timeout
+        self.assertEqual(client.reset_user_result("alice")["status"], "unavailable")
+        self.assertIsNone(client.reset_user("alice"))
+
+
+class StrictServerLookupTests(unittest.TestCase):
+    def setUp(self):
+        self.original_api_client = api_client.APIClient
+        self.original_get_server_configs = api_client.get_server_configs
+
+    def tearDown(self):
+        api_client.APIClient = self.original_api_client
+        api_client.get_server_configs = self.original_get_server_configs
+
+    def test_strict_lookup_never_falls_back_to_same_username_on_another_server(self):
+        calls = []
+
+        class StrictClient:
+            def __init__(self, server):
+                self.server_id = server["id"]
+
+            def get_user_result(self, username):
+                calls.append((self.server_id, username))
+                if self.server_id == "s1":
+                    return {"status": "unavailable", "data": None, "error": "timeout", "http_status": None}
+                return {"status": "found", "data": {"username": username}, "error": None, "http_status": 200}
+
+        servers = [
+            {"id": "s1", "name": "s1", "url": "https://s1.test", "token": "token", "enabled": True},
+            {"id": "s2", "name": "s2", "url": "https://s2.test", "token": "token", "enabled": True},
+        ]
+        api_client.get_server_configs = lambda: servers
+        api_client.APIClient = StrictClient
+        multi_api = api_client.MultiServerAPI()
+
+        client, user, result = multi_api.find_user_on_server("alice", "s1")
+
+        self.assertEqual(client.server_id, "s1")
+        self.assertIsNone(user)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(calls, [("s1", "alice")])
+
+    def test_unknown_strict_server_does_not_use_the_first_configured_server(self):
+        calls = []
+
+        class StrictClient:
+            def __init__(self, server):
+                calls.append(server["id"])
+
+        api_client.get_server_configs = lambda: [
+            {"id": "s1", "name": "s1", "url": "https://s1.test", "token": "token", "enabled": True},
+        ]
+        api_client.APIClient = StrictClient
+
+        client, user, result = api_client.MultiServerAPI().find_user_on_server("alice", "removed")
+
+        self.assertIsNone(client)
+        self.assertIsNone(user)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["error"], "server_not_configured")
+        self.assertEqual(calls, [])
+
 
 class ServerConfigPersistenceTests(unittest.TestCase):
     def setUp(self):

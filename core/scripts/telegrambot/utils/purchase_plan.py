@@ -2038,6 +2038,10 @@ def _reserved_renewal_review_markup(kind, event):
             types.InlineKeyboardButton('Keep for next expiry', callback_data=f"{prefix}:wait:{identity}"),
             types.InlineKeyboardButton('Apply now', callback_data=f"{prefix}:apply:{identity}"),
         )
+    elif reason == 'server_unavailable':
+        markup.add(
+            types.InlineKeyboardButton('Retry now', callback_data=f"{prefix}:retry:{identity}"),
+        )
     else:
         markup.add(
             types.InlineKeyboardButton('Retry now', callback_data=f"{prefix}:retry:{identity}"),
@@ -2083,38 +2087,55 @@ def _notify_reserved_renewal_attention(kind, event, recipient_id):
     from utils.renewal import mark_payment_renewal_alerted
     from utils.reseller import mark_reseller_renewal_alerted
 
-    if not event.get('alert_due'):
+    buyer_alert_due = event.get('buyer_alert_due', event.get('alert_due', False))
+    operator_alert_due = event.get('operator_alert_due', event.get('alert_due', False))
+    if not buyer_alert_due and not operator_alert_due:
         return
     record = event.get('record') or {}
     username = record.get('renewal_username') or record.get('username') or 'unknown'
     reason = event.get('reason') or 'renewal_reset_failed'
     user_language = get_user_language(recipient_id)
     reason_text = _renewal_reason_text(user_language, reason)
-    user_text = get_message_text(user_language, 'renewal_reserved_attention')
-    if user_text == 'renewal_reserved_attention':
-        user_text = f"Your reserved renewal for `{username}` needs attention: {reason_text}"
-    else:
-        user_text = user_text.format(username=username, reason=reason_text)
-    try:
-        bot.send_message(recipient_id, user_text, parse_mode='Markdown')
-    except Exception:
-        pass
-
-    markup = _reserved_renewal_review_markup(kind, event)
-    for admin_id in ADMIN_USER_IDS:
-        try:
-            bot.send_message(
-                admin_id,
-                f"Reserved renewal needs attention.\nUser: `{recipient_id}`\nConfig: `{username}`\nReason: {reason}",
-                reply_markup=markup,
-                parse_mode='Markdown',
+    if buyer_alert_due:
+        message_key = 'renewal_reserved_server_unavailable' if reason == 'server_unavailable' else 'renewal_reserved_attention'
+        user_text = get_message_text(user_language, message_key)
+        if user_text == message_key:
+            user_text = (
+                f"Your reserved renewal for `{username}` is safe, but its server is temporarily unavailable. "
+                "We will keep retrying automatically."
+                if reason == 'server_unavailable'
+                else f"Your reserved renewal for `{username}` needs attention: {reason_text}"
             )
+        else:
+            user_text = user_text.format(username=username, reason=reason_text)
+        try:
+            bot.send_message(recipient_id, user_text, parse_mode='Markdown')
         except Exception:
             pass
+
+    if operator_alert_due:
+        markup = _reserved_renewal_review_markup(kind, event)
+        server_id = record.get('renewal_server_id') or record.get('server_id') or 'unknown'
+        for admin_id in ADMIN_USER_IDS:
+            try:
+                bot.send_message(
+                    admin_id,
+                    f"Reserved renewal needs attention.\nUser: `{recipient_id}`\nConfig: `{username}`\nServer: `{server_id}`\nReason: {reason}",
+                    reply_markup=markup,
+                    parse_mode='Markdown',
+                )
+            except Exception:
+                pass
     if kind == 'p':
-        mark_payment_renewal_alerted(event['payment_id'])
+        if buyer_alert_due:
+            mark_payment_renewal_alerted(event['payment_id'], audience='buyer')
+        if operator_alert_due:
+            mark_payment_renewal_alerted(event['payment_id'], audience='operator')
     else:
-        mark_reseller_renewal_alerted(event['reseller_id'], event['reservation_id'])
+        if buyer_alert_due:
+            mark_reseller_renewal_alerted(event['reseller_id'], event['reservation_id'], audience='buyer')
+        if operator_alert_due:
+            mark_reseller_renewal_alerted(event['reseller_id'], event['reservation_id'], audience='operator')
 
 
 def process_main_reserved_renewals(now=None):
@@ -2187,6 +2208,7 @@ def handle_reserved_renewal_review(call):
     try:
         from utils.renewal import (
             capture_user_state,
+            lookup_renewal_user,
             process_payment_renewal_reservation,
             process_reseller_renewal_reservation,
             refresh_payment_renewal_baseline,
@@ -2197,9 +2219,10 @@ def handle_reserved_renewal_review(call):
             payment_id = parts[3]
             record = get_payment_record(payment_id) or {}
             if action == 'wait':
-                client, live = MultiServerAPI().find_user(
+                client, live, _lookup_result = lookup_renewal_user(
+                    MultiServerAPI(),
                     record.get('renewal_username'),
-                    preferred_server_id=record.get('renewal_server_id'),
+                    server_id=record.get('renewal_server_id'),
                 )
                 success = bool(live) and refresh_payment_renewal_baseline(payment_id, live)
                 event = None
@@ -2217,9 +2240,10 @@ def handle_reserved_renewal_review(call):
             item = get_reseller_renewal_reservation(reseller_id, reservation_id) or {}
             if action == 'wait':
                 config = item.get('config') or {}
-                client, live = MultiServerAPI().find_user(
+                client, live, _lookup_result = lookup_renewal_user(
+                    MultiServerAPI(),
                     config.get('username'),
-                    preferred_server_id=config.get('server_id'),
+                    server_id=config.get('server_id'),
                 )
                 success = bool(live) and refresh_reseller_renewal_baseline(
                     reseller_id,

@@ -1165,6 +1165,8 @@ def finish_reseller_renewal_reservation(
                             reservation.pop('renewal_attention_reason', None)
                             reservation.pop('renewal_last_error', None)
                             reservation.pop('renewal_next_attempt_at', None)
+                            reservation.pop('renewal_api_error', None)
+                            reservation.pop('renewal_api_http_status', None)
                             config['cleanup_status'] = 'renewed'
                             config['cleanup_error'] = None
                             if reservation.get('after_state') is not None:
@@ -1173,6 +1175,8 @@ def finish_reseller_renewal_reservation(
                             reservation.pop('renewal_attention_reason', None)
                             reservation.pop('renewal_last_error', None)
                             reservation.pop('renewal_next_attempt_at', None)
+                            reservation.pop('renewal_api_error', None)
+                            reservation.pop('renewal_api_http_status', None)
                         elif retry:
                             reservation['renewal_attempts'] = int(reservation.get('renewal_attempts', 0) or 0) + 1
                             reservation['renewal_next_attempt_at'] = (
@@ -1210,7 +1214,7 @@ def refresh_reseller_renewal_baseline(user_id, reservation_id, user_data):
             return False
 
 
-def mark_reseller_renewal_alerted(user_id, reservation_id, now=None):
+def mark_reseller_renewal_alerted(user_id, reservation_id, now=None, audience=None):
     user_id = str(user_id)
     timestamp = (now or datetime.now()).strftime('%Y-%m-%d %H:%M:%S')
     with reseller_lock:
@@ -1221,7 +1225,12 @@ def mark_reseller_renewal_alerted(user_id, reservation_id, now=None):
                 for config in current.get('configs', []):
                     for reservation in config.get('renewals', []) if isinstance(config, dict) else []:
                         if isinstance(reservation, dict) and str(reservation.get('reservation_id') or '') == str(reservation_id):
-                            reservation['renewal_last_alert_at'] = timestamp
+                            if audience in {'operator', 'buyer'}:
+                                reservation[f'renewal_last_{audience}_alert_at'] = timestamp
+                            else:
+                                reservation['renewal_last_alert_at'] = timestamp
+                                reservation['renewal_last_operator_alert_at'] = timestamp
+                                reservation['renewal_last_buyer_alert_at'] = timestamp
                             resellers[user_id] = _ensure_reseller_defaults(current)
                             _write_resellers_file(resellers)
                             return True
@@ -1251,10 +1260,18 @@ def sync_reseller_renewal_reservation(user_id, reservation_id, status, fields=No
                             reservation.pop('renewal_attention_reason', None)
                             reservation.pop('renewal_last_error', None)
                             reservation.pop('renewal_next_attempt_at', None)
+                            reservation.pop('renewal_api_error', None)
+                            reservation.pop('renewal_api_http_status', None)
                             config['cleanup_status'] = 'renewed'
                             config['cleanup_error'] = None
                             if reservation.get('after_state') is not None:
                                 config['cleanup_last_state'] = reservation.get('after_state')
+                        elif status == 'reserved':
+                            reservation.pop('renewal_attention_reason', None)
+                            reservation.pop('renewal_last_error', None)
+                            reservation.pop('renewal_next_attempt_at', None)
+                            reservation.pop('renewal_api_error', None)
+                            reservation.pop('renewal_api_http_status', None)
                         resellers[user_id] = _ensure_reseller_defaults(current)
                         _write_resellers_file(resellers)
                         return True
