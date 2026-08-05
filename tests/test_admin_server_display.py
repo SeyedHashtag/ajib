@@ -74,8 +74,13 @@ def load_edituser():
     sys.modules["utils.command"] = command_stub
 
     common_stub = types.ModuleType("utils.common")
+    common_stub.admin_action_text = lambda key: {
+        "show_user": "👤 Show User",
+    }[key]
+    common_stub.create_admin_markup = lambda *args, **kwargs: DummyMarkup()
     common_stub.create_main_markup = lambda *args, **kwargs: DummyMarkup()
     common_stub.is_admin_main_menu_button = lambda _text: False
+    common_stub.resolve_admin_menu_view = lambda _text: None
     sys.modules["utils.common"] = common_stub
 
     api_client_stub = types.ModuleType("utils.api_client")

@@ -1,11 +1,11 @@
 import time
 from utils.command import bot, is_admin
 from utils.test_config import load_test_configs
-from utils.common import create_main_markup
+from utils.common import admin_action_text, create_main_markup
 from utils.translations import get_message_text
 from utils.language import get_user_language
 
-@bot.message_handler(func=lambda message: message.text == '🔄 Update Keyboards' and is_admin(message.from_user.id))
+@bot.message_handler(func=lambda message: message.text == admin_action_text("update_keyboards") and is_admin(message.from_user.id))
 def handle_update_keyboards(message):
     """
     Admin command to update the main keyboard for all users in the test config list.

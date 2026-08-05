@@ -5,6 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from telebot import types
 from utils.command import CLI_PATH, bot, is_admin
+from utils.common import admin_action_text
 from utils.telegram_safe import safe_answer_callback_query, safe_edit_message_text, safe_reply_to
 
 
@@ -215,7 +216,7 @@ def _submit_server_info_reply(message, section):
     return True
 
 
-@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '📊 Server Info')
+@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text("server_info"))
 def server_info(message):
     section = SERVER_INFO_DEFAULT_SECTION
     _submit_server_info_reply(message, section)

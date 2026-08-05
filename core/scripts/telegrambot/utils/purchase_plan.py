@@ -3,7 +3,7 @@ import datetime
 import html
 from telebot import types
 from utils.command import bot, ADMIN_USER_IDS, is_admin
-from utils.common import create_main_markup
+from utils.common import admin_action_text, create_main_markup
 try:
     from utils.common import record_main_growth_event
 except ImportError:
@@ -2492,7 +2492,7 @@ def handle_text_while_waiting(message):
     bot.reply_to(message, get_message_text(language, "upload_receipt"), reply_markup=markup)
 
 
-@bot.message_handler(func=lambda message: message.text == '✅ Confirmations' and _is_confirmation_viewer(message.from_user.id))
+@bot.message_handler(func=lambda message: message.text == admin_action_text("confirmations") and _is_confirmation_viewer(message.from_user.id))
 def show_pending_confirmations(message):
     user_id = message.from_user.id
     payments = load_payments()

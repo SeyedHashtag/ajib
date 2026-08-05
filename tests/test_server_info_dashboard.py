@@ -443,6 +443,12 @@ def load_serverinfo_module():
     command_stub.run_cli_command = run_cli_command
     sys.modules["utils.command"] = command_stub
 
+    common_stub = types.ModuleType("utils.common")
+    common_stub.admin_action_text = lambda key: {
+        "server_info": "📊 Server Info",
+    }[key]
+    sys.modules["utils.common"] = common_stub
+
     telegram_safe_stub = types.ModuleType("utils.telegram_safe")
     telegram_safe_stub.safe_answer_callback_query = lambda bot_obj, *args, **kwargs: bot_obj.answer_callback_query(*args, **kwargs)
     telegram_safe_stub.safe_edit_message_text = lambda bot_obj, *args, **kwargs: bot_obj.edit_message_text(*args, **kwargs)

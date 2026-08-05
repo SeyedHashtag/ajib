@@ -340,7 +340,7 @@ class AdminLogButtonTests(unittest.TestCase):
         self.assertIn("📄 Bot Logs", common.ADMIN_MAIN_MENU_BUTTONS)
 
     def load_bot_logs_module(self, log_file):
-        for name in ("utils", "utils.command", "utils.bot_logging", "bot_logs_under_test"):
+        for name in ("utils", "utils.command", "utils.common", "utils.bot_logging", "bot_logs_under_test"):
             sys.modules.pop(name, None)
 
         utils_pkg = types.ModuleType("utils")
@@ -367,6 +367,12 @@ class AdminLogButtonTests(unittest.TestCase):
         command_stub.bot = bot
         command_stub.is_admin = lambda user_id: user_id == 123
         sys.modules["utils.command"] = command_stub
+
+        common_stub = types.ModuleType("utils.common")
+        common_stub.admin_action_text = lambda key: {
+            "bot_logs": "📄 Bot Logs",
+        }[key]
+        sys.modules["utils.common"] = common_stub
 
         bot_logging_stub = types.ModuleType("utils.bot_logging")
         bot_logging_stub.get_bot_log_file = lambda: log_file

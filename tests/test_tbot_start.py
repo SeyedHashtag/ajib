@@ -64,6 +64,21 @@ def load_tbot_module():
     utils_stub.__path__ = []
     utils_stub.bot = bot
     utils_stub.GROWTH_FUNNEL_BUTTON_TEXT = "📈 Growth Funnel"
+    utils_stub.ADMIN_CATEGORIES = {
+        "users": {"text": "👥 Users", "style": "primary"},
+        "sales": {"text": "💳 Sales", "style": "primary"},
+        "resellers": {"text": "💼 Resellers", "style": "primary"},
+        "system": {"text": "⚙️ System", "style": "primary"},
+        "reports": {"text": "📊 Reports", "style": "primary"},
+        "messaging": {"text": "📣 Messaging", "style": "primary"},
+    }
+    admin_views = {
+        category["text"]: view
+        for view, category in utils_stub.ADMIN_CATEGORIES.items()
+    }
+    admin_views["🏠 Admin Menu"] = "root"
+    utils_stub.resolve_admin_menu_view = lambda text: admin_views.get(text)
+    utils_stub.create_admin_markup = lambda view="root": {"admin_view": view}
     utils_stub.process_referral = lambda *args, **kwargs: (False, None)
     utils_stub.record_main_growth_event = lambda *args, **kwargs: None
     utils_stub.get_user_language = lambda user_id: "en"
@@ -134,6 +149,19 @@ class TBotStartTests(unittest.TestCase):
         self.assertEqual(bot.replies[0][0][1], "language_selection_prompt")
         self.assertEqual(bot.replies[0][1]["reply_markup"], {"languages": True})
 
+    def test_admin_start_renders_the_admin_root_keyboard(self):
+        module, bot, events = load_tbot_module()
+        module.is_admin = lambda user_id: user_id == 123
+
+        module.send_welcome(self.make_message())
+
+        self.assertEqual(events, ["reply"])
+        self.assertEqual(bot.replies[0][0][1], "Welcome to the Admin Dashboard!")
+        self.assertEqual(
+            bot.replies[0][1]["reply_markup"],
+            {"markup": {"is_admin": True}},
+        )
+
     def test_referred_user_with_unsupported_language_sees_language_prompt_first(self):
         module, bot, events = load_tbot_module()
         module.process_referral = lambda *args, **kwargs: (True, "referrer-456")
@@ -203,6 +231,50 @@ class TBotStartTests(unittest.TestCase):
         self.assertTrue(predicate(self.make_message(text="❌ Cancel")))
         self.assertFalse(predicate(self.make_message(user_id=999, text="❌ Cancel")))
         self.assertFalse(predicate(self.make_message(text="Cancel")))
+
+    def test_admin_category_navigation_renders_requested_view(self):
+        module, bot, events = load_tbot_module()
+        module.is_admin = lambda user_id: user_id == 123
+        message = self.make_message(text="👥 Users")
+
+        module.handle_admin_menu_navigation(message)
+
+        self.assertEqual(events, ["reply"])
+        self.assertEqual(bot.replies[0][0][1], "👥 Users\nChoose an action:")
+        self.assertEqual(
+            bot.replies[0][1]["reply_markup"],
+            {"admin_view": "users"},
+        )
+
+    def test_admin_home_navigation_restores_root_view(self):
+        module, bot, events = load_tbot_module()
+        module.is_admin = lambda user_id: user_id == 123
+
+        module.handle_admin_menu_navigation(
+            self.make_message(text="🏠 Admin Menu")
+        )
+
+        self.assertEqual(events, ["reply"])
+        self.assertEqual(bot.replies[0][0][1], "Admin dashboard is ready.")
+        self.assertEqual(
+            bot.replies[0][1]["reply_markup"],
+            {"admin_view": "root"},
+        )
+
+    def test_admin_navigation_filter_rejects_non_admins_and_quick_actions(self):
+        module, bot, _events = load_tbot_module()
+        module.is_admin = lambda user_id: user_id == 123
+        handler = next(
+            item for item in bot.message_handlers
+            if item[0] is module.handle_admin_menu_navigation
+        )
+        predicate = handler[2]["func"]
+
+        self.assertTrue(predicate(self.make_message(text="📣 Messaging")))
+        self.assertFalse(
+            predicate(self.make_message(user_id=999, text="📣 Messaging"))
+        )
+        self.assertFalse(predicate(self.make_message(text="✅ Confirmations")))
 
     def test_growth_funnel_handler_is_private_and_uses_reporting_api(self):
         module, bot, _events = load_tbot_module()

@@ -5,9 +5,10 @@ import threading
 
 from utils.bot_logging import get_bot_log_file
 from utils.command import bot, is_admin
+from utils.common import admin_action_text
 
 
-BOT_LOGS_BUTTON_TEXT = "📄 Bot Logs"
+BOT_LOGS_BUTTON_TEXT = admin_action_text("bot_logs")
 BOT_LOGS_LOCK = threading.Lock()
 BOT_LOGS_INFLIGHT = set()
 

@@ -106,6 +106,12 @@ def load_vpn_servers_module():
     command_stub.is_admin = lambda user_id: user_id == 1
     sys.modules["utils.command"] = command_stub
 
+    common_stub = types.ModuleType("utils.common")
+    common_stub.admin_action_text = lambda key: {
+        "vpn_servers": "⚖️ VPN Servers",
+    }[key]
+    sys.modules["utils.common"] = common_stub
+
     api_client_stub = types.ModuleType("utils.api_client")
     api_client_stub.MultiServerAPI = FakeMultiServerAPI
     api_client_stub.get_server_configs = lambda: [{"id": "s1", "name": "Server 1", "enabled": True}]

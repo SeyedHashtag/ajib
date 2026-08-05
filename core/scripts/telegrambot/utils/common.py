@@ -1,22 +1,138 @@
-from telebot import types
 import datetime
 
-GROWTH_FUNNEL_BUTTON_TEXT = '📈 Growth Funnel'
+from telebot import types
 
-ADMIN_MAIN_MENU_ROWS = (
-    ('➕ Add User', '👤 Show User'),
-    ('❌ Delete User', '📊 Server Info'),
-    ('💾 Backup Bot', '💳 Payment Settings'),
-    ('📝 Edit Plans', '📢 Broadcast Message'),
-    ('📞 Edit Support', '🔄 Update Keyboards'),
-    ('💼 Manage Resellers', '🧪 Manage Test Accounts'),
-    ('💰 Referral Payouts', '⚖️ VPN Servers'),
-    ('✅ Confirmations', '🧹 Expired Cleanup'),
-    ('📄 Bot Logs', '🤖 Hosted Bots'),
-    (GROWTH_FUNNEL_BUTTON_TEXT,),
+
+ADMIN_ACTIONS = {
+    "add_user": {"text": "➕ Add User", "style": "success", "group": "users"},
+    "show_user": {"text": "👤 Show User", "style": None, "group": "users"},
+    "delete_user": {"text": "❌ Delete User", "style": "danger", "group": "users"},
+    "server_info": {"text": "📊 Server Info", "style": "primary", "group": "reports"},
+    "backup_bot": {"text": "💾 Backup Bot", "style": None, "group": "system"},
+    "payment_settings": {"text": "💳 Payment Settings", "style": None, "group": "sales"},
+    "edit_plans": {"text": "📝 Edit Plans", "style": None, "group": "sales"},
+    "broadcast_message": {"text": "📢 Broadcast Message", "style": None, "group": "messaging"},
+    "edit_support": {"text": "📞 Edit Support", "style": None, "group": "messaging"},
+    "update_keyboards": {"text": "🔄 Update Keyboards", "style": None, "group": "messaging"},
+    "manage_resellers": {"text": "💼 Manage Resellers", "style": None, "group": "resellers"},
+    "manage_test_accounts": {"text": "🧪 Manage Test Accounts", "style": None, "group": "users"},
+    "referral_payouts": {"text": "💰 Referral Payouts", "style": None, "group": "sales"},
+    "vpn_servers": {"text": "⚖️ VPN Servers", "style": None, "group": "system"},
+    "confirmations": {"text": "✅ Confirmations", "style": "success", "group": "sales"},
+    "expired_cleanup": {"text": "🧹 Expired Cleanup", "style": "danger", "group": "users"},
+    "bot_logs": {"text": "📄 Bot Logs", "style": None, "group": "system"},
+    "hosted_bots": {"text": "🤖 Hosted Bots", "style": None, "group": "resellers"},
+    "growth_funnel": {"text": "📈 Growth Funnel", "style": "primary", "group": "reports"},
+}
+
+
+def admin_action_text(key):
+    """Return the stable display text for an admin action key."""
+    return ADMIN_ACTIONS[key]["text"]
+
+
+GROWTH_FUNNEL_BUTTON_TEXT = admin_action_text("growth_funnel")
+
+ADMIN_CATEGORIES = {
+    "users": {"text": "👥 Users", "style": "primary"},
+    "sales": {"text": "💳 Sales", "style": "primary"},
+    "resellers": {"text": "💼 Resellers", "style": "primary"},
+    "system": {"text": "⚙️ System", "style": "primary"},
+    "reports": {"text": "📊 Reports", "style": "primary"},
+    "messaging": {"text": "📣 Messaging", "style": "primary"},
+}
+
+ADMIN_HOME_BUTTON_TEXT = "🏠 Admin Menu"
+
+ADMIN_ROOT_MENU_ROWS = (
+    (admin_action_text("confirmations"), admin_action_text("server_info")),
+    (ADMIN_CATEGORIES["users"]["text"], ADMIN_CATEGORIES["sales"]["text"]),
+    (ADMIN_CATEGORIES["resellers"]["text"], ADMIN_CATEGORIES["system"]["text"]),
+    (ADMIN_CATEGORIES["reports"]["text"], ADMIN_CATEGORIES["messaging"]["text"]),
 )
 
-ADMIN_MAIN_MENU_BUTTONS = {button for row in ADMIN_MAIN_MENU_ROWS for button in row}
+ADMIN_GROUP_MENU_ROWS = {
+    "users": (
+        (admin_action_text("add_user"), admin_action_text("show_user")),
+        (admin_action_text("delete_user"), admin_action_text("manage_test_accounts")),
+        (admin_action_text("expired_cleanup"),),
+        (ADMIN_HOME_BUTTON_TEXT,),
+    ),
+    "sales": (
+        (admin_action_text("confirmations"), admin_action_text("payment_settings")),
+        (admin_action_text("edit_plans"), admin_action_text("referral_payouts")),
+        (ADMIN_HOME_BUTTON_TEXT,),
+    ),
+    "resellers": (
+        (admin_action_text("manage_resellers"), admin_action_text("hosted_bots")),
+        (ADMIN_HOME_BUTTON_TEXT,),
+    ),
+    "system": (
+        (admin_action_text("vpn_servers"), admin_action_text("backup_bot")),
+        (admin_action_text("bot_logs"),),
+        (ADMIN_HOME_BUTTON_TEXT,),
+    ),
+    "reports": (
+        (admin_action_text("server_info"), admin_action_text("growth_funnel")),
+        (ADMIN_HOME_BUTTON_TEXT,),
+    ),
+    "messaging": (
+        (admin_action_text("broadcast_message"), admin_action_text("edit_support")),
+        (admin_action_text("update_keyboards"),),
+        (ADMIN_HOME_BUTTON_TEXT,),
+    ),
+}
+
+# Backwards-compatible name for callers that render the admin's main keyboard.
+ADMIN_MAIN_MENU_ROWS = ADMIN_ROOT_MENU_ROWS
+
+ADMIN_ACTION_BUTTONS = {action["text"] for action in ADMIN_ACTIONS.values()}
+ADMIN_NAVIGATION_BUTTONS = {
+    category["text"] for category in ADMIN_CATEGORIES.values()
+} | {ADMIN_HOME_BUTTON_TEXT}
+ADMIN_MAIN_MENU_BUTTONS = ADMIN_ACTION_BUTTONS | ADMIN_NAVIGATION_BUTTONS
+
+_ADMIN_BUTTON_STYLES = {
+    action["text"]: action["style"] for action in ADMIN_ACTIONS.values()
+}
+_ADMIN_BUTTON_STYLES.update({
+    category["text"]: category["style"] for category in ADMIN_CATEGORIES.values()
+})
+_ADMIN_BUTTON_STYLES[ADMIN_HOME_BUTTON_TEXT] = "primary"
+
+_ADMIN_MENU_VIEW_BY_TEXT = {
+    category["text"]: view for view, category in ADMIN_CATEGORIES.items()
+}
+_ADMIN_MENU_VIEW_BY_TEXT[ADMIN_HOME_BUTTON_TEXT] = "root"
+
+
+def resolve_admin_menu_view(text):
+    """Resolve a navigation label to its admin view, or return ``None``."""
+    if not isinstance(text, str):
+        return None
+    return _ADMIN_MENU_VIEW_BY_TEXT.get(text)
+
+
+def _create_admin_button(text):
+    """Create a reply button with its configured semantic style."""
+    style = _ADMIN_BUTTON_STYLES[text]
+    return types.KeyboardButton(text, **({"style": style} if style else {}))
+
+
+def create_admin_markup(view="root"):
+    """Build the compact admin root keyboard or one of its grouped views."""
+    if view == "root":
+        rows = ADMIN_ROOT_MENU_ROWS
+    else:
+        try:
+            rows = ADMIN_GROUP_MENU_ROWS[view]
+        except KeyError as exc:
+            raise ValueError(f"Unknown admin menu view: {view!r}") from exc
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for row in rows:
+        markup.row(*(_create_admin_button(text) for text in row))
+    return markup
 
 
 def record_main_growth_event(
@@ -70,35 +186,33 @@ def create_main_markup_with_language(language_translations, is_admin=False, user
     Create a main menu markup with the given language translations.
     This function doesn't import language or translations to avoid circular imports.
     """
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     if is_admin:
-        # Admin menu
-        for row in ADMIN_MAIN_MENU_ROWS:
-            markup.row(*row)
-    else:
-        # Non-admin menu with translations
-        markup.row(
-            language_translations.get("my_configs", "📱 My Configs"),
-            language_translations.get("purchase_plan", "💳 Purchase Plan")
-        )
-        markup.row(
-            language_translations.get("downloads", "⬇️ Downloads"),
-            language_translations.get("test_config", "🎁 Test Config")
-        )
-        markup.row(
-            language_translations.get("referral", "🎁 Invite & Earn"),
-            language_translations.get("reseller_panel", "💼 Reseller Panel")
-        )
-        markup.row(
-            language_translations.get("support", "📞 Support"),
-            language_translations.get("language", "🌐 Language/زبان")
-        )
-        try:
-            from utils.receipt_checker import is_receipt_checker
-            if user_id is not None and is_receipt_checker(user_id):
-                markup.row('✅ Confirmations')
-        except Exception:
-            pass
+        return create_admin_markup("root")
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    # Non-admin menu with translations
+    markup.row(
+        language_translations.get("my_configs", "📱 My Configs"),
+        language_translations.get("purchase_plan", "💳 Purchase Plan")
+    )
+    markup.row(
+        language_translations.get("downloads", "⬇️ Downloads"),
+        language_translations.get("test_config", "🎁 Test Config")
+    )
+    markup.row(
+        language_translations.get("referral", "🎁 Invite & Earn"),
+        language_translations.get("reseller_panel", "💼 Reseller Panel")
+    )
+    markup.row(
+        language_translations.get("support", "📞 Support"),
+        language_translations.get("language", "🌐 Language/زبان")
+    )
+    try:
+        from utils.receipt_checker import is_receipt_checker
+        if user_id is not None and is_receipt_checker(user_id):
+            markup.row('✅ Confirmations')
+    except Exception:
+        pass
     return markup
 
 def create_main_markup(is_admin=False, user_id=None):
@@ -107,7 +221,7 @@ def create_main_markup(is_admin=False, user_id=None):
     This function handles imports internally to avoid circular imports.
     """
     if is_admin:
-        return create_main_markup_with_language({}, is_admin=True, user_id=user_id)
+        return create_admin_markup("root")
 
     # Import here to avoid circular imports
     from utils.translations import BUTTON_TRANSLATIONS, DEFAULT_LANGUAGE

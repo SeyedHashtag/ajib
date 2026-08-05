@@ -2,7 +2,7 @@ import json
 import os
 from telebot import types
 from utils.command import bot, is_admin
-from utils.common import create_main_markup
+from utils.common import admin_action_text, create_main_markup
 from utils.translations import BUTTON_TRANSLATIONS
 
 SUPPORT_FILE = '/etc/ajib/core/scripts/telegrambot/support_info.json'
@@ -30,7 +30,7 @@ def get_support_text():
     info = load_support_info()
     return info['text']
 
-@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '📞 Edit Support')
+@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text("edit_support"))
 def edit_support(message):
     current_text = get_support_text()
     msg = bot.reply_to(

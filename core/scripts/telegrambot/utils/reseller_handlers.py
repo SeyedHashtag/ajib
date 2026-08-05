@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 from utils.command import bot, ADMIN_USER_IDS, is_admin
+from utils.common import admin_action_text
 from utils.language import get_user_language
 from utils.translations import get_message_text, get_button_text, BUTTON_TRANSLATIONS
 from utils.reseller import (
@@ -3506,13 +3507,15 @@ def handle_admin_custom_debt_input(message):
     bot.send_message(message.chat.id, confirmation, reply_markup=markup)
 
 
-@bot.message_handler(func=lambda message: any(
-    message.text == get_button_text(get_user_language(message.from_user.id), "manage_resellers") for lang in BUTTON_TRANSLATIONS
+@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and (
+    message.text == admin_action_text("manage_resellers")
+    or message.text in {
+        translations.get("manage_resellers")
+        for translations in BUTTON_TRANSLATIONS.values()
+        if translations.get("manage_resellers")
+    }
 ))
 def admin_manage_resellers(message):
-    if not is_admin(message.from_user.id):
-        return
-
     ADMIN_RESELLER_DEBT_INPUT_STATE.pop(message.from_user.id, None)
     _set_admin_view_context(message.from_user.id, ADMIN_RESELLER_DEFAULT_LIST_STATUS, 0)
     language = get_user_language(message.from_user.id)

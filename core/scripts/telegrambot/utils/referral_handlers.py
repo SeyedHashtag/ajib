@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from telebot import types
 from utils.command import bot, ADMIN_USER_IDS, is_admin
+from utils.common import admin_action_text
 from utils.referral import (
     get_or_create_referral_code, 
     get_referral_stats, 
@@ -320,7 +321,7 @@ def _render_admin_referral_detail(chat_id, message_id, target_user_id, return_pa
         parse_mode="Markdown"
     )
 
-@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '💰 Referral Payouts')
+@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text("referral_payouts"))
 def admin_referral_payouts_menu(message):
     text, markup, _ = _build_admin_referral_list(0)
     bot.reply_to(message, text, reply_markup=markup, parse_mode="Markdown")

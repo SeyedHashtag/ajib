@@ -1,6 +1,7 @@
 import os
 import threading
 from utils.command import AJIB_PYTHON, ADMIN_USER_IDS, BACKUP_DIRECTORY, CLI_PATH, bot, is_admin, run_cli_command
+from utils.common import admin_action_text
 
 BACKUP_LOCK = threading.Lock()
 
@@ -66,6 +67,6 @@ def run_backup_and_send_to_admins():
         _send_backup_file(admin_id, backup_file_path, latest_backup_file, caption_prefix="Automated backup completed")
 
 
-@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '💾 Backup Bot')
+@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text("backup_bot"))
 def backup_bot(message):
     run_backup_and_send(message.chat.id)

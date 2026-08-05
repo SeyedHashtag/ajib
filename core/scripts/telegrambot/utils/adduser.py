@@ -2,7 +2,7 @@ import qrcode
 import io
 from telebot import types
 from utils.command import *
-from utils.common import create_main_markup
+from utils.common import admin_action_text, create_main_markup
 from utils.api_client import APIClient, MultiServerAPI
 
 
@@ -13,14 +13,39 @@ def create_cancel_markup(back_step=None):
     markup.row(types.KeyboardButton("❌ Cancel"))
     return markup
 
-@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '➕ Add User')
+
+def _finish_add_user_callback(call, text):
+    """Close the inline prompt and restore the persistent admin dashboard."""
+    chat_id = call.message.chat.id
+    try:
+        bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            reply_markup=types.InlineKeyboardMarkup(),
+        )
+    except Exception:
+        bot.send_message(chat_id, text)
+    bot.send_message(
+        chat_id,
+        "Admin dashboard is ready.",
+        reply_markup=create_main_markup(is_admin=True),
+    )
+
+
+@bot.message_handler(
+    func=lambda message: (
+        is_admin(message.from_user.id)
+        and message.text == admin_action_text("add_user")
+    )
+)
 def add_user(message):
     msg = bot.reply_to(message, "Enter username:", reply_markup=create_cancel_markup())
     bot.register_next_step_handler(msg, process_add_user_step1)
 
 def process_add_user_step1(message):
     if message.text == "❌ Cancel":
-        bot.reply_to(message, "Process canceled.", reply_markup=create_main_markup())
+        bot.reply_to(message, "Process canceled.", reply_markup=create_main_markup(is_admin=True))
         return
 
     username = message.text.strip()
@@ -33,7 +58,7 @@ def process_add_user_step1(message):
     existing_usernames = multi_api.get_all_usernames()
 
     if not multi_api.servers:
-        bot.reply_to(message, "Error connecting to API. Please check API configuration and try again.", reply_markup=create_main_markup())
+        bot.reply_to(message, "Error connecting to API. Please check API configuration and try again.", reply_markup=create_main_markup(is_admin=True))
         return
 
     try:
@@ -50,7 +75,7 @@ def process_add_user_step1(message):
 
 def process_add_user_step2(message, username):
     if message.text == "❌ Cancel":
-        bot.reply_to(message, "Process canceled.", reply_markup=create_main_markup())
+        bot.reply_to(message, "Process canceled.", reply_markup=create_main_markup(is_admin=True))
         return
     if message.text == "⬅️ Back":
         msg = bot.reply_to(message, "Enter username:", reply_markup=create_cancel_markup())
@@ -67,7 +92,7 @@ def process_add_user_step2(message, username):
 
 def process_add_user_step3(message, username, traffic_limit):
     if message.text == "❌ Cancel":
-        bot.reply_to(message, "Process canceled.", reply_markup=create_main_markup())
+        bot.reply_to(message, "Process canceled.", reply_markup=create_main_markup(is_admin=True))
         return
     if message.text == "⬅️ Back":
         msg = bot.reply_to(message, "Enter traffic limit (GB):", reply_markup=create_cancel_markup(back_step=process_add_user_step1))
@@ -98,11 +123,9 @@ def process_add_user_step4(call):
         multi_api = MultiServerAPI()
         api_client = multi_api.select_server_for_new_user()
         if api_client is None:
-            bot.edit_message_text(
+            _finish_add_user_callback(
+                call,
                 "Failed to add user. No healthy VPN server is available.",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                reply_markup=create_main_markup()
             )
             return
         
@@ -110,11 +133,9 @@ def process_add_user_step4(call):
         result = api_client.add_user(username, traffic_limit, expiration_days, unlimited)
 
         if not result:
-            bot.edit_message_text(
+            _finish_add_user_callback(
+                call,
                 "Failed to add user. Please check API connection and try again.",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                reply_markup=create_main_markup()
             )
             return
         multi_api.record_created_user(api_client.server_id, username)
@@ -122,11 +143,9 @@ def process_add_user_step4(call):
         # Get user URI from API
         user_uri_data = api_client.get_user_uri(username)
         if not user_uri_data or 'normal_sub' not in user_uri_data:
-            bot.edit_message_text(
+            _finish_add_user_callback(
+                call,
                 f"User '{username}' created successfully, but failed to get subscription URI. Check API configuration.",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                reply_markup=create_main_markup()
             )
             return
 
@@ -151,12 +170,7 @@ def process_add_user_step4(call):
             
         success_message += f"Subscription URL:\n{sub_url}"
         
-        bot.send_photo(call.message.chat.id, photo=bio, caption=success_message, parse_mode="Markdown", reply_markup=create_main_markup())
+        bot.send_photo(call.message.chat.id, photo=bio, caption=success_message, parse_mode="Markdown", reply_markup=create_main_markup(is_admin=True))
 
     except Exception as e:
-        bot.edit_message_text(
-            f"? Error adding user: {str(e)}",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=create_main_markup()
-        )
+        _finish_add_user_callback(call, f"❌ Error adding user: {str(e)}")

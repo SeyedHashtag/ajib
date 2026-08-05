@@ -91,6 +91,34 @@ def send_welcome(message):
         )
 
 
+@bot.message_handler(
+    func=lambda message: (
+        is_admin(message.from_user.id)
+        and resolve_admin_menu_view(message.text) is not None
+    )
+)
+def handle_admin_menu_navigation(message):
+    """Render an admin category keyboard or return to the dashboard root."""
+    if not is_admin(message.from_user.id):
+        return
+
+    view = resolve_admin_menu_view(message.text)
+    if view is None:
+        return
+
+    if view == "root":
+        reply_text = "Admin dashboard is ready."
+    else:
+        reply_text = f"{ADMIN_CATEGORIES[view]['text']}\nChoose an action:"
+
+    safe_reply_to(
+        bot,
+        message,
+        reply_text,
+        reply_markup=create_admin_markup(view),
+    )
+
+
 @bot.callback_query_handler(func=lambda call: call.data == "welcome:plans")
 def handle_welcome_plans(call):
     safe_answer_callback_query(bot, call.id)

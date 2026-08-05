@@ -52,6 +52,7 @@ except ImportError:
 from utils.api_client import MultiServerAPI
 from utils.atomic_store import locked_json, read_json
 from utils.command import bot, is_admin
+from utils.common import admin_action_text
 from utils.language import get_user_language
 from utils.translations import get_button_text, get_message_text
 
@@ -2672,7 +2673,7 @@ def _submit_manual_review_action(chat_id, message_id, admin_id, review_action, r
     return True
 
 
-@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '🧹 Expired Cleanup')
+@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text("expired_cleanup"))
 def admin_expired_cleanup_menu(message):
     language = get_user_language(message.from_user.id)
     bot.reply_to(

@@ -120,7 +120,10 @@ def test_admin_menu_contains_private_growth_funnel_button():
 
     assert common.GROWTH_FUNNEL_BUTTON_TEXT == "📈 Growth Funnel"
     assert common.GROWTH_FUNNEL_BUTTON_TEXT in common.ADMIN_MAIN_MENU_BUTTONS
-    assert (common.GROWTH_FUNNEL_BUTTON_TEXT,) in common.ADMIN_MAIN_MENU_ROWS
+    assert any(
+        common.GROWTH_FUNNEL_BUTTON_TEXT in row
+        for row in common.ADMIN_GROUP_MENU_ROWS["reports"]
+    )
 
 
 def test_main_growth_hook_promotes_referral_campaign_to_event_field():

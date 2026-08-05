@@ -106,6 +106,12 @@ def load_referral_handlers_module():
     command_stub.is_admin = lambda user_id: user_id == 1
     sys.modules["utils.command"] = command_stub
 
+    common_stub = types.ModuleType("utils.common")
+    common_stub.admin_action_text = lambda key: {
+        "referral_payouts": "💰 Referral Payouts",
+    }[key]
+    sys.modules["utils.common"] = common_stub
+
     referral_stub = types.ModuleType("utils.referral")
     referral_stub.get_or_create_referral_code = lambda user_id: "CODE"
     referral_stub.get_referral_stats = lambda user_id: {"count": 0, "total_earnings": 0.0, "available_balance": 0.0}

@@ -6,7 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from telebot import types
 from utils.command import bot, is_admin
-from utils.common import create_main_markup
+from utils.common import admin_action_text, create_main_markup
 try:
     from utils.common import record_main_growth_event
 except ImportError:
@@ -908,7 +908,7 @@ def build_waiting_chunk_menu(action):
     )
     return text, markup
 
-@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '🧪 Manage Test Accounts')
+@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text("manage_test_accounts"))
 def reset_test_accounts_menu(message):
     """Admin command: show reset and settings management."""
     text, markup = build_test_accounts_menu()

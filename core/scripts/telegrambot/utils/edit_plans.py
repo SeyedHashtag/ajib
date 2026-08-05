@@ -1,6 +1,6 @@
 from telebot import types
 from utils.command import bot, is_admin
-from utils.common import create_main_markup
+from utils.common import admin_action_text, create_main_markup
 import json
 import os
 
@@ -55,7 +55,7 @@ def create_plans_markup():
     
     return markup, plans_text, sorted_plans
 
-@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '📝 Edit Plans')
+@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text("edit_plans"))
 def edit_plans(message):
     markup, plans_text, _ = create_plans_markup()
     plans_text += "\nSelect a plan number to edit:"

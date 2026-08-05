@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from utils.api_client import MultiServerAPI, get_server_configs, save_server_configs
 from utils.command import bot, is_admin
+from utils.common import admin_action_text
 from utils.telegram_safe import (
     safe_answer_callback_query,
     safe_edit_message_text,
@@ -142,7 +143,7 @@ def _queue_vpn_servers_edit(chat_id, message_id):
     return True
 
 
-@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '⚖️ VPN Servers')
+@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text("vpn_servers"))
 def show_vpn_servers(message):
     _queue_vpn_servers_reply(message)
 

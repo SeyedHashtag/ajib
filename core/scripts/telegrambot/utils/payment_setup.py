@@ -1,6 +1,6 @@
 from telebot import types
 from utils.command import bot, is_admin
-from utils.common import create_main_markup
+from utils.common import admin_action_text, create_main_markup
 from utils.payment_records import load_payments
 from utils.receipt_checker import (
     RECEIPT_TYPE_REGULAR,
@@ -42,7 +42,7 @@ def create_payment_method_selection_markup():
     markup.row(types.KeyboardButton("❌ Cancel"))
     return markup
 
-@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '💳 Payment Settings')
+@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text("payment_settings"))
 def payment_settings(message):
     msg = bot.reply_to(
         message, 

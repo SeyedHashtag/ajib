@@ -4,7 +4,12 @@ import qrcode
 import io
 from telebot import types
 from utils.command import bot, is_admin
-from utils.common import create_main_markup, is_admin_main_menu_button
+from utils.common import (
+    admin_action_text,
+    create_admin_markup,
+    is_admin_main_menu_button,
+    resolve_admin_menu_view,
+)
 from utils.api_client import APIClient, MultiServerAPI
 
 
@@ -33,7 +38,7 @@ def handle_cancel_show_user(call):
     bot.clear_step_handler_by_chat_id(call.message.chat.id)
     bot.edit_message_text("Operation canceled.", chat_id=call.message.chat.id, message_id=call.message.message_id)
 
-@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '👤 Show User')
+@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text("show_user"))
 def show_user(message):
     markup = types.InlineKeyboardMarkup()
     cancel_button = types.InlineKeyboardButton("❌ Cancel", callback_data="cancel_show_user")
@@ -45,7 +50,8 @@ def show_user(message):
 def process_show_user(message):
     username = message.text.strip().lower()
     if is_admin_main_menu_button(message.text):
-        bot.reply_to(message, "Operation canceled.", reply_markup=create_main_markup(is_admin=True))
+        view = resolve_admin_menu_view(message.text) or "root"
+        bot.reply_to(message, "Operation canceled.", reply_markup=create_admin_markup(view))
         return
 
     bot.send_chat_action(message.chat.id, 'typing')

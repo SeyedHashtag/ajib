@@ -2,6 +2,7 @@ import telebot
 from telebot import types
 
 from utils.command import bot, is_admin
+from utils.common import admin_action_text
 from utils.hosted_bots import (
     disconnect_bot, get_bot, get_ledger, list_bots,
     list_pending_earnings_withdrawals, register_bot,
@@ -242,7 +243,7 @@ def _admin_text():
     return "\n".join(lines)
 
 
-@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == "🤖 Hosted Bots")
+@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text("hosted_bots"))
 def hosted_admin(message):
     markup = types.InlineKeyboardMarkup(row_width=1)
     for reseller_id, record in sorted(list_bots().items()):

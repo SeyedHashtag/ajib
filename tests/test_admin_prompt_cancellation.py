@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COMMON_PATH = ROOT / "core" / "scripts" / "telegrambot" / "utils" / "common.py"
 DELETEUSER_PATH = ROOT / "core" / "scripts" / "telegrambot" / "utils" / "deleteuser.py"
 EDITUSER_PATH = ROOT / "core" / "scripts" / "telegrambot" / "utils" / "edituser.py"
+ADDUSER_PATH = ROOT / "core" / "scripts" / "telegrambot" / "utils" / "adduser.py"
 
 
 class DummyMarkup:
@@ -37,6 +38,8 @@ class DummyBot:
         self.cleared_chat_ids = []
         self.edited_messages = []
         self.replies = []
+        self.sent_messages = []
+        self.sent_photos = []
         self.chat_actions = []
 
     def callback_query_handler(self, *args, **kwargs):
@@ -60,6 +63,12 @@ class DummyBot:
 
     def send_chat_action(self, *args, **kwargs):
         self.chat_actions.append((args, kwargs))
+
+    def send_message(self, *args, **kwargs):
+        self.sent_messages.append((args, kwargs))
+
+    def send_photo(self, *args, **kwargs):
+        self.sent_photos.append((args, kwargs))
 
 
 class ForbiddenMultiServerAPI:
@@ -92,6 +101,7 @@ def install_stubs():
         InlineKeyboardMarkup=DummyMarkup,
         InlineKeyboardButton=DummyButton,
         ReplyKeyboardMarkup=DummyMarkup,
+        KeyboardButton=DummyButton,
     )
     sys.modules["telebot"] = telebot_stub
     sys.modules["qrcode"] = types.SimpleNamespace(make=lambda *_args, **_kwargs: None)
@@ -124,10 +134,26 @@ def load_edituser():
     return load_module(EDITUSER_PATH, "edituser_under_test"), bot
 
 
+def load_adduser():
+    bot, _common = install_stubs()
+    return load_module(ADDUSER_PATH, "adduser_under_test"), bot
+
+
 def make_call():
     return types.SimpleNamespace(
         id="callback-id",
         message=types.SimpleNamespace(chat=types.SimpleNamespace(id=555), message_id=777),
+    )
+
+
+def make_add_user_call():
+    return types.SimpleNamespace(
+        id="callback-id",
+        data="unlimited_user_choice:yes:alice:10:30",
+        message=types.SimpleNamespace(
+            chat=types.SimpleNamespace(id=555),
+            message_id=777,
+        ),
     )
 
 
@@ -137,6 +163,13 @@ def make_message(text):
         chat=types.SimpleNamespace(id=555),
         from_user=types.SimpleNamespace(id=1),
     )
+
+
+def markup_text_rows(markup):
+    return [
+        [button.args[0] if isinstance(button, DummyButton) else button for button in row]
+        for row in markup.rows
+    ]
 
 
 class AdminPromptCancellationTests(unittest.TestCase):
@@ -168,6 +201,10 @@ class AdminPromptCancellationTests(unittest.TestCase):
         self.assertEqual(len(bot.replies), 1)
         self.assertIn("Operation canceled.", bot.replies[0][0][1])
         self.assertEqual(bot.chat_actions, [])
+        self.assertEqual(
+            markup_text_rows(bot.replies[0][1]["reply_markup"])[0],
+            ["✅ Confirmations", "📊 Server Info"],
+        )
 
     def test_show_user_prompt_treats_admin_menu_button_as_cancel(self):
         edituser, bot = load_edituser()
@@ -177,6 +214,155 @@ class AdminPromptCancellationTests(unittest.TestCase):
         self.assertEqual(len(bot.replies), 1)
         self.assertIn("Operation canceled.", bot.replies[0][0][1])
         self.assertEqual(bot.chat_actions, [])
+        self.assertEqual(
+            markup_text_rows(bot.replies[0][1]["reply_markup"])[0],
+            ["✅ Confirmations", "📊 Server Info"],
+        )
+
+    def test_prompt_category_navigation_opens_requested_admin_group(self):
+        for load_handler, process_name in (
+            (load_deleteuser, "process_delete_user"),
+            (load_edituser, "process_show_user"),
+        ):
+            with self.subTest(process=process_name):
+                module, bot = load_handler()
+
+                getattr(module, process_name)(make_message("👥 Users"))
+
+                markup = bot.replies[0][1]["reply_markup"]
+                self.assertEqual(
+                    markup_text_rows(markup),
+                    [
+                        ["➕ Add User", "👤 Show User"],
+                        ["❌ Delete User", "🧪 Manage Test Accounts"],
+                        ["🧹 Expired Cleanup"],
+                        ["🏠 Admin Menu"],
+                    ],
+                )
+
+    def test_prompt_home_navigation_restores_admin_root(self):
+        for load_handler, process_name in (
+            (load_deleteuser, "process_delete_user"),
+            (load_edituser, "process_show_user"),
+        ):
+            with self.subTest(process=process_name):
+                module, bot = load_handler()
+
+                getattr(module, process_name)(make_message("🏠 Admin Menu"))
+
+                self.assertEqual(
+                    markup_text_rows(bot.replies[0][1]["reply_markup"])[0],
+                    ["✅ Confirmations", "📊 Server Info"],
+                )
+
+    def test_add_user_cancel_paths_restore_admin_root_keyboard(self):
+        adduser, bot = load_adduser()
+
+        adduser.process_add_user_step1(make_message("❌ Cancel"))
+        adduser.process_add_user_step2(make_message("❌ Cancel"), "alice")
+        adduser.process_add_user_step3(make_message("❌ Cancel"), "alice", 10)
+
+        self.assertEqual(len(bot.replies), 3)
+        for _args, kwargs in bot.replies:
+            self.assertEqual(
+                markup_text_rows(kwargs["reply_markup"]),
+                [
+                    ["✅ Confirmations", "📊 Server Info"],
+                    ["👥 Users", "💳 Sales"],
+                    ["💼 Resellers", "⚙️ System"],
+                    ["📊 Reports", "📣 Messaging"],
+                ],
+            )
+
+    def test_add_user_callback_exit_clears_inline_controls_and_restores_root(self):
+        adduser, bot = load_adduser()
+
+        adduser._finish_add_user_callback(make_call(), "Failed to add user.")
+
+        self.assertEqual(bot.edited_messages[0][0][0], "Failed to add user.")
+        self.assertIsInstance(
+            bot.edited_messages[0][1]["reply_markup"],
+            DummyMarkup,
+        )
+        self.assertEqual(
+            bot.sent_messages[0][0],
+            (555, "Admin dashboard is ready."),
+        )
+        self.assertEqual(
+            markup_text_rows(bot.sent_messages[0][1]["reply_markup"]),
+            [
+                ["✅ Confirmations", "📊 Server Info"],
+                ["👥 Users", "💳 Sales"],
+                ["💼 Resellers", "⚙️ System"],
+                ["📊 Reports", "📣 Messaging"],
+            ],
+        )
+
+    def test_add_user_callback_outcomes_restore_admin_navigation(self):
+        class DummyQR:
+            def save(self, buffer, _format):
+                buffer.write(b"qr")
+
+        class FakeClient:
+            server_id = "main"
+
+            def __init__(self, add_result=True, uri=None):
+                self.add_result = add_result
+                self.uri = {"normal_sub": "https://example.test/sub"} if uri is None else uri
+
+            def add_user(self, *_args, **_kwargs):
+                return self.add_result
+
+            def get_user_uri(self, _username):
+                return self.uri
+
+        class FakeMultiServerAPI:
+            def __init__(self, client):
+                self.client = client
+
+            def select_server_for_new_user(self):
+                return self.client
+
+            def record_created_user(self, *_args):
+                return None
+
+        scenarios = {
+            "no_server": None,
+            "api_failure": FakeClient(add_result=False),
+            "missing_uri": FakeClient(uri={}),
+            "success": FakeClient(),
+        }
+
+        for scenario, client in scenarios.items():
+            with self.subTest(scenario=scenario):
+                adduser, bot = load_adduser()
+                adduser.MultiServerAPI = lambda: FakeMultiServerAPI(client)
+                adduser.qrcode.make = lambda _url: DummyQR()
+
+                adduser.process_add_user_step4(make_add_user_call())
+
+                if scenario == "success":
+                    markup = bot.sent_photos[-1][1]["reply_markup"]
+                else:
+                    self.assertEqual(
+                        bot.sent_messages[-1][0],
+                        (555, "Admin dashboard is ready."),
+                    )
+                    markup = bot.sent_messages[-1][1]["reply_markup"]
+                self.assertEqual(
+                    markup_text_rows(markup)[0],
+                    ["✅ Confirmations", "📊 Server Info"],
+                )
+
+        adduser, bot = load_adduser()
+        adduser.MultiServerAPI = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+
+        adduser.process_add_user_step4(make_add_user_call())
+
+        self.assertEqual(
+            bot.sent_messages[-1][0],
+            (555, "Admin dashboard is ready."),
+        )
 
 
 if __name__ == "__main__":

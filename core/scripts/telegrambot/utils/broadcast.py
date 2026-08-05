@@ -1,6 +1,6 @@
 from telebot import types
 from utils.command import bot, is_admin, ADMIN_USER_IDS
-from utils.common import create_main_markup
+from utils.common import admin_action_text, create_main_markup
 from utils.api_client import MultiServerAPI
 from utils.reseller import get_all_resellers
 from utils import test_config_store
@@ -360,7 +360,7 @@ def get_user_ids(filter_type):
         print(f"Error getting user IDs: {str(e)}")
         return [], {}
 
-@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '📢 Broadcast Message')
+@bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text("broadcast_message"))
 def start_broadcast(message):
     msg = bot.reply_to(
         message,

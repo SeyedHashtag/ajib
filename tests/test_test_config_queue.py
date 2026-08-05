@@ -102,6 +102,9 @@ def install_stubs():
     sys.modules["utils.command"] = command_stub
 
     common_stub = types.ModuleType("utils.common")
+    common_stub.admin_action_text = lambda key: {
+        "manage_test_accounts": "🧪 Manage Test Accounts",
+    }[key]
     common_stub.create_main_markup = lambda *args, **kwargs: None
     sys.modules["utils.common"] = common_stub
 

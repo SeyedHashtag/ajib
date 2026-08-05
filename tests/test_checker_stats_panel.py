@@ -92,6 +92,9 @@ def load_payment_setup():
     sys.modules["utils.command"] = command_stub
 
     common_stub = types.ModuleType("utils.common")
+    common_stub.admin_action_text = lambda key: {
+        "payment_settings": "💳 Payment Settings",
+    }[key]
     common_stub.create_main_markup = lambda *args, **kwargs: DummyMarkup()
     sys.modules["utils.common"] = common_stub
 

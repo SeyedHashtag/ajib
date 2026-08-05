@@ -21,9 +21,14 @@ class DummyBot:
         self.edits = []
         self.answers = []
         self.sent_messages = []
+        self.message_handlers = []
 
     def message_handler(self, *args, **kwargs):
-        return lambda func: func
+        def decorator(func):
+            self.message_handlers.append((func, args, kwargs))
+            return func
+
+        return decorator
 
     def callback_query_handler(self, *args, **kwargs):
         return lambda func: func
@@ -89,6 +94,12 @@ def install_stubs():
     command_stub.ADMIN_USER_IDS = []
     command_stub.is_admin = lambda user_id: False
     sys.modules["utils.command"] = command_stub
+
+    common_stub = types.ModuleType("utils.common")
+    common_stub.admin_action_text = lambda key: {
+        "manage_resellers": "💼 Manage Resellers",
+    }[key]
+    sys.modules["utils.common"] = common_stub
 
     language_stub = types.ModuleType("utils.language")
     language_stub.get_user_language = lambda user_id: "en"
@@ -351,6 +362,38 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
         reseller_handlers.RESELLER_CUSTOMER_CONFIG_INFLIGHT.clear()
         reseller_handlers.RESELLER_REQUEST_INFLIGHT.clear()
         reseller_handlers.RESELLER_RENEWAL_INFLIGHT.clear()
+
+    def test_admin_reseller_button_accepts_english_and_localized_aliases(self):
+        original_translations = reseller_handlers.BUTTON_TRANSLATIONS
+        original_is_admin = reseller_handlers.is_admin
+        self.addCleanup(
+            setattr,
+            reseller_handlers,
+            "BUTTON_TRANSLATIONS",
+            original_translations,
+        )
+        self.addCleanup(setattr, reseller_handlers, "is_admin", original_is_admin)
+        reseller_handlers.BUTTON_TRANSLATIONS = {
+            "en": {"manage_resellers": "💼 Manage Resellers"},
+            "fa": {"manage_resellers": "💼 مدیریت نمایندگان"},
+        }
+        reseller_handlers.is_admin = lambda user_id: user_id == 1
+        predicate = next(
+            kwargs["func"]
+            for func, _args, kwargs in reseller_handlers.bot.message_handlers
+            if func is reseller_handlers.admin_manage_resellers
+        )
+
+        def message(user_id, text):
+            return types.SimpleNamespace(
+                text=text,
+                from_user=types.SimpleNamespace(id=user_id),
+            )
+
+        self.assertTrue(predicate(message(1, "💼 Manage Resellers")))
+        self.assertTrue(predicate(message(1, "💼 مدیریت نمایندگان")))
+        self.assertFalse(predicate(message(2, "💼 Manage Resellers")))
+        self.assertFalse(predicate(message(1, None)))
 
     def install_renewal_stub(self, offer, unavailable="Renewal is not available"):
         original = sys.modules.get("utils.renewal")
