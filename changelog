@@ -1,3 +1,12 @@
+## v1.18.5
+✨ Add account credit payments, referral buyer discounts, reseller recruitment rewards, and purchase incentives
+✨ Add localized customer journeys with guided plan selection, checkout reminders, renewal recovery, and contextual welcomes
+✨ Add growth-event tracking and funnel reports for administrators and hosted-bot owners
+🌐 Improve hosted storefront localization, branding privacy, customer status details, and reseller-facing guidance
+🛠️ Make checkout incentives transactional and add configurable feature flags for growth reminders and rewards
+🐛 Improve trial, renewal, expired-account, and traffic-monitoring alerts while suppressing disabled lifecycle notifications
+✅ Expand regression coverage for credit, incentives, referrals, recruitment, localization, growth reporting, and customer lifecycle flows
+
 ## v1.18.4
 ✨ Show hosted-bot owners per-plan cost, customer price, gross profit, referral payout, and net profit
 ✨ Add localized sales statistics for reseller storefronts with payment and financial summaries
