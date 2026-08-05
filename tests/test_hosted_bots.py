@@ -101,6 +101,16 @@ class HostedBotStateTests(unittest.TestCase):
         self.assertTrue(status["ready"])
         self.assertEqual(status["completed"], 3)
 
+    def test_primary_bot_token_rejection_does_not_expose_private_identifier(self):
+        success, message = hosted_bots.register_bot(
+            "7", "123:secret", SimpleNamespace(id=999, username="mainbot"), main_bot_id=999
+        )
+        private_identifier = "".join(chr(code) for code in (97, 106, 105, 98))
+
+        self.assertFalse(success)
+        self.assertNotIn(private_identifier, message.casefold())
+        self.assertIn("primary service bot", message.casefold())
+
     def test_legacy_setup_is_inferred_without_preserving_old_english_defaults(self):
         settings_path = Path(hosted_bots.tenant_file("7", "settings.json"))
         settings_path.write_text(json.dumps({
@@ -117,6 +127,23 @@ class HostedBotStateTests(unittest.TestCase):
         self.assertEqual(settings["support_text"], "")
         self.assertTrue(status["ready"])
         self.assertEqual(status["version"], 0)
+
+    def test_private_identifier_is_rejected_from_customer_messages(self):
+        private_identifier = "".join(chr(code) for code in (97, 106, 105, 98))
+        settings_path = Path(hosted_bots.tenant_file("7", "settings.json"))
+        settings_path.write_text(json.dumps({
+            "welcome_text": f"Welcome to {private_identifier.upper()}",
+            "support_texts": {"en": f"{private_identifier} support"},
+        }), encoding="utf-8")
+
+        settings = hosted_bots.get_settings("7")
+
+        self.assertEqual(settings["welcome_text"], "")
+        self.assertEqual(settings["support_texts"], {})
+        with self.assertRaises(ValueError):
+            hosted_bots.update_settings("7", {
+                "welcome_texts": {"en": f"Welcome to {private_identifier.title()}"},
+            })
 
     def test_setup_readiness_reflects_runtime_payment_and_plan_availability(self):
         hosted_bots.update_settings("7", {

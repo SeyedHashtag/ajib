@@ -24,12 +24,20 @@ def _positive_int_env(name, default):
 
 MAX_ACTIVE_BOTS = _positive_int_env("AJIB_MAX_HOSTED_BOTS", 50)
 CRYPTO_DISCOUNT_PERCENT = Decimal("5")
+INVITED_BUYER_DISCOUNT_PERCENT = Decimal("5")
+MAX_CUSTOMER_DISCOUNT_PERCENT = Decimal("10")
 MINIMUM_PAYOUT = Decimal("2.00")
 SETUP_VERSION = 1
 SETUP_REQUIRED_STEPS = ("pricing", "payments", "plans")
 SETUP_CONFIRMABLE_STEPS = {"pricing", "plans", "messages"}
 LEGACY_WELCOME_TEXT = "Welcome!"
 LEGACY_SUPPORT_TEXT = "Contact the reseller for support."
+SUPPORTED_STOREFRONT_LANGUAGES = ("en", "fa", "ru", "tk")
+PRIVATE_PROJECT_IDENTIFIER = "".join(chr(code) for code in (97, 106, 105, 98))
+
+
+def _contains_private_identifier(value):
+    return PRIVATE_PROJECT_IDENTIFIER in str(value or "").casefold()
 
 
 def _now():
@@ -79,6 +87,9 @@ def default_settings():
         "card_number": "",
         "welcome_text": "",
         "support_text": "",
+        "welcome_texts": {},
+        "support_texts": {},
+        "recommended_plan_id": "",
         "referral_margin_percent": 20.0,
         "crypto_enabled": False,
         "setup_version": 0,
@@ -133,10 +144,33 @@ def _validate_setting(key, value):
             if len(normalized) > 200:
                 raise ValueError("Too many selected plans")
         return normalized
+    if key in {"welcome_texts", "support_texts"}:
+        if not isinstance(value, dict):
+            raise ValueError(f"Invalid {key}")
+        normalized = {}
+        for language, message in value.items():
+            language_code = str(language).strip().lower()
+            if language_code not in SUPPORTED_STOREFRONT_LANGUAGES:
+                raise ValueError(f"Invalid {key}")
+            text = str(message or "").strip()
+            if "\x00" in text or len(text) > 2000 or _contains_private_identifier(text):
+                raise ValueError(f"Invalid {key}")
+            if text:
+                normalized[language_code] = text
+        return normalized
+    if key == "recommended_plan_id":
+        plan_id = str(value or "").strip()
+        if plan_id and (not plan_id.isdigit() or len(plan_id) > 12):
+            raise ValueError("Invalid recommended plan")
+        return plan_id
     if key in {"card_number", "welcome_text", "support_text"}:
         limits = {"card_number": 64, "welcome_text": 2000, "support_text": 2000}
         text = str(value or "").strip()
-        if "\x00" in text or len(text) > limits[key]:
+        if (
+            "\x00" in text
+            or len(text) > limits[key]
+            or (key != "card_number" and _contains_private_identifier(text))
+        ):
             raise ValueError(f"Invalid {key}")
         if key == "card_number" and any(character not in "0123456789 -" for character in text):
             raise ValueError("Invalid card number")
@@ -163,6 +197,21 @@ def _normalized_settings(stored):
         if settings["support_text"] == LEGACY_SUPPORT_TEXT:
             settings["support_text"] = ""
     return settings
+
+
+def localized_storefront_text(settings, field, language, default=""):
+    """Resolve localized storefront copy while retaining legacy single-text fallback."""
+    if field not in {"welcome", "support"}:
+        raise ValueError("Invalid localized storefront field")
+    current = settings if isinstance(settings, dict) else {}
+    language_code = str(language or "en").split("-", 1)[0].lower()
+    messages = current.get(f"{field}_texts")
+    if isinstance(messages, dict):
+        value = messages.get(language_code) or messages.get("en")
+        if str(value or "").strip():
+            return str(value).strip()
+    legacy = str(current.get(f"{field}_text") or "").strip()
+    return legacy or str(default or "")
 
 
 def get_settings(reseller_id):
@@ -192,7 +241,12 @@ def get_setup_status(reseller_id, settings=None, crypto_available=True, plans_av
     version = int(current.get("setup_version", 0) or 0)
     if version == 0:
         completed = {"pricing", "plans"}
-        if current.get("welcome_text") or current.get("support_text"):
+        if (
+            current.get("welcome_text")
+            or current.get("support_text")
+            or current.get("welcome_texts")
+            or current.get("support_texts")
+        ):
             completed.add("messages")
     else:
         completed = {
@@ -228,7 +282,12 @@ def mark_setup_step(reseller_id, step, completed=True):
     current = get_settings(reseller_id)
     if int(current.get("setup_version", 0) or 0) == 0:
         confirmed = {"pricing", "plans"}
-        if current.get("welcome_text") or current.get("support_text"):
+        if (
+            current.get("welcome_text")
+            or current.get("support_text")
+            or current.get("welcome_texts")
+            or current.get("support_texts")
+        ):
             confirmed.add("messages")
     else:
         confirmed = set(current.get("setup_completed_steps", []))
@@ -251,6 +310,7 @@ def calculate_quote(
     referral_margin_percent=0,
     referred=False,
     retail_base=None,
+    buyer_discount_percent=0,
 ):
     wholesale_amount = _money(wholesale)
     if wholesale_amount < 0:
@@ -260,9 +320,27 @@ def calculate_quote(
         raise ValueError("Retail base price cannot be negative")
     markup = Decimal(str(_finite_setting(markup_percent or 0, "markup percentage", 0, 1000)))
     retail = _money(retail_base_amount * (Decimal("1") + markup / Decimal("100")))
-    collected = _money(retail * (Decimal("1") - CRYPTO_DISCOUNT_PERCENT / Decimal("100")))
+    buyer_discount = Decimal(str(_finite_setting(
+        buyer_discount_percent or 0,
+        "buyer discount percentage",
+        0,
+        float(MAX_CUSTOMER_DISCOUNT_PERCENT),
+    )))
+    card_discount = min(MAX_CUSTOMER_DISCOUNT_PERCENT, buyer_discount)
+    crypto_discount = min(
+        MAX_CUSTOMER_DISCOUNT_PERCENT,
+        buyer_discount + CRYPTO_DISCOUNT_PERCENT,
+    )
+    crypto_component_discount = max(Decimal("0"), crypto_discount - card_discount)
+    card_collected = _money(retail * (Decimal("1") - card_discount / Decimal("100")))
+    collected = _money(retail * (Decimal("1") - crypto_discount / Decimal("100")))
+    buyer_discount_amount = _money(retail - card_collected)
+    crypto_discount_amount = _money(retail - collected)
+    crypto_component_discount_amount = _money(
+        max(Decimal("0"), crypto_discount_amount - buyer_discount_amount)
+    )
     margin = _money(collected - wholesale_amount)
-    card_margin = _money(retail - wholesale_amount)
+    card_margin = _money(card_collected - wholesale_amount)
     referral_rate = (
         Decimal(str(_finite_setting(referral_margin_percent or 0, "referral percentage", 0, 100)))
         if referred else Decimal("0")
@@ -273,6 +351,8 @@ def calculate_quote(
         "wholesale": float(wholesale_amount),
         "retail_base": float(retail_base_amount),
         "retail": float(retail),
+        "original_price": float(retail),
+        "card_collected": float(card_collected),
         "crypto_collected": float(collected),
         "crypto_margin": float(margin),
         "card_margin": float(card_margin),
@@ -280,6 +360,16 @@ def calculate_quote(
         "crypto_referral_reward": float(referral_reward),
         "card_referral_reward": float(card_referral_reward),
         "crypto_supported": collected >= wholesale_amount,
+        "card_supported": card_collected >= wholesale_amount,
+        "buyer_discount_percent": float(buyer_discount),
+        "card_discount_percent": float(card_discount),
+        "crypto_discount_percent": float(crypto_discount),
+        "crypto_component_discount_percent": float(crypto_component_discount),
+        "buyer_discount_amount": float(buyer_discount_amount),
+        "crypto_component_discount_amount": float(crypto_component_discount_amount),
+        "card_discount_amount": float(buyer_discount_amount),
+        "crypto_discount_amount": float(crypto_discount_amount),
+        # Kept for backward compatibility with records and owner pricing views.
         "discount_percent": float(CRYPTO_DISCOUNT_PERCENT),
     }
 
@@ -325,7 +415,7 @@ def register_bot(reseller_id, token, bot_info, main_bot_id=None):
     if not bot_id or not username:
         return False, "Telegram did not return a usable bot identity."
     if main_bot_id is not None and bot_id == str(main_bot_id):
-        return False, "The main ajib bot token cannot be used as a reseller bot."
+        return False, "The primary service bot token cannot be used as a reseller bot."
 
     fingerprint = _token_fingerprint(clean_token)
     with locked_json(REGISTRY_FILE, {}) as registry:

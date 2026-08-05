@@ -62,6 +62,16 @@ MONEY_QUANTUM = Decimal('0.01')
 DEBT_CHARGE_EPSILON = 0.005
 
 
+def _update_recruitment_milestone(reseller_id, reseller_data):
+    """Best-effort growth accounting; reseller fulfillment never depends on it."""
+    try:
+        from utils.recruitment import evaluate_and_notify_recruitment_milestone
+
+        evaluate_and_notify_recruitment_milestone(reseller_id, reseller_data)
+    except Exception:
+        pass
+
+
 def _safe_float(value, default=0.0):
     try:
         return float(value)
@@ -751,6 +761,7 @@ def add_reseller_debt(user_id, amount, config_data):
                     resellers[user_id] = current
 
                     _write_resellers_file(resellers)
+                    _update_recruitment_milestone(user_id, current)
                     return True
                 return False
         except Exception:
@@ -783,6 +794,7 @@ def record_funded_reseller_config(user_id, wholesale_amount, config_data):
                 current = _ensure_reseller_defaults(current)
                 resellers[user_id] = current
                 _write_resellers_file(resellers)
+                _update_recruitment_milestone(user_id, current)
                 return True
         except Exception:
             return False
@@ -818,8 +830,10 @@ def record_funded_reseller_renewal(user_id, username, wholesale_amount, renewal_
                 target['cleanup_status'] = 'renewed'
                 current['total_paid'] = get_reseller_total_paid(current) + _safe_float(wholesale_amount, 0.0)
                 current['last_payment_at'] = _now_str()
-                resellers[user_id] = _ensure_reseller_defaults(current)
+                current = _ensure_reseller_defaults(current)
+                resellers[user_id] = current
                 _write_resellers_file(resellers)
+                _update_recruitment_milestone(user_id, current)
                 return True
         except Exception:
             return False
@@ -1561,6 +1575,7 @@ def apply_reseller_payment(user_id, amount, payment_id=None, allocation_kind='se
                 resellers[user_id] = current
 
                 _write_resellers_file(resellers)
+                _update_recruitment_milestone(user_id, current)
                 return True, new_debt
         except Exception:
             return False, None

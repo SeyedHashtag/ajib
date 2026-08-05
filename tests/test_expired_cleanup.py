@@ -173,6 +173,11 @@ def load_module():
     ), None)
     sys.modules["utils.renewal"] = renewal_stub
 
+    growth_events_stub = types.ModuleType("utils.growth_events")
+    growth_events_stub.EVENT_RENEWAL_PROMPTED = "renewal_prompted"
+    growth_events_stub.record_growth_event = lambda *args, **kwargs: None
+    sys.modules["utils.growth_events"] = growth_events_stub
+
     spec = importlib.util.spec_from_file_location("expired_cleanup_under_test", MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -274,6 +279,40 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(chat_id, 1988)
         callbacks = self.callback_data_from_markup(kwargs["reply_markup"])
         self.assertEqual(callbacks, ["renew_plan:renew-token"])
+
+    def test_customer_cleanup_notice_records_one_expiry_recovery_prompt(self):
+        events = []
+        growth_events_stub = sys.modules["utils.growth_events"]
+        growth_events_stub.record_growth_event = (
+            lambda *args, **kwargs: events.append((args, kwargs))
+        )
+        last_state = {
+            **self.expired_user(),
+            "account_creation_date": "2026-05-01 12:00:00",
+        }
+
+        error = self.cleanup._notify_candidate(
+            {
+                "source": "customer",
+                "telegram_user_id": "1988",
+                "username": "alice",
+                "server_id": "s1",
+                "_api_client": object(),
+                "_user_data": self.expired_user(),
+            },
+            grace_hours=24,
+            last_state=last_state,
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], ("renewal_prompted",))
+        self.assertEqual(events[0][1]["user_id"], 1988)
+        self.assertIn(
+            "expiry-recovery:s1:alice:2026-05-01 12:00:00",
+            events[0][1]["deduplication_key"],
+        )
+        self.assertEqual(events[0][1]["metadata"]["basis"], "expired")
 
     def test_reseller_cleanup_notice_includes_customer_name_and_renewal_button_when_eligible(self):
         edit_plans_stub = types.ModuleType("utils.edit_plans")
@@ -1143,7 +1182,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(len(self.cleanup._test_bot.sent_messages), 1)
         self.assertIn("|sara88|r303|", self.cleanup._test_bot.sent_messages[0][1])
 
-    def test_reseller_customer_notification_uses_na_for_missing_or_invalid_name(self):
+    def test_reseller_customer_notification_uses_neutral_fallback_for_missing_name(self):
         self.write_json(self.cleanup.TEST_CONFIGS_FILE, {})
         self.write_json(self.cleanup.PAYMENTS_FILE, {})
         self.write_json(self.cleanup.RESELLERS_FILE, {
@@ -1154,7 +1193,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
 
         self.assertEqual(len(self.cleanup._test_bot.sent_messages), 1)
-        self.assertIn("|N/A|r303|", self.cleanup._test_bot.sent_messages[0][1])
+        self.assertIn("|—|r303|", self.cleanup._test_bot.sent_messages[0][1])
 
     def test_bot_record_missing_from_vpn_is_ignored_without_notification(self):
         self.write_json(self.cleanup.TEST_CONFIGS_FILE, {

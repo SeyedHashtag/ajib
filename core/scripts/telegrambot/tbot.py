@@ -11,70 +11,25 @@ if __name__ == "__main__":
 
 from telebot import types
 from utils import *
-from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 import traceback
-import os
+import logging
+from types import SimpleNamespace
 from utils.telegram_safe import safe_reply_to, safe_send_message
 
 EXPIRED_CLEANUP_INTERVAL_SECONDS = 3600
 
-
-def _int_env(name, default, minimum=1):
-    try:
-        value = int(os.getenv(name, default))
-    except (TypeError, ValueError):
-        return default
-    return value if value >= minimum else default
-
-
-START_TEST_CONFIG_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_int_env("AJIB_START_JOB_WORKERS", 2),
-    thread_name_prefix="ajib-start",
-)
-START_TEST_CONFIG_LOCK = threading.Lock()
-START_TEST_CONFIG_INFLIGHT = set()
-
-
-def _create_automatic_test_config_job(user_id, chat_id, telegram_username, language):
-    try:
-        create_test_config(
-            user_id,
-            chat_id,
-            is_automatic=True,
-            language=language,
-            telegram_username=telegram_username,
-        )
-    except Exception as e:
-        print(f"Error creating automatic test config for {user_id}: {e}")
-    finally:
-        with START_TEST_CONFIG_LOCK:
-            START_TEST_CONFIG_INFLIGHT.discard(user_id)
-
-
-def enqueue_automatic_test_config(user_id, chat_id, telegram_username=None, language=None):
-    with START_TEST_CONFIG_LOCK:
-        if user_id in START_TEST_CONFIG_INFLIGHT:
-            return False
-        START_TEST_CONFIG_INFLIGHT.add(user_id)
-    try:
-        START_TEST_CONFIG_EXECUTOR.submit(
-            _create_automatic_test_config_job,
-            user_id,
-            chat_id,
-            telegram_username,
-            language,
-        )
-    except Exception:
-        with START_TEST_CONFIG_LOCK:
-            START_TEST_CONFIG_INFLIGHT.discard(user_id)
-        raise
-    return True
-
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     user_id = message.from_user.id
+    admin_user = is_admin(user_id)
+    language = None
+    if not admin_user:
+        language = resolve_user_language(
+            user_id,
+            getattr(message.from_user, "language_code", None),
+        )
     
     # Check for referral
     args = message.text.split()
@@ -88,31 +43,69 @@ def send_welcome(message):
                 first_name=message.from_user.first_name,
                 last_name=message.from_user.last_name
             )
-            lang = get_user_language(user_id)
+            lang = language or get_user_language(user_id)
             if success:
-                safe_send_message(bot, user_id, get_message_text(lang, "referral_registered").format(referrer_id=result))
+                record_main_growth_event(
+                    "referral_attributed",
+                    user_id,
+                    language=lang,
+                    referral_campaign="main_invite",
+                    deduplication_key=f"main:referral_attributed:{user_id}",
+                    referrer_id=str(result),
+                )
+                if language:
+                    safe_send_message(bot, user_id, get_message_text(lang, "referral_registered"))
+                else:
+                    from utils.language import defer_referral_confirmation
+
+                    defer_referral_confirmation(user_id)
         except Exception as e:
             print(f"Error processing referral: {e}")
 
-    if is_admin(user_id):
+    if admin_user:
         markup = create_main_markup(is_admin=True)
         safe_reply_to(bot, message, "Welcome to the Admin Dashboard!", reply_markup=markup)
     else:
-        language = get_user_language(user_id)
-        markup = create_main_markup(is_admin=False, user_id=user_id)
-        safe_reply_to(bot, message, "Welcome!", reply_markup=markup)
+        if not language:
+            safe_reply_to(
+                bot,
+                message,
+                get_message_text("en", "language_selection_prompt"),
+                reply_markup=build_language_selection_markup(),
+            )
+            return
 
-        # Automatically create a test config when enabled; otherwise preserve interest silently.
-        if not has_used_test_config(user_id):
-            if is_test_creation_disabled():
-                add_to_waiting_list(user_id, message.from_user.username, language)
-            else:
-                enqueue_automatic_test_config(
-                    user_id,
-                    message.chat.id,
-                    telegram_username=message.from_user.username,
-                    language=language,
-                )
+        welcome_text, welcome_markup = build_customer_welcome(user_id, language)
+        safe_reply_to(
+            bot,
+            message,
+            welcome_text,
+            reply_markup=welcome_markup,
+            parse_mode="Markdown",
+        )
+        safe_send_message(
+            bot,
+            message.chat.id,
+            get_message_text(language, "main_menu_ready"),
+            reply_markup=create_main_markup(is_admin=False, user_id=user_id),
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "welcome:plans")
+def handle_welcome_plans(call):
+    safe_answer_callback_query(bot, call.id)
+    show_plans(call.message.chat.id, call.from_user.id, call.message.message_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "welcome:configs")
+def handle_welcome_configs(call):
+    safe_answer_callback_query(bot, call.id)
+    proxy_message = SimpleNamespace(
+        text=get_button_text(get_user_language(call.from_user.id), "my_configs"),
+        from_user=call.from_user,
+        chat=call.message.chat,
+    )
+    my_configs(proxy_message)
 
 
 @bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == "❌ Cancel")
@@ -122,6 +115,51 @@ def handle_admin_cancel_fallback(message):
         message,
         "Operation canceled.",
         reply_markup=create_main_markup(is_admin=True),
+    )
+
+
+@bot.message_handler(
+    func=lambda message: (
+        is_admin(message.from_user.id)
+        and message.text == GROWTH_FUNNEL_BUTTON_TEXT
+    )
+)
+def show_admin_growth_funnel(message):
+    """Render a private aggregate 30-day funnel comparison for administrators."""
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        # Keep reporting optional at import time so a damaged analytics store
+        # cannot prevent the primary bot and its customer handlers from starting.
+        from utils.growth_reporting import (
+            format_growth_comparison,
+            main_growth_comparison,
+        )
+
+        report = main_growth_comparison(days=30)
+        text = format_growth_comparison(
+            report,
+            title="Main bot growth funnel",
+        )
+    except Exception as error:
+        logging.getLogger("ajib.growth_reporting").exception(
+            "Error building admin growth funnel: %s",
+            error,
+        )
+        safe_reply_to(
+            bot,
+            message,
+            "Growth funnel data is temporarily unavailable.",
+            reply_markup=create_main_markup(is_admin=True),
+        )
+        return
+
+    safe_reply_to(
+        bot,
+        message,
+        text,
+        reply_markup=create_main_markup(is_admin=True),
+        parse_mode="Markdown",
     )
 
 

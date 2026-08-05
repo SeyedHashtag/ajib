@@ -4,6 +4,11 @@ import html
 from telebot import types
 from utils.command import bot, ADMIN_USER_IDS, is_admin
 from utils.common import create_main_markup
+try:
+    from utils.common import record_main_growth_event
+except ImportError:
+    def record_main_growth_event(*args, **kwargs):
+        return False
 from utils.edit_plans import load_plans
 from utils.payments import CryptoPayment
 from utils.payment_records import (
@@ -63,6 +68,18 @@ TELEGRAM_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'
 CRYPTO_PAYMENT_DISCOUNT_PERCENT = 5
 PAYMENT_JOB_INFLIGHT = set()
 PAYMENT_JOB_LOCK = threading.Lock()
+PURCHASE_DISCLOSURES_FILE = os.getenv(
+    "AJIB_PURCHASE_DISCLOSURES_FILE",
+    "/etc/ajib/core/scripts/telegrambot/purchase_disclosures.json",
+)
+_PURCHASE_DISCLOSURE_FALLBACK = set()
+CARD_CHECKOUT_REMINDERS_FILE = os.getenv(
+    "AJIB_CARD_CHECKOUT_REMINDERS_FILE",
+    "/etc/ajib/core/scripts/telegrambot/card_checkout_reminders.json",
+)
+_CARD_CHECKOUT_FALLBACK = {}
+_CARD_CHECKOUT_FALLBACK_LOCK = threading.RLock()
+CHECKOUT_REMINDER_DELAY = datetime.timedelta(minutes=30)
 
 
 def _int_env(name, default, minimum=1):
@@ -103,13 +120,199 @@ def build_crypto_discount_metadata(original_amount):
     }
 
 
+def _reserve_checkout_incentives(
+    user_id,
+    reservation_id,
+    original_price,
+    payment_method,
+    *,
+    allow_account_credit=True,
+):
+    """Build and reserve the auditable main-store checkout quote."""
+    try:
+        from utils.purchase_incentives import release_main_checkout, reserve_main_checkout
+    except ImportError:
+        # Compatibility for isolated deployments/tests during a rolling update.
+        legacy = (
+            build_crypto_discount_metadata(original_price)
+            if payment_method == 'crypto'
+            else {
+                'price': float(original_price),
+                'original_price': float(original_price),
+                'discount_percent': 0.0,
+                'discount_amount': 0.0,
+            }
+        )
+        return {
+            **legacy,
+            'incentive_reservation_id': str(reservation_id),
+            'collected_amount': legacy['price'],
+            'referral_reward_base': legacy['price'],
+            'payment_discount_percent': (
+                CRYPTO_PAYMENT_DISCOUNT_PERCENT if payment_method == 'crypto' else 0.0
+            ),
+            'invite_discount_percent': 0.0,
+            'account_credit_reserved': 0.0,
+        }
+
+    quote = reserve_main_checkout(
+        user_id,
+        reservation_id,
+        original_price,
+        payment_method=payment_method,
+        payment_discount_percent=(
+            CRYPTO_PAYMENT_DISCOUNT_PERCENT if payment_method == 'crypto' else 0
+        ),
+        payments=get_user_payments(user_id),
+        allow_account_credit=allow_account_credit,
+    )
+    if (
+        payment_method == 'crypto'
+        and float(quote.get('price', 0) or 0) <= 0
+        and float(quote.get('account_credit_reserved', 0) or 0) > 0
+    ):
+        # A crypto discount is earned only when some crypto is actually paid.
+        # Requote without that discount. Credit may still fund part of the
+        # order, with only the remaining amount sent to the crypto gateway.
+        release_main_checkout(user_id, reservation_id)
+        quote = reserve_main_checkout(
+            user_id,
+            reservation_id,
+            original_price,
+            payment_method='account_credit',
+            payment_discount_percent=0,
+            payments=get_user_payments(user_id),
+            allow_account_credit=allow_account_credit,
+        )
+    quote['fully_credit_funded'] = bool(
+        float(quote.get('price', 0) or 0) <= 0
+        and float(quote.get('account_credit_reserved', 0) or 0) > 0
+    )
+    quote['incentive_reservation_id'] = str(reservation_id)
+    return quote
+
+
+def _release_checkout_incentives(user_id, reservation_id):
+    try:
+        from utils.purchase_incentives import release_main_checkout
+    except ImportError:
+        return False
+    release_main_checkout(user_id, reservation_id)
+    return True
+
+
+def _close_unpaid_gateway_checkout(payment_id, payment_record, gateway_status):
+    """Close terminal unpaid crypto checkouts and return reserved benefits."""
+    normalized = str(gateway_status or '').strip().lower()
+    terminal_statuses = {
+        'cancel': 'canceled',
+        'cancelled': 'canceled',
+        'canceled': 'canceled',
+        'expired': 'expired',
+        'failed': 'failed',
+        'rejected': 'rejected',
+    }
+    local_status = terminal_statuses.get(normalized)
+    if not local_status:
+        return False
+    update_payment_status(payment_id, local_status)
+    _release_checkout_incentives(
+        payment_record.get('user_id'),
+        payment_record.get('incentive_reservation_id')
+        or payment_record.get('account_credit_reservation_id'),
+    )
+    return True
+
+
+def _format_checkout_incentives(language, quote):
+    lines = []
+    invite_percent = float(quote.get('invite_discount_percent', 0) or 0)
+    if invite_percent > 0:
+        lines.append(get_message_text(language, 'invite_discount_summary').format(
+            percent=f"{invite_percent:g}",
+            discount_amount=format_usd_amount(quote.get('invite_discount_amount', 0)),
+        ))
+    credit = float(quote.get('account_credit_reserved', 0) or 0)
+    if credit > 0:
+        lines.append(get_message_text(language, 'account_credit_summary').format(
+            amount=format_usd_amount(credit),
+        ))
+    return "\n".join(lines)
+
+
+def _finalize_checkout_incentives(payment_id, payment_record):
+    """Finalize idempotent ledgers after fulfillment has succeeded."""
+    try:
+        from utils.purchase_incentives import finalize_main_checkout
+    except ImportError:
+        return None
+    result = finalize_main_checkout(payment_id, payment_record)
+    update_payment_record_fields(payment_id, {
+        'account_credit_consumed': result.get('credit_consumed', 0),
+        'invite_discount_redeemed': bool(result.get('invite_redeemed')),
+        'referral_reward': result.get('reward_amount', 0),
+        'reward_calculation_base': result.get('reward_base', 0),
+        'incentives_finalized_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    })
+    if result.get('reward_created') and float(result.get('reward_amount', 0) or 0) > 0:
+        try:
+            referrer_id = int(result['referrer_id'])
+            referrer_language = get_user_language(referrer_id)
+            safe_send_message(
+                bot,
+                referrer_id,
+                get_message_text(referrer_language, 'referral_purchase_rewarded').format(
+                    amount=format_usd_amount(result['reward_amount']),
+                ),
+            )
+        except Exception:
+            logging.getLogger('ajib.referrals').exception(
+                "Could not notify referrer for completed payment %s",
+                payment_id,
+            )
+    return result
+
+
+def _reconcile_completed_checkout_incentives():
+    for payment_id, record in load_payments().items():
+        if not isinstance(record, dict) or record.get('status') != 'completed':
+            continue
+        if record.get('incentives_finalized_at'):
+            continue
+        if not any(record.get(key) for key in (
+            'incentive_reservation_id',
+            'account_credit_reservation_id',
+            'referrer_id',
+        )):
+            continue
+        try:
+            _finalize_checkout_incentives(payment_id, record)
+        except Exception:
+            logging.getLogger('ajib.payments').exception(
+                "Failed to reconcile incentives for payment %s",
+                payment_id,
+            )
+
+
 def build_crypto_discount_display(language, discount_metadata):
+    crypto_percent = discount_metadata.get(
+        'payment_discount_percent',
+        discount_metadata.get('discount_percent', CRYPTO_PAYMENT_DISCOUNT_PERCENT),
+    )
+    crypto_discount_amount = discount_metadata.get(
+        'crypto_discount_amount',
+        discount_metadata.get('payment_discount_amount', discount_metadata['discount_amount']),
+    )
+    crypto_only_total = round(
+        float(discount_metadata['original_price']) - float(crypto_discount_amount or 0),
+        2,
+    )
     return {
         'summary': get_message_text(language, "crypto_discount_summary").format(
-            percent=discount_metadata['discount_percent'],
+            percent=f"{float(crypto_percent):g}",
             original_price=format_usd_amount(discount_metadata['original_price']),
-            discounted_price=format_usd_amount(discount_metadata['price']),
-            discount_amount=format_usd_amount(discount_metadata['discount_amount']),
+            discounted_price=format_usd_amount(crypto_only_total),
+            discount_amount=format_usd_amount(crypto_discount_amount),
         ),
         'button_text': get_crypto_discount_button_text(language),
     }
@@ -119,6 +322,417 @@ def get_crypto_discount_button_text(language):
     return get_message_text(language, "crypto_discount_button").format(
         percent=CRYPTO_PAYMENT_DISCOUNT_PERCENT
     )
+
+
+def _customer_plan_items(plans):
+    items = []
+    for gb, details in (plans or {}).items():
+        if not isinstance(details, dict) or details.get('target', 'both') == 'reseller':
+            continue
+        try:
+            numeric_gb = Decimal(str(gb))
+            price = Decimal(str(details['price']))
+            days = int(details['days'])
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            continue
+        if numeric_gb <= 0 or price < 0 or days <= 0:
+            continue
+        items.append((str(gb), details))
+    return sorted(items, key=lambda item: (Decimal(str(item[0])), Decimal(str(item[1]['price']))))
+
+
+def select_quick_pick_plans(plans, configured_plan_id=None):
+    """Select factual, deduplicated entry plans for a lower-friction catalog."""
+    items = _customer_plan_items(plans)
+    if not items:
+        return []
+
+    by_id = dict(items)
+    cheapest = min(items, key=lambda item: (Decimal(str(item[1]['price'])), Decimal(str(item[0]))))
+    best_value = min(
+        items,
+        key=lambda item: (
+            Decimal(str(item[1]['price'])) / Decimal(str(item[0])),
+            Decimal(str(item[1]['price'])),
+        ),
+    )
+
+    recommended_id = str(configured_plan_id or os.getenv("AJIB_RECOMMENDED_PLAN_ID") or "").strip()
+    recommended = by_id.get(recommended_id)
+    if recommended is None:
+        recommended = next(
+            (item for item in items if item[1].get("recommended") is True),
+            None,
+        )
+    recommendation_label = "quick_pick_recommended"
+    if recommended is None:
+        recommended = items[len(items) // 2]
+        recommendation_label = "quick_pick_balanced"
+
+    selected = []
+    seen = set()
+    for label_key, item in (
+        ("quick_pick_cheapest", cheapest),
+        (recommendation_label, recommended),
+        ("quick_pick_best_value", best_value),
+    ):
+        if item[0] in seen:
+            continue
+        seen.add(item[0])
+        selected.append((label_key, item[0], item[1]))
+    return selected
+
+
+def _plan_price_pair(language, price, exchange_rate):
+    usd = format_usd_amount(price)
+    toman = format_toman_amount(float(price) * exchange_rate)
+    key = "plan_price_pair_toman_first" if language == "fa" else "plan_price_pair_usd_first"
+    return get_message_text(language, key).format(usd=usd, toman=toman)
+
+
+def _plan_button_text(language, gb, details, exchange_rate, label_key=None):
+    label = f"{get_message_text(language, label_key)} · " if label_key else ""
+    return get_message_text(language, "customer_plan_button").format(
+        label=label,
+        plan_gb=gb,
+        price_pair=_plan_price_pair(language, details['price'], exchange_rate),
+        days=details['days'],
+    )
+
+
+def build_plan_payment_totals(
+    language,
+    plan_gb,
+    price,
+    exchange_rate,
+    *,
+    invite_discount_percent=0,
+):
+    original = Decimal(str(price))
+    invite_percent = Decimal(str(invite_discount_percent or 0))
+    try:
+        from utils.referral import stacked_discount_percent
+
+        crypto_percent = Decimal(str(stacked_discount_percent(
+            invite_percent,
+            CRYPTO_PAYMENT_DISCOUNT_PERCENT,
+        )))
+    except ImportError:
+        crypto_percent = min(
+            Decimal('10'),
+            invite_percent + Decimal(str(CRYPTO_PAYMENT_DISCOUNT_PERCENT)),
+        )
+    card_total = (
+        original * (Decimal('1') - invite_percent / Decimal('100'))
+    ).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    crypto_total = (
+        original * (Decimal('1') - crypto_percent / Decimal('100'))
+    ).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    key = "plan_payment_totals_toman_first" if language == "fa" else "plan_payment_totals_usd_first"
+    return get_message_text(language, key).format(
+        plan_gb=plan_gb,
+        card_total=format_toman_amount(float(card_total) * exchange_rate),
+        crypto_total=format_usd_amount(crypto_total),
+        original_usd=format_usd_amount(price),
+        crypto_percent=f"{float(crypto_percent):g}",
+    )
+
+
+_PAYMENT_STATUS_TRANSLATION_KEYS = {
+    'completed': 'payment_status_completed',
+    'complete': 'payment_status_completed',
+    'processing': 'payment_status_processing',
+    'pending': 'payment_status_pending_label',
+    'paid': 'payment_status_paid',
+    'failed': 'payment_status_failed',
+    'expired': 'payment_status_expired',
+    'rejected': 'payment_status_rejected',
+    'canceled': 'payment_status_canceled',
+    'cancelled': 'payment_status_canceled',
+}
+
+
+def _localized_payment_status(language, status):
+    key = _PAYMENT_STATUS_TRANSLATION_KEYS.get(
+        str(status or '').strip().lower(),
+        'payment_status_unknown',
+    )
+    return get_message_text(language, key)
+
+
+def _localized_ipv4_info(language, ipv4_url):
+    if not ipv4_url:
+        return ''
+    return get_message_text(language, 'renewal_ipv4_line').format(ipv4_url=ipv4_url)
+
+
+def _invite_discount_preview(user_id):
+    try:
+        from utils.referral import (
+            combined_discount_cap_percent,
+            get_invitee_discount_eligibility,
+        )
+
+        eligibility = get_invitee_discount_eligibility(
+            user_id,
+            payments=get_user_payments(user_id),
+        )
+        if not eligibility.get('eligible'):
+            return 0.0
+        return min(
+            float(eligibility.get('percent', 0) or 0),
+            float(combined_discount_cap_percent()),
+        )
+    except Exception:
+        return 0.0
+
+
+def _consume_purchase_disclosure(user_id):
+    """Return True once per customer and persist that the disclosure was shown."""
+    key = str(user_id)
+    try:
+        from utils.atomic_store import locked_json
+
+        with locked_json(PURCHASE_DISCLOSURES_FILE, {}) as stored:
+            if not isinstance(stored, dict):
+                raise ValueError("Purchase disclosure store must contain an object.")
+            if key in stored:
+                return False
+            stored[key] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            return True
+    except Exception:
+        if key in _PURCHASE_DISCLOSURE_FALLBACK:
+            return False
+        _PURCHASE_DISCLOSURE_FALLBACK.add(key)
+        return True
+
+
+def _checkout_reminders_enabled():
+    try:
+        from utils.growth_features import REMINDERS, is_growth_feature_enabled
+
+        return is_growth_feature_enabled(REMINDERS)
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        # Compatibility with isolated tests and rolling upgrades that have not
+        # loaded the shared growth feature module yet.
+        return str(os.getenv("AJIB_BUYER_REMINDERS_ENABLED", "true")).strip().lower() not in {
+            "0", "false", "no", "off",
+        }
+    except ValueError as error:
+        logging.getLogger('ajib.payments').error(
+            "Checkout reminders disabled because the feature flag is invalid: %s",
+            error,
+        )
+        return False
+
+
+def _mutate_card_checkouts(mutator):
+    """Atomically mutate durable pre-receipt card checkout state."""
+    try:
+        from utils.atomic_store import locked_json
+
+        with locked_json(CARD_CHECKOUT_REMINDERS_FILE, {}) as records:
+            if not isinstance(records, dict):
+                raise ValueError("Card checkout reminder store must contain an object.")
+            return mutator(records)
+    except (ImportError, ModuleNotFoundError):
+        # Some compatibility tests intentionally load purchase_plan without
+        # the repository-backed storage layer.
+        with _CARD_CHECKOUT_FALLBACK_LOCK:
+            return mutator(_CARD_CHECKOUT_FALLBACK)
+
+
+def _register_card_checkout(
+    user_id,
+    chat_id,
+    plan_gb,
+    final_amount,
+    resume_callback,
+    *,
+    now=None,
+    checkout_id=None,
+):
+    current = now or datetime.datetime.now()
+    checkout_id = str(checkout_id or uuid.uuid4())
+    timestamp = current.strftime('%Y-%m-%d %H:%M:%S')
+    superseded = []
+
+    def register(records):
+        for record in records.values():
+            if (
+                isinstance(record, dict)
+                and str(record.get('user_id')) == str(user_id)
+                and record.get('status') == 'waiting_receipt'
+            ):
+                record['status'] = 'superseded'
+                record['closed_at'] = timestamp
+                superseded.append(str(record.get('checkout_id') or ''))
+        records[checkout_id] = {
+            'checkout_id': checkout_id,
+            'user_id': user_id,
+            'chat_id': chat_id,
+            'plan_gb': str(plan_gb),
+            'final_amount': float(final_amount),
+            'resume_callback': str(resume_callback),
+            'status': 'waiting_receipt',
+            'created_at': timestamp,
+        }
+
+    _mutate_card_checkouts(register)
+    for previous_id in superseded:
+        if previous_id and previous_id != checkout_id:
+            _release_checkout_incentives(user_id, previous_id)
+    return checkout_id
+
+
+def _close_card_checkout(checkout_id, status, *, now=None):
+    if not checkout_id:
+        return False
+    timestamp = (now or datetime.datetime.now()).strftime('%Y-%m-%d %H:%M:%S')
+
+    def close(records):
+        record = records.get(str(checkout_id))
+        if not isinstance(record, dict) or record.get('status') != 'waiting_receipt':
+            return False
+        record['status'] = str(status)
+        record['closed_at'] = timestamp
+        return True
+
+    return _mutate_card_checkouts(close)
+
+
+def send_due_card_checkout_reminders(now=None):
+    """Send one durable reminder for card checkouts awaiting a receipt."""
+    if not _checkout_reminders_enabled():
+        return 0
+    current = now or datetime.datetime.now()
+    timestamp = current.strftime('%Y-%m-%d %H:%M:%S')
+    due = []
+    expired = []
+
+    def reserve_due(records):
+        for checkout_id, record in records.items():
+            if not isinstance(record, dict) or record.get('status') != 'waiting_receipt':
+                continue
+            try:
+                created_at = datetime.datetime.strptime(
+                    str(record.get('created_at')),
+                    '%Y-%m-%d %H:%M:%S',
+                )
+            except (TypeError, ValueError):
+                continue
+            elapsed = current - created_at
+            if elapsed >= datetime.timedelta(hours=24):
+                record['status'] = 'expired'
+                record['closed_at'] = timestamp
+                expired.append((checkout_id, record.get('user_id')))
+                continue
+            if elapsed < CHECKOUT_REMINDER_DELAY or record.get('checkout_reminded_at'):
+                continue
+            # Persist before I/O so concurrent pollers and restarts remain
+            # at-most-once even if Telegram delivery fails.
+            record['checkout_reminded_at'] = timestamp
+            due.append(dict(record))
+
+    _mutate_card_checkouts(reserve_due)
+
+    for checkout_id, user_id in expired:
+        _release_checkout_incentives(user_id, checkout_id)
+        state = user_data.get(user_id)
+        if isinstance(state, dict) and state.get('card_checkout_id') == checkout_id:
+            user_data.pop(user_id, None)
+
+    sent = 0
+    for record in due:
+        user_id = record.get('user_id')
+        if user_id is None:
+            continue
+        language = get_user_language(user_id)
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        resume_callback = record.get('resume_callback')
+        if resume_callback:
+            markup.add(types.InlineKeyboardButton(
+                get_button_text(language, "card_to_card"),
+                callback_data=resume_callback,
+            ))
+        markup.add(types.InlineKeyboardButton(
+            get_button_text(language, "support"),
+            callback_data="purchase_support",
+        ))
+        try:
+            bot.send_message(
+                record.get('chat_id') or user_id,
+                get_message_text(language, "abandoned_card_checkout_reminder").format(
+                    plan_gb=record.get('plan_gb'),
+                    final_amount=format_toman_amount(record.get('final_amount', 0)),
+                ),
+                reply_markup=markup,
+                parse_mode="Markdown",
+            )
+            sent += 1
+        except Exception:
+            logging.getLogger('ajib.payments').exception(
+                "Failed to send card checkout reminder to user %s",
+                user_id,
+            )
+    return sent
+
+
+def maybe_send_checkout_reminder(payment_id, record, now=None):
+    """Send one durable reminder for an abandoned customer crypto checkout."""
+    if not _checkout_reminders_enabled() or not isinstance(record, dict):
+        return False
+    if record.get('status') != 'pending' or record.get('checkout_reminded_at'):
+        return False
+    if record.get('type') == 'settlement' or record.get('plan_gb') == 'Settlement':
+        return False
+    created_at_value = record.get('created_at')
+    try:
+        created_at = datetime.datetime.strptime(str(created_at_value), '%Y-%m-%d %H:%M:%S')
+    except (TypeError, ValueError):
+        return False
+    current = now or datetime.datetime.now()
+    if current - created_at < CHECKOUT_REMINDER_DELAY or current - created_at >= datetime.timedelta(hours=24):
+        return False
+
+    user_id = record.get('user_id')
+    if user_id is None:
+        return False
+    language = get_user_language(user_id)
+    final_amount = format_usd_amount(record.get('price', 0))
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    payment_url = record.get('payment_url')
+    if payment_url:
+        markup.add(types.InlineKeyboardButton(
+            get_button_text(language, "payment_link"),
+            url=payment_url,
+        ))
+    markup.add(types.InlineKeyboardButton(
+        get_button_text(language, "check_status"),
+        callback_data=f"check_payment:{payment_id}",
+    ))
+    markup.add(types.InlineKeyboardButton(
+        get_button_text(language, "support"),
+        callback_data="purchase_support",
+    ))
+    reminder_timestamp = current.strftime('%Y-%m-%d %H:%M:%S')
+    if not update_payment_record_fields(payment_id, {
+        'checkout_reminded_at': reminder_timestamp,
+    }):
+        return False
+    try:
+        bot.send_message(
+            user_id,
+            get_message_text(language, "abandoned_checkout_reminder").format(
+                plan_gb=record.get('plan_gb'),
+                final_amount=final_amount,
+            ),
+            reply_markup=markup,
+            parse_mode="Markdown",
+        )
+    except Exception:
+        return False
+    return True
 
 
 def _queue_payment_job(job_key, target, *args, **kwargs):
@@ -264,7 +878,11 @@ def _send_reseller_settlement_admin_notification(
 
 
 def _renewal_reason_text(language, reason):
-    return get_message_text(language, reason or "renewal_failed") or str(reason or "renewal_failed")
+    key = reason or "renewal_generic_unavailable_reason"
+    translated = get_message_text(language, key)
+    if not translated or translated == key:
+        return get_message_text(language, "renewal_generic_unavailable_reason")
+    return translated
 
 
 def _process_customer_renewal_payment(payment_id, payment_record, notify_chat_id=None, payment_method=None, telegram_username=None):
@@ -292,7 +910,12 @@ def _process_customer_renewal_payment(payment_id, payment_record, notify_chat_id
         ):
             _notify_sale_completion_persistence_failure(payment_id, user_id, username, server_id)
             return False
-        add_referral_reward(user_id, payment_record.get('price', 0), payment_id)
+        finalized = _finalize_checkout_incentives(
+            payment_id,
+            get_payment_record(payment_id) or payment_record,
+        )
+        if finalized is None:
+            add_referral_reward(user_id, payment_record.get('price', 0), payment_id)
         send_admin_payment_notification(
             user_id,
             username,
@@ -307,8 +930,6 @@ def _process_customer_renewal_payment(payment_id, payment_record, notify_chat_id
             server_id=server_id,
         )
         reserved_text = get_message_text(language, 'renewal_reserved_success')
-        if reserved_text == 'renewal_reserved_success':
-            reserved_text = 'Your renewal is paid and reserved. It will be applied automatically when this config expires.'
         bot.send_message(notify_chat_id, reserved_text, parse_mode='Markdown')
         return True
 
@@ -319,6 +940,14 @@ def _process_customer_renewal_payment(payment_id, payment_record, notify_chat_id
             "renewal_before_state": result.get('before_state', payment_record.get('renewal_before_state')),
         })
         update_payment_status(payment_id, 'renewal_failed')
+        _release_checkout_incentives(
+            user_id,
+            payment_record.get('incentive_reservation_id')
+            or payment_record.get('account_credit_reservation_id'),
+        )
+        update_payment_record_fields(payment_id, {
+            'incentives_released_after_failed_renewal': True,
+        })
         bot.send_message(
             notify_chat_id,
             get_message_text(language, "renewal_failed").format(
@@ -644,6 +1273,20 @@ def _complete_sale_payment_or_notify(payment_id, user_id, username, api_client, 
     completion_fields.setdefault("username", username)
     completion_fields.setdefault("server_id", server_id)
     if complete_payment_record(payment_id, completion_fields):
+        try:
+            completed_record = get_payment_record(payment_id) or {
+                'user_id': user_id,
+                **completion_fields,
+            }
+            _finalize_checkout_incentives(payment_id, completed_record)
+        except Exception as error:
+            update_payment_record_fields(payment_id, {
+                'incentive_finalization_error': str(error)[:500],
+            })
+            logging.getLogger('ajib.payments').exception(
+                "Checkout incentive finalization failed for payment %s",
+                payment_id,
+            )
         return True
 
     error = f"payment_completion_persistence_failed username={username} server_id={server_id}"
@@ -719,6 +1362,164 @@ def create_sale_user_with_note(api_client, user_id, plan_gb, days, unlimited):
 
     return multi_api.create_user_with_retry(allocate, create, fallback_client=api_client)
 
+
+def _record_checkout_started(payment_id, record):
+    record_main_growth_event(
+        "checkout_started",
+        record.get('user_id'),
+        language=record.get('language'),
+        plan_id=record.get('plan_gb'),
+        deduplication_key=f"main:checkout_started:{payment_id}",
+        payment_method=record.get('payment_method'),
+        referral_campaign=record.get('referral_campaign'),
+    )
+
+
+def _fulfill_credit_funded_purchase(call, plan_gb, plan, quote):
+    """Provision a main-store purchase fully funded by reserved AJIB credit."""
+    user_id = call.from_user.id
+    language = get_user_language(user_id)
+    reservation_id = quote['incentive_reservation_id']
+    payment_id = f"credit-{reservation_id}"
+    record = {
+        'user_id': user_id,
+        'language': language,
+        'plan_gb': plan_gb,
+        'days': plan['days'],
+        'unlimited': plan.get('unlimited', False),
+        'payment_id': payment_id,
+        'order_id': reservation_id,
+        'status': 'processing',
+        'payment_method': 'Account Credit',
+        **quote,
+    }
+    try:
+        add_payment_record(payment_id, record)
+        _record_checkout_started(payment_id, record)
+    except Exception:
+        _release_checkout_incentives(user_id, reservation_id)
+        raise
+
+    api_client = APIClient()
+    username, result, api_client = create_sale_user_with_note(
+        api_client,
+        user_id,
+        plan_gb,
+        plan['days'],
+        plan.get('unlimited', False),
+    )
+    if not result:
+        update_payment_status(payment_id, 'failed')
+        _release_checkout_incentives(user_id, reservation_id)
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            get_message_text(language, 'failed_to_create_user'),
+            show_alert=True,
+        )
+        return False
+    if not _complete_sale_payment_or_notify(
+        payment_id,
+        user_id,
+        username,
+        api_client,
+    ):
+        return False
+
+    send_admin_payment_notification(
+        user_id,
+        username,
+        plan_gb,
+        0,
+        payment_id,
+        "Account Credit",
+        telegram_username=getattr(call.from_user, 'username', None),
+        server_name=getattr(api_client, 'server_name', None),
+        server_id=getattr(api_client, 'server_id', None),
+    )
+    uri_data = api_client.get_user_uri(username) if api_client else None
+    sub_url = uri_data.get('normal_sub') if uri_data else None
+    ipv4_url = uri_data.get('ipv4', '') if uri_data else ''
+    ipv4_info = _localized_ipv4_info(language, ipv4_url)
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    if sub_url:
+        qr = qrcode.make(ipv4_url or sub_url)
+        bio = io.BytesIO()
+        qr.save(bio, 'PNG')
+        bio.seek(0)
+        bot.send_photo(
+            call.message.chat.id,
+            photo=bio,
+            caption=get_message_text(language, 'payment_completed').format(
+                plan_gb=plan_gb,
+                username=username,
+                sub_url=sub_url,
+                ipv4_info=ipv4_info,
+            ),
+            parse_mode='Markdown',
+        )
+        send_download_prompt_safely(bot, call.message.chat.id, language)
+    else:
+        bot.send_message(
+            call.message.chat.id,
+            get_message_text(language, 'payment_completed_no_url'),
+            parse_mode='Markdown',
+        )
+    return True
+
+
+def _fulfill_credit_funded_renewal(call, offer, quote):
+    """Execute or reserve a renewal paid entirely with AJIB purchase credit."""
+    from utils.renewal import customer_payment_metadata
+
+    user_id = call.from_user.id
+    language = get_user_language(user_id)
+    reservation_id = quote['incentive_reservation_id']
+    payment_id = f"credit-renewal-{reservation_id}"
+    record = {
+        'user_id': user_id,
+        'language': language,
+        'plan_gb': offer['plan_gb'],
+        'days': offer['days'],
+        'unlimited': offer.get('unlimited', False),
+        'payment_id': payment_id,
+        'order_id': reservation_id,
+        'status': 'processing',
+        'payment_method': 'Account Credit',
+        **customer_payment_metadata(offer),
+        **quote,
+    }
+    try:
+        add_payment_record(payment_id, record)
+        _record_checkout_started(payment_id, record)
+    except Exception:
+        _release_checkout_incentives(user_id, reservation_id)
+        raise
+
+    success = _process_customer_renewal_payment(
+        payment_id,
+        record,
+        notify_chat_id=call.message.chat.id,
+        payment_method='Account Credit',
+        telegram_username=getattr(call.from_user, 'username', None),
+    )
+    if not success:
+        latest = get_payment_record(payment_id) or {}
+        if latest.get('status') == 'renewal_failed':
+            _release_checkout_incentives(user_id, reservation_id)
+            update_payment_record_fields(payment_id, {
+                'incentives_released_after_failed_renewal': True,
+            })
+        return False
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    return True
+
 def send_admin_payment_notification(
     user_id,
     username,
@@ -787,32 +1588,59 @@ def send_admin_payment_notification(
     except Exception as e:
         print(f"Error in send_admin_payment_notification: {str(e)}")
 
-def show_plans(chat_id, user_id, message_id=None):
+def show_plans(chat_id, user_id, message_id=None, show_all=False):
     language = get_user_language(user_id)
+    record_main_growth_event(
+        "plan_viewed",
+        user_id,
+        language=language,
+        deduplication_key=f"main:plan_viewed:{user_id}:{'all' if show_all else 'quick'}",
+        catalog="all" if show_all else "quick",
+    )
     plans = load_plans()
-    sorted_plans = sorted(plans.items(), key=lambda x: int(x[0]))
+    exchange_rate = get_exchange_rate()
+    customer_plans = _customer_plan_items(plans)
     markup = types.InlineKeyboardMarkup(row_width=1)
-    for gb, details in sorted_plans:
-        if details.get('target', 'both') == 'reseller':
-            continue
-        unlimited_text = get_message_text(language, "unlimited_users") if details.get("unlimited") else get_message_text(language, "single_user")
-        button_text = f"{gb} GB - ${format_usd_amount(details['price'])} - {details['days']} " + get_message_text(language, "days") + f"{unlimited_text}"
+    visible_plans = (
+        [(None, gb, details) for gb, details in customer_plans]
+        if show_all
+        else select_quick_pick_plans(plans)
+    )
+    for label_key, gb, details in visible_plans:
+        button_text = _plan_button_text(
+            language,
+            gb,
+            details,
+            exchange_rate,
+            label_key=label_key,
+        )
         markup.add(types.InlineKeyboardButton(button_text, callback_data=f"purchase:{gb}"))
-    
-    text = get_message_text(language, "select_plan")
+
+    if not show_all and len(customer_plans) > len(visible_plans):
+        markup.add(types.InlineKeyboardButton(
+            get_button_text(language, "see_all_plans"),
+            callback_data="show_all_plans",
+        ))
+
+    text = get_message_text(
+        language,
+        "all_plans_title" if show_all else "quick_plans_title",
+    )
     
     if message_id:
         bot.edit_message_text(
             text,
             chat_id=chat_id,
             message_id=message_id,
-            reply_markup=markup
+            reply_markup=markup,
+            parse_mode="Markdown",
         )
     else:
         bot.send_message(
             chat_id,
             text,
-            reply_markup=markup
+            reply_markup=markup,
+            parse_mode="Markdown",
         )
 
 @bot.message_handler(func=lambda message: any(
@@ -829,6 +1657,20 @@ def back_to_plans(call):
     except Exception as e:
         print(f"Error in back_to_plans: {e}")
 
+
+@bot.callback_query_handler(func=lambda call: call.data == "show_all_plans")
+def handle_show_all_plans(call):
+    try:
+        safe_answer_callback_query(bot, call.id)
+        show_plans(
+            call.message.chat.id,
+            call.from_user.id,
+            call.message.message_id,
+            show_all=True,
+        )
+    except Exception as e:
+        print(f"Error showing all plans: {e}")
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith('purchase:'))
 def handle_purchase_selection(call):
     try:
@@ -840,24 +1682,47 @@ def handle_purchase_selection(call):
         if plan_gb in plans:
             plan = plans[plan_gb]
             if plan.get('target', 'both') == 'reseller':
-                safe_answer_callback_query(bot, call.id, text='This plan is for resellers only.')
+                safe_answer_callback_query(
+                    bot,
+                    call.id,
+                    text=get_message_text(language, 'customer_reseller_only_plan'),
+                )
                 return
+            record_main_growth_event(
+                "plan_selected",
+                user_id,
+                language=language,
+                plan_id=plan_gb,
+                deduplication_key=f"main:plan_selected:{user_id}:{plan_gb}",
+            )
             unlimited_text = get_button_text(language, "yes" if plan.get("unlimited") else "no")
             price = float(plan['price'])
             exchange_rate = get_exchange_rate()
-            price_in_tomans = price * exchange_rate
+            invite_discount_percent = _invite_discount_preview(user_id)
             load_dotenv(TELEGRAM_ENV_PATH, override=True)
             crypto_configured = all(os.getenv(key) for key in ['CRYPTO_MERCHANT_ID', 'CRYPTO_API_KEY'])
             card_to_card_configured = get_card_number_for_receipt_type(RECEIPT_TYPE_REGULAR)
-            message = get_message_text(language, "plan_details")
+            message = get_message_text(language, "purchase_progress_payment") + "\n\n"
+            message += get_message_text(language, "plan_details")
             message += get_message_text(language, "data").format(plan_gb=plan_gb)
             message += get_message_text(language, "duration").format(days=plan['days'])
             message += get_message_text(language, "unlimited").format(unlimited_text=unlimited_text)
-            message += get_message_text(language, "price").format(price=format_usd_amount(price))
-            message += get_message_text(language, "exchange_rate").format(exchange_rate=format_toman_amount(exchange_rate))
-            message += get_message_text(language, "toman_price").format(toman_price=format_toman_amount(price_in_tomans))
-            message += get_message_text(language, "purchase_connection_warning")
-            message += get_message_text(language, "select_payment_method")
+            message += build_plan_payment_totals(
+                language,
+                plan_gb,
+                price,
+                exchange_rate,
+                invite_discount_percent=invite_discount_percent,
+            )
+            if invite_discount_percent > 0:
+                message += "\n" + _format_checkout_incentives(language, {
+                    'invite_discount_percent': invite_discount_percent,
+                    'invite_discount_amount': round(
+                        price * invite_discount_percent / 100,
+                        2,
+                    ),
+                    'account_credit_reserved': 0,
+                })
 
             # Check configured payment methods
             
@@ -877,13 +1742,23 @@ def handle_purchase_selection(call):
                  safe_answer_callback_query(bot, call.id, text=get_message_text(language, "no_payment_methods"))
                  return
 
-            markup.add(types.InlineKeyboardButton(get_button_text(language, "back"), callback_data="back_to_plans")) 
+            message += "\n\n" + get_message_text(language, "purchase_delivery_note")
+            if _consume_purchase_disclosure(user_id):
+                message += get_message_text(language, "purchase_connection_warning")
+            message += get_message_text(language, "select_payment_method")
+
+            markup.add(types.InlineKeyboardButton(
+                get_button_text(language, "support"),
+                callback_data="purchase_support",
+            ))
+            markup.add(types.InlineKeyboardButton(get_button_text(language, "back"), callback_data="back_to_plans"))
 
             bot.edit_message_text(
                 message,
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
-                reply_markup=markup
+                reply_markup=markup,
+                parse_mode="Markdown",
             )
         else:
             safe_answer_callback_query(bot, call.id, text=get_message_text(language, "plan_not_found"))
@@ -891,6 +1766,23 @@ def handle_purchase_selection(call):
         user_id = call.from_user.id
         language = get_user_language(user_id)
         safe_answer_callback_query(bot, call.id, text=get_message_text(language, "error_occurred").format(error=str(e)))
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "purchase_support")
+def handle_purchase_support(call):
+    language = get_user_language(call.from_user.id)
+    safe_answer_callback_query(bot, call.id)
+    try:
+        from utils.edit_support import get_support_text
+
+        support_text = get_support_text()
+    except Exception:
+        support_text = get_message_text(language, "support_unavailable")
+    bot.send_message(
+        call.message.chat.id,
+        get_message_text(language, "purchase_support_intro") + "\n\n" + support_text,
+        parse_mode="Markdown",
+    )
 
 @bot.callback_query_handler(func=lambda call: call.data == "cancel_purchase")
 def handle_cancel_purchase(call):
@@ -903,6 +1795,9 @@ def handle_cancel_purchase(call):
     )
     # New: Clear user state if it exists (prevents lingering receipt waiting mode)
     if user_id in user_data:
+        checkout_id = user_data[user_id].get('card_checkout_id')
+        _close_card_checkout(checkout_id, 'canceled')
+        _release_checkout_incentives(user_id, checkout_id)
         del user_data[user_id]
     bot.send_message(
         chat_id=call.message.chat.id,
@@ -953,11 +1848,25 @@ def handle_customer_renewal_start(call):
                 message_id=call.message.message_id,
             )
             return
+        markup.add(types.InlineKeyboardButton(
+            get_button_text(language, "support"),
+            callback_data="purchase_support",
+        ))
         markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="cancel_purchase"))
 
         from utils.renewal import format_renewal_offer
+        exchange_rate = get_exchange_rate()
+        offer_message = get_message_text(language, "purchase_progress_payment") + "\n\n"
+        offer_message += format_renewal_offer(language, offer, include_payment_prompt=True)
+        offer_message += "\n\n" + build_plan_payment_totals(
+            language,
+            offer['plan_gb'],
+            offer['price'],
+            exchange_rate,
+        )
+        offer_message += "\n\n" + get_message_text(language, "purchase_delivery_note")
         bot.edit_message_text(
-            format_renewal_offer(language, offer, include_payment_prompt=True),
+            offer_message,
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=markup,
@@ -1000,12 +1909,26 @@ def _handle_customer_renewal_crypto(call, offer):
 
     user_id = call.from_user.id
     language = get_user_language(user_id)
-    discount_metadata = build_crypto_discount_metadata(offer['price'])
+    incentive_reservation_id = uuid.uuid4().hex
+    discount_metadata = _reserve_checkout_incentives(
+        user_id,
+        incentive_reservation_id,
+        offer['price'],
+        'crypto',
+    )
     discounted_price = discount_metadata['price']
     safe_answer_callback_query(bot, call.id)
+    if discount_metadata.get('fully_credit_funded'):
+        _fulfill_credit_funded_renewal(call, offer, discount_metadata)
+        return
     payment_handler = CryptoPayment()
-    payment_response = payment_handler.create_payment(discounted_price, offer['plan_gb'], user_id)
+    try:
+        payment_response = payment_handler.create_payment(discounted_price, offer['plan_gb'], user_id)
+    except Exception:
+        _release_checkout_incentives(user_id, incentive_reservation_id)
+        raise
     if "error" in payment_response:
+        _release_checkout_incentives(user_id, incentive_reservation_id)
         bot.edit_message_text(
             get_message_text(language, "error_creating_payment").format(error=payment_response['error']),
             chat_id=call.message.chat.id,
@@ -1017,6 +1940,7 @@ def _handle_customer_renewal_crypto(call, offer):
     payment_url = payment_data.get('url')
     gateway_order_id = payment_data.get('order_id')
     if not payment_id or not payment_url:
+        _release_checkout_incentives(user_id, incentive_reservation_id)
         bot.edit_message_text(
             get_message_text(language, "invalid_payment_response"),
             chat_id=call.message.chat.id,
@@ -1026,33 +1950,51 @@ def _handle_customer_renewal_crypto(call, offer):
 
     payment_record = {
         'user_id': user_id,
+        'language': language,
         'plan_gb': offer['plan_gb'],
         'days': offer['days'],
         'unlimited': offer.get('unlimited', False),
         'payment_id': payment_id,
         'order_id': gateway_order_id,
+        'payment_url': payment_url,
         'status': 'pending',
         'payment_method': 'Crypto',
         **customer_payment_metadata(offer),
         **discount_metadata,
     }
-    add_payment_record(payment_id, payment_record)
+    try:
+        add_payment_record(payment_id, payment_record)
+    except Exception:
+        _release_checkout_incentives(user_id, incentive_reservation_id)
+        raise
+    _record_checkout_started(payment_id, payment_record)
 
     qr = qrcode.make(payment_url)
     bio = io.BytesIO()
     qr.save(bio, 'PNG')
     bio.seek(0)
-    payment_message = get_message_text(language, "payment_instructions").format(
+    payment_message = get_message_text(language, "purchase_progress_payment") + "\n\n"
+    payment_message += get_message_text(language, "crypto_checkout_summary").format(
+        plan_gb=offer['plan_gb'],
+        final_amount=format_usd_amount(discounted_price),
+    ) + "\n\n"
+    payment_message += get_message_text(language, "payment_instructions").format(
         price=format_usd_amount(discounted_price),
         payment_url=payment_url,
         payment_id=payment_id,
     )
-    payment_message += "\n\n" + build_crypto_discount_display(language, discount_metadata)['summary']
+    if float(discount_metadata.get('payment_discount_percent', 0) or 0) > 0:
+        payment_message += "\n\n" + build_crypto_discount_display(language, discount_metadata)['summary']
+    incentive_summary = _format_checkout_incentives(language, discount_metadata)
+    if incentive_summary:
+        payment_message += "\n\n" + incentive_summary
     payment_message += "\n\n" + get_message_text(language, "renewal_quota_reset_warning")
+    payment_message += "\n\n" + get_message_text(language, "purchase_delivery_note")
     markup = types.InlineKeyboardMarkup()
     markup.add(
         types.InlineKeyboardButton(get_button_text(language, "payment_link"), url=payment_url),
-        types.InlineKeyboardButton(get_button_text(language, "check_status"), callback_data=f"check_payment:{payment_id}")
+        types.InlineKeyboardButton(get_button_text(language, "check_status"), callback_data=f"check_payment:{payment_id}"),
+        types.InlineKeyboardButton(get_button_text(language, "support"), callback_data="purchase_support"),
     )
     bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
     bot.send_photo(
@@ -1079,34 +2021,75 @@ def _handle_customer_renewal_card_to_card(call, offer):
             message_id=call.message.message_id
         )
         return
-    price = offer['price']
-    price_in_tomans = float(price) * exchange_rate
-    message = get_message_text(language, "card_to_card_payment").format(
-        price=format_toman_amount(price_in_tomans),
-        exchange_rate=format_toman_amount(exchange_rate),
-        card_number=card_number
-    )
-    message += "\n\n" + get_message_text(language, "renewal_quota_reset_warning")
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="cancel_purchase"))
-    bot.edit_message_text(
-        message,
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=markup
-    )
-    user_data[user_id] = {
-        'state': 'waiting_receipt',
-        'plan_gb': offer['plan_gb'],
-        'price': price,
-        'converted_amount': price_in_tomans,
-        'converted_currency': 'Tomans',
-        'exchange_rate': exchange_rate,
-        'receipt_type': RECEIPT_TYPE_REGULAR,
-        'renewal_metadata': customer_payment_metadata(offer),
-        'receipt_prompt_message_id': call.message.message_id,
-    }
+    incentive_reservation_id = uuid.uuid4().hex
+    checkout_persisted = False
+    try:
+        quote = _reserve_checkout_incentives(
+            user_id,
+            incentive_reservation_id,
+            offer['price'],
+            'card',
+        )
+        price = quote['price']
+        if quote.get('fully_credit_funded'):
+            safe_answer_callback_query(bot, call.id)
+            _fulfill_credit_funded_renewal(call, offer, quote)
+            return
+        price_in_tomans = float(price) * exchange_rate
+        message = get_message_text(language, "purchase_progress_payment") + "\n\n"
+        message += get_message_text(language, "card_checkout_summary").format(
+            plan_gb=offer['plan_gb'],
+            final_amount=format_toman_amount(price_in_tomans),
+        ) + "\n\n"
+        message += get_message_text(language, "card_to_card_payment").format(
+            price=format_toman_amount(price_in_tomans),
+            exchange_rate=format_toman_amount(exchange_rate),
+            card_number=card_number
+        )
+        incentive_summary = _format_checkout_incentives(language, quote)
+        if incentive_summary:
+            message += "\n\n" + incentive_summary
+        message += "\n\n" + get_message_text(language, "renewal_quota_reset_warning")
+        message += "\n\n" + get_message_text(language, "purchase_delivery_note")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton(get_button_text(language, "support"), callback_data="purchase_support"),
+            types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="cancel_purchase"),
+        )
+        card_checkout_id = _register_card_checkout(
+            user_id,
+            call.message.chat.id,
+            offer['plan_gb'],
+            price_in_tomans,
+            call.data,
+            checkout_id=incentive_reservation_id,
+        )
+        user_data[user_id] = {
+            'state': 'waiting_receipt',
+            'plan_gb': offer['plan_gb'],
+            'price': price,
+            'converted_amount': price_in_tomans,
+            'converted_currency': 'Tomans',
+            'exchange_rate': exchange_rate,
+            'receipt_type': RECEIPT_TYPE_REGULAR,
+            'renewal_metadata': customer_payment_metadata(offer),
+            'receipt_prompt_message_id': call.message.message_id,
+            'card_checkout_id': card_checkout_id,
+            'incentive_metadata': dict(quote),
+            'language': language,
+        }
+        checkout_persisted = True
+        bot.edit_message_text(
+            message,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+    except Exception:
+        if not checkout_persisted:
+            _release_checkout_incentives(user_id, incentive_reservation_id)
+        raise
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('payment_method:'))
@@ -1151,6 +2134,8 @@ def handle_payment_method_selection(call, data=None):
         bot.answer_callback_query(call.id, text=get_message_text(language, "error_occurred").format(error=str(e)))
 
 def handle_crypto_payment(call, plan_gb, answer_callback=True):
+    incentive_reservation_id = None
+    payment_persisted = False
     try:
         user_id = call.from_user.id
         language = get_user_language(user_id)
@@ -1158,17 +2143,35 @@ def handle_crypto_payment(call, plan_gb, answer_callback=True):
         if plan_gb in plans:
             plan = plans[plan_gb]
             if plan.get('target', 'both') == 'reseller':
-                bot.answer_callback_query(call.id, text='This plan is for resellers only.')
+                bot.answer_callback_query(
+                    call.id,
+                    text=get_message_text(language, 'customer_reseller_only_plan'),
+                )
                 return
-            discount_metadata = build_crypto_discount_metadata(plan['price'])
+            incentive_reservation_id = uuid.uuid4().hex
+            discount_metadata = _reserve_checkout_incentives(
+                user_id,
+                incentive_reservation_id,
+                plan['price'],
+                'crypto',
+            )
             discounted_price = discount_metadata['price']
             if answer_callback:
                 safe_answer_callback_query(bot, call.id)
+            if discount_metadata.get('fully_credit_funded'):
+                _fulfill_credit_funded_purchase(
+                    call,
+                    plan_gb,
+                    plan,
+                    discount_metadata,
+                )
+                return
             payment_handler = CryptoPayment()
             payment_response = payment_handler.create_payment(
                 discounted_price, plan_gb, user_id
             )
             if "error" in payment_response:
+                _release_checkout_incentives(user_id, incentive_reservation_id)
                 bot.edit_message_text(
                     get_message_text(language, "error_creating_payment").format(error=payment_response['error']),
                     chat_id=call.message.chat.id,
@@ -1180,6 +2183,7 @@ def handle_crypto_payment(call, plan_gb, answer_callback=True):
             payment_url = payment_data.get('url')
             gateway_order_id = payment_data.get('order_id')
             if not payment_id or not payment_url:
+                _release_checkout_incentives(user_id, incentive_reservation_id)
                 bot.edit_message_text(
                     get_message_text(language, "invalid_payment_response"),
                     chat_id=call.message.chat.id,
@@ -1188,27 +2192,45 @@ def handle_crypto_payment(call, plan_gb, answer_callback=True):
                 return
             payment_record = {
                 'user_id': user_id,
+                'language': language,
                 'plan_gb': plan_gb,
                 'days': plan['days'],
                 'unlimited': plan.get('unlimited', False),
                 'payment_id': payment_id,
                 'order_id': gateway_order_id,
+                'payment_url': payment_url,
                 'status': 'pending',
                 'payment_method': 'Crypto',
                 **discount_metadata,
             }
-            add_payment_record(payment_id, payment_record)
+            try:
+                add_payment_record(payment_id, payment_record)
+            except Exception:
+                _release_checkout_incentives(user_id, incentive_reservation_id)
+                raise
+            payment_persisted = True
+            _record_checkout_started(payment_id, payment_record)
             qr = qrcode.make(payment_url)
             bio = io.BytesIO()
             qr.save(bio, 'PNG')
             bio.seek(0)
-            payment_message = get_message_text(language, "payment_instructions").format(price=format_usd_amount(discounted_price), payment_url=payment_url, payment_id=payment_id)
-            payment_message += "\n\n" + build_crypto_discount_display(language, discount_metadata)['summary']
-            payment_message += get_message_text(language, "purchase_connection_warning")
+            payment_message = get_message_text(language, "purchase_progress_payment") + "\n\n"
+            payment_message += get_message_text(language, "crypto_checkout_summary").format(
+                plan_gb=plan_gb,
+                final_amount=format_usd_amount(discounted_price),
+            ) + "\n\n"
+            payment_message += get_message_text(language, "payment_instructions").format(price=format_usd_amount(discounted_price), payment_url=payment_url, payment_id=payment_id)
+            if float(discount_metadata.get('payment_discount_percent', 0) or 0) > 0:
+                payment_message += "\n\n" + build_crypto_discount_display(language, discount_metadata)['summary']
+            incentive_summary = _format_checkout_incentives(language, discount_metadata)
+            if incentive_summary:
+                payment_message += "\n\n" + incentive_summary
+            payment_message += "\n\n" + get_message_text(language, "purchase_delivery_note")
             markup = types.InlineKeyboardMarkup()
             markup.add(
                 types.InlineKeyboardButton(get_button_text(language, "payment_link"), url=payment_url),
-                types.InlineKeyboardButton(get_button_text(language, "check_status"), callback_data=f"check_payment:{payment_id}")
+                types.InlineKeyboardButton(get_button_text(language, "check_status"), callback_data=f"check_payment:{payment_id}"),
+                types.InlineKeyboardButton(get_button_text(language, "support"), callback_data="purchase_support"),
             )
             bot.delete_message(
                 chat_id=call.message.chat.id,
@@ -1226,9 +2248,13 @@ def handle_crypto_payment(call, plan_gb, answer_callback=True):
     except Exception as e:
         user_id = call.from_user.id
         language = get_user_language(user_id)
+        if incentive_reservation_id and not payment_persisted:
+            _release_checkout_incentives(user_id, incentive_reservation_id)
         bot.answer_callback_query(call.id, text=get_message_text(language, "error_processing_payment").format(error=str(e)))
 
 def handle_card_to_card_payment(call, plan_gb):
+    incentive_reservation_id = None
+    checkout_persisted = False
     try:
         user_id = call.from_user.id
         language = get_user_language(user_id)
@@ -1245,25 +2271,47 @@ def handle_card_to_card_payment(call, plan_gb):
             return
         plans = load_plans()
         plan = plans[plan_gb]
-        price = plan['price']
+        incentive_reservation_id = uuid.uuid4().hex
+        quote = _reserve_checkout_incentives(
+            user_id,
+            incentive_reservation_id,
+            plan['price'],
+            'card',
+        )
+        price = quote['price']
+        if quote.get('fully_credit_funded'):
+            safe_answer_callback_query(bot, call.id)
+            _fulfill_credit_funded_purchase(call, plan_gb, plan, quote)
+            return
         # Convert price to tomans using the exchange rate
         price_in_tomans = float(price) * exchange_rate
-        message = get_message_text(language, "card_to_card_payment").format(
+        message = get_message_text(language, "purchase_progress_payment") + "\n\n"
+        message += get_message_text(language, "card_checkout_summary").format(
+            plan_gb=plan_gb,
+            final_amount=format_toman_amount(price_in_tomans),
+        ) + "\n\n"
+        message += get_message_text(language, "card_to_card_payment").format(
             price=format_toman_amount(price_in_tomans),
             exchange_rate=format_toman_amount(exchange_rate),
             card_number=card_number
         )
-        message += get_message_text(language, "purchase_connection_warning")
+        incentive_summary = _format_checkout_incentives(language, quote)
+        if incentive_summary:
+            message += "\n\n" + incentive_summary
+        message += "\n\n" + get_message_text(language, "purchase_delivery_note")
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="cancel_purchase"))
-        bot.edit_message_text(
-            message,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode="Markdown",
-            reply_markup=markup
+        markup.add(
+            types.InlineKeyboardButton(get_button_text(language, "support"), callback_data="purchase_support"),
+            types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="cancel_purchase"),
         )
-        # New: Set user state instead of registering next_step_handler
+        card_checkout_id = _register_card_checkout(
+            user_id,
+            call.message.chat.id,
+            plan_gb,
+            price_in_tomans,
+            f"payment_method:card_to_card:{plan_gb}",
+            checkout_id=incentive_reservation_id,
+        )
         user_data[user_id] = {
             'state': 'waiting_receipt',
             'plan_gb': plan_gb,
@@ -1273,10 +2321,23 @@ def handle_card_to_card_payment(call, plan_gb):
             'exchange_rate': exchange_rate,
             'receipt_type': receipt_type,
             'receipt_prompt_message_id': call.message.message_id,
+            'card_checkout_id': card_checkout_id,
+            'incentive_metadata': dict(quote),
+            'language': language,
         }
+        checkout_persisted = True
+        bot.edit_message_text(
+            message,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
     except Exception as e:
         user_id = call.from_user.id
         language = get_user_language(user_id)
+        if incentive_reservation_id and not checkout_persisted:
+            _release_checkout_incentives(user_id, incentive_reservation_id)
         bot.answer_callback_query(call.id, text=get_message_text(language, "error_occurred").format(error=str(e)))
 
 # Modified: Remove photo check and re-registration; assume called only on photos
@@ -1289,6 +2350,8 @@ def process_receipt_photo(message, plan_gb, price):
         converted_currency = None
         exchange_rate = None
         renewal_metadata = None
+        incentive_metadata = None
+        card_checkout_id = None
         receipt_type = RECEIPT_TYPE_SETTLEMENT if plan_gb == 'Settlement' else RECEIPT_TYPE_REGULAR
         if user_id in user_data:
             receipt_prompt_message_id = user_data[user_id].get('receipt_prompt_message_id')
@@ -1298,6 +2361,8 @@ def process_receipt_photo(message, plan_gb, price):
             receipt_type = user_data[user_id].get('receipt_type', receipt_type)
             settlement_amount = user_data[user_id].get('settlement_amount')
             renewal_metadata = user_data[user_id].get('renewal_metadata')
+            incentive_metadata = user_data[user_id].get('incentive_metadata')
+            card_checkout_id = user_data[user_id].get('card_checkout_id')
         else:
             settlement_amount = None
         file_id = message.photo[-1].file_id
@@ -1316,6 +2381,7 @@ def process_receipt_photo(message, plan_gb, price):
              checker_id = get_receipt_checker_user_id() if routed_to_checker else None
              payment_record = {
                 'user_id': user_id,
+                'language': language,
                 'plan_gb': plan_gb,
                 'price': price,
                 'days': 0,
@@ -1336,6 +2402,7 @@ def process_receipt_photo(message, plan_gb, price):
             checker_id = get_receipt_checker_user_id() if routed_to_checker else None
             payment_record = {
                 'user_id': user_id,
+                'language': language,
                 'plan_gb': plan_gb,
                 'price': price,
                 'days': plan['days'],
@@ -1350,12 +2417,16 @@ def process_receipt_photo(message, plan_gb, price):
             }
             if renewal_metadata:
                 payment_record.update(renewal_metadata)
+            if incentive_metadata:
+                payment_record.update(incentive_metadata)
         if converted_amount is not None:
             payment_record['converted_amount'] = converted_amount
             payment_record['converted_currency'] = converted_currency or 'Tomans'
             payment_record['exchange_rate'] = exchange_rate
             
         add_payment_record(payment_id, payment_record)
+        _record_checkout_started(payment_id, payment_record)
+        _close_card_checkout(card_checkout_id, 'submitted')
         notification_message = _format_pending_receipt_caption(payment_id, payment_record, message.from_user.username)
         receipt_message_refs = []
         for admin_id in ADMIN_USER_IDS:
@@ -1606,7 +2677,7 @@ def _process_admin_approval_job(call, action, payment_id, payment_record, review
                 if user_uri_data and 'normal_sub' in user_uri_data:
                     sub_url = user_uri_data['normal_sub']
                     ipv4_url = user_uri_data.get('ipv4', '')
-                    ipv4_info = f"IPv4 URL: `{ipv4_url}`\n\n" if ipv4_url else ""
+                    ipv4_info = _localized_ipv4_info(user_language, ipv4_url)
 
                     qr = qrcode.make(ipv4_url or sub_url)
                     bio = io.BytesIO()
@@ -1635,6 +2706,11 @@ def _process_admin_approval_job(call, action, payment_id, payment_record, review
             _record_review_audit(payment_id, call, action, reviewer_role)
             update_payment_status(payment_id, 'rejected')
             user_to_notify = payment_record['user_id']
+            _release_checkout_incentives(
+                user_to_notify,
+                payment_record.get('incentive_reservation_id')
+                or payment_record.get('account_credit_reservation_id'),
+            )
             user_language = get_user_language(user_to_notify)
             current_caption = call.message.caption or ""
             
@@ -1715,10 +2791,22 @@ def _process_check_payment_job(call):
         safe_send_message(bot, caller_id, get_message_text(language, "not_authorized"))
         return
     if payment_record.get('status') == 'completed':
-        safe_send_message(bot, caller_id, get_message_text(language, "payment_already_processed").format(status='completed'))
+        safe_send_message(
+            bot,
+            caller_id,
+            get_message_text(language, "payment_already_processed").format(
+                status=_localized_payment_status(language, 'completed')
+            ),
+        )
         return
     if payment_record.get('status') == 'processing':
-        safe_send_message(bot, caller_id, get_message_text(language, "payment_already_processed").format(status='processing'))
+        safe_send_message(
+            bot,
+            caller_id,
+            get_message_text(language, "payment_already_processed").format(
+                status=_localized_payment_status(language, 'processing')
+            ),
+        )
         return
     payment_handler = CryptoPayment()
     payment_status_response = payment_handler.check_payment_status(payment_id)
@@ -1731,7 +2819,13 @@ def _process_check_payment_job(call):
         if not claim_payment_for_processing(payment_id, allowed_statuses={'pending'}):
             latest_record = get_payment_record(payment_id) or {}
             latest_status = latest_record.get('status', 'unknown')
-            safe_send_message(bot, caller_id, get_message_text(language, "payment_already_processed").format(status=latest_status))
+            safe_send_message(
+                bot,
+                caller_id,
+                get_message_text(language, "payment_already_processed").format(
+                    status=_localized_payment_status(language, latest_status)
+                ),
+            )
             return
 
         payment_record = get_payment_record(payment_id) or payment_record
@@ -1747,7 +2841,11 @@ def _process_check_payment_job(call):
             success, credited_amount, remaining_debt = _apply_reseller_settlement_payment(user_id, payment_record)
             if not success:
                 _release_processing_for_retry(payment_id, 'pending', "settlement credit failed")
-                safe_send_message(bot, caller_id, get_message_text(language, "error_processing_payment").format(error="settlement credit failed"))
+                safe_send_message(
+                    bot,
+                    caller_id,
+                    get_message_text(language, "settlement_credit_failed"),
+                )
                 return
             update_payment_status(payment_id, 'completed')
             _send_reseller_settlement_admin_notification(
@@ -1818,7 +2916,7 @@ def _process_check_payment_job(call):
             if user_uri_data and 'normal_sub' in user_uri_data:
                 sub_url = user_uri_data['normal_sub']
                 ipv4_url = user_uri_data.get('ipv4', '')
-                ipv4_info = f"IPv4 URL: `{ipv4_url}`\n\n" if ipv4_url else ""
+                ipv4_info = _localized_ipv4_info(user_language, ipv4_url)
 
                 qr = qrcode.make(ipv4_url or sub_url)
                 bio = io.BytesIO()
@@ -1848,7 +2946,14 @@ def _process_check_payment_job(call):
     elif status and status.lower() == 'pending':
         safe_send_message(bot, caller_id, get_message_text(language, "payment_pending"))
     else:
-        safe_send_message(bot, caller_id, get_message_text(language, "payment_status").format(status=status or 'unknown'))
+        _close_unpaid_gateway_checkout(payment_id, payment_record, status)
+        safe_send_message(
+            bot,
+            caller_id,
+            get_message_text(language, "payment_status").format(
+                status=_localized_payment_status(language, status)
+            ),
+        )
     try:
         import logging
         logging.getLogger('ajib.payments').debug(f"Check payment response for {payment_id}: {payment_status_response}")
@@ -1869,10 +2974,22 @@ def handle_check_payment(call):
         safe_answer_callback_query(bot, call.id, text=get_message_text(language, "not_authorized"), show_alert=True)
         return
     if payment_record.get('status') == 'completed':
-        safe_answer_callback_query(bot, call.id, text=get_message_text(language, "payment_already_processed").format(status='completed'))
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            text=get_message_text(language, "payment_already_processed").format(
+                status=_localized_payment_status(language, 'completed')
+            ),
+        )
         return
     if payment_record.get('status') == 'processing':
-        safe_answer_callback_query(bot, call.id, text=get_message_text(language, "payment_already_processed").format(status='processing'))
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            text=get_message_text(language, "payment_already_processed").format(
+                status=_localized_payment_status(language, 'processing')
+            ),
+        )
         return
 
     try:
@@ -1881,9 +2998,17 @@ def handle_check_payment(call):
         safe_answer_callback_query(bot, call.id, text=get_message_text(language, "error_checking_payment").format(error=str(enqueue_error)))
         return
     if queued:
-        safe_answer_callback_query(bot, call.id, text="Checking payment status...")
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            text=get_message_text(language, 'payment_status_checking'),
+        )
     else:
-        safe_answer_callback_query(bot, call.id, text="Payment status check is already in progress.")
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            text=get_message_text(language, 'payment_status_check_in_progress'),
+        )
 
 
 def process_payment_webhook(request_data):
@@ -1991,7 +3116,7 @@ def process_payment_webhook(request_data):
                     user_uri_data = api_client.get_user_uri(username)
                     sub_url = user_uri_data.get('normal_sub') if user_uri_data else None
                     ipv4_url = user_uri_data.get('ipv4', '') if user_uri_data else ''
-                    ipv4_info = f"IPv4 URL: `{ipv4_url}`\n\n" if ipv4_url else ""
+                    ipv4_info = _localized_ipv4_info(user_language, ipv4_url)
 
                     success_message = get_message_text(user_language, "payment_completed").format(plan_gb=plan_gb, username=username, sub_url=sub_url, ipv4_info=ipv4_info)
                     bot.send_message(
@@ -2019,6 +3144,9 @@ def process_payment_webhook(request_data):
                     )
                     return False
             return False
+        payment_record = get_payment_record(record_key)
+        if payment_record and payment_record.get('status') == 'pending':
+            _close_unpaid_gateway_checkout(record_key, payment_record, status)
         return False
     except Exception as e:
         print(f"Error processing webhook: {str(e)}")
@@ -2092,22 +3220,20 @@ def _notify_reserved_renewal_attention(kind, event, recipient_id):
     if not buyer_alert_due and not operator_alert_due:
         return
     record = event.get('record') or {}
-    username = record.get('renewal_username') or record.get('username') or 'unknown'
-    reason = event.get('reason') or 'renewal_reset_failed'
     user_language = get_user_language(recipient_id)
+    username = (
+        record.get('renewal_username')
+        or record.get('username')
+        or get_message_text(user_language, 'value_unknown')
+    )
+    reason = event.get('reason') or 'renewal_reset_failed'
     reason_text = _renewal_reason_text(user_language, reason)
     if buyer_alert_due:
         message_key = 'renewal_reserved_server_unavailable' if reason == 'server_unavailable' else 'renewal_reserved_attention'
-        user_text = get_message_text(user_language, message_key)
-        if user_text == message_key:
-            user_text = (
-                f"Your reserved renewal for `{username}` is safe, but its server is temporarily unavailable. "
-                "We will keep retrying automatically."
-                if reason == 'server_unavailable'
-                else f"Your reserved renewal for `{username}` needs attention: {reason_text}"
-            )
-        else:
-            user_text = user_text.format(username=username, reason=reason_text)
+        user_text = get_message_text(user_language, message_key).format(
+            username=username,
+            reason=reason_text,
+        )
         try:
             bot.send_message(recipient_id, user_text, parse_mode='Markdown')
         except Exception:
@@ -2280,6 +3406,18 @@ def check_pending_payments():
             # Rolling upgrades and isolated compatibility tests may load only
             # the legacy renewal surface.
             pass
+        try:
+            _reconcile_completed_checkout_incentives()
+        except Exception:
+            logging.getLogger('ajib.payments').exception(
+                "Failed while reconciling completed checkout incentives"
+            )
+        try:
+            send_due_card_checkout_reminders()
+        except Exception:
+            logging.getLogger('ajib.payments').exception(
+                "Failed while processing card checkout reminders"
+            )
         payments = load_payments()
         payment_handler = CryptoPayment()
         
@@ -2292,9 +3430,18 @@ def check_pending_payments():
                         created_at = datetime.datetime.strptime(created_at_str, '%Y-%m-%d %H:%M:%S')
                         if datetime.datetime.now() - created_at > datetime.timedelta(hours=24):
                             update_payment_status(payment_id, 'expired')
+                            _release_checkout_incentives(
+                                record.get('user_id'),
+                                record.get('incentive_reservation_id')
+                                or record.get('account_credit_reservation_id'),
+                            )
                             continue
                     except ValueError:
                         pass
+
+                # One event-triggered reminder; the persisted marker prevents repeats
+                # across polling cycles and bot restarts.
+                maybe_send_checkout_reminder(payment_id, record)
 
                 # Check status
                 try:
@@ -2304,6 +3451,8 @@ def check_pending_payments():
                         
                     result = response.get('result', {})
                     status = result.get('status') or result.get('payment_status') or result.get('paymentStatus')
+                    if _close_unpaid_gateway_checkout(payment_id, record, status):
+                        continue
                     
                     if status and status.lower() == 'paid':
                         if not claim_payment_for_processing(payment_id, allowed_statuses={'pending'}):
@@ -2401,7 +3550,7 @@ def check_pending_payments():
                             if user_uri_data and 'normal_sub' in user_uri_data:
                                 sub_url = user_uri_data['normal_sub']
                                 ipv4_url = user_uri_data.get('ipv4', '')
-                                ipv4_info = f"IPv4 URL: `{ipv4_url}`\n\n" if ipv4_url else ""
+                                ipv4_info = _localized_ipv4_info(user_language, ipv4_url)
 
                                 qr = qrcode.make(ipv4_url or sub_url)
                                 bio = io.BytesIO()

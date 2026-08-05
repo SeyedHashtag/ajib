@@ -233,7 +233,22 @@ def install_common_stubs(bot, payment_records):
         "renewal_ineligible_plan_missing": "plan missing",
         "renewal_ineligible_plan_mismatch": "plan mismatch",
         "renewal_reset_failed": "reset failed",
+        "renewal_generic_unavailable_reason": "renewal unavailable",
+        "renewal_reserved_attention": "Reserved renewal for `{username}` needs attention: {reason}.",
+        "renewal_reserved_server_unavailable": "Your reserved renewal for `{username}` is safe, but its server is temporarily unavailable.",
+        "renewal_ipv4_line": "IPv4 URL: `{ipv4_url}`\n\n",
         "payment_already_processed": "Already processed: {status}",
+        "payment_status_completed": "completed",
+        "payment_status_processing": "processing",
+        "payment_status_pending_label": "pending",
+        "payment_status_paid": "paid",
+        "payment_status_failed": "failed",
+        "payment_status_expired": "expired",
+        "payment_status_rejected": "rejected",
+        "payment_status_canceled": "canceled",
+        "payment_status_unknown": "unknown",
+        "payment_status_checking": "Checking payment status...",
+        "payment_status_check_in_progress": "Payment status check is already in progress.",
         "payment_approved": "approved {username} {sub_url}",
         "payment_completed": "completed {username} {sub_url}",
         "payment_completed_no_url": "completed no url",
@@ -241,6 +256,7 @@ def install_common_stubs(bot, payment_records):
         "payment_approved_user_error": "approved user error",
         "failed_to_create_user": "failed to create user",
         "payment_rejected": "rejected",
+        "reseller_config_accounting_cancelled": "Config could not be accounted, so creation was canceled.",
         "not_authorized": "not authorized",
         "cancel": "cancel",
     }.get(key, key)
@@ -309,8 +325,16 @@ def install_common_stubs(bot, payment_records):
     level_ui_stub.build_reseller_level_compact = lambda language, data: "Level"
     level_ui_stub.build_reseller_level_profile = lambda *args, **kwargs: "Profile"
     level_ui_stub.build_reseller_level_roadmap = lambda language, data: "Roadmap"
+    level_ui_stub.build_reseller_program_preview = lambda *args, **kwargs: "Preview"
     level_ui_stub.present_pending_reseller_level = lambda *args, **kwargs: False
     sys.modules["utils.reseller_level_ui"] = level_ui_stub
+
+    account_credit_stub = types.ModuleType("utils.account_credit")
+    account_credit_stub.get_account_credit = lambda user_id: {"available": 0, "reserved": 0}
+    account_credit_stub.reserve_account_credit = lambda *args, **kwargs: 0
+    account_credit_stub.release_account_credit = lambda *args, **kwargs: False
+    account_credit_stub.consume_account_credit = lambda *args, **kwargs: 0
+    sys.modules["utils.account_credit"] = account_credit_stub
 
     currency_stub = types.ModuleType("utils.currency_format")
     currency_stub.format_toman_amount = lambda value: str(int(round(float(value))))
@@ -694,6 +718,47 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         self.assertIn("Discount: -$5.00", caption)
         self.assertIn("Final crypto price: $95.00", caption)
         self.assertEqual(apply_calls, [])
+
+    def test_reseller_debt_can_be_partially_settled_with_purchase_credit(self):
+        bot = DummyBot()
+        payment_records = []
+        purchase_plan = load_purchase_plan(bot, payment_records)
+        reseller_handlers = load_reseller_handlers(purchase_plan)
+        calls = []
+        completed = []
+        reseller_handlers.get_payment_record = lambda _payment_id: None
+        reseller_handlers.reserve_account_credit = (
+            lambda user_id, reservation_id, amount, **kwargs:
+            calls.append(("reserve", user_id, amount)) or 5.0
+        )
+        reseller_handlers.consume_account_credit = (
+            lambda user_id, reservation_id, **kwargs:
+            calls.append(("consume", user_id, reservation_id)) or 5.0
+        )
+        reseller_handlers.release_account_credit = lambda *args, **kwargs: False
+        reseller_handlers.apply_reseller_payment = (
+            lambda user_id, amount, payment_id=None:
+            calls.append(("settle", user_id, amount, payment_id)) or (True, 95.0)
+        )
+        reseller_handlers.add_payment_record = (
+            lambda payment_id, record: payment_records.append((payment_id, record))
+        )
+        reseller_handlers.complete_payment_record = (
+            lambda payment_id, fields: completed.append((payment_id, fields)) or True
+        )
+
+        reseller_handlers.handle_reseller_payment(
+            make_call("reseller:pay:credit:5.00")
+        )
+
+        payment_id, record = payment_records[0]
+        self.assertTrue(payment_id.startswith("credit-settlement-1988-555-777"))
+        self.assertEqual(record["payment_method"], "Account Credit")
+        self.assertEqual(record["settlement_amount"], 5.0)
+        self.assertEqual(record["collected_amount"], 0.0)
+        self.assertEqual([call[0] for call in calls], ["reserve", "settle", "consume"])
+        self.assertEqual(completed[0][1]["account_credit_consumed"], 5.0)
+        self.assertIn("remaining $95.00", bot.edited_messages[-1][0][0])
 
     def test_approved_settlement_payment_applies_reseller_credit(self):
         bot = DummyBot()

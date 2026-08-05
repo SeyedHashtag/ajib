@@ -10,6 +10,8 @@ import time
 import uuid
 from contextlib import nullcontext
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from urllib.parse import quote as urlquote
 
 os.environ["AJIB_BOT_ROLE"] = "hosted"
 
@@ -35,6 +37,8 @@ from utils.exchange_rate import get_exchange_rate
 from utils.hosted_bots import (
     add_referral_liability, calculate_quote, consume_credit,
     consume_renewal_credit, credit_crypto_sale, get_ledger, get_settings, get_setup_status, get_token,
+    INVITED_BUYER_DISCOUNT_PERCENT,
+    localized_storefront_text,
     mark_setup_step,
     release_credit, release_stale_credit_reservations, request_earnings_withdrawal, reserve_credit,
     set_bot_runtime_status, settle_referral_liability, tenant_file, transfer_earnings_to_debt,
@@ -42,6 +46,11 @@ from utils.hosted_bots import (
 )
 from utils.hosted_translations import HOSTED_TRANSLATIONS, hosted_text
 from utils.hosted_stats import build_hosted_stats
+from utils.growth_features import (
+    BUYER_DISCOUNTS,
+    REMINDERS,
+    is_growth_feature_enabled,
+)
 from utils.download_guidance import (
     render_download_callback,
     send_download_prompt,
@@ -104,6 +113,8 @@ OWNER_STATS_SEND_HOUR = 0
 OWNER_STATS_SEND_MINUTE = 5
 OWNER_STATS_CLAIM_LEASE_SECONDS = 600
 OWNER_STATS_MONITOR_INTERVAL_SECONDS = 60
+BUYER_DISCOUNTS_ENABLED = is_growth_feature_enabled(BUYER_DISCOUNTS)
+REMINDERS_ENABLED = is_growth_feature_enabled(REMINDERS)
 
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=4)
 
@@ -117,6 +128,116 @@ def _parse_time(value):
         return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError):
         return None
+
+
+def _financial_amount(value, field):
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError(f"Invalid hosted payment {field}") from error
+    if not amount.is_finite() or amount < 0:
+        raise ValueError(f"Invalid hosted payment {field}")
+    return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _settlement_financials(record):
+    """Validate immutable hosted checkout economics before side effects."""
+    if not isinstance(record, dict):
+        raise ValueError("Invalid hosted payment record")
+
+    payment_method = str(record.get("payment_method") or "").strip().lower()
+    if payment_method == "account_credit":
+        raise ValueError("Main-account credit is not valid for hosted-store checkout")
+    for field in (
+        "account_credit_reserved",
+        "account_credit_consumed",
+        "account_credit_applied",
+    ):
+        if field in record and _financial_amount(record.get(field, 0), field) > 0:
+            raise ValueError("Main-account credit cannot reduce hosted-store proceeds")
+
+    collected_value = record.get("collected_amount")
+    if collected_value is None and payment_method == "crypto":
+        collected_value = record.get("crypto_collected")
+    if collected_value is None:
+        collected_value = record.get("retail_price")
+    collected = _financial_amount(collected_value, "collected amount")
+    wholesale = _financial_amount(record.get("wholesale_price"), "wholesale price")
+    margin = (collected - wholesale).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if margin < 0:
+        raise ValueError("Hosted payment route falls below wholesale cost")
+
+    reward = _financial_amount(record.get("referral_reward", 0), "referral reward")
+    if reward > margin:
+        raise ValueError("Hosted referral reward exceeds positive post-discount margin")
+
+    if record.get("reward_calculation_base") is not None:
+        reward_base = _financial_amount(
+            record.get("reward_calculation_base"),
+            "reward calculation base",
+        )
+        if reward_base != margin:
+            raise ValueError("Hosted referral reward base is not the post-discount margin")
+
+    if record.get("margin") is not None:
+        recorded_margin = _financial_amount(record.get("margin"), "margin")
+        if recorded_margin != margin:
+            raise ValueError("Hosted payment margin does not match collected amount")
+
+    component_fields = ("invite_discount_percent", "crypto_discount_percent")
+    components = Decimal("0")
+    for field in component_fields:
+        if record.get(field) is not None:
+            components += _financial_amount(record.get(field), field)
+    if components > Decimal("10.00"):
+        raise ValueError("Hosted customer discount components exceed the 10% cap")
+    if record.get("total_discount_percent") is not None:
+        total_discount = _financial_amount(
+            record.get("total_discount_percent"),
+            "total discount percent",
+        )
+        if total_discount > Decimal("10.00"):
+            raise ValueError("Hosted customer discount exceeds the 10% cap")
+        if any(record.get(field) is not None for field in component_fields) and total_discount != components:
+            raise ValueError("Hosted customer discount components do not match the capped total")
+
+    if record.get("original_price") is not None and record.get("total_discount_amount") is not None:
+        original_price = _financial_amount(record.get("original_price"), "original price")
+        total_discount_amount = _financial_amount(
+            record.get("total_discount_amount"),
+            "total discount amount",
+        )
+        if total_discount_amount > original_price or original_price - total_discount_amount != collected:
+            raise ValueError("Hosted collected amount does not match the recorded discount")
+        if (
+            record.get("invite_discount_amount") is not None
+            or record.get("crypto_discount_amount") is not None
+        ):
+            invite_amount = _financial_amount(
+                record.get("invite_discount_amount", 0),
+                "invite discount amount",
+            )
+            crypto_amount = _financial_amount(
+                record.get("crypto_discount_amount", 0),
+                "crypto discount amount",
+            )
+            if invite_amount + crypto_amount != total_discount_amount:
+                raise ValueError("Hosted discount amounts do not match the collected total")
+
+    return {
+        "collected_amount": float(collected),
+        "wholesale_price": float(wholesale),
+        "margin": float(margin),
+        "reward_calculation_base": float(margin),
+        "referral_reward": float(reward),
+    }
+
+
+def _escape_markdown(value):
+    text = str(value or "")
+    for character in ("\\", "`", "*", "_", "[", "]"):
+        text = text.replace(character, f"\\{character}")
+    return text
 
 
 def _set_input_state(user_id, state):
@@ -208,7 +329,13 @@ def _reseller_plan_pricing(plan, reseller=None):
     }
 
 
-def _hosted_plan_quote(plan, settings, referral_margin_percent=0, referred=False):
+def _hosted_plan_quote(
+    plan,
+    settings,
+    referral_margin_percent=0,
+    referred=False,
+    buyer_discount_percent=0,
+):
     pricing = _reseller_plan_pricing(plan)
     quote = calculate_quote(
         pricing["wholesale_price"],
@@ -216,6 +343,7 @@ def _hosted_plan_quote(plan, settings, referral_margin_percent=0, referred=False
         referral_margin_percent,
         referred,
         retail_base=pricing["list_price"],
+        buyer_discount_percent=buyer_discount_percent,
     )
     return {**quote, **pricing}
 
@@ -228,13 +356,23 @@ def _language(user_id):
     return _languages().get(str(user_id), "en")
 
 
+def _has_language(user_id):
+    return str(user_id) in _languages()
+
+
+def _telegram_language(user):
+    language = str(getattr(user, "language_code", "") or "").split("-", 1)[0].lower()
+    return language if language in LANGUAGES else None
+
+
 def _set_language(user_id, value):
     with locked_json(tenant_file(OWNER_ID, "languages.json"), {}) as languages:
         languages[str(user_id)] = value
 
 
-def _button(user_id, key, fallback):
-    return BUTTON_TRANSLATIONS.get(_language(user_id), BUTTON_TRANSLATIONS["en"]).get(key, fallback)
+def _button(user_id, key, fallback=None):
+    default = BUTTON_TRANSLATIONS["en"].get(key, key) if fallback is None else fallback
+    return BUTTON_TRANSLATIONS.get(_language(user_id), BUTTON_TRANSLATIONS["en"]).get(key, default)
 
 
 def _message(user_id, key):
@@ -245,16 +383,31 @@ def _hosted_message(recipient_id, key, **values):
     return hosted_text(_language(recipient_id), key, **values)
 
 
-def _all_button_values(key, fallback):
-    return {items.get(key, fallback) for items in BUTTON_TRANSLATIONS.values()}
+def _storefront_setting(recipient_id, field):
+    language = _language(recipient_id)
+    return localized_storefront_text(
+        get_settings(OWNER_ID),
+        field,
+        language,
+        default=hosted_text(language, f"{field}_default"),
+    )
+
+
+def _all_button_values(key, fallback=None):
+    default = BUTTON_TRANSLATIONS["en"].get(key, key) if fallback is None else fallback
+    return {items.get(key, default) for items in BUTTON_TRANSLATIONS.values()}
+
+
+def _all_hosted_values(key):
+    return {items.get(key, key) for items in HOSTED_TRANSLATIONS.values()}
 
 
 def _main_markup(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row(_button(user_id, "my_configs", "📱 My Configs"), _button(user_id, "purchase_plan", "💳 Purchase Plan"))
-    markup.row(_button(user_id, "downloads", "⬇️ Downloads"), _button(user_id, "test_config", "🎁 Test Config"))
-    markup.row(_button(user_id, "referral", "💰 Earn Crypto"), _button(user_id, "support", "📞 Support"))
-    markup.row(_button(user_id, "language", "🌐 Language/زبان"))
+    markup.row(_button(user_id, "my_configs"), _button(user_id, "purchase_plan"))
+    markup.row(_button(user_id, "downloads"), _button(user_id, "test_config"))
+    markup.row(_hosted_message(user_id, "invite_and_earn_button"), _button(user_id, "support"))
+    markup.row(_button(user_id, "language"))
     if user_id == OWNER_ID:
         markup.row(_hosted_message(user_id, "owner_panel"))
     return markup
@@ -550,6 +703,7 @@ def _recover_saved_receipts():
 
 def _recover_stale_payment_claims():
     recovered = []
+    failed_creations = []
     release_reservations = []
     with locked_json(tenant_file(OWNER_ID, "payments.json"), {}) as payments:
         for payment_id, record in payments.items():
@@ -565,6 +719,7 @@ def _recover_stale_payment_claims():
                     if record.get("reservation_id"):
                         release_reservations.append(str(record["reservation_id"]))
                     recovered.append(payment_id)
+                    failed_creations.append((payment_id, record.get("user_id")))
                 continue
             if record.get("status") != "processing":
                 continue
@@ -583,6 +738,8 @@ def _recover_stale_payment_claims():
             recovered.append(payment_id)
     for reservation_id in release_reservations:
         release_credit(OWNER_ID, reservation_id, kind="credit_creation_recovered")
+    for payment_id, user_id in failed_creations:
+        _release_invite_discount(user_id, payment_id)
     return recovered
 
 
@@ -694,8 +851,191 @@ def _resolve_hosted_renewal_checkout(user_id, plan_id, renewal):
 def _referral_data():
     return read_json(tenant_file(OWNER_ID, "referrals.json"), {
         "referrals": {}, "codes": {}, "user_codes": {}, "stats": {}, "wallets": {},
-        "pending_withdrawals": [], "payouts": [],
+        "pending_withdrawals": [], "payouts": [], "buyer_discount_reservations": {},
+        "buyer_discount_redeemed": {},
     })
+
+
+def _record_growth(event_type, user_id, **fields):
+    """Best-effort hook for the shared growth-event store, when installed."""
+    try:
+        from utils import growth_events
+
+        aliases = {
+            "onboarding": growth_events.EVENT_ONBOARDING_VIEWED,
+            "trial_activation": growth_events.EVENT_TRIAL_STARTED,
+            "trial_connected": growth_events.EVENT_TRIAL_ACTIVATED,
+            "plan_view": growth_events.EVENT_PLAN_VIEWED,
+            "plan_selection": growth_events.EVENT_PLAN_SELECTED,
+            "checkout": growth_events.EVENT_CHECKOUT_STARTED,
+            "purchase_completed": growth_events.EVENT_CHECKOUT_COMPLETED,
+            "renewal": growth_events.EVENT_RENEWAL_PROMPTED,
+            "renewal_completed": growth_events.EVENT_RENEWAL_COMPLETED,
+            "referral_attributed": growth_events.EVENT_REFERRAL_ATTRIBUTED,
+            "referral_conversion": growth_events.EVENT_REFERRAL_CONVERTED,
+            "hosted_first_sale": growth_events.EVENT_HOSTED_FIRST_SALE,
+        }
+        plan_id = fields.pop("plan", fields.pop("plan_id", None))
+        deduplication_key = fields.pop("deduplication_key", None) or (
+            f"hosted:{OWNER_ID}:{event_type}:{user_id}"
+        )
+        payment_method = fields.pop("payment_method", None)
+        referral_campaign = fields.pop("referral_campaign", None)
+        growth_events.record_growth_event(
+            aliases.get(event_type, event_type),
+            user_id=user_id,
+            surface=growth_events.SURFACE_HOSTED,
+            hosted_tenant_id=str(OWNER_ID),
+            language=_language(user_id),
+            plan_id=plan_id,
+            payment_method=payment_method,
+            referral_campaign=referral_campaign,
+            deduplication_key=deduplication_key,
+            metadata=fields or None,
+        )
+    except Exception:
+        pass
+
+
+def _journey_state(user_id):
+    data = read_json(tenant_file(OWNER_ID, "customer_journey.json"), {})
+    item = data.get(str(user_id), {}) if isinstance(data, dict) else {}
+    return dict(item) if isinstance(item, dict) else {}
+
+
+def _record_completed_growth(payment_id, record, renewed=False):
+    user_id = record.get("user_id")
+    common = {
+        "plan": record.get("plan_gb"),
+        "payment_method": record.get("payment_method"),
+        "referral_campaign": "hosted_invite" if record.get("referral_attribution") else None,
+    }
+    _record_growth(
+        "checkout_completed",
+        user_id,
+        **common,
+        deduplication_key=f"hosted-checkout-completed:{OWNER_ID}:{payment_id}",
+    )
+    if renewed:
+        _record_growth(
+            "renewal_completed",
+            user_id,
+            **common,
+            deduplication_key=f"hosted-renewal-completed:{OWNER_ID}:{payment_id}",
+        )
+    completed_count = sum(
+        1
+        for item in _tenant_payments().values()
+        if isinstance(item, dict) and item.get("status") == "completed"
+    )
+    if completed_count == 1:
+        _record_growth(
+            "hosted_first_sale",
+            user_id,
+            **common,
+            deduplication_key=f"hosted-first-sale:{OWNER_ID}",
+        )
+
+
+def _reconcile_invite_discount_reservations():
+    payments = _tenant_payments()
+    active_statuses = {
+        "creating", "waiting_receipt", "pending_approval", "pending", "processing",
+        "paid_provision_failed",
+    }
+    released = []
+    with locked_json(tenant_file(OWNER_ID, "referrals.json"), _referral_data()) as data:
+        reservations = data.setdefault("buyer_discount_reservations", {})
+        for user_id, reservation in list(reservations.items()):
+            order_id = reservation.get("order_id") if isinstance(reservation, dict) else None
+            payment = payments.get(str(order_id), {})
+            if not isinstance(payment, dict) or payment.get("status") not in active_statuses:
+                reservations.pop(user_id, None)
+                released.append(str(order_id or ""))
+    return released
+
+
+def _update_journey_state(user_id, **updates):
+    with locked_json(tenant_file(OWNER_ID, "customer_journey.json"), {}) as data:
+        item = data.setdefault(str(user_id), {})
+        if not isinstance(item, dict):
+            item = {}
+            data[str(user_id)] = item
+        item.update(updates)
+        item["updated_at"] = _now()
+        return dict(item)
+
+
+def _claim_risk_disclosure(user_id):
+    with locked_json(tenant_file(OWNER_ID, "customer_journey.json"), {}) as data:
+        item = data.setdefault(str(user_id), {})
+        if not isinstance(item, dict):
+            item = {}
+            data[str(user_id)] = item
+        if item.get("risk_disclosed_at"):
+            return False
+        item["risk_disclosed_at"] = _now()
+        return True
+
+
+def _customer_has_completed_order(user_id):
+    return any(
+        isinstance(record, dict)
+        and str(record.get("user_id")) == str(user_id)
+        and record.get("status") == "completed"
+        for record in _tenant_payments().values()
+    )
+
+
+def _invite_discount_preview(user_id, renewal=False):
+    if not BUYER_DISCOUNTS_ENABLED or renewal or _customer_has_completed_order(user_id):
+        return 0.0
+    data = _referral_data()
+    key = str(user_id)
+    if key not in data.get("referrals", {}) or key in data.get("buyer_discount_redeemed", {}):
+        return 0.0
+    return 5.0
+
+
+def _reserve_invite_discount(user_id, order_id, renewal=False):
+    if not BUYER_DISCOUNTS_ENABLED or renewal or _customer_has_completed_order(user_id):
+        return False
+    key = str(user_id)
+    with locked_json(tenant_file(OWNER_ID, "referrals.json"), _referral_data()) as data:
+        if key not in data.setdefault("referrals", {}):
+            return False
+        if key in data.setdefault("buyer_discount_redeemed", {}):
+            return False
+        reservations = data.setdefault("buyer_discount_reservations", {})
+        current = reservations.get(key)
+        if isinstance(current, dict) and str(current.get("order_id")) != str(order_id):
+            return False
+        reservations[key] = {"order_id": str(order_id), "reserved_at": _now()}
+        return True
+
+
+def _release_invite_discount(user_id, order_id):
+    key = str(user_id)
+    with locked_json(tenant_file(OWNER_ID, "referrals.json"), _referral_data()) as data:
+        current = data.setdefault("buyer_discount_reservations", {}).get(key)
+        if not isinstance(current, dict) or str(current.get("order_id")) != str(order_id):
+            return False
+        data["buyer_discount_reservations"].pop(key, None)
+        return True
+
+
+def _redeem_invite_discount(user_id, order_id):
+    key = str(user_id)
+    with locked_json(tenant_file(OWNER_ID, "referrals.json"), _referral_data()) as data:
+        redeemed = data.setdefault("buyer_discount_redeemed", {})
+        if key in redeemed:
+            return str(redeemed[key].get("order_id")) == str(order_id) if isinstance(redeemed[key], dict) else False
+        current = data.setdefault("buyer_discount_reservations", {}).get(key)
+        if not isinstance(current, dict) or str(current.get("order_id")) != str(order_id):
+            return False
+        redeemed[key] = {"order_id": str(order_id), "redeemed_at": _now()}
+        data["buyer_discount_reservations"].pop(key, None)
+        return True
 
 
 def _ensure_referral_code(user_id):
@@ -713,6 +1053,7 @@ def _ensure_referral_code(user_id):
 
 
 def _register_referral(user_id, code):
+    registered = False
     with locked_json(tenant_file(OWNER_ID, "referrals.json"), _referral_data()) as data:
         key = str(user_id)
         referrer = data.setdefault("codes", {}).get(code)
@@ -721,12 +1062,21 @@ def _register_referral(user_id, code):
         data["referrals"][key] = referrer
         stats = data.setdefault("stats", {}).setdefault(referrer, {"count": 0, "total_earnings": 0.0, "available_balance": 0.0})
         stats["count"] = int(stats.get("count", 0)) + 1
-        return True
+        registered = True
+    if registered:
+        _record_growth(
+            "referral_attributed",
+            user_id,
+            referral_campaign="hosted_invite",
+            deduplication_key=f"hosted-referral-attributed:{OWNER_ID}:{user_id}",
+        )
+    return registered
 
 
 def _credit_referral(order_id, customer_id, reward):
     if float(reward or 0) <= 0:
         return 0.0
+    credited_referrer = None
     with locked_json(tenant_file(OWNER_ID, "referrals.json"), _referral_data()) as data:
         referrer = data.setdefault("referrals", {}).get(str(customer_id))
         if not referrer:
@@ -738,6 +1088,20 @@ def _credit_referral(order_id, customer_id, reward):
         stats["total_earnings"] = round(float(stats.get("total_earnings", 0)) + float(reward), 2)
         stats["available_balance"] = round(float(stats.get("available_balance", 0)) + float(reward), 2)
         rewarded[order_id] = float(reward)
+        credited_referrer = referrer
+    if credited_referrer:
+        try:
+            bot.send_message(
+                int(credited_referrer),
+                _hosted_message(
+                    int(credited_referrer),
+                    "referral_reward_ready",
+                    amount=format_usd_amount(reward),
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
     return float(reward)
 
 
@@ -750,6 +1114,10 @@ def _credit_sale_and_referral(
     funded,
     margin=0,
 ):
+    margin_value = _financial_amount(margin, "margin")
+    reward_value = _financial_amount(reward, "referral reward")
+    if reward_value > margin_value:
+        raise ValueError("Hosted referral reward exceeds positive post-discount margin")
     transaction = (
         database.write_transaction(operation="hosted_sale_referral_accounting")
         if os.getenv("AJIB_SQLITE_ACTIVE") == "1"
@@ -757,21 +1125,50 @@ def _credit_sale_and_referral(
     )
     with transaction:
         if funded:
-            credit_crypto_sale(
+            accounted = credit_crypto_sale(
                 OWNER_ID,
                 payment_id,
-                margin,
-                reward,
+                float(margin_value),
+                float(reward_value),
                 metadata,
             )
+            expected_transactions = {
+                f"sale:{payment_id}": margin_value,
+            }
+            if reward_value > 0:
+                expected_transactions[f"referral:{payment_id}"] = reward_value
+        elif reward_value > 0:
+            accounted = add_referral_liability(
+                OWNER_ID,
+                payment_id,
+                float(reward_value),
+                metadata,
+            )
+            expected_transactions = {f"referral:{payment_id}": reward_value}
         else:
-            add_referral_liability(
-                OWNER_ID,
-                payment_id,
-                reward,
-                metadata,
+            accounted = True
+            expected_transactions = {}
+        if not accounted:
+            transactions = {
+                str(item.get("id")): _financial_amount(item.get("amount", 0), "ledger amount")
+                for item in get_ledger(OWNER_ID).get("transactions", [])
+                if isinstance(item, dict) and str(item.get("id")) in expected_transactions
+            }
+            if any(transactions.get(transaction_id) != amount for transaction_id, amount in expected_transactions.items()):
+                raise RuntimeError("Hosted sale accounting was not persisted")
+        credited = _credit_referral(payment_id, customer_id, float(reward_value))
+        payment = _tenant_payments().get(str(payment_id), {})
+        if isinstance(payment, dict) and float(payment.get("invite_discount_percent", 0) or 0) > 0:
+            _redeem_invite_discount(customer_id, payment_id)
+            _record_growth(
+                "referral_converted",
+                customer_id,
+                payment_method=payment.get("payment_method"),
+                plan=payment.get("plan_gb"),
+                referral_campaign="hosted_invite",
+                deduplication_key=f"hosted-referral-conversion:{OWNER_ID}:{payment_id}",
             )
-        return _credit_referral(payment_id, customer_id, reward)
+        return credited
 
 
 def _create_user(
@@ -867,9 +1264,13 @@ def _deliver_config_safely(chat_id, username, client, renewed=False):
         return False
 
 
-def _settle_hosted_reserved_renewal(payment_id, record, funded):
+def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None):
     from utils.renewal import mark_payment_renewal_reserved
 
+    try:
+        settlement = settlement or _settlement_financials(record)
+    except ValueError as error:
+        return False, str(error)
     customer_id = int(record["user_id"])
     username = record.get("renew_username")
     server_id = record.get("server_id")
@@ -927,10 +1328,10 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded):
     _credit_sale_and_referral(
         payment_id,
         customer_id,
-        record.get("referral_reward", 0),
+        settlement["referral_reward"],
         common,
         funded=funded,
-        margin=record.get("margin", 0),
+        margin=settlement["margin"],
     )
     if not mark_payment_renewal_reserved(
         payment_id,
@@ -942,6 +1343,7 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded):
         },
     ):
         return False, "Reservation persistence failed"
+    _record_completed_growth(payment_id, record, renewed=True)
     if funded:
         present_pending_reseller_level(
             bot,
@@ -950,19 +1352,26 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded):
             allow_introduction=False,
         )
     reserved_text = _hosted_message(customer_id, "renewal_reserved_success")
-    if reserved_text == "renewal_reserved_success":
-        reserved_text = "Your renewal is paid and reserved. It will apply automatically when this config expires."
     bot.send_message(customer_id, reserved_text)
     return True, username
 
 
 def _provision_payment(payment_id, record, funded):
+    try:
+        settlement = _settlement_financials(record)
+    except ValueError as error:
+        return False, str(error)
     customer_id = int(record["user_id"])
     username = record.get("renew_username")
     client = None
     renewed = bool(username)
     if renewed and record.get("renewal_mode") == "reserved":
-        return _settle_hosted_reserved_renewal(payment_id, record, funded)
+        return _settle_hosted_reserved_renewal(
+            payment_id,
+            record,
+            funded,
+            settlement=settlement,
+        )
     reseller_snapshot = get_reseller_data(OWNER_ID) or {}
     existing_config = None
     for item in reseller_snapshot.get("configs", []):
@@ -986,13 +1395,14 @@ def _provision_payment(payment_id, record, funded):
         _credit_sale_and_referral(
             payment_id,
             customer_id,
-            record.get("referral_reward", 0),
+            settlement["referral_reward"],
             metadata,
             funded=funded,
-            margin=record.get("margin", 0),
+            margin=settlement["margin"],
         )
         _save_payment(payment_id, {"status": "completed", "username": username,
                                    "server_id": existing_config.get("server_id")})
+        _record_completed_growth(payment_id, record, renewed=renewed)
         _deliver_config_safely(customer_id, username, client, renewed=renewed)
         if funded:
             present_pending_reseller_level(
@@ -1082,12 +1492,13 @@ def _provision_payment(payment_id, record, funded):
     _credit_sale_and_referral(
         payment_id,
         customer_id,
-        record.get("referral_reward", 0),
+        settlement["referral_reward"],
         common,
         funded=funded,
-        margin=record.get("margin", 0),
+        margin=settlement["margin"],
     )
     _save_payment(payment_id, {"status": "completed", "username": username, "server_id": server_id})
+    _record_completed_growth(payment_id, record, renewed=renewed)
     _deliver_config_safely(customer_id, username, client, renewed=renewed)
     return True, username
 
@@ -1106,20 +1517,94 @@ def _provision_claimed_payment(payment_id, record, funded, retry_status):
     return success, detail
 
 
-def _show_plans(chat_id, user_id, message_id=None):
+def _quick_pick_plans(plans, settings):
+    if not plans:
+        return []
+    quoted = {
+        plan_id: _hosted_plan_quote(plan, settings)
+        for plan_id, plan in plans.items()
+    }
+    cheapest = min(plans, key=lambda plan_id: (quoted[plan_id]["retail"], int(plan_id)))
+    recommended = str(settings.get("recommended_plan_id") or "")
+    recommended_label = "pick_recommended"
+    if recommended not in plans:
+        ordered = sorted(plans, key=lambda plan_id: (quoted[plan_id]["retail"], int(plan_id)))
+        recommended = ordered[(len(ordered) - 1) // 2]
+        recommended_label = "pick_balanced"
+    best_value = min(
+        plans,
+        key=lambda plan_id: (
+            quoted[plan_id]["retail"] / max(1, int(plans[plan_id].get("gb", plan_id))),
+            quoted[plan_id]["retail"],
+        ),
+    )
+    result = []
+    for plan_id, label in (
+        (cheapest, "pick_cheapest"),
+        (recommended, recommended_label),
+        (best_value, "pick_best_value"),
+    ):
+        if plan_id not in {item[0] for item in result}:
+            result.append((plan_id, label))
+    return result
+
+
+def _plan_button_text(user_id, plan_id, plan, quote, label_key=None, exchange_rate=None):
     language = _language(user_id)
+    exchange_rate = exchange_rate if exchange_rate is not None else get_exchange_rate()
+    label = hosted_text(language, label_key) if label_key else ""
+    template_key = "plan_button_toman_first" if language == "fa" else "plan_button_usd_first"
+    return hosted_text(
+        language,
+        template_key,
+        label=(f"{label} · " if label else ""),
+        gb=plan.get("gb", plan_id),
+        days=plan.get("days", 30),
+        usd=format_usd_amount(quote["retail"]),
+        toman=format_toman_amount(quote["retail"] * exchange_rate),
+    )
+
+
+def _show_plans(chat_id, user_id, message_id=None, show_all=False, event_key=None):
     markup = types.InlineKeyboardMarkup(row_width=1)
     settings = get_settings(OWNER_ID)
-    for plan_id, plan in sorted(_sellable_plans().items(), key=lambda item: int(item[0])):
+    plans = _sellable_plans()
+    exchange_rate = get_exchange_rate()
+    if show_all:
+        choices = [(plan_id, None) for plan_id in sorted(plans, key=lambda value: int(value))]
+    else:
+        choices = _quick_pick_plans(plans, settings)
+    for plan_id, label_key in choices:
+        plan = plans[plan_id]
         quote = _hosted_plan_quote(plan, settings)
-        account_type = get_message_text(
-            language, "unlimited_users" if plan.get("unlimited", False) else "single_user"
-        )
         markup.add(types.InlineKeyboardButton(
-            f"{plan_id} GB · {plan.get('days', 30)} days · ${format_usd_amount(quote['retail'])}{account_type}",
+            _plan_button_text(
+                user_id,
+                plan_id,
+                plan,
+                quote,
+                label_key=label_key,
+                exchange_rate=exchange_rate,
+            ),
             callback_data=f"hb:buy:{plan_id}",
         ))
-    text = _message(user_id, "select_plan") if markup.keyboard else _message(user_id, "plan_not_found")
+    if plans and not show_all and len(choices) < len(plans):
+        markup.add(types.InlineKeyboardButton(
+            _hosted_message(user_id, "see_all_plans"),
+            callback_data="hb:plans:all",
+        ))
+    text = (
+        _hosted_message(user_id, "all_plans_title" if show_all else "quick_plans_title")
+        if markup.keyboard else _message(user_id, "plan_not_found")
+    )
+    _record_growth(
+        "plan_viewed",
+        user_id,
+        deduplication_key=(
+            event_key
+            or f"hosted-plan-viewed:{OWNER_ID}:{user_id}:{message_id or 'direct'}:{'all' if show_all else 'quick'}"
+        ),
+    )
     if message_id is not None:
         bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
     else:
@@ -1137,46 +1622,212 @@ def _purchase_options(chat_id, user_id, plan_id, renewal=None, message_id=None):
         return
     settings = get_settings(OWNER_ID)
     language = _language(user_id)
+    buyer_discount_percent = _invite_discount_preview(user_id, renewal=bool(renewal))
     quote = _hosted_plan_quote(
         plan,
         settings,
         settings["referral_margin_percent"],
         referred=str(user_id) in _referral_data().get("referrals", {}),
+        buyer_discount_percent=buyer_discount_percent,
     )
     markup = types.InlineKeyboardMarkup(row_width=1)
     suffix = ""
     if renewal:
         token = _store_renewal_token(user_id, renewal)
         suffix = f":{token}"
-    if settings.get("card_number"):
-        markup.add(types.InlineKeyboardButton(get_button_text(language, "card_to_card"),
-                                              callback_data=f"hb:pay:card:{plan_id}{suffix}"))
+    exchange_rate = get_exchange_rate()
+    if settings.get("card_number") and quote["card_supported"]:
+        markup.add(types.InlineKeyboardButton(
+            _hosted_message(
+                user_id,
+                "card_method",
+                amount=format_toman_amount(quote["card_collected"] * exchange_rate),
+            ),
+            callback_data=f"hb:pay:card:{plan_id}{suffix}",
+        ))
     if settings.get("crypto_enabled") and quote["crypto_supported"] and os.getenv("CRYPTO_MERCHANT_ID") and os.getenv("CRYPTO_API_KEY"):
         markup.add(types.InlineKeyboardButton(
-            get_message_text(language, "crypto_discount_button").format(percent=5),
+            _hosted_message(user_id, "crypto_method", amount=format_usd_amount(quote["crypto_collected"])),
             callback_data=f"hb:pay:crypto:{plan_id}{suffix}",
         ))
     if not markup.keyboard:
         bot.send_message(chat_id, _message(user_id, "no_payment_methods"))
         return
     markup.add(types.InlineKeyboardButton(get_button_text(language, "back"), callback_data="hb:plans"))
-    exchange_rate = get_exchange_rate()
-    unlimited_text = get_button_text(language, "yes" if plan.get("unlimited", False) else "no")
-    text = _message(user_id, "plan_details")
-    text += _message(user_id, "data").format(plan_gb=plan_id)
-    text += _message(user_id, "duration").format(days=plan.get("days", 30))
-    text += _message(user_id, "unlimited").format(unlimited_text=unlimited_text)
-    text += _message(user_id, "price").format(price=format_usd_amount(quote["retail"]))
-    text += _message(user_id, "exchange_rate").format(exchange_rate=format_toman_amount(exchange_rate))
-    text += _message(user_id, "toman_price").format(
-        toman_price=format_toman_amount(quote["retail"] * exchange_rate)
+    text = _hosted_message(user_id, "checkout_progress")
+    text += "\n\n" + _hosted_message(
+        user_id,
+        "plan_checkout_header",
+        gb=plan.get("gb", plan_id),
+        days=plan.get("days", 30),
     )
-    text += _message(user_id, "purchase_connection_warning")
-    text += _message(user_id, "select_payment_method")
+    card_key = "card_total_toman_first" if language == "fa" else "card_total_usd_first"
+    crypto_key = "crypto_total_toman_first" if language == "fa" else "crypto_total_usd_first"
+    if settings.get("card_number") and quote["card_supported"]:
+        text += "\n" + _hosted_message(
+            user_id,
+            card_key,
+            usd=format_usd_amount(quote["card_collected"]),
+            toman=format_toman_amount(quote["card_collected"] * exchange_rate),
+        )
+    if (
+        settings.get("crypto_enabled")
+        and quote["crypto_supported"]
+        and os.getenv("CRYPTO_MERCHANT_ID")
+        and os.getenv("CRYPTO_API_KEY")
+    ):
+        text += "\n" + _hosted_message(
+            user_id,
+            crypto_key,
+            usd=format_usd_amount(quote["crypto_collected"]),
+            toman=format_toman_amount(quote["crypto_collected"] * exchange_rate),
+        )
+    if buyer_discount_percent:
+        text += "\n" + _hosted_message(
+            user_id,
+            "invite_discount_applied",
+            percent=f"{buyer_discount_percent:g}",
+        )
+    text += "\n\n" + _hosted_message(user_id, "delivery_summary")
+    text += "\n" + _hosted_message(user_id, "support_summary")
+    if not renewal and _claim_risk_disclosure(user_id):
+        text += "\n\n" + _hosted_message(user_id, "risk_disclosure")
+    _record_growth(
+        "plan_selected",
+        user_id,
+        plan=plan_id,
+        deduplication_key=(
+            f"hosted-plan-selected:{OWNER_ID}:{user_id}:{message_id or 'direct'}:{plan_id}"
+        ),
+    )
     if message_id is not None:
         bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
     else:
         bot.send_message(chat_id, text, reply_markup=markup)
+
+
+def _language_markup():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(*[
+        types.InlineKeyboardButton(name, callback_data=f"hb:lang:{code}")
+        for code, name in LANGUAGES.items()
+    ])
+    return markup
+
+
+def _test_record(user_id):
+    tests = read_json(GLOBAL_TEST_FILE, {})
+    record = tests.get(str(user_id), {}) if isinstance(tests, dict) else {}
+    return dict(record) if isinstance(record, dict) else {}
+
+
+def _customer_onboarding_state(user_id):
+    configs = _find_customer_configs(user_id)
+    if configs:
+        any_active = False
+        for config in configs:
+            client, live = MultiServerAPI().find_user(
+                config.get("username"),
+                preferred_server_id=config.get("server_id"),
+            )
+            if not client or not live:
+                continue
+            remaining_time = int(live.get("expiration_days", 0) or 0) > 0
+            maximum = float(live.get("max_download_bytes", 0) or 0)
+            used = float(live.get("upload_bytes", 0) or 0) + float(live.get("download_bytes", 0) or 0)
+            remaining_traffic = maximum <= 0 or used < maximum
+            if remaining_time and remaining_traffic:
+                any_active = True
+                break
+        return ("paid" if any_active else "expired"), configs
+    test = _test_record(user_id)
+    if test.get("used_at"):
+        connected = bool(_journey_state(user_id).get("trial_connected_at"))
+        return ("trial_active" if connected else "trial"), test
+    return "new", None
+
+
+def _send_onboarding(chat_id, user_id, reply_to=None):
+    state, detail = _customer_onboarding_state(user_id)
+    settings = get_settings(OWNER_ID)
+    custom_welcome = localized_storefront_text(settings, "welcome", _language(user_id), default="")
+    state_key = {
+        "new": "welcome_new",
+        "trial": "welcome_trial",
+        "trial_active": "welcome_trial_active",
+        "paid": "welcome_paid",
+        "expired": "welcome_expired",
+    }[state]
+    text = _hosted_message(user_id, state_key)
+    if state == "trial_active" and isinstance(detail, dict) and detail.get("username"):
+        _client, live = MultiServerAPI().find_user(
+            detail.get("username"),
+            preferred_server_id=detail.get("server_id"),
+        )
+        if live:
+            maximum = float(live.get("max_download_bytes", 0) or 0)
+            used = float(live.get("upload_bytes", 0) or 0) + float(live.get("download_bytes", 0) or 0)
+            remaining_gb = max(0.0, maximum - used) / (1024 ** 3) if maximum > 0 else 0.0
+            text += "\n\n" + _hosted_message(
+                user_id,
+                "trial_remaining",
+                days=max(0, int(live.get("expiration_days", 0) or 0)),
+                gb=f"{remaining_gb:.1f}",
+            )
+    if custom_welcome:
+        text = f"{custom_welcome}\n\n{text}"
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if state == "new":
+        markup.add(types.InlineKeyboardButton(
+            _hosted_message(user_id, "start_free_test"),
+            callback_data="hb:test:start",
+        ))
+        markup.add(types.InlineKeyboardButton(
+            _hosted_message(user_id, "see_plans"),
+            callback_data="hb:plans",
+        ))
+    elif state == "trial":
+        markup.add(types.InlineKeyboardButton(
+            _hosted_message(user_id, "need_help_action"),
+            callback_data="hb:test:help",
+        ))
+        markup.add(types.InlineKeyboardButton(
+            _hosted_message(user_id, "connected_action"),
+            callback_data="hb:test:connected",
+        ))
+        markup.add(types.InlineKeyboardButton(
+            _hosted_message(user_id, "see_plans"),
+            callback_data="hb:plans",
+        ))
+    elif state == "expired":
+        markup.add(types.InlineKeyboardButton(
+            _hosted_message(user_id, "renew_action"),
+            callback_data="hb:renewcfg:0",
+        ))
+    else:
+        markup.add(types.InlineKeyboardButton(
+            _hosted_message(user_id, "my_configs_action"),
+            callback_data="hb:configs",
+        ))
+        markup.add(types.InlineKeyboardButton(
+            _hosted_message(user_id, "see_plans"),
+            callback_data="hb:plans",
+        ))
+    _record_growth(
+        "onboarding_viewed",
+        user_id,
+        deduplication_key=f"hosted-onboarding:{OWNER_ID}:{user_id}:{state}",
+    )
+    sender = bot.reply_to if reply_to is not None else bot.send_message
+    if reply_to is not None:
+        sender(reply_to, text, reply_markup=markup)
+    else:
+        sender(chat_id, text, reply_markup=markup)
+    bot.send_message(
+        chat_id,
+        _hosted_message(user_id, "menu_updated"),
+        reply_markup=_main_markup(user_id),
+    )
 
 
 @bot.message_handler(commands=["start"])
@@ -1188,23 +1839,50 @@ def start(message):
         return
     if start_payload and start_payload != "owner_setup":
         _register_referral(message.from_user.id, parts[1].strip())
-    settings = get_settings(OWNER_ID)
-    bot.reply_to(
-        message,
-        settings.get("welcome_text") or _hosted_message(message.from_user.id, "welcome_default"),
-        reply_markup=_main_markup(message.from_user.id),
-    )
+    if not _has_language(message.from_user.id):
+        detected = _telegram_language(message.from_user)
+        if detected:
+            _set_language(message.from_user.id, detected)
+        else:
+            bot.reply_to(
+                message,
+                hosted_text("en", "choose_language"),
+                reply_markup=_language_markup(),
+            )
+            return
+    _send_onboarding(message.chat.id, message.from_user.id, reply_to=message)
 
 
-@bot.message_handler(func=lambda m: m.text in _all_button_values("purchase_plan", "💳 Purchase Plan"))
+@bot.message_handler(func=lambda m: m.text in _all_button_values("purchase_plan"))
 def plans(message):
-    _show_plans(message.chat.id, message.from_user.id)
+    _show_plans(
+        message.chat.id,
+        message.from_user.id,
+        event_key=f"hosted-plan-viewed:{OWNER_ID}:{message.from_user.id}:message:{message.message_id}:quick",
+    )
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "hb:plans")
 def plans_back(call):
     bot.answer_callback_query(call.id)
-    _show_plans(call.message.chat.id, call.from_user.id, call.message.message_id)
+    _show_plans(
+        call.message.chat.id,
+        call.from_user.id,
+        call.message.message_id,
+        event_key=f"hosted-plan-viewed:{OWNER_ID}:{call.from_user.id}:callback:{call.message.message_id}:quick",
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "hb:plans:all")
+def plans_all(call):
+    bot.answer_callback_query(call.id)
+    _show_plans(
+        call.message.chat.id,
+        call.from_user.id,
+        call.message.message_id,
+        show_all=True,
+        event_key=f"hosted-plan-viewed:{OWNER_ID}:{call.from_user.id}:callback:{call.message.message_id}:all",
+    )
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:buy:"))
@@ -1218,7 +1896,11 @@ def buy(call):
 def payment_method(call):
     parts = call.data.split(":")
     if len(parts) not in {4, 5} or parts[2] not in {"card", "crypto"}:
-        bot.answer_callback_query(call.id, "Invalid checkout action.", show_alert=True)
+        bot.answer_callback_query(
+            call.id,
+            _hosted_message(call.from_user.id, "invalid_checkout_action"),
+            show_alert=True,
+        )
         return
     method, plan_id = parts[2], parts[3]
     plan = _sellable_plans().get(plan_id)
@@ -1232,7 +1914,7 @@ def payment_method(call):
         if not renewal:
             bot.answer_callback_query(
                 call.id,
-                "This renewal checkout expired. Open the config and start again.",
+                _hosted_message(call.from_user.id, "renewal_checkout_expired"),
                 show_alert=True,
             )
             return
@@ -1250,20 +1932,62 @@ def payment_method(call):
             )
             return
     referred = str(call.from_user.id) in _referral_data().get("referrals", {})
+    order_id = str(uuid.uuid4())
+    invite_discount_eligible = bool(
+        _invite_discount_preview(call.from_user.id, renewal=bool(renewal))
+    )
+    invite_discount_reserved = _reserve_invite_discount(
+        call.from_user.id,
+        order_id,
+        renewal=bool(renewal),
+    )
+    if invite_discount_eligible and not invite_discount_reserved:
+        bot.answer_callback_query(
+            call.id,
+            _hosted_message(call.from_user.id, "checkout_already_started"),
+            show_alert=True,
+        )
+        return
+    buyer_discount_percent = (
+        float(INVITED_BUYER_DISCOUNT_PERCENT) if invite_discount_reserved else 0.0
+    )
     quote = _hosted_plan_quote(
         plan,
         settings,
         settings["referral_margin_percent"],
         referred,
+        buyer_discount_percent=buyer_discount_percent,
     )
-    order_id = str(uuid.uuid4())
+    collected_amount = quote["card_collected"] if method == "card" else quote["crypto_collected"]
+    margin = quote["card_margin"] if method == "card" else quote["crypto_margin"]
+    customer_discount_percent = (
+        quote["card_discount_percent"] if method == "card" else quote["crypto_discount_percent"]
+    )
+    customer_discount_amount = (
+        quote["card_discount_amount"] if method == "card" else quote["crypto_discount_amount"]
+    )
+    referrer_id = _referral_data().get("referrals", {}).get(str(call.from_user.id))
     record = {
         "id": order_id, "user_id": call.from_user.id, "telegram_username": call.from_user.username,
         "reseller_id": str(OWNER_ID), "origin_bot_id": os.getenv("AJIB_HOSTED_BOT_ID"),
         "plan_gb": plan_id, "days": plan.get("days", 30), "unlimited": plan.get("unlimited", False),
-        "wholesale_price": quote["wholesale"], "retail_price": quote["retail"],
+        "wholesale_price": quote["wholesale"], "retail_price": collected_amount,
+        "original_price": quote["original_price"], "collected_amount": collected_amount,
+        "margin": margin,
         "list_price": quote["list_price"], "reseller_level": quote["reseller_level"],
         "discount_percent": quote["discount_percent"],
+        "invite_discount_percent": quote["buyer_discount_percent"],
+        "invite_discount_amount": quote["buyer_discount_amount"],
+        "crypto_discount_percent": (
+            quote["crypto_component_discount_percent"] if method == "crypto" else 0.0
+        ),
+        "crypto_discount_amount": (
+            quote["crypto_component_discount_amount"] if method == "crypto" else 0.0
+        ),
+        "total_discount_percent": customer_discount_percent,
+        "total_discount_amount": customer_discount_amount,
+        "referral_attribution": str(referrer_id) if referrer_id else None,
+        "reward_calculation_base": max(0.0, margin),
         "referral_reward": quote["card_referral_reward"] if method == "card" else quote["crypto_referral_reward"],
         "payment_method": method,
         "checkout_source": f"{call.message.chat.id}:{call.message.message_id}:{method}:{plan_id}",
@@ -1282,15 +2006,22 @@ def payment_method(call):
         },
     }
     if method == "card" and not settings.get("card_number"):
+        _release_invite_discount(call.from_user.id, order_id)
+        bot.answer_callback_query(call.id, _message(call.from_user.id, "no_payment_methods"), show_alert=True)
+        return
+    if method == "card" and not quote["card_supported"]:
+        _release_invite_discount(call.from_user.id, order_id)
         bot.answer_callback_query(call.id, _message(call.from_user.id, "no_payment_methods"), show_alert=True)
         return
     if method == "crypto" and (not settings.get("crypto_enabled") or not quote["crypto_supported"]):
+        _release_invite_discount(call.from_user.id, order_id)
         bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "crypto_disabled"), show_alert=True)
         return
     if method == "card":
         record["reservation_id"] = order_id
     started, existing_id = _start_checkout(order_id, record)
     if not started:
+        _release_invite_discount(call.from_user.id, order_id)
         bot.answer_callback_query(
             call.id,
             _hosted_message(
@@ -1304,12 +2035,13 @@ def payment_method(call):
         reseller = get_reseller_data(OWNER_ID) or {}
         _, _, available = can_reseller_add_debt(reseller, 0)
         if not reserve_credit(OWNER_ID, order_id, quote["wholesale"], available):
+            _release_invite_discount(call.from_user.id, order_id)
             _save_payment(order_id, {"status": "failed", "last_error": "Reseller credit is unavailable"})
             bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "credit_unavailable"),
                                       show_alert=True)
             return
         exchange_rate = get_exchange_rate()
-        toman_price = quote["retail"] * exchange_rate
+        toman_price = quote["card_collected"] * exchange_rate
         record.update({"status": "waiting_receipt", "reservation_id": order_id,
                        "exchange_rate": exchange_rate, "converted_amount": toman_price,
                        "converted_currency": "TOMAN",
@@ -1323,12 +2055,31 @@ def payment_method(call):
             get_button_text(_language(call.from_user.id), "cancel"),
             callback_data=f"hb:cancel:{order_id}",
         ))
+        markup.add(types.InlineKeyboardButton(
+            _button(call.from_user.id, "support"),
+            callback_data="hb:support",
+        ))
         bot.edit_message_text(
-            _message(call.from_user.id, "card_to_card_payment").format(
-                price=format_toman_amount(toman_price),
-                exchange_rate=format_toman_amount(exchange_rate),
-                card_number=settings["card_number"],
-            ), call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup,
+            _hosted_message(
+                call.from_user.id,
+                "card_checkout",
+                gb=plan.get("gb", plan_id),
+                days=plan.get("days", 30),
+                amount=format_toman_amount(toman_price),
+                card=settings["card_number"],
+            ),
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+        _record_growth(
+            "checkout_started",
+            call.from_user.id,
+            plan=plan_id,
+            payment_method="card",
+            referral_campaign="hosted_invite" if referred else None,
+            deduplication_key=f"hosted-checkout:{OWNER_ID}:{order_id}",
         )
         return
     try:
@@ -1341,8 +2092,10 @@ def payment_method(call):
     if not isinstance(response, dict) or "error" in response:
         error_message = response.get("error", "Invalid gateway response") if isinstance(response, dict) else "Invalid gateway response"
         _save_payment(order_id, {"status": "failed", "last_error": str(error_message)[:500]})
+        _release_invite_discount(call.from_user.id, order_id)
         bot.answer_callback_query(
-            call.id, _message(call.from_user.id, "error_creating_payment").format(error=error_message),
+            call.id,
+            _hosted_message(call.from_user.id, "checkout_creation_failed"),
             show_alert=True,
         )
         return
@@ -1350,8 +2103,10 @@ def payment_method(call):
     gateway_id, url = gateway.get("uuid"), gateway.get("url")
     if not gateway_id or not url:
         _save_payment(order_id, {"status": "failed", "last_error": "Invalid gateway response"})
+        _release_invite_discount(call.from_user.id, order_id)
         bot.answer_callback_query(
-            call.id, _message(call.from_user.id, "error_creating_payment").format(error="Invalid gateway response"),
+            call.id,
+            _hosted_message(call.from_user.id, "checkout_creation_failed"),
             show_alert=True,
         )
         return
@@ -1363,22 +2118,32 @@ def payment_method(call):
     markup.add(types.InlineKeyboardButton(get_button_text(language, "payment_link"), url=url),
                types.InlineKeyboardButton(get_button_text(language, "check_status"),
                                           callback_data=f"hb:check:{order_id}"))
-    caption = _message(call.from_user.id, "payment_instructions").format(
-        price=format_usd_amount(quote["crypto_collected"]), payment_url=url, payment_id=gateway_id
+    markup.add(types.InlineKeyboardButton(
+        _button(call.from_user.id, "support"),
+        callback_data="hb:support",
+    ))
+    caption = _hosted_message(
+        call.from_user.id,
+        "crypto_checkout",
+        gb=plan.get("gb", plan_id),
+        days=plan.get("days", 30),
+        amount=format_usd_amount(quote["crypto_collected"]),
+        payment_id=gateway_id,
     )
-    caption += "\n\n" + _message(call.from_user.id, "crypto_discount_summary").format(
-        percent=5,
-        original_price=format_usd_amount(quote["retail"]),
-        discount_amount=format_usd_amount(quote["retail"] - quote["crypto_collected"]),
-        discounted_price=format_usd_amount(quote["crypto_collected"]),
-    )
-    caption += _message(call.from_user.id, "purchase_connection_warning")
     image = io.BytesIO()
     qrcode.make(url).save(image, "PNG")
     image.seek(0)
     bot.answer_callback_query(call.id)
     bot.delete_message(call.message.chat.id, call.message.message_id)
     bot.send_photo(call.message.chat.id, image, caption=caption, parse_mode="Markdown", reply_markup=markup)
+    _record_growth(
+        "checkout_started",
+        call.from_user.id,
+        plan=plan_id,
+        payment_method="crypto",
+        referral_campaign="hosted_invite" if referred else None,
+        deduplication_key=f"hosted-checkout:{OWNER_ID}:{order_id}",
+    )
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:cancel:"))
@@ -1395,6 +2160,7 @@ def cancel_card_payment(call):
                                   show_alert=True)
         return
     release_credit(OWNER_ID, payment_id, kind="credit_canceled")
+    _release_invite_discount(call.from_user.id, payment_id)
     _save_payment(payment_id, {"status": "canceled"})
     _clear_input_state(call.from_user.id, kind="receipt", payment_id=payment_id)
     bot.answer_callback_query(call.id)
@@ -1443,7 +2209,7 @@ def receipt_photo(message):
             flush=True,
         )
         try:
-            bot.reply_to(message, "Receipt upload failed. Please send the photo again.")
+            bot.reply_to(message, _hosted_message(message.from_user.id, "receipt_upload_failed"))
         except Exception:
             pass
         return
@@ -1472,6 +2238,7 @@ def owner_receipt(call):
         return
     if action == "reject":
         release_credit(OWNER_ID, payment_id)
+        _release_invite_discount(record["user_id"], payment_id)
         _save_payment(payment_id, {"status": "rejected"})
         bot.send_message(record["user_id"], _hosted_message(record["user_id"], "receipt_rejected"))
         bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "rejected"))
@@ -1494,14 +2261,15 @@ def check_crypto(call):
         return
     if current.get("status") == "completed":
         bot.answer_callback_query(
-            call.id, _message(call.from_user.id, "payment_already_processed").format(status="completed"),
+            call.id,
+            _hosted_message(call.from_user.id, "payment_completed"),
             show_alert=True,
         )
         return
     if current.get("status") not in {"pending", "paid_provision_failed", "processing"}:
         bot.answer_callback_query(
             call.id,
-            _message(call.from_user.id, "payment_already_processed").format(status=current.get("status", "unknown")),
+            _hosted_message(call.from_user.id, "payment_closed"),
             show_alert=True,
         )
         return
@@ -1514,7 +2282,11 @@ def check_crypto(call):
         retry_status = "pending"
     if not record.get("gateway_payment_id"):
         _save_payment(payment_id, {"status": retry_status, "last_error": "Gateway reference is missing"})
-        bot.answer_callback_query(call.id, "Payment gateway reference is missing.", show_alert=True)
+        bot.answer_callback_query(
+            call.id,
+            _hosted_message(call.from_user.id, "payment_gateway_missing"),
+            show_alert=True,
+        )
         return
     try:
         response = CryptoPayment().check_payment_status(record["gateway_payment_id"])
@@ -1523,7 +2295,11 @@ def check_crypto(call):
             payment_id,
             {"status": retry_status, "last_error": f"Gateway status failed: {type(error).__name__}"},
         )
-        bot.answer_callback_query(call.id, "Payment status is temporarily unavailable.", show_alert=True)
+        bot.answer_callback_query(
+            call.id,
+            _hosted_message(call.from_user.id, "payment_status_unavailable"),
+            show_alert=True,
+        )
         return
     result = response.get("result", {}) if isinstance(response, dict) else {}
     status = result.get("status") or result.get("payment_status") or result.get("paymentStatus")
@@ -1531,8 +2307,7 @@ def check_crypto(call):
         _save_payment(payment_id, {"status": retry_status})
         bot.answer_callback_query(
             call.id,
-            (_message(call.from_user.id, "payment_pending") if not status else
-             _message(call.from_user.id, "payment_status").format(status=status)),
+            _message(call.from_user.id, "payment_pending"),
             show_alert=True,
         )
         return
@@ -1544,20 +2319,43 @@ def check_crypto(call):
         bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "paid_needs_attention"),
                                   show_alert=True)
         return
-    bot.answer_callback_query(call.id, _message(call.from_user.id, "payment_status").format(status="completed"),
-                              show_alert=True)
+    bot.answer_callback_query(
+        call.id,
+        _hosted_message(call.from_user.id, "payment_completed"),
+        show_alert=True,
+    )
 
 
-@bot.message_handler(func=lambda m: m.text in _all_button_values("my_configs", "📱 My Configs"))
+@bot.message_handler(func=lambda m: m.text in _all_button_values("my_configs"))
 def my_configs(message):
-    configs = _find_customer_configs(message.from_user.id)
+    _show_customer_configs(message.chat.id, message.from_user.id, reply_to=message)
+
+
+def _show_customer_configs(chat_id, user_id, reply_to=None):
+    configs = _find_customer_configs(user_id)
     if not configs:
-        bot.reply_to(message, "You have no configs in this bot.")
+        if reply_to is not None:
+            bot.reply_to(reply_to, _hosted_message(user_id, "no_configs"))
+        else:
+            bot.send_message(chat_id, _hosted_message(user_id, "no_configs"))
         return
     markup = types.InlineKeyboardMarkup(row_width=1)
     for index, config in enumerate(configs):
-        markup.add(types.InlineKeyboardButton(config.get("username", f"Config {index + 1}"), callback_data=f"hb:cfg:{index}"))
-    bot.reply_to(message, "Your configs:", reply_markup=markup)
+        fallback = _hosted_message(user_id, "config_fallback", number=index + 1)
+        markup.add(types.InlineKeyboardButton(
+            config.get("username", fallback),
+            callback_data=f"hb:cfg:{index}",
+        ))
+    if reply_to is not None:
+        bot.reply_to(reply_to, _hosted_message(user_id, "configs_title"), reply_markup=markup)
+    else:
+        bot.send_message(chat_id, _hosted_message(user_id, "configs_title"), reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "hb:configs")
+def configs_callback(call):
+    bot.answer_callback_query(call.id)
+    _show_customer_configs(call.message.chat.id, call.from_user.id)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:cfg:"))
@@ -1566,7 +2364,11 @@ def config_detail(call):
     try:
         config = configs[int(call.data.split(":")[2])]
     except (IndexError, ValueError):
-        bot.answer_callback_query(call.id, "Config not found", show_alert=True)
+        bot.answer_callback_query(
+            call.id,
+            _hosted_message(call.from_user.id, "config_not_found"),
+            show_alert=True,
+        )
         return
     from utils.renewal import find_reseller_renewal_offer, find_reseller_reservation, lookup_renewal_user
 
@@ -1576,7 +2378,11 @@ def config_detail(call):
         server_id=config.get("server_id"),
     )
     if not client or not live:
-        bot.answer_callback_query(call.id, "Config unavailable", show_alert=True)
+        bot.answer_callback_query(
+            call.id,
+            _hosted_message(call.from_user.id, "config_unavailable"),
+            show_alert=True,
+        )
         return
     bot.answer_callback_query(call.id)
     _deliver_config(call.message.chat.id, config["username"], client)
@@ -1588,8 +2394,6 @@ def config_detail(call):
     )
     if existing:
         status_text = _hosted_message(call.from_user.id, "renewal_reserved_status")
-        if status_text == "renewal_reserved_status":
-            status_text = "A renewal is already reserved for this config."
         bot.send_message(call.message.chat.id, status_text)
         return
     plan_id = str(config.get("plan_gb") or config.get("gb") or "")
@@ -1630,12 +2434,6 @@ def config_detail(call):
         ))
         message_key = "renewal_available" if renewal_mode == "immediate" else "renewal_reservation_available"
         message = _hosted_message(call.from_user.id, message_key)
-        if message == message_key:
-            message = (
-                "This config is eligible for renewal."
-                if renewal_mode == "immediate"
-                else "Reserve the next renewal now and it will apply automatically at expiry."
-            )
         bot.send_message(call.message.chat.id, message, reply_markup=markup)
     elif plan_id in plans:
         reason_key = offer.get("reason") or "renewal_ineligible_plan_mismatch"
@@ -1650,28 +2448,79 @@ def config_detail(call):
 def renew(call):
     parts = call.data.split(":")
     if len(parts) != 4:
-        bot.answer_callback_query(call.id, "Invalid renewal action.", show_alert=True)
+        bot.answer_callback_query(
+            call.id,
+            _hosted_message(call.from_user.id, "invalid_renewal_action"),
+            show_alert=True,
+        )
         return
     plan_id, token = parts[2], parts[3]
     renewal = _consume_renewal_token(token, call.from_user.id)
     if not renewal:
-        bot.answer_callback_query(call.id, "This renewal action expired. Open the config again.", show_alert=True)
+        bot.answer_callback_query(
+            call.id,
+            _hosted_message(call.from_user.id, "renewal_action_expired"),
+            show_alert=True,
+        )
         return
     bot.answer_callback_query(call.id)
     _purchase_options(call.message.chat.id, call.from_user.id, plan_id, renewal)
 
 
-@bot.message_handler(func=lambda m: m.text in _all_button_values("support", "📞 Support"))
+@bot.callback_query_handler(func=lambda c: c.data.startswith("hb:renewcfg:"))
+def renew_config_direct(call):
+    configs = _find_customer_configs(call.from_user.id)
+    try:
+        config = configs[int(call.data.split(":")[2])]
+    except (IndexError, ValueError):
+        bot.answer_callback_query(
+            call.id,
+            _hosted_message(call.from_user.id, "config_not_found"),
+            show_alert=True,
+        )
+        return
+    plan_id = str(config.get("plan_gb") or config.get("gb") or "")
+    if plan_id not in _sellable_plans():
+        bot.answer_callback_query(call.id, _message(call.from_user.id, "plan_not_found"), show_alert=True)
+        return
+    renewal, reason = _resolve_hosted_renewal_checkout(
+        call.from_user.id,
+        plan_id,
+        {
+            "config_index": config.get("_config_index"),
+            "username": config.get("username"),
+        },
+    )
+    if not renewal:
+        localized_reason = _message(call.from_user.id, reason)
+        bot.answer_callback_query(
+            call.id,
+            _message(call.from_user.id, "renewal_unavailable").format(reason=localized_reason),
+            show_alert=True,
+        )
+        return
+    bot.answer_callback_query(call.id)
+    _purchase_options(call.message.chat.id, call.from_user.id, plan_id, renewal)
+
+
+@bot.message_handler(func=lambda m: m.text in _all_button_values("support"))
 def support(message):
-    bot.reply_to(message, get_settings(OWNER_ID).get("support_text") or
-                 _hosted_message(message.from_user.id, "support_default"))
+    bot.reply_to(message, _storefront_setting(message.from_user.id, "support"))
 
 
-@bot.message_handler(func=lambda m: m.text in _all_button_values("language", "🌐 Language/زبان"))
+@bot.callback_query_handler(func=lambda c: c.data == "hb:support")
+def support_callback(call):
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, _storefront_setting(call.from_user.id, "support"))
+
+
+@bot.message_handler(func=lambda m: m.text in _all_button_values("language"))
 def language(message):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(*[types.InlineKeyboardButton(name, callback_data=f"hb:lang:{code}") for code, name in LANGUAGES.items()])
-    bot.reply_to(message, "Select language:", reply_markup=markup)
+    bot.reply_to(
+        message,
+        _hosted_message(message.from_user.id, "choose_language"),
+        reply_markup=_language_markup(),
+    )
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:lang:"))
@@ -1679,11 +2528,15 @@ def language_set(call):
     code = call.data.split(":")[2]
     if code in LANGUAGES:
         _set_language(call.from_user.id, code)
-    bot.answer_callback_query(call.id, "Language updated", show_alert=True)
-    bot.send_message(call.message.chat.id, "Menu updated.", reply_markup=_main_markup(call.from_user.id))
+    bot.answer_callback_query(
+        call.id,
+        _hosted_message(call.from_user.id, "language_updated"),
+        show_alert=True,
+    )
+    _send_onboarding(call.message.chat.id, call.from_user.id)
 
 
-@bot.message_handler(func=lambda m: m.text in _all_button_values("downloads", "⬇️ Downloads"))
+@bot.message_handler(func=lambda m: m.text in _all_button_values("downloads"))
 def downloads(message):
     send_download_prompt(
         bot,
@@ -1714,13 +2567,14 @@ def download_selection(call):
             pass
 
 
-@bot.message_handler(func=lambda m: m.text in _all_button_values("test_config", "🎁 Test Config"))
-def free_test(message):
+@bot.message_handler(func=lambda m: m.text in _all_button_values("test_config"))
+def free_test(message, customer=None):
+    customer = customer or message.from_user
     recovering_pending_test = False
     pending_username = None
     pending_server_id = None
     with locked_json(GLOBAL_TEST_FILE, {}) as tests:
-        key = str(message.from_user.id)
+        key = str(customer.id)
         if key in tests:
             existing = tests.get(key)
             pending_at = _parse_time(existing.get("creation_pending_at")) if isinstance(existing, dict) else None
@@ -1732,14 +2586,14 @@ def free_test(message):
                 and not existing.get("used_at")
             )
             if not pending_is_stale:
-                bot.reply_to(message, "You have already used a free test on this infrastructure.")
+                bot.reply_to(message, _hosted_message(customer.id, "test_already_used"))
                 return
             recovering_pending_test = True
             pending_username = existing.get("username")
             pending_server_id = existing.get("server_id")
         tests[key] = {
             **(dict(existing) if recovering_pending_test else {}),
-            "telegram_id": message.from_user.id,
+            "telegram_id": customer.id,
             "creation_pending_at": _now(),
             "origin_bot_id": os.getenv("AJIB_HOSTED_BOT_ID"),
             "reseller_id": str(OWNER_ID),
@@ -1755,7 +2609,7 @@ def free_test(message):
     if not client or not live:
         def persist_test_allocation(allocated_username, allocated_client):
             with locked_json(GLOBAL_TEST_FILE, {}) as tests:
-                current = tests.get(str(message.from_user.id))
+                current = tests.get(str(customer.id))
                 if not isinstance(current, dict) or not current.get("creation_pending_at"):
                     raise RuntimeError("Hosted test creation claim is missing")
                 current["username"] = allocated_username
@@ -1764,44 +2618,154 @@ def free_test(message):
         username, result, client = _create_user(
             plan,
             "",
-            customer_id=message.from_user.id,
+            customer_id=customer.id,
             username_prefix="ht",
             on_username_allocated=persist_test_allocation,
             preferred_username=pending_username,
         )
     if result is None:
         with locked_json(GLOBAL_TEST_FILE, {}) as tests:
-            current = tests.get(str(message.from_user.id))
+            current = tests.get(str(customer.id))
             if not isinstance(current, dict) or not current.get("username"):
-                tests.pop(str(message.from_user.id), None)
-        bot.reply_to(message, "Test creation failed. Please try again later.")
+                tests.pop(str(customer.id), None)
+        bot.reply_to(message, _hosted_message(customer.id, "test_creation_failed"))
         return
     with locked_json(GLOBAL_TEST_FILE, {}) as tests:
-        tests[str(message.from_user.id)].update({"username": username, "server_id": getattr(client, "server_id", None),
-                                                 "used_at": _now(), "creation_pending_at": None})
+        tests[str(customer.id)].update({"username": username, "server_id": getattr(client, "server_id", None),
+                                        "used_at": _now(), "creation_pending_at": None})
     _deliver_config_safely(message.chat.id, username, client)
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton(
+        _hosted_message(customer.id, "connected_action"),
+        callback_data="hb:test:connected",
+    ))
+    markup.add(types.InlineKeyboardButton(
+        _hosted_message(customer.id, "need_help_action"),
+        callback_data="hb:test:help",
+    ))
+    markup.add(types.InlineKeyboardButton(
+        _hosted_message(customer.id, "see_plans"),
+        callback_data="hb:plans",
+    ))
+    bot.reply_to(
+        message,
+        _hosted_message(customer.id, "activation_steps"),
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+    _record_growth(
+        "trial_started",
+        customer.id,
+        deduplication_key=f"hosted-trial-created:{OWNER_ID}:{customer.id}",
+    )
 
 
-@bot.message_handler(func=lambda m: m.text in _all_button_values("referral", "💰 Earn Crypto"))
-def referral(message):
+@bot.callback_query_handler(func=lambda c: c.data.startswith("hb:test:"))
+def test_action(call):
+    action = call.data.split(":")[2]
+    if action == "start":
+        bot.answer_callback_query(call.id)
+        free_test(call.message, customer=call.from_user)
+        return
+    if action == "help":
+        bot.answer_callback_query(call.id)
+        send_download_prompt(
+            bot,
+            call.message.chat.id,
+            _language(call.from_user.id),
+            callback_prefix="hb:download",
+        )
+        return
+    if action == "connected":
+        _update_journey_state(call.from_user.id, trial_connected_at=_now())
+        _record_growth(
+            "trial_activated",
+            call.from_user.id,
+            deduplication_key=f"hosted-trial-connected:{OWNER_ID}:{call.from_user.id}",
+        )
+        bot.answer_callback_query(
+            call.id,
+            _hosted_message(call.from_user.id, "activation_confirmed"),
+            show_alert=True,
+        )
+        _show_plans(call.message.chat.id, call.from_user.id)
+        return
+    bot.answer_callback_query(
+        call.id,
+        _hosted_message(call.from_user.id, "invalid_checkout_action"),
+        show_alert=True,
+    )
+
+
+def _referral_first_purchase_count(referrer_id):
     data = _referral_data()
+    invited = {
+        customer_id
+        for customer_id, owner in data.get("referrals", {}).items()
+        if str(owner) == str(referrer_id)
+    }
+    completed = {
+        str(record.get("user_id"))
+        for record in _tenant_payments().values()
+        if isinstance(record, dict)
+        and record.get("status") == "completed"
+        and str(record.get("user_id")) in invited
+    }
+    return len(completed)
+
+
+@bot.message_handler(func=lambda m: (
+    m.text in _all_button_values("referral")
+    or m.text in _all_hosted_values("invite_and_earn_button")
+))
+def referral(message):
     code = _ensure_referral_code(message.from_user.id)
+    data = _referral_data()
     stats = data.get("stats", {}).get(str(message.from_user.id), {})
     wallet = data.get("wallets", {}).get(str(message.from_user.id))
+    link = f"https://t.me/{BOT_USERNAME}?start={code}"
+    share_text = _hosted_message(message.from_user.id, "referral_share_text")
+    share_url = f"https://t.me/share/url?url={urlquote(link)}&text={urlquote(share_text)}"
     markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton("Set wallet", callback_data="hb:refwallet"),
-               types.InlineKeyboardButton("Withdraw", callback_data="hb:refwithdraw"))
-    bot.reply_to(message,
-                 f"Invites: {stats.get('count', 0)}\nEarned: ${float(stats.get('total_earnings', 0)):.2f}\n"
-                 f"Available: ${float(stats.get('available_balance', 0)):.2f}\nWallet: {wallet or 'not set'}\n"
-                 f"Link: https://t.me/{BOT_USERNAME}?start={code}", reply_markup=markup)
+    markup.add(types.InlineKeyboardButton(
+        _hosted_message(message.from_user.id, "share_invite"),
+        url=share_url,
+    ))
+    markup.add(
+        types.InlineKeyboardButton(
+            _hosted_message(message.from_user.id, "set_wallet"),
+            callback_data="hb:refwallet",
+        ),
+        types.InlineKeyboardButton(
+            _hosted_message(message.from_user.id, "withdraw"),
+            callback_data="hb:refwithdraw",
+        ),
+    )
+    intro = _hosted_message(
+        message.from_user.id,
+        "referral_intro",
+        percent=f"{float(get_settings(OWNER_ID)['referral_margin_percent']):g}",
+    )
+    progress = _hosted_message(
+        message.from_user.id,
+        "referral_progress",
+        invited=int(stats.get("count", 0) or 0),
+        buyers=_referral_first_purchase_count(message.from_user.id),
+        available=format_usd_amount(stats.get("available_balance", 0)),
+        earned=format_usd_amount(stats.get("total_earnings", 0)),
+        wallet=_escape_markdown(
+            wallet or _hosted_message(message.from_user.id, "wallet_not_set")
+        ),
+        link=link,
+    )
+    bot.reply_to(message, f"{intro}\n\n{progress}", parse_mode="Markdown", reply_markup=markup)
 
 
 @bot.callback_query_handler(func=lambda c: c.data in {"hb:refwallet", "hb:refwithdraw"})
 def referral_action(call):
     if call.data == "hb:refwallet":
         _set_input_state(call.from_user.id, {"kind": "referral_wallet"})
-        bot.send_message(call.message.chat.id, "Send your payout wallet/destination.")
+        bot.send_message(call.message.chat.id, _hosted_message(call.from_user.id, "wallet_prompt"))
         bot.answer_callback_query(call.id)
         return
     with locked_json(tenant_file(OWNER_ID, "referrals.json"), _referral_data()) as data:
@@ -1809,7 +2773,11 @@ def referral_action(call):
         amount = round(float(stats.get("available_balance", 0)), 2)
         wallet = data.get("wallets", {}).get(str(call.from_user.id))
         if amount < 2 or not wallet:
-            bot.answer_callback_query(call.id, "Minimum $2 and a wallet are required.", show_alert=True)
+            bot.answer_callback_query(
+                call.id,
+                _hosted_message(call.from_user.id, "withdrawal_requirements"),
+                show_alert=True,
+            )
             return
         request = {"id": str(uuid.uuid4()), "user_id": str(call.from_user.id), "amount": amount,
                    "wallet": wallet, "status": "pending", "requested_at": _now()}
@@ -1832,7 +2800,11 @@ def referral_action(call):
         parse_mode="Markdown",
         reply_markup=markup,
     )
-    bot.answer_callback_query(call.id, "Withdrawal requested", show_alert=True)
+    bot.answer_callback_query(
+        call.id,
+        _hosted_message(call.from_user.id, "withdrawal_requested"),
+        show_alert=True,
+    )
 
 
 @bot.message_handler(func=lambda m: (_get_input_state(m.from_user.id) or {}).get("kind") == "referral_wallet")
@@ -1840,12 +2812,12 @@ def referral_wallet_input(message):
     destination = (message.text or "").strip()
     if not destination or len(destination) > 500 or "\x00" in destination:
         _pop_input_state(message.from_user.id)
-        bot.reply_to(message, "That payout destination is invalid.")
+        bot.reply_to(message, _hosted_message(message.from_user.id, "referral_destination_invalid"))
         return
     with locked_json(tenant_file(OWNER_ID, "referrals.json"), _referral_data()) as data:
         data.setdefault("wallets", {})[str(message.from_user.id)] = destination
     _pop_input_state(message.from_user.id)
-    bot.reply_to(message, "Wallet saved.")
+    bot.reply_to(message, _hosted_message(message.from_user.id, "referral_destination_saved"))
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:refresolve:"))
@@ -1919,7 +2891,7 @@ def _owner_menu_command(text):
     rows = OWNER_MENU_ROWS + OWNER_SETUP_ROWS + OWNER_CUSTOMER_ROWS + OWNER_MONEY_ROWS + LEGACY_OWNER_MENU_ROWS
     for row in rows:
         for key in row:
-            if key == "back" and text in _all_button_values("back", "🔙 Back"):
+            if key == "back" and text in _all_button_values("back"):
                 return "customer_view", None
             if text in LEGACY_OWNER_LABELS.get(key, set()):
                 return "setting", key
@@ -1936,7 +2908,7 @@ def _owner_menu_command(text):
 
 def _owner_menu_text(user_id, key):
     if key == "back":
-        return _button(user_id, "back", "🔙 Back")
+        return _button(user_id, "back")
     return _hosted_message(user_id, key)
 
 
@@ -2093,11 +3065,94 @@ def _owner_stats_chunks(end_date=None, scheduled=False):
     return _split_message_blocks(blocks)
 
 
+def _owner_growth_comparison_text(report):
+    """Render tenant-scoped aggregate funnel comparison in the owner's language."""
+    def display_percent(value):
+        if value is None:
+            return _hosted_message(OWNER_ID, "growth_value_unavailable")
+        return _hosted_message(
+            OWNER_ID,
+            "growth_percent_value",
+            value=f"{float(value):.1f}",
+        )
+
+    def display_delta(value):
+        if value is None:
+            return _hosted_message(OWNER_ID, "growth_value_unavailable")
+        return _hosted_message(
+            OWNER_ID,
+            "growth_percent_value",
+            value=f"{float(value):+.1f}",
+        )
+
+    current_start = report["current_start"]
+    baseline_start = report["baseline_start"]
+    end_at = report["end_at"]
+    blocks = [
+        _hosted_message(
+            OWNER_ID,
+            "growth_comparison_header",
+            days=int(report.get("days", 30) or 30),
+            current_start=current_start.date().isoformat(),
+            current_end=(end_at - timedelta(days=1)).date().isoformat(),
+            baseline_start=baseline_start.date().isoformat(),
+            baseline_end=(current_start - timedelta(days=1)).date().isoformat(),
+        )
+    ]
+    labels = {
+        "trial_to_paid": "growth_label_trial_to_paid",
+        "checkout": "growth_label_checkout",
+        "renewal": "growth_label_renewal",
+        "referral": "growth_label_referral",
+    }
+    funnels = report.get("funnels", {})
+    for funnel_name, label_key in labels.items():
+        item = funnels.get(funnel_name, {})
+        blocks.append(
+            _hosted_message(
+                OWNER_ID,
+                "growth_comparison_line",
+                label=_hosted_message(OWNER_ID, label_key),
+                completed=int(item.get("completed", 0) or 0),
+                started=int(item.get("started", 0) or 0),
+                rate=display_percent(item.get("conversion_percent")),
+                baseline_completed=int(item.get("baseline_completed", 0) or 0),
+                baseline_started=int(item.get("baseline_started", 0) or 0),
+                baseline_rate=display_percent(item.get("baseline_conversion_percent")),
+                delta=display_delta(item.get("relative_change_percent")),
+            )
+        )
+    blocks.append(_hosted_message(OWNER_ID, "growth_aggregate_only"))
+    return "\n\n".join(blocks)
+
+
 def _send_owner_stats(chat_id, end_date=None, scheduled=False):
     chunks = _owner_stats_chunks(end_date=end_date, scheduled=scheduled)
     for chunk in chunks:
         bot.send_message(chat_id, chunk, parse_mode="Markdown")
-    return len(chunks)
+    sent_count = len(chunks)
+    try:
+        from utils.growth_reporting import hosted_growth_comparison
+
+        report_end = end_date or datetime.now().date()
+        comparison_end = datetime.combine(
+            report_end + timedelta(days=1),
+            datetime.min.time(),
+        )
+        comparison = hosted_growth_comparison(
+            OWNER_ID,
+            end_at=comparison_end,
+            days=30,
+        )
+        bot.send_message(
+            chat_id,
+            _owner_growth_comparison_text(comparison),
+            parse_mode="Markdown",
+        )
+        sent_count += 1
+    except Exception:
+        pass
+    return sent_count
 
 
 def _owner_stats_report_end(now=None):
@@ -2283,8 +3338,11 @@ def owner_panel(message):
     _show_owner_dashboard(message.chat.id, reply_to=message)
 
 
-def _begin_owner_setting(chat_id, field):
-    _set_input_state(OWNER_ID, {"kind": "owner_setting", "field": field})
+def _begin_owner_setting(chat_id, field, customer_language=None):
+    state = {"kind": "owner_setting", "field": field}
+    if field in {"welcome", "support"}:
+        state["customer_language"] = customer_language or _language(OWNER_ID)
+    _set_input_state(OWNER_ID, state)
     markup = None
     if field == "markup":
         markup = types.InlineKeyboardMarkup()
@@ -2337,9 +3395,11 @@ def owner_menu_action(message):
         _show_owner_dashboard(message.chat.id)
         return
     if command == "customer_view":
-        settings = get_settings(OWNER_ID)
-        bot.reply_to(message, settings.get("welcome_text") or _hosted_message(OWNER_ID, "welcome_default"),
-                     reply_markup=_main_markup(OWNER_ID))
+        bot.reply_to(
+            message,
+            _storefront_setting(OWNER_ID, "welcome"),
+            reply_markup=_main_markup(OWNER_ID),
+        )
         return
     if command == "setting":
         _begin_owner_setting(message.chat.id, action)
@@ -2354,6 +3414,7 @@ def owner_setting_input(message):
         bot.reply_to(message, _hosted_message(OWNER_ID, "prompt_expired"))
         return
     field = state["field"]
+    customer_language = state.get("customer_language")
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
         _pop_input_state(OWNER_ID)
@@ -2367,9 +3428,19 @@ def owner_setting_input(message):
                 raise ValueError
         else:
             value = raw
-        key = {"markup": "markup_percent", "card": "card_number",
-               "support": "support_text", "welcome": "welcome_text", "refpercent": "referral_margin_percent"}[field]
-        update_settings(OWNER_ID, {key: value})
+        if field in {"support", "welcome"} and customer_language in LANGUAGES:
+            settings = get_settings(OWNER_ID)
+            key = f"{field}_texts"
+            localized = dict(settings.get(key, {}))
+            if value:
+                localized[customer_language] = value
+            else:
+                localized.pop(customer_language, None)
+            update_settings(OWNER_ID, {key: localized})
+        else:
+            key = {"markup": "markup_percent", "card": "card_number",
+                   "support": "support_text", "welcome": "welcome_text", "refpercent": "referral_margin_percent"}[field]
+            update_settings(OWNER_ID, {key: value})
         if field == "markup":
             mark_setup_step(OWNER_ID, "pricing")
         elif field in {"support", "welcome"}:
@@ -2410,12 +3481,19 @@ def _owner_plans_markup(settings=None):
         {str(item) for item in settings.get("enabled_plan_ids", [])}
         if settings.get("plan_selection_configured") else set(all_ids)
     )
-    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    recommended = str(settings.get("recommended_plan_id") or "")
     for plan_id in sorted(all_ids, key=int):
-        markup.add(types.InlineKeyboardButton(
-            f"{'✅' if plan_id in enabled else '❌'} {plan_id} GB",
-            callback_data=f"hb:plantoggle:{plan_id}",
-        ))
+        markup.row(
+            types.InlineKeyboardButton(
+                f"{'✅' if plan_id in enabled else '❌'} {plan_id} GB",
+                callback_data=f"hb:plantoggle:{plan_id}",
+            ),
+            types.InlineKeyboardButton(
+                f"{'⭐' if plan_id == recommended else '☆'} {_hosted_message(OWNER_ID, 'recommend_plan')}",
+                callback_data=f"hb:planrecommend:{plan_id}",
+            ),
+        )
     markup.add(types.InlineKeyboardButton(
         _hosted_message(OWNER_ID, "plans_done"), callback_data="hb:plansdone"
     ))
@@ -2649,9 +3727,26 @@ def owner_messages_action(call):
     if call.from_user.id != OWNER_ID:
         bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "owner_only"), show_alert=True)
         return
-    action = call.data.split(":")[2]
-    if action in {"welcome", "support"}:
-        _begin_owner_setting(call.message.chat.id, action)
+    parts = call.data.split(":")
+    action = parts[2]
+    if action in {"welcome", "support"} and len(parts) == 3:
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(*[
+            types.InlineKeyboardButton(
+                name,
+                callback_data=f"hb:messages:{action}:{code}",
+            )
+            for code, name in LANGUAGES.items()
+        ])
+        bot.send_message(
+            call.message.chat.id,
+            _hosted_message(OWNER_ID, "owner_message_language"),
+            reply_markup=markup,
+        )
+        bot.answer_callback_query(call.id)
+        return
+    if action in {"welcome", "support"} and len(parts) == 4 and parts[3] in LANGUAGES:
+        _begin_owner_setting(call.message.chat.id, action, customer_language=parts[3])
         bot.answer_callback_query(call.id)
         return
     if action == "done":
@@ -2755,6 +3850,39 @@ def plan_toggle(call):
     enabled.symmetric_difference_update({plan_id})
     update_settings(OWNER_ID, {"enabled_plan_ids": sorted(enabled), "plan_selection_configured": True})
     bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "action_updated"))
+    try:
+        bot.edit_message_reply_markup(
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=_owner_plans_markup(),
+        )
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("hb:planrecommend:"))
+def plan_recommend(call):
+    if call.from_user.id != OWNER_ID:
+        bot.answer_callback_query(
+            call.id,
+            _hosted_message(call.from_user.id, "owner_only"),
+            show_alert=True,
+        )
+        return
+    plan_id = call.data.split(":")[2]
+    if plan_id not in _owner_plan_ids():
+        bot.answer_callback_query(
+            call.id,
+            _hosted_message(OWNER_ID, "plan_unavailable"),
+            show_alert=True,
+        )
+        return
+    update_settings(OWNER_ID, {"recommended_plan_id": plan_id})
+    bot.answer_callback_query(
+        call.id,
+        _hosted_message(OWNER_ID, "recommended_plan_updated"),
+        show_alert=True,
+    )
     try:
         bot.edit_message_reply_markup(
             call.message.chat.id,
@@ -2906,13 +4034,6 @@ def _handle_hosted_renewal_event(event):
                 username=username,
                 reason=customer_reason,
             )
-            if message == message_key:
-                message = (
-                    f"Your reserved renewal for `{username}` is safe, but its server is temporarily unavailable. "
-                    "We will keep retrying automatically."
-                    if reason == "server_unavailable"
-                    else f"Your reserved renewal for `{username}` needs attention: {reason}"
-                )
             bot.send_message(int(customer_id), message, parse_mode="Markdown")
         except Exception:
             pass
@@ -3045,27 +4166,70 @@ def _crypto_monitor():
             _recover_stale_payment_claims()
             _recover_saved_receipts()
             _reconcile_credit_reservations()
+            _reconcile_invite_discount_reservations()
             _process_hosted_reserved_renewals()
             for payment_id, current in _tenant_payments().items():
                 if not isinstance(current, dict):
                     continue
-                if current.get("status") in {"waiting_receipt", "pending_approval"}:
-                    created = _parse_time(current.get("created_at")) or datetime.min
-                    if datetime.now() - created >= timedelta(hours=24):
-                        claimed = _claim_payment(payment_id, {"waiting_receipt", "pending_approval"})
+                status = current.get("status")
+                created = _parse_time(current.get("created_at")) or datetime.min
+                age = datetime.now() - created
+                if status in {"waiting_receipt", "pending_approval", "pending"}:
+                    if (
+                        REMINDERS_ENABLED
+                        and age >= timedelta(minutes=30)
+                        and not current.get("abandoned_reminder_at")
+                        and status in {"waiting_receipt", "pending"}
+                    ):
+                        markup = types.InlineKeyboardMarkup(row_width=1)
+                        if status == "pending" and current.get("payment_url"):
+                            markup.add(types.InlineKeyboardButton(
+                                get_button_text(_language(current["user_id"]), "payment_link"),
+                                url=current["payment_url"],
+                            ))
+                            markup.add(types.InlineKeyboardButton(
+                                get_button_text(_language(current["user_id"]), "check_status"),
+                                callback_data=f"hb:check:{payment_id}",
+                            ))
+                        markup.add(types.InlineKeyboardButton(
+                            _button(current["user_id"], "support"),
+                            callback_data="hb:support",
+                        ))
+                        try:
+                            bot.send_message(
+                                current["user_id"],
+                                _hosted_message(
+                                    current["user_id"],
+                                    "checkout_reminder",
+                                    gb=current.get("plan_gb", ""),
+                                ),
+                                reply_markup=markup,
+                            )
+                            _save_payment(payment_id, {"abandoned_reminder_at": _now()})
+                        except Exception:
+                            pass
+                    if age >= timedelta(hours=24) and status in {"waiting_receipt", "pending_approval"}:
+                        claimed = _claim_payment(
+                            payment_id,
+                            {"waiting_receipt", "pending_approval"},
+                        )
                         if claimed:
                             release_credit(OWNER_ID, payment_id, kind="credit_expired")
+                            _release_invite_discount(current.get("user_id"), payment_id)
                             _save_payment(payment_id, {"status": "expired"})
                             try:
                                 bot.send_message(
                                     current["user_id"],
-                                    "Your pending card order expired. Start a new purchase if needed.",
+                                    _hosted_message(current["user_id"], "pending_order_expired"),
                                 )
                             except Exception:
                                 pass
-                    elif current.get("status") == "pending_approval":
+                        continue
+                    if status == "pending_approval":
                         _notify_owner_of_receipt(payment_id)
-                    continue
+                        continue
+                    if status == "waiting_receipt":
+                        continue
                 if current.get("status") not in {"pending", "paid_provision_failed"} or not current.get("gateway_payment_id"):
                     continue
                 record = _claim_payment(payment_id, {"pending", "paid_provision_failed"})
@@ -3085,7 +4249,19 @@ def _crypto_monitor():
                 result = response.get("result", {}) if isinstance(response, dict) else {}
                 status = result.get("status") or result.get("payment_status") or result.get("paymentStatus")
                 if str(status).lower() != "paid":
-                    _save_payment(payment_id, {"status": retry_status})
+                    normalized_status = str(status or "").lower()
+                    if normalized_status in {"expired", "failed", "canceled", "cancelled"}:
+                        _release_invite_discount(record.get("user_id"), payment_id)
+                        _save_payment(payment_id, {"status": "expired"})
+                        try:
+                            bot.send_message(
+                                record["user_id"],
+                                _hosted_message(record["user_id"], "pending_order_expired"),
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        _save_payment(payment_id, {"status": retry_status})
                     continue
                 success, detail = _provision_claimed_payment(
                     payment_id, record, funded=True, retry_status="paid_provision_failed"
@@ -3110,6 +4286,15 @@ def _customer_notification_monitor():
                     if not client or not live:
                         continue
                     user_id = int(config["customer_telegram_id"])
+                    customer_configs = _find_customer_configs(user_id)
+                    customer_index = next(
+                        (
+                            index for index, candidate in enumerate(customer_configs)
+                            if candidate.get("username") == config.get("username")
+                            and candidate.get("server_id") == config.get("server_id")
+                        ),
+                        None,
+                    )
                     expiration = int(live.get("expiration_days", 0) or 0)
                     cycle = str(config.get("timestamp") or config.get("retail_order_id") or "initial")
                     if expiration <= 0:
@@ -3118,17 +4303,59 @@ def _customer_notification_monitor():
                         if find_reseller_reservation(config):
                             continue
                     if expiration <= 0 and sent.get(f"expired:{username}") != cycle:
-                        bot.send_message(user_id, f"Your config `{username}` has expired. Open My Configs to renew it.", parse_mode="Markdown")
+                        markup = types.InlineKeyboardMarkup()
+                        if customer_index is not None:
+                            markup.add(types.InlineKeyboardButton(
+                                _hosted_message(user_id, "renew_action"),
+                                callback_data=f"hb:renewcfg:{customer_index}",
+                            ))
+                        bot.send_message(
+                            user_id,
+                            _hosted_message(user_id, "expired_alert", username=username),
+                            parse_mode="Markdown",
+                            reply_markup=markup,
+                        )
                         sent[f"expired:{username}"] = cycle
+                    if expiration <= 0:
+                        continue
                     maximum = float(live.get("max_download_bytes", 0) or 0)
                     used = float(live.get("upload_bytes", 0) or 0) + float(live.get("download_bytes", 0) or 0)
+                    progress = []
                     if maximum > 0:
-                        percent = int((used / maximum) * 100)
-                        threshold = 90 if percent >= 90 else 80 if percent >= 80 else None
-                        alert_key = f"traffic:{username}:{cycle}"
-                        if threshold and int(sent.get(alert_key, 0) or 0) < threshold:
-                            bot.send_message(user_id, f"Config `{username}` has used {percent}% of its traffic quota.", parse_mode="Markdown")
-                            sent[alert_key] = threshold
+                        progress.append((int((used / maximum) * 100), "traffic"))
+                    plan_days = int(config.get("days", 0) or 0)
+                    if plan_days > 0 and expiration > 0:
+                        progress.append((int((1 - min(expiration, plan_days) / plan_days) * 100), "time"))
+                    percent, basis = max(progress, default=(0, "traffic"), key=lambda item: item[0])
+                    percent = max(0, min(100, percent))
+                    threshold = 90 if percent >= 90 else 80 if percent >= 80 else None
+                    alert_key = f"allowance:{username}:{cycle}"
+                    if threshold and int(sent.get(alert_key, 0) or 0) < threshold:
+                        markup = types.InlineKeyboardMarkup()
+                        if customer_index is not None:
+                            markup.add(types.InlineKeyboardButton(
+                                _hosted_message(user_id, "reserve_renewal_action"),
+                                callback_data=f"hb:renewcfg:{customer_index}",
+                            ))
+                        bot.send_message(
+                            user_id,
+                            _hosted_message(
+                                user_id,
+                                "usage_alert",
+                                username=username,
+                                percent=percent,
+                                basis=_hosted_message(user_id, f"usage_basis_{basis}"),
+                            ),
+                            parse_mode="Markdown",
+                            reply_markup=markup,
+                        )
+                        sent[alert_key] = threshold
+                        _record_growth(
+                            "renewal_prompted",
+                            user_id,
+                            plan=config.get("plan_gb") or config.get("gb"),
+                            deduplication_key=f"hosted-renewal-alert:{OWNER_ID}:{username}:{cycle}:{threshold}",
+                        )
         except Exception as error:
             print(f"Hosted notification monitor failed for reseller {OWNER_ID}: {type(error).__name__}", flush=True)
         time.sleep(7200)
@@ -3156,6 +4383,7 @@ def run():
     _recover_stale_payment_claims()
     _recover_saved_receipts()
     _reconcile_credit_reservations()
+    _reconcile_invite_discount_reservations()
     threading.Thread(target=_crypto_monitor, daemon=True, name="hosted-crypto").start()
     threading.Thread(target=_customer_notification_monitor, daemon=True, name="hosted-notifications").start()
     threading.Thread(target=_owner_stats_monitor, daemon=True, name="hosted-owner-stats").start()

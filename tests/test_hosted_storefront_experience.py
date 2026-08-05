@@ -421,7 +421,7 @@ class HostedStorefrontParityTests(unittest.TestCase):
         self.assertIn('username_prefix="hs"', provision)
         self.assertIn("operation_id=payment_id", provision)
         self.assertIn("preferred_username=provisioned_username", provision)
-        self.assertIn("customer_id=message.from_user.id", free_test)
+        self.assertIn("customer_id=customer.id", free_test)
         self.assertIn('username_prefix="ht"', free_test)
         self.assertIn("preferred_username=pending_username", free_test)
         self.assertNotIn("operation_id=", free_test)
@@ -434,7 +434,7 @@ class HostedStorefrontParityTests(unittest.TestCase):
         self.assertIn('allocate_username("s", user_id', purchase_source)
         self.assertIn('allocate_username("t", user_id', test_source)
 
-    def test_checkout_keeps_main_bot_navigation_and_payment_context(self):
+    def test_checkout_keeps_navigation_and_uses_the_localized_progress_context(self):
         source = (BOT_DIR / "hosted_worker.py").read_text(encoding="utf-8")
 
         for behavior in (
@@ -442,9 +442,9 @@ class HostedStorefrontParityTests(unittest.TestCase):
             'callback_data=f"hb:cancel:{order_id}"',
             '"checkout_source"',
             '"receipt_prompt_message_id"',
-            '"card_to_card_payment"',
-            '"payment_instructions"',
-            '"purchase_connection_warning"',
+            '"card_checkout"',
+            '"crypto_checkout"',
+            '"risk_disclosure"',
             "qrcode.make(url)",
             "format_toman_amount",
         ):
@@ -453,6 +453,8 @@ class HostedStorefrontParityTests(unittest.TestCase):
 
         self.assertNotIn("Another checkout is already open", source)
         self.assertNotIn('callback_data=f"hb:receipt:', source)
+        payment_method = ast.get_source_segment(WORKER_SOURCE, _worker_function("payment_method"))
+        self.assertNotIn('"purchase_connection_warning"', payment_method)
 
     def test_customer_handlers_do_not_use_old_reseller_disclosures(self):
         source = (BOT_DIR / "hosted_worker.py").read_text(encoding="utf-8")
@@ -591,7 +593,7 @@ class HostedStorefrontParityTests(unittest.TestCase):
         self.assertIn("types.ReplyKeyboardMarkup(resize_keyboard=True)", owner_markup)
         self.assertNotIn("types.InlineKeyboardMarkup", owner_markup)
         self.assertIn("for row in rows", owner_markup)
-        self.assertIn('_button(user_id, "back", "🔙 Back")', owner_menu_text)
+        self.assertIn('_button(user_id, "back")', owner_menu_text)
         for callback in (
             "hb:ogen:", "hb:plantoggle:", "hb:plansdone", "hb:payment:",
             "hb:messages:", "hb:earn:", "hb:refresolve:",
@@ -619,8 +621,9 @@ class HostedStorefrontParityTests(unittest.TestCase):
             "OWNER_SETTING_KEYS": setting_keys,
             "OWNER_GROUP_KEYS": group_keys,
             "LEGACY_OWNER_LABELS": legacy_labels,
-            "_all_button_values": lambda key, fallback: {
-                catalog.get(key, fallback) for catalog in button_translations.values()
+            "_all_button_values": lambda key, fallback=None: {
+                catalog.get(key, fallback or button_translations["en"].get(key, key))
+                for catalog in button_translations.values()
             },
         }
         module = ast.Module(body=[_worker_function("_owner_menu_command")], type_ignores=[])

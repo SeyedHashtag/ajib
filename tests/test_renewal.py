@@ -149,8 +149,21 @@ def load_renewal_module():
             "Before\n{before}\nAfter\n{after}\n{ipv4_info}{sub_url}"
         ),
         "select_payment_method": "Select payment method",
+        "renewal_state_summary": "Days remaining: {days_remaining}\nUsage: {gb_used} / {gb_limit}",
+        "renewal_generic_unavailable_reason": "Renewal is currently unavailable.",
+        "renewal_ipv4_line": "IPv4 URL: `{ipv4_url}`\n\n",
+        "value_not_available": "Not available",
+        "value_unknown": "Unknown",
+        "value_unlimited": "Unlimited",
     }.get(key, key)
     sys.modules["utils.translations"] = translations_stub
+
+    growth_events_stub = types.ModuleType("utils.growth_events")
+    growth_events_stub.EVENT_RENEWAL_COMPLETED = "renewal_completed"
+    growth_events_stub.SURFACE_MAIN = "main"
+    growth_events_stub.SURFACE_HOSTED = "hosted"
+    growth_events_stub.record_growth_event = lambda *args, **kwargs: None
+    sys.modules["utils.growth_events"] = growth_events_stub
 
     spec = importlib.util.spec_from_file_location("renewal_under_test", RENEWAL_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -442,6 +455,10 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(reseller_offer["reason"], "renewal_ineligible_plan_mismatch")
 
     def test_customer_renewal_resets_existing_user_and_clears_cleanup_state(self):
+        events = []
+        sys.modules["utils.growth_events"].record_growth_event = (
+            lambda *args, **kwargs: events.append((args, kwargs))
+        )
         client = FakeClient("s1", {"alice": self.expired_user()})
         multi_api = FakeMultiAPI({"s1": client})
         self.write_json(self.renewal.PAYMENTS_FILE, {"base-1": self.base_payment()})
@@ -458,6 +475,7 @@ class RenewalTests(unittest.TestCase):
             "renewal_username": "alice",
             "renewal_server_id": "s1",
             "renewal_base_record_id": "base-1",
+            "created_at": "2026-08-05 12:00:00",
         }
 
         result = self.renewal.execute_customer_renewal(payment_record, plans=self.plans, multi_api=multi_api)
@@ -470,6 +488,15 @@ class RenewalTests(unittest.TestCase):
         saved_payments = self.read_json(self.renewal.PAYMENTS_FILE)
         self.assertEqual(saved_payments["base-1"]["cleanup_status"], "renewed")
         self.assertEqual(self.read_json(self.renewal.STATE_FILE), {})
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], ("renewal_completed",))
+        self.assertEqual(events[0][1]["user_id"], 123)
+        self.assertEqual(events[0][1]["surface"], "main")
+        self.assertEqual(events[0][1]["plan_id"], "5")
+        self.assertIn(
+            "renewal-completed:customer:2026-08-05 12:00:00",
+            events[0][1]["deduplication_key"],
+        )
 
     def test_customer_renewal_rechecks_expiry_at_execution_time(self):
         active_user = dict(self.expired_user(), blocked=False, expiration_days=30)

@@ -160,6 +160,37 @@ def install_stubs():
         "renewal_unavailable": "Renewal is not available for this config: {reason}.",
         "renewal_ineligible_no_record": "no matching paid record was found",
         "reseller_suspended_due_debt": "Account suspended due to debt (${debt:.2f}). Pay ${unlock_amount:.2f} to unlock config generation.",
+        "value_not_available": "Not available",
+        "value_unknown": "Unknown",
+        "value_unlimited": "Unlimited",
+        "refresh_action": "Refresh",
+        "reseller_invalid_request": "This request is invalid or has expired.",
+        "reseller_removed_during_cleanup": "Removed during account cleanup",
+        "reseller_customer_entry": (
+            "{identifiers}\n   {status}\n   📊 {gb} GB | 📅 {days}d | 💰 ${price}"
+            "\n   🕒 {timestamp}{removal_reason}"
+        ),
+        "reseller_config_data_unavailable": (
+            "Data for `{username}` is unavailable. The config may have been removed."
+        ),
+        "reseller_traffic_no_data": "Traffic data\nNo usage has been recorded yet.",
+        "reseller_traffic_data": (
+            "Traffic data\nUpload: {upload_gb} GB\nDownload: {download_gb} GB\n"
+            "Total: {total_usage_gb} GB\nLimit: {traffic_limit}\nPanel status: {status}"
+        ),
+        "reseller_config_status_blocked": "Blocked or expired",
+        "reseller_config_status_active": "Active",
+        "reseller_config_live_details": (
+            "Username: `{username}`\nTraffic limit: {traffic_limit}\n"
+            "Days remaining: {days_remaining}\nCreated: {creation_date}\n"
+            "Status: {account_status}\n\n{traffic_message}"
+        ),
+        "reseller_config_expired": "Configuration expired or blocked\n{details}{renewal_message}",
+        "reseller_subscription_unavailable": "The subscription URL for `{username}` is unavailable.",
+        "reseller_config_subscription_caption": (
+            "{details}\n\n{ipv4_info}Subscription URL:\n{sub_url}{reservation_status}"
+        ),
+        "renewal_ipv4_line": "IPv4 URL: `{ipv4_url}`\n\n",
     }
     translations_stub = types.ModuleType("utils.translations")
     translations_stub.get_message_text = lambda language, key: translations.get(key, key)
@@ -226,6 +257,7 @@ def install_stubs():
     level_ui_stub.build_reseller_level_compact = lambda language, data: "Level"
     level_ui_stub.build_reseller_level_profile = lambda *args, **kwargs: "Profile"
     level_ui_stub.build_reseller_level_roadmap = lambda language, data: "Roadmap"
+    level_ui_stub.build_reseller_program_preview = lambda *args, **kwargs: "Preview"
     level_ui_stub.present_pending_reseller_level = lambda *args, **kwargs: False
     sys.modules["utils.reseller_level_ui"] = level_ui_stub
 
@@ -253,7 +285,17 @@ def install_stubs():
 
     payment_records_stub = types.ModuleType("utils.payment_records")
     payment_records_stub.add_payment_record = lambda *args, **kwargs: None
+    payment_records_stub.complete_payment_record = lambda *args, **kwargs: True
+    payment_records_stub.get_payment_record = lambda *args, **kwargs: None
+    payment_records_stub.update_payment_status = lambda *args, **kwargs: True
     sys.modules["utils.payment_records"] = payment_records_stub
+
+    account_credit_stub = types.ModuleType("utils.account_credit")
+    account_credit_stub.get_account_credit = lambda user_id: {"available": 0, "reserved": 0}
+    account_credit_stub.reserve_account_credit = lambda *args, **kwargs: 0
+    account_credit_stub.release_account_credit = lambda *args, **kwargs: False
+    account_credit_stub.consume_account_credit = lambda *args, **kwargs: 0
+    sys.modules["utils.account_credit"] = account_credit_stub
 
     currency_stub = types.ModuleType("utils.currency_format")
     currency_stub.format_toman_amount = lambda value: str(value)
@@ -404,7 +446,7 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
 
         self.assertIn("4. 🗑 `reza`", entry)
         self.assertIn("   Deleted", entry)
-        self.assertIn("Removed during banned reseller unpaid user cleanup (2026-06-02 13:00:00)", entry)
+        self.assertIn("Removed during account cleanup (2026-06-02 13:00:00)", entry)
 
     def test_reseller_live_users_uses_cached_snapshot_ttl_by_default(self):
         original_multi_api = reseller_handlers.MultiServerAPI
@@ -869,7 +911,12 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
 
             self.assertEqual(executor.jobs, [])
             self.assertEqual(FakeMultiServerAPI.calls, [])
-            self.assertTrue(all(args[1] == "Invalid request." for args, _kwargs in reseller_handlers.bot.answers))
+            self.assertTrue(
+                all(
+                    args[1] == "This request is invalid or has expired."
+                    for args, _kwargs in reseller_handlers.bot.answers
+                )
+            )
         finally:
             reseller_handlers.MultiServerAPI = original_multi_api
             reseller_handlers.get_reseller_data = original_get_reseller_data

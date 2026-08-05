@@ -7,6 +7,7 @@ import os
 import re
 import logging
 import threading
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
@@ -26,12 +27,24 @@ from utils.reseller import (
 from utils.edit_plans import load_plans
 from utils.api_client import APIClient, MultiServerAPI
 from utils.payments import CryptoPayment
-from utils.payment_records import add_payment_record
+from utils.payment_records import (
+    add_payment_record,
+    complete_payment_record,
+    get_payment_record,
+    update_payment_status,
+)
+from utils.account_credit import (
+    consume_account_credit,
+    get_account_credit,
+    release_account_credit,
+    reserve_account_credit,
+)
 from utils.currency_format import format_toman_amount, format_usd_amount
 from utils.reseller_level_ui import (
     build_reseller_level_compact,
     build_reseller_level_profile,
     build_reseller_level_roadmap,
+    build_reseller_program_preview,
     present_pending_reseller_level,
 )
 try:
@@ -106,6 +119,97 @@ RESELLER_RENEWAL_EXECUTOR = ThreadPoolExecutor(
     max_workers=_int_env("AJIB_RESELLER_RENEWAL_WORKERS", 2),
     thread_name_prefix="ajib-reseller-renewal",
 )
+RESELLER_CREDIT_SETTLEMENT_LOCK = threading.Lock()
+RESELLER_CREDIT_SETTLEMENT_INFLIGHT = set()
+
+
+class _AccountCreditUnavailable(RuntimeError):
+    pass
+
+
+def _apply_account_credit_debt_payment(user_id, payment_id, amount_to_pay):
+    """Atomically reserve, apply, consume, and record a debt-credit payment."""
+    try:
+        from utils.database import write_transaction
+
+        transaction = write_transaction(operation="reseller_account_credit_settlement")
+    except (ImportError, ModuleNotFoundError):
+        # Isolated compatibility tests may not load the SQLite state layer.
+        transaction = nullcontext()
+
+    with transaction:
+        reserved = reserve_account_credit(
+            user_id,
+            payment_id,
+            amount_to_pay,
+            order_id=payment_id,
+            metadata={"kind": "reseller_debt_payment"},
+        )
+        if reserved <= 0:
+            raise _AccountCreditUnavailable("No purchase credit is available")
+        payment_record = {
+            'user_id': user_id,
+            'plan_gb': 'Settlement',
+            'days': 0,
+            'payment_id': payment_id,
+            'status': 'processing',
+            'type': 'settlement',
+            'payment_method': 'Account Credit',
+            'original_price': reserved,
+            'price': 0.0,
+            'collected_amount': 0.0,
+            'referral_reward_base': 0.0,
+            'account_credit_reserved': reserved,
+            'account_credit_reservation_id': payment_id,
+            'settlement_amount': reserved,
+        }
+        add_payment_record(payment_id, payment_record)
+        result = apply_reseller_payment(
+            user_id,
+            reserved,
+            payment_id=payment_id,
+        )
+        success = bool(result[0]) if isinstance(result, tuple) else bool(result)
+        remaining_debt = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+        if not success:
+            raise RuntimeError("Reseller debt could not be credited")
+        consumed = consume_account_credit(
+            user_id,
+            payment_id,
+            order_id=payment_id,
+            metadata={"kind": "reseller_debt_payment"},
+        )
+        if consumed != reserved:
+            raise RuntimeError("Reserved account credit could not be consumed")
+        if not complete_payment_record(
+            payment_id,
+            {
+                'account_credit_consumed': consumed,
+                'remaining_debt': remaining_debt,
+            },
+        ):
+            raise RuntimeError("Account-credit payment record could not be completed")
+        return reserved, remaining_debt
+
+
+def _record_reseller_growth(event_type, user_id, deduplication_key):
+    """Record private funnel progress without making applications depend on it."""
+    try:
+        from utils.growth_events import record_growth_event
+
+        record_growth_event(
+            event_type,
+            user_id=user_id,
+            language=get_user_language(user_id),
+            deduplication_key=deduplication_key,
+        )
+    except Exception:
+        logging.getLogger("ajib.growth").debug(
+            "Could not record reseller growth event %s for %s",
+            event_type,
+            user_id,
+            exc_info=True,
+        )
 
 
 def _get_approved_reseller_data(user_id):
@@ -377,6 +481,54 @@ def _notify_reseller_accounting_failure(user_id, username, price, rollback_resul
             pass
 
 
+def _reseller_preview_plan():
+    candidates = []
+    for plan_id, plan in (load_plans() or {}).items():
+        if not isinstance(plan, dict) or plan.get("target", "both") == "customer":
+            continue
+        try:
+            price = float(plan.get("price", 0))
+            size = int(plan_id)
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            candidates.append((price, size, str(plan_id), plan))
+    if not candidates:
+        return None, None
+    _price, _size, plan_id, plan = min(candidates)
+    return plan_id, plan
+
+
+def _reseller_program_preview(language, reseller_data=None):
+    plan_id, plan = _reseller_preview_plan()
+    if plan is None:
+        return get_message_text(language, "reseller_program_preview_no_plan")
+    return build_reseller_program_preview(
+        language,
+        reseller_data or {"total_paid": 0, "debt": 0, "configs": []},
+        plan_id,
+        plan,
+    )
+
+
+def _reseller_prospect_markup(language, *, allow_request=True):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if allow_request:
+        label = get_message_text(language, "reseller_program_apply")
+        markup.add(types.InlineKeyboardButton(label, callback_data="reseller:request"))
+    plans_label = get_message_text(language, "reseller_program_see_plans")
+    markup.add(types.InlineKeyboardButton(plans_label, callback_data="reseller:eligible_plans"))
+    return markup
+
+
+def _reseller_ineligible_text(language, *, has_username):
+    return get_message_text(language, "reseller_eligibility_checklist").format(
+        paid="❌",
+        username="✅" if has_username else "❌",
+        approval="⬜",
+    )
+
+
 # Reseller Menu Handler
 @bot.message_handler(func=lambda message: any(
     message.text == get_button_text(get_user_language(message.from_user.id), "reseller_panel") for lang in BUTTON_TRANSLATIONS
@@ -392,6 +544,8 @@ def reseller_panel(message):
         present_pending_reseller_level(bot, user_id, language)
         # Show Reseller Menu (suspended can still access panel but with restrictions)
         markup = types.InlineKeyboardMarkup(row_width=2)
+        hosted_label = get_message_text(language, "reseller_launch_storefront")
+        markup.add(types.InlineKeyboardButton(hosted_label, callback_data="hosted:menu"))
         markup.add(
             types.InlineKeyboardButton(get_button_text(language, "generate_config"), callback_data="reseller:generate"),
             types.InlineKeyboardButton(get_button_text(language, "reseller_my_customers"), callback_data="reseller:my_customers:0")
@@ -400,8 +554,6 @@ def reseller_panel(message):
             types.InlineKeyboardButton(get_button_text(language, "reseller_stats"), callback_data="reseller:stats"),
             types.InlineKeyboardButton(get_button_text(language, "my_debt"), callback_data="reseller:debt")
         )
-        markup.add(types.InlineKeyboardButton(hosted_text(language, "main_hosted_bot") or "🤖 My Hosted Bot",
-                                              callback_data="hosted:menu"))
         debt = float(reseller_data.get('debt', 0.0))
         debt_state_text = get_message_text(language, _debt_state_label(reseller_data.get('debt_state', 'active')))
         trust_limit = get_reseller_trust_limit(get_reseller_total_paid(reseller_data))
@@ -415,18 +567,31 @@ def reseller_panel(message):
         bot.reply_to(message, intro, reply_markup=markup)
         
     elif status == 'pending':
-        bot.reply_to(message, get_message_text(language, "reseller_status_pending"))
-        
+        text = get_message_text(language, "reseller_status_pending") + "\n\n" + _reseller_program_preview(language, reseller_data)
+        bot.reply_to(message, text, reply_markup=_reseller_prospect_markup(language, allow_request=False))
+
     elif status == 'rejected':
-        bot.reply_to(message, get_message_text(language, "reseller_status_rejected"))
+        text = get_message_text(language, "reseller_status_rejected") + "\n\n" + _reseller_program_preview(language, reseller_data)
+        bot.reply_to(message, text, reply_markup=_reseller_prospect_markup(language))
     elif status == 'banned':
         bot.reply_to(message, get_message_text(language, "reseller_access_banned"))
         
     else:
         # Not a reseller yet
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton(get_button_text(language, "request_reseller"), callback_data="reseller:request"))
-        bot.reply_to(message, get_message_text(language, "reseller_intro").replace("${debt}", "0") + "\n\n" + get_message_text(language, "request_reseller"), reply_markup=markup)
+        bot.reply_to(
+            message,
+            _reseller_program_preview(language, reseller_data),
+            reply_markup=_reseller_prospect_markup(language),
+            parse_mode="Markdown",
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "reseller:eligible_plans")
+def handle_reseller_eligible_plans(call):
+    from utils.purchase_plan import show_plans
+
+    safe_answer_callback_query(bot, call.id)
+    show_plans(call.message.chat.id, call.from_user.id, call.message.message_id)
 
 
 def _queue_reseller_request_job(call, user_id, language, telegram_username):
@@ -455,9 +620,11 @@ def _process_reseller_request_job(call, user_id, language, telegram_username):
     if not _has_active_purchased_config(user_id):
         safe_edit_message_text(
             bot,
-            get_message_text(language, "reseller_requires_active_paid_config"),
+            _reseller_ineligible_text(language, has_username=bool(telegram_username)),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
+            reply_markup=_reseller_prospect_markup(language),
+            parse_mode="Markdown",
         )
         return
 
@@ -465,11 +632,17 @@ def _process_reseller_request_job(call, user_id, language, telegram_username):
     if not update_reseller_status(user_id, 'pending', telegram_username=telegram_username):
         safe_edit_message_text(
             bot,
-            "Failed to submit request. Please try again.",
+            get_message_text(language, "reseller_request_failed"),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
         )
         return
+
+    _record_reseller_growth(
+        "reseller_applied",
+        user_id,
+        f"reseller-application:{user_id}",
+    )
 
     safe_edit_message_text(
         bot,
@@ -503,7 +676,11 @@ def handle_reseller_request(call):
     telegram_username = str(call.from_user.username or "").strip().lstrip("@")
 
     if current_status == 'approved':
-        safe_answer_callback_query(bot, call.id, "You are already an approved reseller.")
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            get_message_text(language, "reseller_already_approved"),
+        )
         return
     if current_status == 'pending':
         safe_answer_callback_query(bot, call.id, get_message_text(language, "reseller_status_pending"))
@@ -512,12 +689,28 @@ def handle_reseller_request(call):
         safe_answer_callback_query(bot, call.id, get_message_text(language, "reseller_access_banned"))
         return
     if not telegram_username:
-        safe_answer_callback_query(bot, call.id, get_message_text(language, "reseller_requires_telegram_username"), show_alert=True)
+        safe_answer_callback_query(bot, call.id)
+        safe_edit_message_text(
+            bot,
+            _reseller_ineligible_text(language, has_username=False),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=_reseller_prospect_markup(language),
+            parse_mode="Markdown",
+        )
         return
 
-    safe_answer_callback_query(bot, call.id, text="Checking reseller eligibility...")
+    safe_answer_callback_query(
+        bot,
+        call.id,
+        text=get_message_text(language, "reseller_eligibility_checking"),
+    )
     if not _queue_reseller_request_job(call, user_id, language, telegram_username):
-        safe_answer_callback_query(bot, call.id, text="Reseller request is already being checked.")
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            text=get_message_text(language, "reseller_request_check_in_progress"),
+        )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_reseller:"))
 def handle_admin_reseller(call):
@@ -530,6 +723,11 @@ def handle_admin_reseller(call):
     
     if action == 'approve':
         update_reseller_status(target_user_id, 'approved')
+        _record_reseller_growth(
+            "reseller_approved",
+            target_user_id,
+            f"reseller-approval:{target_user_id}",
+        )
         try:
             bot.send_message(target_user_id, get_message_text(target_language, "reseller_approved_notification"))
         except:
@@ -551,7 +749,7 @@ def handle_reseller_generate(call):
     language = get_user_language(user_id)
     reseller_data = _get_active_reseller_data(user_id)
     if not reseller_data:
-        bot.answer_callback_query(call.id, "Reseller access required.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_access_required"))
         return
     if _is_reseller_suspended(reseller_data):
         debt = float(reseller_data.get('debt', 0.0))
@@ -593,7 +791,7 @@ def handle_reseller_buy(call):
     language = get_user_language(user_id)
     reseller_data = _get_active_reseller_data(user_id)
     if not reseller_data:
-        bot.answer_callback_query(call.id, "Reseller access required.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_access_required"))
         return
     if _is_reseller_suspended(reseller_data):
         debt = float(reseller_data.get('debt', 0.0))
@@ -611,7 +809,7 @@ def handle_reseller_buy(call):
         
     plan = plans[gb]
     if plan.get("target", "both") == "customer":
-        bot.answer_callback_query(call.id, "This plan is for customers only.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_customer_only_plan"))
         return
         
     quote = _reseller_plan_quote(plan['price'], reseller_data)
@@ -651,7 +849,7 @@ def handle_reseller_purchase_details(call):
     language = get_user_language(user_id)
     reseller_data = _get_active_reseller_data(user_id)
     if not reseller_data:
-        bot.answer_callback_query(call.id, "Reseller access required.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_access_required"))
         return
     if _is_reseller_suspended(reseller_data):
         debt = float(reseller_data.get('debt', 0.0))
@@ -665,12 +863,12 @@ def handle_reseller_purchase_details(call):
     gb = call.data.split(':')[2]
     plans = load_plans()
     if gb not in plans:
-        bot.answer_callback_query(call.id, "Plan not found.")
+        bot.answer_callback_query(call.id, get_message_text(language, "plan_not_found"))
         return
 
     plan = plans[gb]
     if plan.get("target", "both") == "customer":
-        bot.answer_callback_query(call.id, "This plan is for customers only.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_customer_only_plan"))
         return
 
     quote = _reseller_plan_quote(plan['price'], reseller_data)
@@ -690,7 +888,7 @@ def handle_reseller_confirm_buy(call):
     language = get_user_language(user_id)
     reseller_data = _get_active_reseller_data(user_id)
     if not reseller_data:
-        bot.answer_callback_query(call.id, "Reseller access required.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_access_required"))
         return
     if _is_reseller_suspended(reseller_data):
         debt = float(reseller_data.get('debt', 0.0))
@@ -704,12 +902,12 @@ def handle_reseller_confirm_buy(call):
     gb = call.data.split(':')[2]
     plans = load_plans()
     if gb not in plans:
-        bot.answer_callback_query(call.id, "Plan not found.")
+        bot.answer_callback_query(call.id, get_message_text(language, "plan_not_found"))
         return
 
     plan = plans[gb]
     if plan.get("target", "both") == "customer":
-        bot.answer_callback_query(call.id, "This plan is for customers only.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_customer_only_plan"))
         return
         
     quote = _reseller_plan_quote(plan['price'], reseller_data)
@@ -803,24 +1001,32 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
         if not debt_added or not reseller_config_is_recorded(user_id, username, api_client.server_id):
             rollback_result = _rollback_unaccounted_reseller_user(api_client, username)
             _notify_reseller_accounting_failure(user_id, username, price, rollback_result)
-            safe_reply_to(bot, message, "Config creation could not be accounted for, so it was cancelled. Admins have been notified.")
+            safe_reply_to(
+                bot,
+                message,
+                get_message_text(language, "reseller_config_accounting_cancelled"),
+            )
             return
 
         user_uri_data = api_client.get_user_uri(username)
-        sub_url = user_uri_data.get('normal_sub', 'N/A') if user_uri_data else 'N/A'
+        sub_url = user_uri_data.get('normal_sub') if user_uri_data else None
         ipv4_url = user_uri_data.get('ipv4', '') if user_uri_data else ''
-        ipv4_info = f"IPv4 URL: `{ipv4_url}`\n\n" if ipv4_url else ""
+        ipv4_info = (
+            get_message_text(language, "renewal_ipv4_line").format(ipv4_url=ipv4_url)
+            if ipv4_url
+            else ""
+        )
 
         msg = get_message_text(language, "reseller_config_created").format(
             username=username,
             plan_gb=gb,
             days=days,
             price=format_usd_amount(price),
-            sub_url=sub_url,
+            sub_url=sub_url or get_message_text(language, "value_not_available"),
             ipv4_info=ipv4_info
         )
 
-        if sub_url != 'N/A':
+        if sub_url:
             qr = qrcode.make(ipv4_url or sub_url)
             bio = io.BytesIO()
             qr.save(bio, 'PNG')
@@ -829,7 +1035,11 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
         else:
             safe_send_message(bot, message.chat.id, msg, parse_mode="Markdown")
     else:
-        safe_reply_to(bot, message, "Failed to create config. Please try again or contact support.")
+        safe_reply_to(
+            bot,
+            message,
+            get_message_text(language, "reseller_config_creation_failed"),
+        )
 
 
 @bot.message_handler(func=lambda message: message.from_user.id in user_data and user_data[message.from_user.id].get('state') == 'waiting_reseller_username')
@@ -852,7 +1062,7 @@ def handle_reseller_username_input(message):
 
     reseller_data = _get_active_reseller_data(user_id)
     if not reseller_data:
-        bot.reply_to(message, "Your reseller access is not active.")
+        bot.reply_to(message, get_message_text(language, "reseller_access_inactive"))
         return
     if _is_reseller_suspended(reseller_data):
         debt = float(reseller_data.get('debt', 0.0))
@@ -860,18 +1070,18 @@ def handle_reseller_username_input(message):
         bot.reply_to(message, get_message_text(language, "reseller_suspended_due_debt").format(debt=debt, unlock_amount=unlock_amount))
         return
 
-    safe_reply_to(bot, message, "Creating config. I will send it here when it is ready.")
+    safe_reply_to(bot, message, get_message_text(language, "reseller_config_creating"))
     try:
         queued = _queue_reseller_customer_creation(user_id, message, language, data, chosen_username)
     except Exception as e:
         with reseller_username_state_lock:
             user_data[user_id] = data
         logging.getLogger("ajib.reseller").exception("Failed to queue reseller customer creation: %s", e)
-        safe_reply_to(bot, message, "Failed to start config creation. Please try again.")
+        safe_reply_to(bot, message, get_message_text(language, "reseller_config_start_failed"))
         return
 
     if not queued:
-        safe_reply_to(bot, message, "Config creation is already in progress.")
+        safe_reply_to(bot, message, get_message_text(language, "reseller_config_in_progress"))
 
 @bot.callback_query_handler(func=lambda call: call.data == "reseller:debt")
 def handle_reseller_debt(call):
@@ -879,13 +1089,14 @@ def handle_reseller_debt(call):
     language = get_user_language(user_id)
     reseller_data = _get_active_reseller_data(user_id)
     if not reseller_data:
-        bot.answer_callback_query(call.id, "Reseller access required.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_access_required"))
         return
     debt = float(reseller_data.get('debt', 0.0))
     debt_state = reseller_data.get('debt_state', 'active')
     debt_state_text = get_message_text(language, _debt_state_label(debt_state))
-    debt_since = reseller_data.get('debt_since') or 'N/A'
-    last_payment_at = reseller_data.get('last_payment_at') or 'N/A'
+    unavailable = get_message_text(language, "value_not_available")
+    debt_since = reseller_data.get('debt_since') or unavailable
+    last_payment_at = reseller_data.get('last_payment_at') or unavailable
     trust_limit = get_reseller_trust_limit(get_reseller_total_paid(reseller_data))
     unlock_amount = get_reseller_unlock_amount(debt) if _is_reseller_suspended(reseller_data) else 0.0
     
@@ -914,7 +1125,7 @@ def handle_reseller_settle(call):
     language = get_user_language(user_id)
     reseller_data = _get_active_reseller_data(user_id)
     if not reseller_data:
-        bot.answer_callback_query(call.id, "Reseller access required.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_access_required"))
         return
     amount = float(reseller_data.get('debt', 0.0))
     if amount <= 0:
@@ -933,6 +1144,17 @@ def handle_reseller_settle(call):
         markup.add(types.InlineKeyboardButton(get_crypto_discount_button_text(language), callback_data=f"reseller:pay:crypto:{amount:.2f}"))
     if card_to_card_configured:
         markup.add(types.InlineKeyboardButton(get_button_text(language, "card_to_card"), callback_data=f"reseller:pay:card:{amount:.2f}"))
+    purchase_credit = get_account_credit(user_id).get("available", 0)
+    credit_to_use = min(amount, float(purchase_credit or 0))
+    if credit_to_use > 0:
+        credit_label = get_message_text(
+            language,
+            "account_credit_payment_button",
+        ).format(amount=format_usd_amount(credit_to_use))
+        markup.add(types.InlineKeyboardButton(
+            credit_label,
+            callback_data=f"reseller:pay:credit:{credit_to_use:.2f}",
+        ))
         
     markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
 
@@ -951,7 +1173,7 @@ def handle_reseller_payment(call):
     language = get_user_language(user_id)
     reseller_data = _get_active_reseller_data(user_id)
     if not reseller_data:
-        bot.answer_callback_query(call.id, "Reseller access required.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_access_required"))
         return
     _, _, method, amount = call.data.split(':')
     amount = float(amount)
@@ -960,6 +1182,80 @@ def handle_reseller_payment(call):
         bot.answer_callback_query(call.id, get_message_text(language, "debt_cleared"))
         return
     amount_to_pay = min(amount, current_debt)
+
+    if method == 'credit':
+        payment_id = (
+            f"credit-settlement-{user_id}-"
+            f"{call.message.chat.id}-{call.message.message_id}"
+        )
+        existing = get_payment_record(payment_id)
+        if isinstance(existing, dict) and existing.get('status') == 'completed':
+            safe_answer_callback_query(
+                bot,
+                call.id,
+                get_message_text(language, "payment_already_processed").format(
+                    status=get_message_text(language, "payment_status_completed"),
+                ),
+                show_alert=True,
+            )
+            return
+        with RESELLER_CREDIT_SETTLEMENT_LOCK:
+            if payment_id in RESELLER_CREDIT_SETTLEMENT_INFLIGHT:
+                safe_answer_callback_query(
+                    bot,
+                    call.id,
+                    get_message_text(language, "payment_already_processed").format(
+                        status=get_message_text(language, "payment_status_processing"),
+                    ),
+                    show_alert=True,
+                )
+                return
+            RESELLER_CREDIT_SETTLEMENT_INFLIGHT.add(payment_id)
+        try:
+            reserved, remaining_debt = _apply_account_credit_debt_payment(
+                user_id,
+                payment_id,
+                amount_to_pay,
+            )
+        except _AccountCreditUnavailable:
+            safe_answer_callback_query(
+                bot,
+                call.id,
+                get_message_text(language, "account_credit_unavailable"),
+                show_alert=True,
+            )
+            return
+        except Exception:
+            # In the SQLite runtime, the encompassing transaction has already
+            # rolled back the debt, reservation, and payment record together.
+            # These calls are safe compatibility cleanup for legacy stores.
+            release_account_credit(user_id, payment_id)
+            update_payment_status(payment_id, 'failed')
+            logging.getLogger("ajib.reseller").exception(
+                "Account-credit debt payment failed for reseller %s",
+                user_id,
+            )
+            safe_answer_callback_query(
+                bot,
+                call.id,
+                get_message_text(language, "account_credit_apply_failed"),
+                show_alert=True,
+            )
+            return
+        finally:
+            with RESELLER_CREDIT_SETTLEMENT_LOCK:
+                RESELLER_CREDIT_SETTLEMENT_INFLIGHT.discard(payment_id)
+        safe_answer_callback_query(bot, call.id)
+        bot.edit_message_text(
+            get_message_text(language, "settlement_payment_approved").format(
+                amount=format_usd_amount(reserved),
+                remaining_debt=format_usd_amount(remaining_debt or 0),
+            ),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="Markdown",
+        )
+        return
     
     if method == 'crypto':
         discount_metadata = build_crypto_discount_metadata(amount_to_pay)
@@ -970,7 +1266,12 @@ def handle_reseller_payment(call):
             discounted_amount_to_pay, "Settlement", user_id
         )
         if "error" in payment_response:
-             bot.answer_callback_query(call.id, f"Error: {payment_response['error']}")
+             bot.answer_callback_query(
+                 call.id,
+                 get_message_text(language, "error_processing_payment").format(
+                     error=payment_response['error'],
+                 ),
+             )
              return
              
         payment_data = payment_response.get('result', {})
@@ -1065,7 +1366,7 @@ def handle_reseller_stats(call):
     reseller_data = _get_active_reseller_data(user_id)
     
     if not reseller_data:
-        bot.answer_callback_query(call.id, "Reseller access required.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_access_required"))
         return
     present_pending_reseller_level(bot, user_id, language)
 
@@ -1078,7 +1379,7 @@ def handle_reseller_stats(call):
         language,
         reseller_data,
         user_id=user_id,
-        joined_date=reseller_data.get('created_at', 'N/A'),
+        joined_date=reseller_data.get('created_at') or get_message_text(language, "value_not_available"),
         total_configs=total_configs,
         total_value=total_value,
         current_debt=current_debt,
@@ -1108,7 +1409,7 @@ def handle_reseller_levels(call):
     language = get_user_language(user_id)
     reseller_data = _get_active_reseller_data(user_id)
     if not reseller_data:
-        bot.answer_callback_query(call.id, "Reseller access required.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_access_required"))
         return
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
@@ -1187,10 +1488,15 @@ def _is_removed_config(cfg):
     return isinstance(cfg, dict) and bool(cfg.get("removed_from_vpn"))
 
 
-def _removed_config_reason_line(cfg):
+def _removed_config_reason_line(cfg, language):
     if not _is_removed_config(cfg):
         return ""
-    note = str(cfg.get("removal_note") or "Removed from VPN during cleanup").strip()
+    stored_note = str(cfg.get("removal_note") or "").strip()
+    note = (
+        get_message_text(language, "reseller_removed_during_cleanup")
+        if not stored_note or stored_note == "Removed during banned reseller unpaid user cleanup"
+        else stored_note
+    )
     removed_at = str(cfg.get("removed_at") or "").strip()
     if removed_at:
         return f"\n   🧾 {note} ({removed_at})"
@@ -1198,12 +1504,13 @@ def _removed_config_reason_line(cfg):
 
 
 def _format_reseller_customer_entry(index, cfg, category, language):
-    username = cfg.get('username', 'N/A')
+    unavailable = get_message_text(language, "value_not_available")
+    username = cfg.get('username') or unavailable
     customer_name = _resolve_reseller_customer_name(cfg)
-    gb = cfg.get('gb', '?')
-    days = cfg.get('days', '?')
+    gb = cfg.get('gb') or unavailable
+    days = cfg.get('days') or unavailable
     price = cfg.get('price', 0)
-    timestamp = cfg.get('timestamp', 'N/A')
+    timestamp = cfg.get('timestamp') or unavailable
     status_category = cfg.get("_status_category", category)
     status_label = _customer_category_label(language, status_category)
     if cfg.get("_status_note") == "status_unavailable":
@@ -1212,14 +1519,16 @@ def _format_reseller_customer_entry(index, cfg, category, language):
     identifier_lines = [f"{index}. {RESELLER_CUSTOMER_CATEGORY_ICONS.get(status_category, '✅')} `{customer_name or username}`"]
     if customer_name:
         identifier_lines.append(f"   🆔 `{username}`")
-    removal_reason = _removed_config_reason_line(cfg)
+    removal_reason = _removed_config_reason_line(cfg, language)
 
-    return (
-        "\n".join(identifier_lines) + "\n"
-        f"   {status_label}\n"
-        f"   📊 {gb} GB | 📅 {days}d | 💰 ${format_usd_amount(price)}\n"
-        f"   🕒 {timestamp}"
-        f"{removal_reason}"
+    return get_message_text(language, "reseller_customer_entry").format(
+        identifiers="\n".join(identifier_lines),
+        status=status_label,
+        gb=gb,
+        days=days,
+        price=format_usd_amount(price),
+        timestamp=timestamp,
+        removal_reason=removal_reason,
     )
 
 
@@ -1372,7 +1681,10 @@ def _render_reseller_customer_overview(call, language, categorized, total):
             )
         )
     markup.add(*buttons)
-    markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="reseller:my_customers_refresh:overview:0"))
+    markup.add(types.InlineKeyboardButton(
+        get_message_text(language, "refresh_action"),
+        callback_data="reseller:my_customers_refresh:overview:0",
+    ))
     markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
     _render_reseller_customer_message(call, msg, markup)
 
@@ -1385,7 +1697,10 @@ def _render_reseller_customer_category(call, language, categorized, category, pa
     if total == 0:
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton(get_button_text(language, "reseller_back_to_customers"), callback_data="reseller:my_customers:overview"))
-        markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"reseller:my_customers_refresh:{category}:{page}"))
+        markup.add(types.InlineKeyboardButton(
+            get_message_text(language, "refresh_action"),
+            callback_data=f"reseller:my_customers_refresh:{category}:{page}",
+        ))
         markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
         _render_reseller_customer_message(
             call,
@@ -1433,7 +1748,10 @@ def _render_reseller_customer_category(call, language, categorized, category, pa
         markup.row(*nav_buttons)
 
     markup.add(types.InlineKeyboardButton(get_button_text(language, "reseller_back_to_customers"), callback_data="reseller:my_customers:overview"))
-    markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"reseller:my_customers_refresh:{category}:{page}"))
+    markup.add(types.InlineKeyboardButton(
+        get_message_text(language, "refresh_action"),
+        callback_data=f"reseller:my_customers_refresh:{category}:{page}",
+    ))
     markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
     _render_reseller_customer_message(call, msg, markup)
 
@@ -1485,7 +1803,11 @@ def handle_reseller_my_customers(call):
     reseller_data = _get_active_reseller_data(user_id)
 
     if not reseller_data:
-        safe_answer_callback_query(bot, call.id, "Reseller access required.")
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            get_message_text(language, "reseller_access_required"),
+        )
         return
     safe_answer_callback_query(bot, call.id)
 
@@ -1521,7 +1843,11 @@ def handle_reseller_my_customers(call):
         return
 
     if category not in RESELLER_CUSTOMER_CATEGORY_ORDER:
-        safe_answer_callback_query(bot, call.id, "Invalid customer category.")
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            get_message_text(language, "reseller_invalid_customer_category"),
+        )
         return
 
     try:
@@ -1568,7 +1894,7 @@ def handle_reseller_customer_config(call):
     # Validate reseller access (both approved and suspended can view configs)
     reseller_data = get_reseller_data(user_id)
     if not reseller_data or reseller_data.get('status') not in ('approved', 'suspended'):
-        bot.answer_callback_query(call.id, "Reseller access required.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_access_required"))
         return
 
     # Current callback: reseller:cfg_index:{config_index}:{category}:{page}
@@ -1576,7 +1902,7 @@ def handle_reseller_customer_config(call):
     # reseller:cfg:{username}:{page} remain accepted for existing keyboards.
     parts = call.data.split(":")
     if len(parts) < 4:
-        bot.answer_callback_query(call.id, "Invalid request.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_invalid_request"))
         return
 
     config_index = None
@@ -1585,7 +1911,7 @@ def handle_reseller_customer_config(call):
         try:
             config_index = int(parts[2])
         except (TypeError, ValueError):
-            bot.answer_callback_query(call.id, "Invalid request.")
+            bot.answer_callback_query(call.id, get_message_text(language, "reseller_invalid_request"))
             return
     else:
         username = parts[2]
@@ -1609,7 +1935,7 @@ def handle_reseller_customer_config(call):
         config_index=config_index,
     )
     if matched_config_index is None:
-        bot.answer_callback_query(call.id, "Invalid request.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_invalid_request"))
         return
 
     username = str(matched_config.get('username') or '').strip()
@@ -1718,7 +2044,9 @@ def _render_reseller_customer_config_job(
     if not user_config:
         safe_edit_message_text(
             bot,
-            f"⚠️ Could not retrieve data for `{username}`. The config may have been deleted.",
+            get_message_text(language, "reseller_config_data_unavailable").format(
+                username=username,
+            ),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=back_markup,
@@ -1732,35 +2060,49 @@ def _render_reseller_customer_config_job(
     download_bytes = user_config.get('download_bytes', 0) or 0
     max_download_bytes = user_config.get('max_download_bytes', 0) or 0
     expiration_days = user_config.get('expiration_days', 0)
-    account_creation_date = user_config.get('account_creation_date', 'N/A')
-    status = user_config.get('status', 'Unknown')
+    account_creation_date = (
+        user_config.get('account_creation_date')
+        or get_message_text(language, "value_not_available")
+    )
+    status = user_config.get('status') or get_message_text(language, "value_unknown")
 
     upload_gb = upload_bytes / (1024 ** 3)
     download_gb = download_bytes / (1024 ** 3)
     total_usage_gb = upload_gb + download_gb
     max_traffic_gb = max_download_bytes / (1024 ** 3)
 
-    traffic_limit_display = f"{max_traffic_gb:.2f} GB" if max_traffic_gb > 0 else "Unlimited"
+    traffic_limit_display = (
+        f"{max_traffic_gb:.2f} GB"
+        if max_traffic_gb > 0
+        else get_message_text(language, "value_unlimited")
+    )
 
     if upload_bytes == 0 and download_bytes == 0:
-        traffic_message = "**Traffic Data:**\nNo traffic data available."
+        traffic_message = get_message_text(language, "reseller_traffic_no_data")
     else:
-        traffic_message = (
-            f"🔼 Upload: {upload_gb:.2f} GB\n"
-            f"🔽 Download: {download_gb:.2f} GB\n"
-            f"📊 Total Usage: {total_usage_gb:.2f} GB"
+        traffic_message = get_message_text(language, "reseller_traffic_data").format(
+            upload_gb=f"{upload_gb:.2f}",
+            download_gb=f"{download_gb:.2f}",
+            total_usage_gb=f"{total_usage_gb:.2f}",
+            traffic_limit=(
+                f"{max_traffic_gb:.2f} GB"
+                if max_traffic_gb > 0
+                else get_message_text(language, "value_unlimited")
+            ),
+            status=status,
         )
-        if max_traffic_gb > 0:
-            traffic_message += f" / {max_traffic_gb:.2f} GB"
-        traffic_message += f"\n🌐 Status: {status}"
 
-    formatted_details = (
-        f"\n🆔 Username: `{username}`\n"
-        f"📊 Traffic Limit: {traffic_limit_display}\n"
-        f"📅 Days Remaining: {expiration_days}\n"
-        f"⏳ Creation Date: {account_creation_date}\n"
-        f"💡 Status: {'❌ Blocked/Expired' if is_blocked else '✅ Active'}\n\n"
-        f"{traffic_message}"
+    account_status = get_message_text(
+        language,
+        "reseller_config_status_blocked" if is_blocked else "reseller_config_status_active",
+    )
+    formatted_details = get_message_text(language, "reseller_config_live_details").format(
+        username=username,
+        traffic_limit=traffic_limit_display,
+        days_remaining=expiration_days,
+        creation_date=account_creation_date,
+        account_status=account_status,
+        traffic_message=traffic_message,
     )
 
     if is_blocked:
@@ -1799,7 +2141,7 @@ def _render_reseller_customer_config_job(
                     expired_markup = types.InlineKeyboardMarkup()
                     expired_markup.add(
                         types.InlineKeyboardButton(
-                            get_button_text(language, "renew_plan") or "Renew Plan",
+                            get_button_text(language, "renew_plan"),
                             callback_data=f"reseller:renew:{offer['token']}"
                         )
                     )
@@ -1820,9 +2162,14 @@ def _render_reseller_customer_config_job(
                     )
             except Exception as renewal_error:
                 print(f"Error building reseller renewal offer for {username}: {renewal_error}")
-        message_text = f"❌ **Configuration expired/blocked**\n{formatted_details}"
-        if renewal_unavailable_message:
-            message_text += f"\n\n{renewal_unavailable_message}"
+        message_text = get_message_text(language, "reseller_config_expired").format(
+            details=formatted_details,
+            renewal_message=(
+                f"\n\n{renewal_unavailable_message}"
+                if renewal_unavailable_message
+                else ""
+            ),
+        )
         safe_edit_message_text(
             bot,
             message_text,
@@ -1838,7 +2185,9 @@ def _render_reseller_customer_config_job(
     if not user_uri_data or 'normal_sub' not in user_uri_data:
         safe_edit_message_text(
             bot,
-            f"⚠️ Could not generate subscription URL for `{username}`.",
+            get_message_text(language, "reseller_subscription_unavailable").format(
+                username=username,
+            ),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=back_markup,
@@ -1867,7 +2216,7 @@ def _render_reseller_customer_config_job(
         if active_offer.get('eligible') and active_offer.get('renewal_mode') == 'reserved':
             reserve_markup = types.InlineKeyboardMarkup()
             reserve_markup.add(types.InlineKeyboardButton(
-                get_button_text(language, 'reserve_renewal') or 'Reserve renewal',
+                get_button_text(language, 'reserve_renewal'),
                 callback_data=f"reseller:renew:{active_offer['token']}",
             ))
             reserve_markup.add(types.InlineKeyboardButton(
@@ -1877,17 +2226,19 @@ def _render_reseller_customer_config_job(
             back_markup = reserve_markup
         elif active_offer.get('reason') == 'renewal_already_reserved':
             reservation_status = get_message_text(language, 'renewal_reserved_status')
-            if reservation_status == 'renewal_reserved_status':
-                reservation_status = 'A renewal is reserved for this config.'
     except Exception as renewal_error:
         print(f"Error building reseller renewal reservation for {username}: {renewal_error}")
 
-    caption = f"{formatted_details}\n\n"
-    if ipv4_url:
-        caption += f"IPv4 URL: `{ipv4_url}`\n\n"
-    caption += f"Subscription URL:\n{sub_url}"
-    if reservation_status:
-        caption += f"\n\n{reservation_status}"
+    caption = get_message_text(language, "reseller_config_subscription_caption").format(
+        details=formatted_details,
+        ipv4_info=(
+            get_message_text(language, "renewal_ipv4_line").format(ipv4_url=ipv4_url)
+            if ipv4_url
+            else ""
+        ),
+        sub_url=sub_url,
+        reservation_status=f"\n\n{reservation_status}" if reservation_status else "",
+    )
 
     try:
         qr_code = qrcode.make(ipv4_url or sub_url)
@@ -1950,7 +2301,11 @@ def _reseller_renewal_details_message(language, offer, current_debt, trust_limit
 
 
 def _renewal_reason_text(language, reason):
-    return get_message_text(language, reason or "renewal_failed") or str(reason or "renewal_failed")
+    key = reason or "renewal_failed"
+    text = get_message_text(language, key)
+    if not text or text == key:
+        return get_message_text(language, "renewal_generic_unavailable_reason")
+    return text
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reseller:renew:"))
@@ -1959,7 +2314,7 @@ def handle_reseller_renewal_start(call):
     language = get_user_language(user_id)
     reseller_data = _get_active_reseller_data(user_id)
     if not reseller_data:
-        bot.answer_callback_query(call.id, "Reseller access required.")
+        bot.answer_callback_query(call.id, get_message_text(language, "reseller_access_required"))
         return
     if _is_reseller_suspended(reseller_data):
         debt = float(reseller_data.get('debt', 0.0))
@@ -2028,7 +2383,7 @@ def _process_reseller_renewal_confirm_job(call, user_id, language, token):
     if not reseller_data:
         safe_edit_message_text(
             bot,
-            "Reseller access required.",
+            get_message_text(language, "reseller_access_required"),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
         )
@@ -2107,16 +2462,10 @@ def _process_reseller_renewal_confirm_job(call, user_id, language, token):
             )
             return
         reserved_text = get_message_text(language, 'renewal_reserved_reseller_success')
-        if reserved_text == 'renewal_reserved_reseller_success':
-            reserved_text = (
-                f"Renewal reserved for `{offer.get('username')}`. "
-                f"${format_usd_amount(price)} was added to your debt and the renewal will apply automatically at expiry."
-            )
-        else:
-            reserved_text = reserved_text.format(
-                username=offer.get('username'),
-                price=format_usd_amount(price),
-            )
+        reserved_text = reserved_text.format(
+            username=offer.get('username'),
+            price=format_usd_amount(price),
+        )
         safe_edit_message_text(
             bot,
             reserved_text,
@@ -2203,7 +2552,11 @@ def handle_reseller_renewal_confirm(call):
     language = get_user_language(user_id)
     reseller_data = _get_active_reseller_data(user_id)
     if not reseller_data:
-        safe_answer_callback_query(bot, call.id, "Reseller access required.")
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            get_message_text(language, "reseller_access_required"),
+        )
         return
     if _is_reseller_suspended(reseller_data):
         debt = float(reseller_data.get('debt', 0.0))
@@ -2218,9 +2571,17 @@ def handle_reseller_renewal_confirm(call):
 
     token = call.data.split(":", 2)[2]
     if _queue_reseller_renewal_confirm(call, user_id, language, token):
-        safe_answer_callback_query(bot, call.id, text="Processing renewal...")
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            text=get_message_text(language, "reseller_renewal_processing"),
+        )
     else:
-        safe_answer_callback_query(bot, call.id, text="Renewal is already in progress.")
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            text=get_message_text(language, "reseller_renewal_in_progress"),
+        )
 
 
 # Admin Management Handlers

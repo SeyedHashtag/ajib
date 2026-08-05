@@ -676,7 +676,7 @@ def _format_state_summary(last_state, language, missing=False):
 
 
 def _escape_markdown(value):
-    text = str(value if value is not None else 'N/A')
+    text = str(value if value is not None else '—')
     for char in ('\\', '`', '*', '_', '[', ']'):
         text = text.replace(char, f"\\{char}")
     return text
@@ -1732,7 +1732,7 @@ def _resolve_reseller_customer_name(candidate):
     note_name = _extract_reseller_customer_name_from_note(
         (candidate.get('_user_data') or {}).get('note')
     )
-    return note_name or 'N/A'
+    return note_name or '—'
 
 
 def _candidate_has_reserved_renewal(candidate, stores=None):
@@ -1766,6 +1766,37 @@ def _candidate_has_reserved_renewal(candidate, stores=None):
     except (ImportError, IndexError, TypeError, ValueError):
         return False
     return False
+
+
+def _record_expiry_recovery_prompt(candidate, recipient_id, language, last_state):
+    """Measure the single recovery notice without affecting cleanup delivery."""
+    if candidate.get('source') not in {'customer', 'reseller_customer'}:
+        return
+    try:
+        from utils.growth_events import EVENT_RENEWAL_PROMPTED, record_growth_event
+
+        cycle = (
+            (last_state or {}).get('account_creation_date')
+            or (last_state or {}).get('expiration_date')
+            or 'unknown-cycle'
+        )
+        server_id = candidate.get('server_id') or 'primary'
+        username = candidate.get('username') or 'unknown'
+        record_growth_event(
+            EVENT_RENEWAL_PROMPTED,
+            user_id=recipient_id,
+            language=language,
+            plan_id=candidate.get('plan_gb') or candidate.get('gb'),
+            deduplication_key=f"expiry-recovery:{server_id}:{username}:{cycle}",
+            metadata={
+                'basis': 'expired',
+                'recovery': True,
+                'source': candidate.get('source'),
+                'username': str(username),
+            },
+        )
+    except Exception:
+        return
 
 
 def _notify_candidate(candidate, grace_hours, last_state=None, missing=False):
@@ -1810,7 +1841,7 @@ def _notify_candidate(candidate, grace_hours, last_state=None, missing=False):
                 if offer.get('eligible'):
                     markup = types.InlineKeyboardMarkup()
                     markup.add(types.InlineKeyboardButton(
-                        get_button_text(language, "renew_plan") or "Renew Plan",
+                        get_button_text(language, "renew_plan"),
                         callback_data=f"renew_plan:{offer['token']}"
                     ))
             elif source == 'reseller_customer':
@@ -1826,13 +1857,14 @@ def _notify_candidate(candidate, grace_hours, last_state=None, missing=False):
                     if offer.get('eligible'):
                         markup = types.InlineKeyboardMarkup()
                         markup.add(types.InlineKeyboardButton(
-                            get_button_text(language, "renew_plan") or "Renew Plan",
+                            get_button_text(language, "renew_plan"),
                             callback_data=f"reseller:renew:{offer['token']}"
                         ))
         except Exception as e:
             print(f"Failed to build renewal cleanup action for {candidate.get('username')}: {e}")
 
         bot.send_message(int(recipient_id), message, parse_mode='Markdown', reply_markup=markup)
+        _record_expiry_recovery_prompt(candidate, int(recipient_id), language, last_state)
         return None
     except Exception as e:
         return str(e)

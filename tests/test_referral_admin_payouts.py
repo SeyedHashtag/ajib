@@ -67,7 +67,7 @@ class DummyBot:
 
     def get_me(self):
         self.get_me_calls += 1
-        return types.SimpleNamespace(username="AjibBot")
+        return types.SimpleNamespace(username="ServiceBot")
 
 
 class HoldingExecutor:
@@ -154,6 +154,90 @@ class ReferralAdminHelperTests(unittest.TestCase):
 
     def read_referrals(self):
         return json.loads(self.referrals_file.read_text(encoding="utf-8"))
+
+    def _seed_referred_user(self, invitee="20", referrer="10", code="CODE"):
+        data = self.referral._default_referrals_data()
+        data["referrals"][str(invitee)] = str(referrer)
+        data["codes"][code] = str(referrer)
+        data["user_codes"][str(referrer)] = code
+        data["stats"][str(referrer)] = {
+            "count": 1,
+            "total_earnings": 0,
+            "available_balance": 0,
+        }
+        data["referral_details"][str(invitee)] = {
+            "referral_code": code,
+            "referrer_id": str(referrer),
+            "campaign_type": "customer",
+        }
+        self.referral.save_referrals(data)
+
+    def test_invitee_discount_is_reserved_released_and_redeemed_once(self):
+        self._seed_referred_user()
+
+        eligibility = self.referral.get_invitee_discount_eligibility("20", payments={})
+        self.assertTrue(eligibility["eligible"])
+        self.assertEqual(eligibility["percent"], 5.0)
+
+        reservation = self.referral.reserve_invitee_discount("20", "order-1", payments={})
+        self.assertEqual(reservation["referrer_id"], "10")
+        self.assertEqual(
+            self.referral.reserve_invitee_discount("20", "order-1", payments={}),
+            reservation,
+        )
+        self.assertIsNone(
+            self.referral.reserve_invitee_discount("20", "order-2", payments={})
+        )
+
+        self.assertTrue(self.referral.release_invitee_discount("order-1", "20"))
+        self.assertIsNotNone(
+            self.referral.reserve_invitee_discount("20", "order-2", payments={})
+        )
+        self.assertTrue(self.referral.redeem_invitee_discount("20", "order-2"))
+        self.assertTrue(self.referral.redeem_invitee_discount("20", "order-2"))
+        self.assertFalse(
+            self.referral.get_invitee_discount_eligibility("20", payments={})["eligible"]
+        )
+        self.assertIsNone(
+            self.referral.reserve_invitee_discount("20", "order-3", payments={})
+        )
+
+    def test_invitee_discount_rejects_existing_paid_customer_and_caps_stacking(self):
+        self._seed_referred_user()
+
+        eligibility = self.referral.get_invitee_discount_eligibility(
+            "20",
+            payments={"old": {"status": "completed", "plan_gb": "10"}},
+        )
+        self.assertFalse(eligibility["eligible"])
+        self.assertEqual(eligibility["reason"], "existing_customer")
+        self.assertEqual(self.referral.stacked_discount_percent(5, 5), 10.0)
+        self.assertEqual(self.referral.stacked_discount_percent(7, 8), 10.0)
+
+    def test_referral_rewards_use_collected_amount_and_report_conversion_progress(self):
+        self._seed_referred_user()
+
+        result = self.referral.add_referral_reward("20", 90, "order-paid")
+        self.assertEqual(result, (True, "10", 18.0))
+        progress = self.referral.get_referral_progress("10")
+        self.assertEqual(progress["invited"], 1)
+        self.assertEqual(progress["first_purchases"], 1)
+        self.assertEqual(progress["available_balance"], 18.0)
+
+    def test_manual_referral_reward_is_idempotent(self):
+        self._seed_referred_user()
+
+        self.assertTrue(
+            self.referral.credit_manual_referral_reward(
+                "10", 5, "recruitment:20", {"reseller_id": "20"}
+            )
+        )
+        self.assertTrue(
+            self.referral.credit_manual_referral_reward(
+                "10", 5, "recruitment:20", {"reseller_id": "20"}
+            )
+        )
+        self.assertEqual(self.referral.get_referral_stats("10")["available_balance"], 5.0)
 
     def test_eligible_users_include_exact_threshold_and_sort_by_balance(self):
         self.write_referrals({
@@ -332,7 +416,7 @@ class ReferralAdminHandlerTests(unittest.TestCase):
 
         self.assertEqual(module.REFERRAL_MENU_INFLIGHT, set())
         self.assertEqual(bot.get_me_calls, 1)
-        self.assertIn("https://t.me/AjibBot?start=CODE", bot.messages[0][0][1])
+        self.assertIn("https://t.me/ServiceBot?start=CODE", bot.messages[0][0][1])
 
     def test_admin_menu_renders_eligible_users(self):
         module, bot = load_referral_handlers_module()

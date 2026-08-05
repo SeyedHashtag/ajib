@@ -6,6 +6,7 @@ from utils.reseller import (
     RESELLER_TRUST_PAID_STEP,
     claim_reseller_level_presentation,
     complete_reseller_level_presentation,
+    calculate_reseller_wholesale_price,
     get_reseller_level_summary,
     release_reseller_level_presentation,
 )
@@ -93,6 +94,34 @@ def build_reseller_level_roadmap(language, reseller_data):
             )
         )
     return "\n".join(lines)
+
+
+def build_reseller_program_preview(
+    language,
+    reseller_data,
+    plan_id,
+    plan,
+    *,
+    example_markup_percent=20.0,
+):
+    """Render a factual, personalized program preview without social proof."""
+    summary = get_reseller_level_summary(reseller_data or {})
+    list_price = float((plan or {}).get("price", 0) or 0)
+    wholesale = calculate_reseller_wholesale_price(list_price, reseller_data or {})
+    retail = round(list_price * (1 + float(example_markup_percent) / 100), 2)
+    gross_profit = round(max(0.0, retail - wholesale), 2)
+    return get_message_text(language, "reseller_program_preview").format(
+        plan_gb=plan_id,
+        days=int((plan or {}).get("days", 30) or 30),
+        level=summary["level"],
+        discount_percent=f"{float(summary['discount_percent']):g}",
+        trust_limit=format_usd_amount(summary["trust_limit"]),
+        catalog_price=format_usd_amount(list_price),
+        wholesale_price=format_usd_amount(wholesale),
+        markup_percent=f"{float(example_markup_percent):g}",
+        customer_price=format_usd_amount(retail),
+        gross_profit=format_usd_amount(gross_profit),
+    )
 
 
 def build_reseller_level_presentation(language, claim):

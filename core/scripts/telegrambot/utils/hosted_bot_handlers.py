@@ -26,7 +26,7 @@ def _registration_error_text(user_id, detail):
         return _owner_text(user_id, "bot_already_connected")
     if "already has" in normalized:
         return _owner_text(user_id, "bot_capacity_reached")
-    if "main ajib bot" in normalized:
+    if "primary service bot token" in normalized:
         return _owner_text(user_id, "main_token_forbidden")
     return _owner_text(user_id, "token_rejected")
 

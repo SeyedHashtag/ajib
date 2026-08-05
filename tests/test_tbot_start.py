@@ -20,10 +20,18 @@ class DummyBot:
         self.replies = []
         self.sent_messages = []
         self.message_handlers = []
+        self.callback_handlers = []
 
     def message_handler(self, *args, **kwargs):
         def decorator(func):
             self.message_handlers.append((func, args, kwargs))
+            return func
+
+        return decorator
+
+    def callback_query_handler(self, *args, **kwargs):
+        def decorator(func):
+            self.callback_handlers.append((func, args, kwargs))
             return func
 
         return decorator
@@ -41,8 +49,9 @@ class DummyBot:
 
 
 def load_tbot_module():
-    for name in ("telebot", "utils", "utils.telegram_safe", "tbot_under_test"):
-        sys.modules.pop(name, None)
+    for name in list(sys.modules):
+        if name == "telebot" or name == "tbot_under_test" or name == "utils" or name.startswith("utils."):
+            sys.modules.pop(name, None)
 
     events = []
     bot = DummyBot(events)
@@ -54,11 +63,24 @@ def load_tbot_module():
     utils_stub = types.ModuleType("utils")
     utils_stub.__path__ = []
     utils_stub.bot = bot
+    utils_stub.GROWTH_FUNNEL_BUTTON_TEXT = "📈 Growth Funnel"
     utils_stub.process_referral = lambda *args, **kwargs: (False, None)
+    utils_stub.record_main_growth_event = lambda *args, **kwargs: None
     utils_stub.get_user_language = lambda user_id: "en"
-    utils_stub.get_message_text = lambda language, key: "{referrer_id}" if key == "referral_registered" else key
+    utils_stub.get_message_text = lambda language, key: key
+    utils_stub.get_button_text = lambda language, key: key
     utils_stub.is_admin = lambda user_id: False
     utils_stub.create_main_markup = lambda *args, **kwargs: {"markup": kwargs}
+    utils_stub.resolve_user_language = lambda user_id, telegram_language_code=None: (
+        telegram_language_code if telegram_language_code in {"en", "fa", "ru", "tk"} else None
+    )
+    utils_stub.build_language_selection_markup = lambda: {"languages": True}
+    utils_stub.build_customer_welcome = lambda user_id, language: (
+        f"welcome_{language}",
+        {"welcome": user_id},
+    )
+    utils_stub.show_plans = lambda *args, **kwargs: events.append("show_plans")
+    utils_stub.my_configs = lambda *args, **kwargs: events.append("my_configs")
     utils_stub.has_used_test_config = lambda user_id: False
     utils_stub.is_test_creation_disabled = lambda: False
     utils_stub.add_to_waiting_list = lambda *args, **kwargs: events.append("waitlist")
@@ -68,6 +90,7 @@ def load_tbot_module():
     telegram_safe_stub = types.ModuleType("utils.telegram_safe")
     telegram_safe_stub.safe_reply_to = lambda bot_obj, *args, **kwargs: bot_obj.reply_to(*args, **kwargs)
     telegram_safe_stub.safe_send_message = lambda bot_obj, *args, **kwargs: bot_obj.send_message(*args, **kwargs)
+    telegram_safe_stub.safe_answer_callback_query = lambda *args, **kwargs: events.append("answer")
     sys.modules["utils.telegram_safe"] = telegram_safe_stub
 
     spec = importlib.util.spec_from_file_location("tbot_under_test", MODULE_PATH)
@@ -78,13 +101,7 @@ def load_tbot_module():
 
 
 class TBotStartTests(unittest.TestCase):
-    def tearDown(self):
-        module = sys.modules.get("tbot_under_test")
-        executor = getattr(module, "START_TEST_CONFIG_EXECUTOR", None)
-        if executor is not None and hasattr(executor, "shutdown"):
-            executor.shutdown(wait=False, cancel_futures=True)
-
-    def make_message(self, user_id=123, text="/start"):
+    def make_message(self, user_id=123, text="/start", language_code="en"):
         return types.SimpleNamespace(
             text=text,
             from_user=types.SimpleNamespace(
@@ -92,23 +109,73 @@ class TBotStartTests(unittest.TestCase):
                 username="buyer",
                 first_name="Buyer",
                 last_name="Example",
+                language_code=language_code,
             ),
             chat=types.SimpleNamespace(id=456),
         )
 
-    def test_start_replies_before_enqueueing_automatic_test_config(self):
+    def test_start_shows_explicit_welcome_without_automatic_test_creation(self):
         module, bot, events = load_tbot_module()
-
-        def enqueue(*args, **kwargs):
-            events.append("enqueue")
-            return True
-
-        module.enqueue_automatic_test_config = enqueue
 
         module.send_welcome(self.make_message())
 
-        self.assertEqual(events, ["reply", "enqueue"])
-        self.assertEqual(bot.replies[0][0][1], "Welcome!")
+        self.assertEqual(events, ["reply", "send"])
+        self.assertEqual(bot.replies[0][0][1], "welcome_en")
+        self.assertEqual(bot.replies[0][1]["reply_markup"], {"welcome": 123})
+        self.assertEqual(bot.sent_messages[0][0][1], "main_menu_ready")
+        self.assertNotIn("create_test_config", events)
+
+    def test_start_requests_language_when_telegram_language_is_unsupported(self):
+        module, bot, events = load_tbot_module()
+
+        module.send_welcome(self.make_message(language_code="de"))
+
+        self.assertEqual(events, ["reply"])
+        self.assertEqual(bot.replies[0][0][1], "language_selection_prompt")
+        self.assertEqual(bot.replies[0][1]["reply_markup"], {"languages": True})
+
+    def test_referred_user_with_unsupported_language_sees_language_prompt_first(self):
+        module, bot, events = load_tbot_module()
+        module.process_referral = lambda *args, **kwargs: (True, "referrer-456")
+        deferred = []
+        language_stub = types.ModuleType("utils.language")
+        language_stub.defer_referral_confirmation = lambda user_id: deferred.append(user_id)
+        sys.modules["utils.language"] = language_stub
+
+        module.send_welcome(
+            self.make_message(text="/start invite-code", language_code="de")
+        )
+
+        self.assertEqual(events, ["reply"])
+        self.assertEqual(bot.replies[0][0][1], "language_selection_prompt")
+        self.assertEqual(bot.sent_messages, [])
+        self.assertEqual(deferred, [123])
+
+    def test_successful_referral_records_attribution_growth_event_once(self):
+        module, bot, _events = load_tbot_module()
+        captured = []
+        module.process_referral = lambda *args, **kwargs: (True, "referrer-456")
+        module.record_main_growth_event = (
+            lambda event_type, user_id, **fields:
+            captured.append((event_type, user_id, fields))
+        )
+
+        module.send_welcome(self.make_message(text="/start invite-code"))
+
+        self.assertEqual(len(captured), 1)
+        event_type, user_id, fields = captured[0]
+        self.assertEqual(event_type, "referral_attributed")
+        self.assertEqual(user_id, 123)
+        self.assertEqual(fields["referral_campaign"], "main_invite")
+        self.assertEqual(fields["referrer_id"], "referrer-456")
+        self.assertEqual(
+            fields["deduplication_key"],
+            "main:referral_attributed:123",
+        )
+        self.assertTrue(any(
+            args[1] == "referral_registered"
+            for args, _kwargs in bot.sent_messages
+        ))
 
     def test_orphaned_admin_cancel_restores_admin_main_keyboard(self):
         module, bot, events = load_tbot_module()
@@ -137,38 +204,60 @@ class TBotStartTests(unittest.TestCase):
         self.assertFalse(predicate(self.make_message(user_id=999, text="❌ Cancel")))
         self.assertFalse(predicate(self.make_message(text="Cancel")))
 
-    def test_start_job_enqueue_dedupes_per_user(self):
-        module, _bot, _events = load_tbot_module()
+    def test_growth_funnel_handler_is_private_and_uses_reporting_api(self):
+        module, bot, _events = load_tbot_module()
+        module.is_admin = lambda user_id: user_id == 123
+        calls = []
+        reporting = types.ModuleType("utils.growth_reporting")
+        reporting.main_growth_comparison = lambda **kwargs: (
+            calls.append(("report", kwargs)) or {"surface": "main"}
+        )
+        reporting.format_growth_comparison = lambda report, **kwargs: (
+            calls.append(("format", report, kwargs)) or "private aggregate funnel"
+        )
+        sys.modules[reporting.__name__] = reporting
 
-        class FakeExecutor:
-            def __init__(self):
-                self.submissions = []
+        message = self.make_message(text="📈 Growth Funnel")
+        module.show_admin_growth_funnel(message)
 
-            def submit(self, *args, **kwargs):
-                self.submissions.append((args, kwargs))
+        self.assertEqual(calls[0], ("report", {"days": 30}))
+        self.assertEqual(calls[1][2]["title"], "Main bot growth funnel")
+        self.assertEqual(bot.replies[-1][0][1], "private aggregate funnel")
+        self.assertEqual(bot.replies[-1][1]["parse_mode"], "Markdown")
 
-            def shutdown(self, *args, **kwargs):
-                return None
+        reply_count = len(bot.replies)
+        module.show_admin_growth_funnel(self.make_message(user_id=999, text="📈 Growth Funnel"))
+        self.assertEqual(len(bot.replies), reply_count)
 
-        fake_executor = FakeExecutor()
-        module.START_TEST_CONFIG_EXECUTOR.shutdown(wait=False, cancel_futures=True)
-        module.START_TEST_CONFIG_EXECUTOR = fake_executor
-        module.START_TEST_CONFIG_INFLIGHT.clear()
+        handler = next(
+            item for item in bot.message_handlers
+            if item[0] is module.show_admin_growth_funnel
+        )
+        predicate = handler[2]["func"]
+        self.assertTrue(predicate(message))
+        self.assertFalse(predicate(self.make_message(user_id=999, text="📈 Growth Funnel")))
+        self.assertFalse(predicate(self.make_message(text="Growth Funnel")))
 
-        self.assertTrue(module.enqueue_automatic_test_config(123, 456, telegram_username="buyer", language="en"))
-        self.assertFalse(module.enqueue_automatic_test_config(123, 456, telegram_username="buyer", language="en"))
-        self.assertEqual(len(fake_executor.submissions), 1)
-        self.assertIn(123, module.START_TEST_CONFIG_INFLIGHT)
+    def test_growth_funnel_handler_fails_closed_without_breaking_admin_menu(self):
+        module, bot, _events = load_tbot_module()
+        module.is_admin = lambda user_id: user_id == 123
+        reporting = types.ModuleType("utils.growth_reporting")
+        reporting.main_growth_comparison = lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("database unavailable")
+        )
+        reporting.format_growth_comparison = lambda *_args, **_kwargs: "unused"
+        sys.modules[reporting.__name__] = reporting
 
-    def test_start_job_clears_inflight_after_completion(self):
-        module, _bot, events = load_tbot_module()
-        module.START_TEST_CONFIG_INFLIGHT.add(123)
+        module.show_admin_growth_funnel(self.make_message(text="📈 Growth Funnel"))
 
-        module._create_automatic_test_config_job(123, 456, "buyer", "en")
-
-        self.assertIn("create_test_config", events)
-        self.assertNotIn(123, module.START_TEST_CONFIG_INFLIGHT)
-
+        self.assertEqual(
+            bot.replies[-1][0][1],
+            "Growth funnel data is temporarily unavailable.",
+        )
+        self.assertEqual(
+            bot.replies[-1][1]["reply_markup"],
+            {"markup": {"is_admin": True}},
+        )
 
 if __name__ == "__main__":
     unittest.main()

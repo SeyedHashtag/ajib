@@ -484,6 +484,44 @@ class SQLiteStateTests(unittest.TestCase):
         self.assertEqual(reseller.get_reseller_data("7")["debt"], 0)
         self.assertIn("order", hosted_bots.get_ledger("7")["credit_reservations"])
 
+    def test_account_credit_debt_settlement_rolls_back_as_one_transaction(self):
+        self.migrate()
+        _hosted, payment_records, reseller, _state_store = self._configure_runtime_modules()
+        from utils import account_credit
+
+        reseller.save_resellers({
+            "7": {
+                "status": "approved",
+                "debt": 5,
+                "total_paid": 0,
+                "configs": [],
+            }
+        })
+        account_credit.credit_account("7", 5, "seed")
+
+        with self.assertRaisesRegex(RuntimeError, "injected"):
+            with self.database.write_transaction(operation="test_credit_settlement"):
+                self.assertEqual(
+                    account_credit.reserve_account_credit("7", "settlement", 5),
+                    5,
+                )
+                payment_records.add_payment_record(
+                    "settlement",
+                    {"user_id": "7", "status": "processing"},
+                )
+                self.assertTrue(
+                    reseller.apply_reseller_payment(
+                        "7", 5, payment_id="settlement"
+                    )[0]
+                )
+                raise RuntimeError("injected failure before credit consumption")
+
+        self.assertEqual(reseller.get_reseller_data("7")["debt"], 5)
+        self.assertIsNone(payment_records.get_payment_record("settlement"))
+        balance = account_credit.get_account_credit("7")
+        self.assertEqual(balance["available"], 5)
+        self.assertEqual(balance["reserved"], 0)
+
     def test_multiprocess_claims_and_reservations_are_serialized(self):
         self.migrate()
         hosted_bots, payment_records, reseller, _state_store = self._configure_runtime_modules()

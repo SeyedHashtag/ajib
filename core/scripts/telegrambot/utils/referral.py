@@ -4,6 +4,7 @@ import threading
 import random
 import string
 import uuid
+import math
 from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime
@@ -24,6 +25,54 @@ def _atomic_helpers():
 # Configuration
 REFERRAL_REWARD_PERCENTAGE = 20  # 20% reward
 REFERRAL_MIN_PAYOUT_BALANCE = 2.0
+REFERRAL_BUYER_DISCOUNT_PERCENTAGE = 5.0
+REFERRAL_COMBINED_DISCOUNT_CAP_PERCENTAGE = 10.0
+
+
+def _env_flag(name, default=True):
+    value = str(os.getenv(name, "1" if default else "0")).strip().lower()
+    return value not in {"0", "false", "no", "off", "disabled"}
+
+
+def _env_percentage(name, default, maximum=100.0):
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(value):
+        return float(default)
+    return max(0.0, min(float(maximum), value))
+
+
+def referral_buyer_discount_enabled():
+    """Emergency kill switch for the two-sided first-purchase incentive."""
+    try:
+        from utils.growth_features import BUYER_DISCOUNTS, is_growth_feature_enabled
+
+        if not is_growth_feature_enabled(BUYER_DISCOUNTS):
+            return False
+    except ImportError:
+        # Keep the legacy-specific switch usable during rolling upgrades.
+        pass
+    except ValueError:
+        return False
+    return _env_flag("AJIB_REFERRAL_BUYER_DISCOUNT_ENABLED", True)
+
+
+def referral_buyer_discount_percent():
+    return _env_percentage(
+        "AJIB_REFERRAL_BUYER_DISCOUNT_PERCENT",
+        REFERRAL_BUYER_DISCOUNT_PERCENTAGE,
+        REFERRAL_COMBINED_DISCOUNT_CAP_PERCENTAGE,
+    )
+
+
+def combined_discount_cap_percent():
+    return _env_percentage(
+        "AJIB_COMBINED_DISCOUNT_CAP_PERCENT",
+        REFERRAL_COMBINED_DISCOUNT_CAP_PERCENTAGE,
+        100.0,
+    )
 
 def _default_referrals_data():
     return {
@@ -34,6 +83,11 @@ def _default_referrals_data():
         "wallets": {},    # user_id -> wallet_address
         "referral_details": {},  # invited user_id -> invite metadata
         "rewarded_orders": {},  # payment/order ID -> immutable reward record
+        "discount_reservations": {},  # order ID -> reserved first-purchase benefit
+        "discount_redemptions": {},  # invitee user ID -> completed discounted order
+        "manual_rewards": {},  # immutable non-order rewards such as reseller recruitment
+        "recruitment_milestones": {},  # referred reseller ID -> milestone/claim state
+        "account_credits": {},  # compatibility mirror for user credit balances and history
         "pending_withdrawals": [],  # referral withdrawal requests awaiting admin payout
         "payouts": []     # paid referral payout audit records
     }
@@ -133,7 +187,14 @@ def get_or_create_referral_code(user_id):
         })
         return code
 
-def process_referral(new_user_id, code, telegram_username=None, first_name=None, last_name=None):
+def process_referral(
+    new_user_id,
+    code,
+    telegram_username=None,
+    first_name=None,
+    last_name=None,
+    campaign_type="customer",
+):
     new_user_id_str = str(new_user_id)
     with _edit_referrals() as data:
         if new_user_id_str in data["referrals"]:
@@ -153,7 +214,10 @@ def process_referral(new_user_id, code, telegram_username=None, first_name=None,
             "last_name": last_name,
             "referral_code": code,
             "referrer_id": referrer_id,
-            "invited_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            "invited_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "campaign_type": (
+                "reseller" if str(campaign_type).strip().lower() == "reseller" else "customer"
+            ),
         }
         if referrer_id not in data["stats"]:
             data["stats"][referrer_id] = {
@@ -176,20 +240,225 @@ def add_referral_reward(user_id, purchase_amount, order_id=None):
         rewarded_orders = data.setdefault("rewarded_orders", {})
         if order_key and order_key in rewarded_orders:
             return False
-        reward_amount = float(purchase_amount) * (REFERRAL_REWARD_PERCENTAGE / 100)
+        reward_amount = round(
+            float(purchase_amount) * (REFERRAL_REWARD_PERCENTAGE / 100),
+            2,
+        )
         if referrer_id not in data["stats"]:
             data["stats"][referrer_id] = {
                 "count": 0, "total_earnings": 0, "available_balance": 0
             }
-        data["stats"][referrer_id]["total_earnings"] += reward_amount
-        data["stats"][referrer_id]["available_balance"] += reward_amount
+        data["stats"][referrer_id]["total_earnings"] = round(
+            _safe_float(data["stats"][referrer_id].get("total_earnings"))
+            + reward_amount,
+            2,
+        )
+        data["stats"][referrer_id]["available_balance"] = round(
+            _safe_float(data["stats"][referrer_id].get("available_balance"))
+            + reward_amount,
+            2,
+        )
         if order_key:
             rewarded_orders[order_key] = {
                 "referrer_id": referrer_id,
+                "invitee_user_id": user_id_str,
                 "amount": reward_amount,
                 "rewarded_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             }
         return True, referrer_id, reward_amount
+
+
+def get_referral_attribution(user_id):
+    """Return immutable referral attribution without exposing mutable internals."""
+    data = load_referrals()
+    invitee_id = str(user_id)
+    referrer_id = data.get("referrals", {}).get(invitee_id)
+    if not referrer_id:
+        return None
+    detail = data.get("referral_details", {}).get(invitee_id, {})
+    return {
+        "invitee_user_id": invitee_id,
+        "referrer_user_id": str(referrer_id),
+        "referral_code": detail.get("referral_code"),
+        "campaign_type": detail.get("campaign_type", "customer"),
+        "invited_at": detail.get("invited_at"),
+    }
+
+
+def _completed_main_purchase_exists(user_id, payments=None):
+    if payments is None:
+        try:
+            from utils.payment_records import get_user_payments
+
+            payments = get_user_payments(int(user_id) if str(user_id).isdigit() else user_id)
+        except Exception:
+            payments = {}
+    terminal_paid_statuses = {
+        "completed",
+        "paid",
+        "approved",
+        "renewal_reserved",
+    }
+    for record in (payments or {}).values():
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("status") or "").strip().lower() in terminal_paid_statuses:
+            if record.get("type") != "settlement" and record.get("plan_gb") != "Settlement":
+                return True
+    return False
+
+
+def get_invitee_discount_eligibility(user_id, payments=None):
+    """Describe a referred user's one-time discount without reserving it."""
+    invitee_id = str(user_id)
+    data = load_referrals()
+    if not referral_buyer_discount_enabled():
+        return {"eligible": False, "reason": "disabled", "percent": 0.0}
+    if invitee_id not in data.get("referrals", {}):
+        return {"eligible": False, "reason": "not_referred", "percent": 0.0}
+    if invitee_id in data.get("discount_redemptions", {}):
+        return {"eligible": False, "reason": "already_redeemed", "percent": 0.0}
+    if _completed_main_purchase_exists(user_id, payments=payments):
+        return {"eligible": False, "reason": "existing_customer", "percent": 0.0}
+    return {
+        "eligible": True,
+        "reason": None,
+        "percent": referral_buyer_discount_percent(),
+        "referrer_id": str(data["referrals"][invitee_id]),
+    }
+
+
+def reserve_invitee_discount(user_id, order_id, payments=None):
+    """Atomically reserve the first-order benefit for exactly one live checkout."""
+    invitee_id = str(user_id)
+    order_key = str(order_id or "").strip()
+    if not order_key:
+        return None
+    if not referral_buyer_discount_enabled():
+        return None
+    # Check historical payments before taking the referral-store lock. The
+    # redemption/reservation checks are repeated atomically below.
+    if _completed_main_purchase_exists(user_id, payments=payments):
+        return None
+    with _edit_referrals() as data:
+        if invitee_id not in data.get("referrals", {}):
+            return None
+        if invitee_id in data.setdefault("discount_redemptions", {}):
+            return None
+        reservations = data.setdefault("discount_reservations", {})
+        existing = reservations.get(order_key)
+        if isinstance(existing, dict):
+            return dict(existing) if existing.get("invitee_user_id") == invitee_id else None
+        if any(
+            isinstance(item, dict)
+            and item.get("invitee_user_id") == invitee_id
+            and item.get("status", "reserved") == "reserved"
+            for item in reservations.values()
+        ):
+            return None
+        reservation = {
+            "order_id": order_key,
+            "invitee_user_id": invitee_id,
+            "referrer_id": str(data["referrals"][invitee_id]),
+            "percent": referral_buyer_discount_percent(),
+            "status": "reserved",
+            "reserved_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        reservations[order_key] = reservation
+        return dict(reservation)
+
+
+def release_invitee_discount(order_id, user_id=None):
+    order_key = str(order_id or "").strip()
+    if not order_key:
+        return False
+    with _edit_referrals() as data:
+        reservation = data.setdefault("discount_reservations", {}).get(order_key)
+        if not isinstance(reservation, dict):
+            return False
+        if user_id is not None and reservation.get("invitee_user_id") != str(user_id):
+            return False
+        data["discount_reservations"].pop(order_key, None)
+        return True
+
+
+def redeem_invitee_discount(user_id, order_id):
+    """Consume a reserved benefit after payment completion, idempotently."""
+    invitee_id = str(user_id)
+    order_key = str(order_id or "").strip()
+    if not order_key:
+        return False
+    with _edit_referrals() as data:
+        redemptions = data.setdefault("discount_redemptions", {})
+        existing = redemptions.get(invitee_id)
+        if isinstance(existing, dict):
+            return existing.get("order_id") == order_key
+        reservation = data.setdefault("discount_reservations", {}).get(order_key)
+        if not isinstance(reservation, dict) or reservation.get("invitee_user_id") != invitee_id:
+            return False
+        redemption = {
+            **reservation,
+            "status": "redeemed",
+            "redeemed_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        redemptions[invitee_id] = redemption
+        data["discount_reservations"].pop(order_key, None)
+        return True
+
+
+def stacked_discount_percent(invitee_percent=0, payment_discount_percent=0):
+    """Combine independently earned discounts while enforcing the global cap."""
+    try:
+        invitee = max(0.0, float(invitee_percent or 0))
+        payment = max(0.0, float(payment_discount_percent or 0))
+    except (TypeError, ValueError):
+        return 0.0
+    return min(combined_discount_cap_percent(), invitee + payment)
+
+
+def credit_manual_referral_reward(user_id, amount, reward_id, metadata=None):
+    """Credit an idempotent non-order reward to the withdrawable referral balance."""
+    user_key = str(user_id)
+    reward_key = str(reward_id or "").strip()
+    amount_value = _safe_float(amount)
+    if not reward_key or amount_value <= 0:
+        return False
+    with _edit_referrals() as data:
+        rewards = data.setdefault("manual_rewards", {})
+        if reward_key in rewards:
+            return True
+        stats = data.setdefault("stats", {}).setdefault(
+            user_key,
+            {"count": 0, "total_earnings": 0, "available_balance": 0},
+        )
+        stats["total_earnings"] = round(_safe_float(stats.get("total_earnings")) + amount_value, 2)
+        stats["available_balance"] = round(_safe_float(stats.get("available_balance")) + amount_value, 2)
+        rewards[reward_key] = {
+            "user_id": user_key,
+            "amount": round(amount_value, 2),
+            "credited_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "metadata": dict(metadata or {}),
+        }
+        return True
+
+
+def get_referral_progress(user_id):
+    data = load_referrals()
+    user_key = str(user_id)
+    stats = data.get("stats", {}).get(user_key, {})
+    converted_invitees = {
+        str(reward.get("invitee_user_id"))
+        for reward in data.get("rewarded_orders", {}).values()
+        if isinstance(reward, dict)
+        and str(reward.get("referrer_id")) == user_key
+        and reward.get("invitee_user_id") is not None
+    }
+    return {
+        "invited": _safe_int(stats.get("count", 0)),
+        "first_purchases": len(converted_invitees),
+        "total_earnings": _safe_float(stats.get("total_earnings", 0)),
+        "available_balance": _safe_float(stats.get("available_balance", 0)),
+    }
 
 def get_referral_stats(user_id):
     data = load_referrals()

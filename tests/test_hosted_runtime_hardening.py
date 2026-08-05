@@ -5,7 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -186,6 +186,210 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
         self.assertFalse(success)
         self.assertIn("RuntimeError", detail)
         self.assertEqual(self.worker._tenant_payments()["payment"]["status"], "paid_provision_failed")
+
+    def test_invite_discount_reservation_release_and_redemption_are_idempotent(self):
+        referrals_path = self.hosted_bots.tenant_file("7", "referrals.json")
+        with self.worker.locked_json(referrals_path, self.worker._referral_data()) as data:
+            data.setdefault("referrals", {})["100"] = "200"
+
+        with mock.patch.object(self.worker, "BUYER_DISCOUNTS_ENABLED", True):
+            self.assertTrue(self.worker._reserve_invite_discount(100, "first"))
+            self.assertTrue(self.worker._reserve_invite_discount(100, "first"))
+            self.assertFalse(self.worker._reserve_invite_discount(100, "second"))
+            self.assertFalse(self.worker._release_invite_discount(100, "wrong"))
+            self.assertTrue(self.worker._release_invite_discount(100, "first"))
+            self.assertFalse(self.worker._release_invite_discount(100, "first"))
+
+            self.assertTrue(self.worker._reserve_invite_discount(100, "second"))
+            self.assertTrue(self.worker._redeem_invite_discount(100, "second"))
+            self.assertTrue(self.worker._redeem_invite_discount(100, "second"))
+            self.assertFalse(self.worker._release_invite_discount(100, "second"))
+            self.assertFalse(self.worker._reserve_invite_discount(100, "third"))
+
+        data = self.worker._referral_data()
+        self.assertFalse(data["buyer_discount_reservations"])
+        self.assertEqual(data["buyer_discount_redeemed"]["100"]["order_id"], "second")
+
+    def test_settlement_recomputes_margin_and_rejects_financial_invariant_violations(self):
+        valid = {
+            "payment_method": "crypto",
+            "original_price": 120,
+            "collected_amount": 108,
+            "crypto_collected": 108,
+            "wholesale_price": 80,
+            "margin": 28,
+            "reward_calculation_base": 28,
+            "referral_reward": 5.6,
+            "invite_discount_percent": 5,
+            "crypto_discount_percent": 5,
+            "total_discount_percent": 10,
+            "invite_discount_amount": 6,
+            "crypto_discount_amount": 6,
+            "total_discount_amount": 12,
+        }
+
+        settlement = self.worker._settlement_financials(valid)
+        self.assertEqual(settlement["collected_amount"], 108.0)
+        self.assertEqual(settlement["margin"], 28.0)
+        self.assertEqual(settlement["reward_calculation_base"], 28.0)
+
+        invalid_records = (
+            {**valid, "collected_amount": 79.99, "margin": 0, "reward_calculation_base": 0},
+            {**valid, "referral_reward": 28.01},
+            {**valid, "reward_calculation_base": 27.99},
+            {**valid, "crypto_discount_percent": 5.01, "total_discount_percent": 10.01},
+            {**valid, "total_discount_amount": 11.99},
+            {**valid, "invite_discount_amount": 5.99},
+            {**valid, "account_credit_reserved": 0.01},
+            {**valid, "payment_method": "account_credit"},
+        )
+        for record in invalid_records:
+            with self.subTest(record=record), self.assertRaises(ValueError):
+                self.worker._settlement_financials(record)
+
+    def test_hosted_completion_never_applies_main_account_credit_before_side_effects(self):
+        record = {
+            "user_id": 100,
+            "payment_method": "card",
+            "collected_amount": 6,
+            "retail_price": 6,
+            "wholesale_price": 5,
+            "margin": 1,
+            "referral_reward": 0,
+            "account_credit_consumed": 1,
+        }
+
+        with mock.patch.object(self.worker, "get_reseller_data") as reseller_lookup:
+            success, detail = self.worker._provision_payment("order", record, funded=False)
+
+        self.assertFalse(success)
+        self.assertIn("credit", detail.lower())
+        reseller_lookup.assert_not_called()
+
+    def test_referral_accounting_is_idempotent_and_missing_ledger_writes_fail_closed(self):
+        referrals_path = self.hosted_bots.tenant_file("7", "referrals.json")
+        with self.worker.locked_json(referrals_path, self.worker._referral_data()) as data:
+            data.setdefault("referrals", {})["100"] = "200"
+
+        with mock.patch.object(self.worker.bot, "send_message"):
+            first = self.worker._credit_sale_and_referral(
+                "card-order",
+                100,
+                2,
+                {"retail_order_id": "card-order"},
+                funded=False,
+                margin=10,
+            )
+            ledger_path = self.hosted_bots.tenant_file("7", "ledger.json")
+            with self.worker.locked_json(ledger_path, {}) as ledger:
+                ledger.setdefault("transactions", []).append({
+                    "id": "unrelated-debit",
+                    "type": "withdrawal_requested",
+                    "amount": -3,
+                })
+            duplicate = self.worker._credit_sale_and_referral(
+                "card-order",
+                100,
+                2,
+                {"retail_order_id": "card-order"},
+                funded=False,
+                margin=10,
+            )
+
+        self.assertEqual(first, 2.0)
+        self.assertEqual(duplicate, 2.0)
+        ledger = self.hosted_bots.get_ledger("7")
+        self.assertEqual(ledger["referral_liability"], 2.0)
+        stats = self.worker._referral_data()["stats"]["200"]
+        self.assertEqual(stats["available_balance"], 2.0)
+
+        with (
+            mock.patch.object(self.worker, "add_referral_liability", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "not persisted"),
+        ):
+            self.worker._credit_sale_and_referral(
+                "missing-order",
+                100,
+                1,
+                {"retail_order_id": "missing-order"},
+                funded=False,
+                margin=10,
+            )
+
+    def growth_comparison_report(self):
+        end = datetime(2026, 8, 2, tzinfo=timezone.utc)
+        current_start = end - timedelta(days=30)
+        baseline_start = current_start - timedelta(days=30)
+        funnels = {
+            name: {
+                "started": 4,
+                "completed": 2,
+                "conversion_percent": 50.0,
+                "baseline_started": 4,
+                "baseline_completed": 1,
+                "baseline_conversion_percent": 25.0,
+                "relative_change_percent": 100.0,
+                "customer_ids": ["must-not-render"],
+            }
+            for name in ("trial_to_paid", "checkout", "renewal", "referral")
+        }
+        return {
+            "surface": "hosted",
+            "hosted_tenant_id": "7",
+            "days": 30,
+            "baseline_start": baseline_start,
+            "current_start": current_start,
+            "end_at": end,
+            "funnels": funnels,
+        }
+
+    def test_owner_growth_comparison_is_localized_and_aggregate_only(self):
+        report = self.growth_comparison_report()
+        rendered = {}
+
+        for language in ("en", "fa", "ru", "tk"):
+            with self.subTest(language=language):
+                self.worker._set_language(self.worker.OWNER_ID, language)
+                text = self.worker._owner_growth_comparison_text(report)
+                rendered[language] = text
+                self.assertIn("2026-07-03", text)
+                self.assertIn("2026-08-01", text)
+                self.assertIn("2/4", text)
+                self.assertIn("1/4", text)
+                self.assertIn("+100.0", text)
+                self.assertNotIn("must-not-render", text)
+
+        for language in ("fa", "ru", "tk"):
+            self.assertNotEqual(rendered[language], rendered["en"])
+
+    def test_owner_stats_uses_tenant_scoped_prior_period_comparison(self):
+        reporting = importlib.import_module("utils.growth_reporting")
+        report = self.growth_comparison_report()
+        self.worker._set_language(self.worker.OWNER_ID, "en")
+
+        with (
+            mock.patch.object(self.worker, "_owner_stats_chunks", return_value=["base stats"]),
+            mock.patch.object(
+                reporting,
+                "hosted_growth_comparison",
+                return_value=report,
+            ) as comparison,
+            mock.patch.object(self.worker.bot, "send_message") as send_message,
+        ):
+            sent = self.worker._send_owner_stats(
+                self.worker.OWNER_ID,
+                end_date=date(2026, 8, 1),
+            )
+
+        self.assertEqual(sent, 2)
+        comparison.assert_called_once_with(
+            self.worker.OWNER_ID,
+            end_at=datetime(2026, 8, 2),
+            days=30,
+        )
+        comparison_text = send_message.call_args_list[1].args[1]
+        self.assertIn("Available prior 30-day baseline", comparison_text)
+        self.assertIn("relative change", comparison_text)
 
     def test_paid_provisioning_persists_hs_allocation_before_vpn_creation(self):
         record = {

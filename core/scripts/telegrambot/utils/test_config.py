@@ -7,6 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from telebot import types
 from utils.command import bot, is_admin
 from utils.common import create_main_markup
+try:
+    from utils.common import record_main_growth_event
+except ImportError:
+    def record_main_growth_event(*args, **kwargs):
+        return False
 from utils.api_client import MultiServerAPI
 from utils.translations import BUTTON_TRANSLATIONS, get_message_text
 from utils.language import get_user_language
@@ -172,6 +177,41 @@ def _has_used_test_config_from(configs, user_id, now=None):
 
 def has_used_test_config(user_id):
     return _has_used_test_config_from(load_test_configs(), user_id)
+
+
+def get_test_config_journey(user_id, now=None):
+    """Return the persisted onboarding state for a customer's free test."""
+    entry = load_test_configs().get(str(user_id))
+    if not isinstance(entry, dict) or not _has_used_test_config_from({str(user_id): entry}, user_id, now=now):
+        return None
+    used_at = _parse_config_time(entry.get("used_at"))
+    remaining_days = TEST_DAYS
+    if used_at:
+        elapsed = max(0, ((now or datetime.datetime.now()) - used_at).days)
+        remaining_days = max(0, TEST_DAYS - elapsed)
+    return {
+        "used_at": entry.get("used_at"),
+        "connected_at": entry.get("connected_at"),
+        "remaining_days": remaining_days,
+        "traffic_gb": TEST_TRAFFIC_GB,
+        "username": entry.get("username"),
+        "server_id": entry.get("server_id"),
+    }
+
+
+def mark_test_config_connected(user_id, connected_at=None):
+    """Idempotently record that the customer confirmed a successful connection."""
+    key = str(user_id)
+    timestamp = connected_at or datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    def mutate(configs):
+        entry = configs.get(key)
+        if not isinstance(entry, dict) or not _has_used_test_config_from(configs, user_id):
+            return False
+        entry.setdefault("connected_at", timestamp)
+        return True
+
+    return bool(test_config_store.update_test_configs(TEST_CONFIGS_FILE, mutate))
 
 def add_to_waiting_list(user_id, username=None, language=None):
     if has_used_test_config(user_id):
@@ -344,25 +384,35 @@ def test_config(message):
         )
         return
     
-    # Ask for confirmation
+    # The customer makes one explicit commitment before any account is provisioned.
     markup = types.InlineKeyboardMarkup()
     markup.add(
-        types.InlineKeyboardButton("✅ Yes, create my test config", callback_data="confirm_test_config"),
-        types.InlineKeyboardButton("❌ No, cancel", callback_data="cancel_test_config")
+        types.InlineKeyboardButton(
+            get_message_text(language, "start_free_test_button"),
+            callback_data="start_free_test",
+        ),
+        types.InlineKeyboardButton(
+            get_message_text(language, "cancel_test_button"),
+            callback_data="cancel_test_config",
+        )
     )
     
     bot.reply_to(
         message,
-        "🎁 You're about to create a free test configuration (1GB for 30 days). Would you like to continue?",
+        get_message_text(language, "test_config_offer").format(
+            traffic_gb=TEST_TRAFFIC_GB,
+            days=TEST_DAYS,
+        ),
         reply_markup=markup
     )
 
 @bot.callback_query_handler(func=lambda call: call.data == "cancel_test_config")
 def handle_cancel_test_config(call):
+    language = get_user_language(call.from_user.id)
     safe_answer_callback_query(bot, call.id)
     safe_edit_message_text(
         bot,
-        "❌ Test config creation cancelled.",
+        get_message_text(language, "test_config_cancelled"),
         chat_id=call.message.chat.id,
         message_id=call.message.message_id
     )
@@ -378,7 +428,7 @@ def _queue_test_config_creation(user_id, chat_id, message_id, language, telegram
         try:
             safe_edit_message_text(
                 bot,
-                "⏳ Creating your test configuration...",
+                get_message_text(language, "test_config_creating"),
                 chat_id=chat_id,
                 message_id=message_id,
             )
@@ -405,7 +455,7 @@ def _queue_test_config_creation(user_id, chat_id, message_id, language, telegram
     return True
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "confirm_test_config")
+@bot.callback_query_handler(func=lambda call: call.data in {"confirm_test_config", "start_free_test"})
 def handle_confirm_test_config(call):
     user_id = call.from_user.id
     language = get_user_language(user_id)
@@ -443,16 +493,49 @@ def handle_confirm_test_config(call):
         return
 
     safe_answer_callback_query(bot, call.id)
-    if not _queue_test_config_creation(
+    queued = _queue_test_config_creation(
         user_id,
         call.message.chat.id,
         call.message.message_id,
         language,
         telegram_username=call.from_user.username,
-    ):
-        safe_answer_callback_query(bot, call.id, text="Test config creation is already in progress.")
+    )
+    if queued:
+        record_main_growth_event(
+            "trial_started",
+            user_id,
+            language=language,
+            deduplication_key=f"main:trial_started:{user_id}",
+        )
+    else:
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            text=get_message_text(language, "test_config_in_progress"),
+        )
 
-def _send_created_test_config(chat_id, username, user_uri_data, is_automatic=False):
+
+def _trial_activation_markup(language):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            get_message_text(language, "trial_connected_button"),
+            callback_data="trial_connected",
+        ),
+        types.InlineKeyboardButton(
+            get_message_text(language, "trial_need_help_button"),
+            callback_data="trial_need_help",
+        ),
+        types.InlineKeyboardButton(
+            get_message_text(language, "trial_see_plans_button"),
+            callback_data="trial_see_plans",
+        ),
+    )
+    return markup
+
+
+def _send_created_test_config(chat_id, username, user_uri_data, is_automatic=False, language=None):
+    language = language or get_user_language(chat_id)
     if user_uri_data and 'normal_sub' in user_uri_data:
         sub_url = user_uri_data['normal_sub']
         ipv4_url = user_uri_data.get('ipv4', '')
@@ -463,24 +546,16 @@ def _send_created_test_config(chat_id, username, user_uri_data, is_automatic=Fal
         qr.save(bio, 'PNG')
         bio.seek(0)
 
-        if is_automatic:
-            prefix = "🎁 Your free test configuration (1GB - 30 days) has been created automatically!\n\n"
-        else:
-            prefix = "✅ Your test configuration has been created successfully!\n\n"
-
-        success_message = prefix
-        success_message += (
-            f"📊 Test Plan Details:\n"
-            f"- 🔹 Data: {TEST_TRAFFIC_GB} GB\n"
-            f"- 🔹 Duration: {TEST_DAYS} days\n"
-            f"- 🔹 Unlimited Devices: Yes\n"
-            f"- 🔹 Username: `{username}`\n\n"
+        success_message = get_message_text(language, "test_config_created").format(
+            traffic_gb=TEST_TRAFFIC_GB,
+            days=TEST_DAYS,
+            username=username,
+            ipv4_line=(
+                get_message_text(language, "test_config_ipv4_line").format(ipv4_url=ipv4_url)
+                if ipv4_url else ""
+            ),
+            sub_url=sub_url,
         )
-
-        if ipv4_url:
-            success_message += f"IPv4 URL: `{ipv4_url}`\n\n"
-
-        success_message += f"Subscription URL:\n{sub_url}"
         safe_send_photo(
             bot,
             chat_id,
@@ -488,18 +563,73 @@ def _send_created_test_config(chat_id, username, user_uri_data, is_automatic=Fal
             caption=success_message,
             parse_mode="Markdown"
         )
-        send_download_prompt_safely(
+        safe_send_message(
             bot,
             chat_id,
-            get_user_language(chat_id),
+            get_message_text(language, "trial_activation_steps"),
+            reply_markup=_trial_activation_markup(language),
+            parse_mode="Markdown",
         )
+        send_download_prompt_safely(bot, chat_id, language)
     else:
         safe_send_message(
             bot,
             chat_id,
-            f"✅ Your test configuration has been created, but the subscription URL could not be generated. Please contact support.",
+            get_message_text(language, "test_config_created_no_url"),
             parse_mode="Markdown"
         )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "trial_connected")
+def handle_trial_connected(call):
+    language = get_user_language(call.from_user.id)
+    safe_answer_callback_query(bot, call.id)
+    if not mark_test_config_connected(call.from_user.id):
+        safe_edit_message_text(
+            bot,
+            get_message_text(language, "test_config_used"),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+        return
+    record_main_growth_event(
+        "trial_activated",
+        call.from_user.id,
+        language=language,
+        deduplication_key=f"main:trial_activated:{call.from_user.id}",
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton(
+        get_message_text(language, "trial_see_plans_button"),
+        callback_data="trial_see_plans",
+    ))
+    safe_edit_message_text(
+        bot,
+        get_message_text(language, "trial_connected_confirmation"),
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=markup,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "trial_need_help")
+def handle_trial_need_help(call):
+    language = get_user_language(call.from_user.id)
+    safe_answer_callback_query(bot, call.id)
+    safe_send_message(
+        bot,
+        call.message.chat.id,
+        get_message_text(language, "trial_help_intro"),
+    )
+    send_download_prompt_safely(bot, call.message.chat.id, language)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "trial_see_plans")
+def handle_trial_see_plans(call):
+    safe_answer_callback_query(bot, call.id)
+    from utils.purchase_plan import show_plans
+
+    show_plans(call.message.chat.id, call.from_user.id, call.message.message_id)
 
 def _create_test_config_with_client(
     user_id,
@@ -566,10 +696,33 @@ def _create_test_config_with_client(
     existing_usernames.add(username)
 
     user_uri_data = api_client.get_user_uri(username)
-    _send_created_test_config(chat_id, username, user_uri_data, is_automatic=is_automatic)
+    _send_created_test_config(
+        chat_id,
+        username,
+        user_uri_data,
+        is_automatic=is_automatic,
+        language=language,
+    )
     return True
 
 def create_test_config(user_id, chat_id, is_automatic=False, language=None, telegram_username=None, ignore_creation_disabled=False):
+    def notify_creation_failed():
+        if is_automatic:
+            return
+        message_lookup = globals().get("get_message_text")
+        language_lookup = globals().get("get_user_language")
+        bot_instance = globals().get("bot")
+        if not callable(message_lookup) or bot_instance is None:
+            return
+        resolved_language = language
+        if not resolved_language and callable(language_lookup):
+            resolved_language = language_lookup(user_id)
+        bot_instance.send_message(
+            chat_id,
+            message_lookup(resolved_language or "en", "test_config_creation_failed"),
+            parse_mode="Markdown",
+        )
+
     # Check if test creation is disabled
     if is_test_creation_disabled() and not ignore_creation_disabled:
         return False
@@ -587,12 +740,7 @@ def create_test_config(user_id, chat_id, is_automatic=False, language=None, tele
             exc,
         )
         _release_test_config_creation(user_id)
-        if not is_automatic:
-            bot.send_message(
-                chat_id,
-                "❌ Failed to create test configuration. Please try again later or contact support.",
-                parse_mode="Markdown"
-            )
+        notify_creation_failed()
         return False
     except Exception:
         _release_test_config_creation(user_id)
@@ -644,17 +792,18 @@ def create_test_config(user_id, chat_id, is_automatic=False, language=None, tele
             server_id=api_client.server_id,
         )
         user_uri_data = api_client.get_user_uri(username)
-        _send_created_test_config(chat_id, username, user_uri_data, is_automatic=is_automatic)
+        _send_created_test_config(
+            chat_id,
+            username,
+            user_uri_data,
+            is_automatic=is_automatic,
+            language=language,
+        )
         return True
 
     _release_test_config_creation(user_id)
 
-    if not is_automatic:
-        bot.send_message(
-            chat_id,
-            "❌ Failed to create test configuration. Please try again later or contact support.",
-            parse_mode="Markdown"
-        )
+    notify_creation_failed()
     return False
 
 def _safe_server_weight(value):

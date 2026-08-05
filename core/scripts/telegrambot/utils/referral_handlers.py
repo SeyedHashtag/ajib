@@ -2,6 +2,7 @@ import io
 import json
 import os
 import threading
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from telebot import types
@@ -15,8 +16,23 @@ from utils.referral import (
     build_withdrawal_audit_payload,
     get_eligible_referral_users,
     mark_referral_payout_paid,
-    mark_withdrawal_request_paid
+    mark_withdrawal_request_paid,
 )
+try:
+    from utils.referral import get_referral_progress, referral_buyer_discount_percent
+except ImportError:  # Rolling-upgrade compatibility.
+    get_referral_progress = lambda user_id: {"first_purchases": 0}
+    referral_buyer_discount_percent = lambda: 5.0
+try:
+    from utils.recruitment import (
+        claim_recruitment_reward,
+        claimable_recruitment_rewards,
+        recruitment_progress_for_referrer,
+    )
+except ImportError:  # Rolling-upgrade compatibility.
+    claim_recruitment_reward = lambda *args, **kwargs: None
+    claimable_recruitment_rewards = lambda *args, **kwargs: []
+    recruitment_progress_for_referrer = lambda *args, **kwargs: []
 from utils.translations import BUTTON_TRANSLATIONS, get_message_text, get_button_text
 from utils.language import get_user_language
 from utils.telegram_safe import safe_answer_callback_query, safe_edit_message_text, safe_send_message
@@ -98,6 +114,7 @@ def show_referral_menu(user_id, chat_id, message_id=None):
     
     code = get_or_create_referral_code(user_id)
     stats = get_referral_stats(user_id)
+    progress = get_referral_progress(user_id)
     wallet = get_wallet_address(user_id)
     
     bot_username = _get_bot_username()
@@ -108,11 +125,21 @@ def show_referral_menu(user_id, chat_id, message_id=None):
     
     msg = get_message_text(language, "referral_stats").format(
         count=stats["count"],
+        first_purchases=progress["first_purchases"],
         total_earnings=stats["total_earnings"],
         available_balance=stats["available_balance"],
         referral_link=referral_link,
-        wallet_info=wallet_info
+        wallet_info=wallet_info,
+        buyer_discount=f"{referral_buyer_discount_percent():g}",
     )
+    recruitment_progress = recruitment_progress_for_referrer(user_id)
+    if recruitment_progress:
+        counts = {
+            status: sum(1 for item in recruitment_progress if item.get("status") == status)
+            for status in ("tracking", "qualified", "claimed")
+        }
+        progress_text = get_message_text(language, "recruitment_progress_summary")
+        msg += "\n\n" + progress_text.format(**counts)
     
     markup = types.InlineKeyboardMarkup(row_width=2)
     set_wallet_btn = types.InlineKeyboardButton(get_button_text(language, "set_wallet"), callback_data="ref_set_wallet")
@@ -124,6 +151,28 @@ def show_referral_menu(user_id, chat_id, message_id=None):
         buttons.append(withdraw_btn)
         
     markup.add(*buttons)
+    share_copy = get_message_text(language, "referral_share_text")
+    share_copy = share_copy.format(
+        buyer_discount=f"{referral_buyer_discount_percent():g}",
+    )
+    share_label = get_message_text(language, "referral_share_button")
+    share_url = (
+        "https://t.me/share/url?url="
+        f"{quote(referral_link, safe='')}&text={quote(share_copy, safe='')}"
+    )
+    markup.add(types.InlineKeyboardButton(share_label, url=share_url))
+    for reward in claimable_recruitment_rewards(user_id):
+        reseller_id = reward["reseller_id"]
+        markup.add(
+            types.InlineKeyboardButton(
+                get_message_text(language, "recruitment_claim_cash"),
+                callback_data=f"recruit_reward:{reseller_id}:cash",
+            ),
+            types.InlineKeyboardButton(
+                get_message_text(language, "recruitment_claim_credit"),
+                callback_data=f"recruit_reward:{reseller_id}:credit",
+            ),
+        )
     
     if message_id:
         safe_edit_message_text(bot, chat_id=chat_id, message_id=message_id, text=msg, reply_markup=markup, parse_mode="Markdown")
@@ -134,6 +183,42 @@ def _admin_referral_page_count(total_items):
     if total_items <= 0:
         return 1
     return (total_items + ADMIN_REFERRAL_PAGE_SIZE - 1) // ADMIN_REFERRAL_PAGE_SIZE
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("recruit_reward:"))
+def handle_recruitment_reward_claim(call):
+    parts = call.data.split(":")
+    language = get_user_language(call.from_user.id)
+    if len(parts) != 3 or parts[2] not in {"cash", "credit"}:
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            get_message_text(language, "referral_invalid_reward_action"),
+            show_alert=True,
+        )
+        return
+    reseller_id, choice = parts[1], parts[2]
+    result = claim_recruitment_reward(call.from_user.id, reseller_id, choice)
+    if not result:
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            get_message_text(language, "recruitment_reward_unavailable"),
+            show_alert=True,
+        )
+        return
+    key = (
+        "recruitment_reward_claimed_cash"
+        if choice == "cash"
+        else "recruitment_reward_claimed_credit"
+    )
+    safe_answer_callback_query(
+        bot,
+        call.id,
+        get_message_text(language, key).format(amount=f"{result['reward_amount']:.2f}"),
+        show_alert=True,
+    )
+    show_referral_menu(call.from_user.id, call.message.chat.id, call.message.message_id)
 
 def _admin_referral_clamped_page(page, total_items):
     try:
@@ -319,7 +404,7 @@ def process_wallet_input(message):
     # Basic validation (optional: regex for LTC address)
     if len(wallet_address) < 10: 
         # Very basic check, can be improved
-        bot.reply_to(message, "Invalid address length. Please try again.")
+        bot.reply_to(message, get_message_text(language, "referral_wallet_invalid"))
         return
 
     set_wallet_address(user_id, wallet_address)
@@ -336,11 +421,17 @@ def handle_withdraw(call):
     wallet = get_wallet_address(user_id)
     
     if not wallet:
-        bot.answer_callback_query(call.id, "Please set a wallet first.")
+        bot.answer_callback_query(
+            call.id,
+            get_message_text(language, "referral_wallet_required"),
+        )
         return
         
     if stats["available_balance"] < 2.0:
-        bot.answer_callback_query(call.id, "Minimum withdrawal is $2.00")
+        bot.answer_callback_query(
+            call.id,
+            get_message_text(language, "referral_withdraw_minimum").format(amount="2.00"),
+        )
         return
 
     msg = get_message_text(language, "withdraw_confirm").format(
@@ -384,7 +475,11 @@ def handle_withdraw_confirm(call):
         wallet = result["wallet"]
         audit_payload = build_withdrawal_audit_payload(user_id, telegram_username, result)
         
-        safe_answer_callback_query(bot, call.id, "Request sent!")
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            get_message_text(language, "referral_withdraw_request_sent"),
+        )
         safe_edit_message_text(
             bot,
             chat_id=call.message.chat.id, 
@@ -396,7 +491,11 @@ def handle_withdraw_confirm(call):
         # Notify Admins
         notify_admins_withdrawal(user_id, telegram_username, amount, wallet, result, audit_payload)
     else:
-        safe_answer_callback_query(bot, call.id, "Error!")
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            get_message_text(language, "referral_withdraw_request_error"),
+        )
         safe_send_message(bot, call.message.chat.id, get_message_text(language, "withdraw_failed").format(reason=result))
         _queue_referral_menu_render(user_id, call.message.chat.id)
 

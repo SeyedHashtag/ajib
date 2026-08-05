@@ -12,7 +12,7 @@ from pathlib import Path
 
 DEFAULT_BOT_DIR = "/etc/ajib/core/scripts/telegrambot"
 DATABASE_NAME = "ajib.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 5000
 
 _local = threading.local()
@@ -336,6 +336,98 @@ SCHEMA_STATEMENTS = (
         PRIMARY KEY (namespace, scope, state_key)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS growth_events (
+        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type TEXT NOT NULL,
+        user_id TEXT,
+        surface TEXT NOT NULL,
+        hosted_tenant_id TEXT NOT NULL DEFAULT '',
+        language TEXT,
+        plan_id TEXT,
+        payment_method TEXT,
+        referral_campaign TEXT,
+        occurred_at TEXT NOT NULL,
+        deduplication_key TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        recorded_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(event_type, surface, hosted_tenant_id, deduplication_key)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS growth_events_time_idx
+    ON growth_events(occurred_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS growth_events_scope_time_idx
+    ON growth_events(surface, hosted_tenant_id, occurred_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS growth_events_type_time_idx
+    ON growth_events(event_type, occurred_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS growth_events_user_time_idx
+    ON growth_events(user_id, occurred_at)
+    WHERE user_id IS NOT NULL AND user_id != ''
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS account_credit_accounts (
+        user_id TEXT PRIMARY KEY,
+        available_cents INTEGER NOT NULL DEFAULT 0,
+        reserved_cents INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL DEFAULT '{}'
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS account_credit_transactions (
+        user_id TEXT NOT NULL,
+        transaction_id TEXT NOT NULL,
+        kind TEXT,
+        amount_cents INTEGER NOT NULL,
+        order_id TEXT,
+        created_at TEXT,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY (user_id, transaction_id),
+        FOREIGN KEY (user_id)
+            REFERENCES account_credit_accounts(user_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS account_credit_transactions_order_idx
+    ON account_credit_transactions(order_id)
+    WHERE order_id IS NOT NULL AND order_id != ''
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS account_credit_reservations (
+        user_id TEXT NOT NULL,
+        reservation_id TEXT NOT NULL,
+        amount_cents INTEGER NOT NULL,
+        created_at TEXT,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY (user_id, reservation_id),
+        FOREIGN KEY (user_id)
+            REFERENCES account_credit_accounts(user_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS recruitment_milestones (
+        reseller_id TEXT PRIMARY KEY,
+        referrer_id TEXT,
+        sales_count INTEGER NOT NULL DEFAULT 0,
+        settled_cents INTEGER NOT NULL DEFAULT 0,
+        status TEXT,
+        reward_cents INTEGER NOT NULL DEFAULT 0,
+        qualified_at TEXT,
+        claimed_at TEXT,
+        choice TEXT,
+        payload_json TEXT NOT NULL DEFAULT '{}'
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS recruitment_milestones_status_idx
+    ON recruitment_milestones(status, qualified_at)
+    """,
 )
 
 
@@ -580,6 +672,11 @@ def user_table_row_count(path: str | os.PathLike[str] | None = None) -> int:
         "referral_payouts",
         "checker_settlements",
         "kv_state",
+        "growth_events",
+        "account_credit_accounts",
+        "account_credit_transactions",
+        "account_credit_reservations",
+        "recruitment_milestones",
     )
     return sum(int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables)
 

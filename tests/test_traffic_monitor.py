@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import types
@@ -27,6 +28,21 @@ class FakeBot:
         self.sent_messages.append((chat_id, text, kwargs))
 
 
+class FakeButton:
+    def __init__(self, text, callback_data=None, **_kwargs):
+        self.text = text
+        self.callback_data = callback_data
+
+
+class FakeMarkup:
+    def __init__(self, *args, **kwargs):
+        self.rows = []
+
+    def add(self, *buttons):
+        self.rows.append(list(buttons))
+        return self
+
+
 class FakeClient:
     server_id = "primary"
 
@@ -45,6 +61,13 @@ class FakeMultiServerAPI:
 
 
 def install_stubs():
+    telebot_stub = types.ModuleType("telebot")
+    telebot_stub.types = types.SimpleNamespace(
+        InlineKeyboardMarkup=FakeMarkup,
+        InlineKeyboardButton=FakeButton,
+    )
+    sys.modules["telebot"] = telebot_stub
+
     utils_pkg = types.ModuleType("utils")
     utils_pkg.__path__ = []
     sys.modules["utils"] = utils_pkg
@@ -64,9 +87,11 @@ def install_stubs():
     translations_stub = types.ModuleType("utils.translations")
     translations_stub.get_message_text = lambda language, key: {
         "traffic_quota_alert": "regular {username} {percent}",
+        "time_quota_alert": "regular-time {username} {percent} {days_used} {total_days} {days_remaining}",
         "reseller_client_traffic_alert": "reseller-gb {customer_name} {username} {percent}",
         "reseller_client_days_alert": "reseller-days {customer_name} {username} {percent} {days_used} {total_days} {days_remaining}",
     }[key]
+    translations_stub.get_button_text = lambda language, key: key
     sys.modules["utils.translations"] = translations_stub
 
 
@@ -113,6 +138,38 @@ class TrafficMonitorTests(unittest.TestCase):
             config["customer_name"] = customer_name
         with open(self.monitor.RESELLERS_FILE, "w") as f:
             json.dump({str(reseller_id): {"configs": [config]}}, f)
+
+    def install_customer_context(self, payments, offer=None, growth_events=None):
+        edit_plans_stub = types.ModuleType("utils.edit_plans")
+        edit_plans_stub.load_plans = lambda: {
+            "100": {"price": 10, "days": 30, "unlimited": False, "target": "both"},
+        }
+        sys.modules["utils.edit_plans"] = edit_plans_stub
+
+        payment_records_stub = types.ModuleType("utils.payment_records")
+        payment_records_stub.load_payments = lambda: payments
+        sys.modules["utils.payment_records"] = payment_records_stub
+
+        renewal_stub = types.ModuleType("utils.renewal")
+        renewal_stub.find_customer_renewal_offer = lambda *args, **kwargs: (
+            offer or {"eligible": False}
+        )
+        renewal_stub.find_reseller_renewal_offer = lambda *args, **kwargs: {"eligible": False}
+        sys.modules["utils.renewal"] = renewal_stub
+
+        if growth_events is not None:
+            growth_stub = types.ModuleType("utils.growth_events")
+            growth_stub.EVENT_RENEWAL_PROMPTED = "renewal_prompted"
+            growth_stub.record_growth_event = growth_events
+            sys.modules["utils.growth_events"] = growth_stub
+
+    @staticmethod
+    def first_callback(markup):
+        if markup is None:
+            return None
+        rows = getattr(markup, "keyboard", None) or getattr(markup, "rows", None)
+        button = rows[0][0]
+        return getattr(button, "callback_data", None)
 
     def test_regular_user_at_95_percent_gets_one_alert_and_marks_all_crossed_thresholds(self):
         self.run_monitor([
@@ -167,7 +224,7 @@ class TrafficMonitorTests(unittest.TestCase):
         self.assertEqual(len(self.bot.sent_messages), 1)
         self.assertIn("reseller-gb sara88 r456 95", self.bot.sent_messages[0][1])
 
-    def test_reseller_customer_name_falls_back_to_na_when_missing_or_invalid(self):
+    def test_reseller_customer_name_uses_neutral_fallback_when_missing_or_invalid(self):
         self.write_reseller_config(456, "r456", customer_name="too-long-name")
 
         self.run_monitor([
@@ -175,7 +232,7 @@ class TrafficMonitorTests(unittest.TestCase):
         ])
 
         self.assertEqual(len(self.bot.sent_messages), 1)
-        self.assertIn("reseller-gb N/A r456 95", self.bot.sent_messages[0][1])
+        self.assertIn("reseller-gb — r456 95", self.bot.sent_messages[0][1])
 
     def test_regular_user_already_notified_at_80_only_gets_90_alert(self):
         self.write_alerts({"s123": {"notified": [80], "max_download_bytes": 100 * GB}})
@@ -194,6 +251,129 @@ class TrafficMonitorTests(unittest.TestCase):
         ])
 
         self.assertEqual(multi_api.include_disabled_calls, [False])
+        self.assertEqual(self.bot.sent_messages, [])
+
+    def test_regular_time_threshold_uses_payment_duration_and_reserved_renewal_action(self):
+        events = []
+        self.install_customer_context(
+            {
+                "sale-1": {
+                    "user_id": 123,
+                    "username": "s123",
+                    "server_id": "primary",
+                    "status": "completed",
+                    "plan_gb": "100",
+                    "days": 30,
+                },
+            },
+            offer={
+                "eligible": True,
+                "token": "reserve-token",
+                "renewal_mode": "reserved",
+            },
+            growth_events=lambda *args, **kwargs: events.append((args, kwargs)),
+        )
+
+        self.run_monitor([
+            (
+                True,
+                "s123",
+                {
+                    "expiration_days": 6,
+                    "upload_bytes": 10 * GB,
+                    "download_bytes": 0,
+                    "max_download_bytes": 100 * GB,
+                },
+            ),
+        ])
+
+        self.assertEqual(len(self.bot.sent_messages), 1)
+        self.assertIn("regular-time s123 80", self.bot.sent_messages[0][1])
+        self.assertEqual(
+            self.first_callback(self.bot.sent_messages[0][2]["reply_markup"]),
+            "renew_plan:reserve-token",
+        )
+        self.assertEqual(self.read_alerts()["s123"]["notified"], [80])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][1]["metadata"]["basis"], "time")
+
+    def test_time_and_traffic_share_thresholds_without_duplicate_alerts(self):
+        payments = {
+            "sale-1": {
+                "user_id": 123,
+                "username": "s123",
+                "server_id": "primary",
+                "status": "completed",
+                "plan_gb": "100",
+                "days": 30,
+            },
+        }
+        self.install_customer_context(payments)
+
+        self.run_monitor([
+            (
+                True,
+                "s123",
+                {
+                    "expiration_days": 9,
+                    "upload_bytes": 85 * GB,
+                    "download_bytes": 0,
+                    "max_download_bytes": 100 * GB,
+                },
+            ),
+        ])
+        self.run_monitor([
+            (
+                True,
+                "s123",
+                {
+                    "expiration_days": 4,
+                    "upload_bytes": 85 * GB,
+                    "download_bytes": 0,
+                    "max_download_bytes": 100 * GB,
+                },
+            ),
+        ])
+        self.run_monitor([
+            (
+                True,
+                "s123",
+                {
+                    "expiration_days": 3,
+                    "upload_bytes": 85 * GB,
+                    "download_bytes": 0,
+                    "max_download_bytes": 100 * GB,
+                },
+            ),
+        ])
+
+        self.assertEqual(len(self.bot.sent_messages), 2)
+        self.assertIn("regular s123 85", self.bot.sent_messages[0][1])
+        self.assertIn("regular-time s123 90", self.bot.sent_messages[1][1])
+        self.assertEqual(self.read_alerts()["s123"]["notified"], [80, 90])
+
+    def test_reminders_feature_flag_suppresses_lifecycle_alerts(self):
+        original = os.environ.get("AJIB_GROWTH_REMINDERS_ENABLED")
+        os.environ["AJIB_GROWTH_REMINDERS_ENABLED"] = "false"
+        try:
+            multi_api = self.run_monitor([
+                (
+                    True,
+                    "s123",
+                    {
+                        "upload_bytes": 95 * GB,
+                        "download_bytes": 0,
+                        "max_download_bytes": 100 * GB,
+                    },
+                ),
+            ])
+        finally:
+            if original is None:
+                os.environ.pop("AJIB_GROWTH_REMINDERS_ENABLED", None)
+            else:
+                os.environ["AJIB_GROWTH_REMINDERS_ENABLED"] = original
+
+        self.assertEqual(multi_api.include_disabled_calls, [])
         self.assertEqual(self.bot.sent_messages, [])
 
 

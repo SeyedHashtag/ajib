@@ -155,6 +155,32 @@ class ResellerLevelPresentationTests(unittest.TestCase):
                 ]
                 self.assertEqual(len(rows), 6)
 
+    def test_program_preview_uses_real_catalog_and_wholesale_prices(self):
+        template = (
+            "{plan_gb}|{days}|{level}|{discount_percent}|{trust_limit}|"
+            "{catalog_price}|{wholesale_price}|{markup_percent}|"
+            "{customer_price}|{gross_profit}"
+        )
+        original_get_message_text = self.level_ui.get_message_text
+        self.level_ui.get_message_text = lambda language, key: template
+        self.addCleanup(
+            setattr,
+            self.level_ui,
+            "get_message_text",
+            original_get_message_text,
+        )
+
+        preview = self.level_ui.build_reseller_program_preview(
+            "en",
+            {"total_paid": 0, "debt": 0, "configs": []},
+            "10",
+            {"price": 10, "days": 30},
+        )
+
+        fields = preview.split("|")
+        self.assertEqual(fields[:4], ["10", "30", "1", "20"])
+        self.assertEqual(fields[5:10], ["10.00", "8.00", "20", "12.00", "4.00"])
+
 
 if __name__ == "__main__":
     unittest.main()

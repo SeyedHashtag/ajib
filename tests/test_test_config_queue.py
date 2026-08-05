@@ -24,6 +24,8 @@ class DummyBot:
         self.answers = []
         self.edits = []
         self.replies = []
+        self.sent_messages = []
+        self.sent_photos = []
 
     def message_handler(self, *args, **kwargs):
         return lambda func: func
@@ -41,9 +43,11 @@ class DummyBot:
         self.replies.append((args, kwargs))
 
     def send_message(self, *args, **kwargs):
+        self.sent_messages.append((args, kwargs))
         return None
 
     def send_photo(self, *args, **kwargs):
+        self.sent_photos.append((args, kwargs))
         return None
 
 
@@ -153,6 +157,8 @@ class TestConfigQueueTests(unittest.TestCase):
         test_config_module.TEST_CONFIG_INFLIGHT.clear()
         test_config_module.bot.answers = []
         test_config_module.bot.edits = []
+        test_config_module.bot.sent_messages = []
+        test_config_module.bot.sent_photos = []
         test_config_module.is_test_creation_disabled = lambda: False
         test_config_module.has_used_test_config = lambda user_id: False
         test_config_module.create_test_config = (
@@ -188,7 +194,7 @@ class TestConfigQueueTests(unittest.TestCase):
         self.assertEqual(kwargs["language"], "en")
         self.assertEqual(kwargs["telegram_username"], "buyer")
         self.assertEqual(test_config_module.TEST_CONFIG_INFLIGHT, set())
-        self.assertEqual(test_config_module.bot.edits[0][0][0], "⏳ Creating your test configuration...")
+        self.assertEqual(test_config_module.bot.edits[0][0][0], "test_config_creating")
 
     def test_creation_claim_prevents_duplicates_and_stale_claim_recovers(self):
         now = datetime(2026, 6, 9, 12, 0, 0)
@@ -238,19 +244,36 @@ class TestConfigQueueTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertFalse(test_config_module._has_used_test_config_from(test_config_module.load_test_configs(), 123))
 
-    def test_successful_test_config_sends_download_guidance(self):
+    def test_connected_marker_drives_persisted_trial_journey_state(self):
+        used_at = "2026-06-09 12:00:00"
+        Path(test_config_module.TEST_CONFIGS_FILE).write_text(json.dumps({
+            "123": {
+                "telegram_id": 123,
+                "used_at": used_at,
+                "username": "t123",
+            }
+        }), encoding="utf-8")
+        now = datetime(2026, 6, 10, 12, 0, 0)
+
+        before = test_config_module.get_test_config_journey(123, now=now)
+        self.assertIsNone(before["connected_at"])
+        self.assertEqual(before["remaining_days"], 29)
+
+        self.assertTrue(test_config_module.mark_test_config_connected(
+            123,
+            connected_at="2026-06-10 12:00:00",
+        ))
+        after = test_config_module.get_test_config_journey(123, now=now)
+        self.assertEqual(after["connected_at"], "2026-06-10 12:00:00")
+
+    def test_successful_test_config_sends_three_step_activation_flow(self):
         class DummyQR:
             def save(self, target, image_format):
                 target.write(b"qr")
 
-        calls = []
         original_make = test_config_module.qrcode.make
-        original_guidance = test_config_module.send_download_prompt_safely
         try:
             test_config_module.qrcode.make = lambda value: DummyQR()
-            test_config_module.send_download_prompt_safely = (
-                lambda *args, **kwargs: calls.append((args, kwargs))
-            )
             test_config_module._send_created_test_config(
                 456,
                 "t123",
@@ -258,9 +281,28 @@ class TestConfigQueueTests(unittest.TestCase):
             )
         finally:
             test_config_module.qrcode.make = original_make
+
+        self.assertEqual(len(test_config_module.bot.sent_photos), 1)
+        self.assertEqual(test_config_module.bot.sent_messages[0][0], (456, "trial_activation_steps"))
+        markup = test_config_module.bot.sent_messages[0][1]["reply_markup"]
+        self.assertEqual(
+            [button.callback_data for button in markup.buttons],
+            ["trial_connected", "trial_need_help", "trial_see_plans"],
+        )
+
+    def test_need_help_opens_download_guidance_on_demand(self):
+        calls = []
+        original_guidance = test_config_module.send_download_prompt_safely
+        try:
+            test_config_module.send_download_prompt_safely = (
+                lambda *args, **kwargs: calls.append((args, kwargs))
+            )
+            call = self.make_call()
+            call.data = "trial_need_help"
+            test_config_module.handle_trial_need_help(call)
+        finally:
             test_config_module.send_download_prompt_safely = original_guidance
 
-        self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0][1:], (456, "en"))
 
     def test_test_config_without_a_url_does_not_send_download_guidance(self):

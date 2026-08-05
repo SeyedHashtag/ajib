@@ -113,8 +113,69 @@ def _token(*parts):
     return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
 
 
+def _record_renewal_completed(plan_record, result, source):
+    """Best-effort idempotent renewal measurement after a successful reset."""
+    try:
+        from utils.growth_events import (
+            EVENT_RENEWAL_COMPLETED,
+            SURFACE_HOSTED,
+            SURFACE_MAIN,
+            record_growth_event,
+        )
+
+        record = plan_record if isinstance(plan_record, dict) else {}
+        after_state = (result or {}).get('after_state') or {}
+        identity = next((
+            str(value)
+            for value in (
+                record.get('payment_id'),
+                record.get('reservation_id'),
+                record.get('retail_order_id'),
+                record.get('created_at'),
+                record.get('renewal_reserved_at'),
+                record.get('timestamp'),
+                after_state.get('captured_at'),
+            )
+            if value
+        ), _token(source, (result or {}).get('username'), _now_str()))
+        hosted = str(source or '').lower() == 'hosted_customer'
+        tenant_id = (
+            record.get('hosted_tenant_id')
+            or record.get('hosted_bot_id')
+            or record.get('bot_id')
+        ) if hosted else None
+        user_id = (
+            record.get('buyer_user_id')
+            or record.get('customer_user_id')
+            or record.get('user_id')
+            or record.get('reseller_id')
+        )
+        plan_id = (
+            record.get('plan_gb')
+            or record.get('gb')
+            or (record.get('renewal_plan_snapshot') or {}).get('plan_gb')
+        )
+        record_growth_event(
+            EVENT_RENEWAL_COMPLETED,
+            user_id=user_id,
+            surface=SURFACE_HOSTED if hosted else SURFACE_MAIN,
+            hosted_tenant_id=tenant_id,
+            plan_id=plan_id,
+            payment_method=record.get('payment_method'),
+            deduplication_key=f"renewal-completed:{source}:{identity}",
+            metadata={
+                'source': source,
+                'username': str((result or {}).get('username') or _record_username(record)),
+                'server_id': (result or {}).get('server_id') or _record_server_id(record),
+                'renewal_mode': record.get('renewal_mode', 'immediate'),
+            },
+        )
+    except Exception:
+        return
+
+
 def _escape_markdown(value):
-    text = str(value if value is not None else 'N/A')
+    text = str(value if value is not None else '—')
     for char in ('\\', '`', '*', '_', '[', ']'):
         text = text.replace(char, f"\\{char}")
     return text
@@ -1407,6 +1468,7 @@ def execute_customer_renewal(payment_record, plans=None, multi_api=None):
     result = _execute_reset(username, server_id, payment_record, 'customer', multi_api=multi_api)
     if result.get('success'):
         _mark_payment_record_renewed(payment_record.get('renewal_base_record_id'), result.get('after_state'))
+        _record_renewal_completed(payment_record, result, 'customer')
     return result
 
 
@@ -1415,7 +1477,16 @@ def execute_reseller_renewal(offer, multi_api=None):
     server_id = offer.get('server_id')
     if not username:
         return {'success': False, 'reason': 'renewal_ineligible_missing'}
-    return _execute_reset(username, server_id, {'gb': offer.get('plan_gb')}, 'reseller_customer', multi_api=multi_api)
+    result = _execute_reset(
+        username,
+        server_id,
+        {'gb': offer.get('plan_gb')},
+        'reseller_customer',
+        multi_api=multi_api,
+    )
+    if result.get('success'):
+        _record_renewal_completed(offer, result, 'reseller_customer')
+    return result
 
 
 def execute_reserved_renewal(record, multi_api=None, force=False):
@@ -1441,17 +1512,39 @@ def execute_reserved_renewal(record, multi_api=None, force=False):
     )
     if result.get('success') and record.get('renewal_base_record_id'):
         _mark_payment_record_renewed(record.get('renewal_base_record_id'), result.get('after_state'))
+    if result.get('success'):
+        _record_renewal_completed(
+            record,
+            result,
+            record.get('renewal_source') or 'reserved',
+        )
     return result
 
 
-def format_state_summary(state):
+def format_state_summary(state, language='en'):
+    from utils.translations import get_message_text
+
     if not isinstance(state, dict):
-        return "Days remaining: unknown\nUsage: unknown"
+        return get_message_text(language, 'renewal_state_summary').format(
+            days_remaining=get_message_text(language, 'value_unknown'),
+            gb_used=get_message_text(language, 'value_unknown'),
+            gb_limit=get_message_text(language, 'value_unknown'),
+        )
     gb_limit = state.get('gb_limit')
-    gb_limit_text = "Unlimited" if gb_limit is None else f"{_safe_float(gb_limit):.2f} GB"
-    return (
-        f"Days remaining: {state.get('days_remaining') if state.get('days_remaining') is not None else 'unknown'}\n"
-        f"Usage: {_safe_float(state.get('gb_used')):.2f} / {gb_limit_text}"
+    gb_limit_text = (
+        get_message_text(language, 'value_unlimited')
+        if gb_limit is None
+        else f"{_safe_float(gb_limit):.2f} GB"
+    )
+    days_remaining = state.get('days_remaining')
+    return get_message_text(language, 'renewal_state_summary').format(
+        days_remaining=(
+            days_remaining
+            if days_remaining is not None
+            else get_message_text(language, 'value_unknown')
+        ),
+        gb_used=f"{_safe_float(state.get('gb_used')):.2f} GB",
+        gb_limit=gb_limit_text,
     )
 
 
@@ -1459,8 +1552,8 @@ def format_renewal_offer(language, offer, include_payment_prompt=True):
     from utils.currency_format import format_usd_amount
     from utils.translations import get_message_text
 
-    before = format_state_summary(offer.get('before_state'))
-    after = format_state_summary(offer.get('expected_after_state'))
+    before = format_state_summary(offer.get('before_state'), language)
+    after = format_state_summary(offer.get('expected_after_state'), language)
     payment_prompt = f"\n\n{get_message_text(language, 'select_payment_method')}" if include_payment_prompt else ""
     return get_message_text(language, 'renewal_offer_details').format(
         username=_escape_markdown(offer.get('username')),
@@ -1481,21 +1574,25 @@ def format_renewal_unavailable(language, offer):
 
     reason = (offer or {}).get('reason')
     reason_text = get_message_text(language, reason) if reason else ''
-    if not reason_text:
-        reason_text = str(reason or 'renewal is unavailable')
+    if not reason_text or reason_text == reason:
+        reason_text = get_message_text(language, 'renewal_generic_unavailable_reason')
     return get_message_text(language, 'renewal_unavailable').format(reason=reason_text)
 
 
 def format_renewal_success(language, result, plan_gb, days, sub_url=None, ipv4_url=None):
     from utils.translations import get_message_text
 
-    ipv4_info = f"IPv4 URL: `{ipv4_url}`\n\n" if ipv4_url else ""
+    ipv4_info = (
+        get_message_text(language, 'renewal_ipv4_line').format(ipv4_url=ipv4_url)
+        if ipv4_url
+        else ""
+    )
     return get_message_text(language, 'renewal_success').format(
         username=_escape_markdown(result.get('username')),
         plan_gb=plan_gb,
         days=days,
-        before=format_state_summary(result.get('before_state')),
-        after=format_state_summary(result.get('after_state')),
-        sub_url=sub_url or 'N/A',
+        before=format_state_summary(result.get('before_state'), language),
+        after=format_state_summary(result.get('after_state'), language),
+        sub_url=sub_url or get_message_text(language, 'value_not_available'),
         ipv4_info=ipv4_info,
     )
