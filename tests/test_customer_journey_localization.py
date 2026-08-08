@@ -109,6 +109,13 @@ def test_customer_journey_catalog_is_complete_in_all_supported_languages():
             assert str(catalogs[language][key]).strip(), f"{language}.{key} is empty"
 
 
+def test_invite_and_earn_heading_uses_money_bag_emoji_in_every_language():
+    catalogs = _load_translations().MESSAGE_TRANSLATIONS
+
+    for language in ("en", "fa", "ru", "tk"):
+        assert catalogs[language]["referral_stats"].startswith("💰 ")
+
+
 def test_customer_journey_placeholders_match_english_catalog():
     translations = _load_translations()
     catalogs = translations.MESSAGE_TRANSLATIONS

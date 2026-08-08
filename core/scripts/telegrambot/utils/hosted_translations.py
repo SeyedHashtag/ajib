@@ -519,7 +519,7 @@ OWNER_EXPERIENCE_TRANSLATIONS = {
 
 CUSTOMER_EXPERIENCE_TRANSLATIONS = {
     "en": {
-        "invite_and_earn_button": "🎁 Invite & Earn",
+        "invite_and_earn_button": "💰 Invite & Earn",
         "choose_language": "Choose your language to continue:",
         "language_updated": "Language updated.",
         "menu_updated": "Your menu is ready.",
@@ -596,7 +596,7 @@ CUSTOMER_EXPERIENCE_TRANSLATIONS = {
         "messages_summary": "Localized welcome and support messages can be set independently for English, Persian, Russian, and Turkmen. Legacy text remains the fallback.",
     },
     "fa": {
-        "invite_and_earn_button": "🎁 دعوت و کسب درآمد", "choose_language": "برای ادامه زبان خود را انتخاب کنید:",
+        "invite_and_earn_button": "💰 دعوت و کسب درآمد", "choose_language": "برای ادامه زبان خود را انتخاب کنید:",
         "language_updated": "زبان به‌روزرسانی شد.", "menu_updated": "منوی شما آماده است.",
         "welcome_new": "خوش آمدید! با ۱ گیگ رایگان سرویس را آزمایش کنید یا ابتدا طرح‌ها را ببینید.",
         "welcome_trial": "تست رایگان شما آماده است. مراحل زیر را انجام دهید و سپس اتصال را تأیید کنید.",
@@ -626,7 +626,7 @@ CUSTOMER_EXPERIENCE_TRANSLATIONS = {
         "owner_message_language": "زبان مشتری برای ویرایش را انتخاب کنید:", "recommend_plan": "پیشنهاد", "recommended_plan_updated": "طرح پیشنهادی به‌روزرسانی شد.", "messages_summary": "پیام خوش‌آمد و پشتیبانی را می‌توان جداگانه برای انگلیسی، فارسی، روسی و ترکمنی تنظیم کرد. متن قدیمی نقش جایگزین را دارد.",
     },
     "ru": {
-        "invite_and_earn_button": "🎁 Приглашай и зарабатывай", "choose_language": "Выберите язык, чтобы продолжить:", "language_updated": "Язык обновлён.", "menu_updated": "Меню готово.",
+        "invite_and_earn_button": "💰 Приглашай и зарабатывай", "choose_language": "Выберите язык, чтобы продолжить:", "language_updated": "Язык обновлён.", "menu_updated": "Меню готово.",
         "welcome_new": "Добро пожаловать! Попробуйте сервис бесплатно с 1 ГБ или сначала посмотрите планы.", "welcome_trial": "Бесплатный тест готов. Выполните шаги ниже и подтвердите подключение.", "welcome_trial_active": "Тест активен. Проверьте конфиг или выберите платный план.", "welcome_paid": "С возвращением. Ваши конфиги и варианты продления доступны ниже.", "welcome_expired": "Срок конфига истёк. Продлите его для подключения.",
         "start_free_test": "🎁 Начать бесплатный тест 1 ГБ", "connected_action": "✅ Подключено", "need_help_action": "🆘 Нужна помощь", "see_plans": "🧾 Посмотреть планы", "see_all_plans": "Все планы", "my_configs_action": "📱 Мои конфиги",
         "quick_plans_title": "Выберите простой вариант или откройте все планы:", "all_plans_title": "Все доступные планы:", "pick_cheapest": "Самая низкая цена", "pick_recommended": "Рекомендация магазина", "pick_balanced": "Сбалансированный", "pick_best_value": "Лучшая цена за ГБ",
@@ -641,7 +641,7 @@ CUSTOMER_EXPERIENCE_TRANSLATIONS = {
         "owner_message_language": "Выберите язык клиента для редактирования:", "recommend_plan": "Рекомендовать", "recommended_plan_updated": "Рекомендуемый план обновлён.", "messages_summary": "Приветствие и поддержку можно отдельно задать для английского, персидского, русского и туркменского. Старый текст остаётся резервным.",
     },
     "tk": {
-        "invite_and_earn_button": "🎁 Çagyr we gazan", "choose_language": "Dowam etmek üçin dili saýlaň:", "language_updated": "Dil täzelendi.", "menu_updated": "Menýu taýýar.",
+        "invite_and_earn_button": "💰 Çagyr we gazan", "choose_language": "Dowam etmek üçin dili saýlaň:", "language_updated": "Dil täzelendi.", "menu_updated": "Menýu taýýar.",
         "welcome_new": "Hoş geldiňiz! Hyzmaty 1 GB mugt synag bilen barlaň ýa-da meýilnamalara serediň.", "welcome_trial": "Mugt synag taýýar. Aşakdaky ädimleri ýerine ýetirip, birikmäni tassyklaň.", "welcome_trial_active": "Synag işjeň. Sazlamany barlaň ýa-da tölegli meýilnama saýlaň.", "welcome_paid": "Hoş geldiňiz. Sazlamalaryňyz we uzaltma mümkinçilikleri taýýar.", "welcome_expired": "Sazlamaňyzyň möhleti geçdi. Gaýtadan birikmek üçin uzaldyň.",
         "start_free_test": "🎁 1 GB mugt synagy başla", "connected_action": "✅ Birikdim", "need_help_action": "🆘 Kömek gerek", "see_plans": "🧾 Meýilnamalary gör", "see_all_plans": "Ähli meýilnamalar", "my_configs_action": "📱 Sazlamalarym",
         "quick_plans_title": "Ýönekeý wariant saýlaň ýa-da ähli meýilnamalary görüň:", "all_plans_title": "Ähli elýeterli meýilnamalar:", "pick_cheapest": "Iň arzan", "pick_recommended": "Dükanyň maslahaty", "pick_balanced": "Deňagramly", "pick_best_value": "Her GB üçin iň gowy baha",

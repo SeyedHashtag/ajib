@@ -164,6 +164,14 @@ class HostedStorefrontTranslationTests(unittest.TestCase):
                 self.assertEqual(set(catalog), expected)
                 self.assertTrue(all(str(value).strip() for value in catalog.values()))
 
+    def test_invite_and_earn_buttons_use_money_bag_emoji_in_every_language(self):
+        button_translations = _button_translations()
+
+        for language in ("en", "fa", "ru", "tk"):
+            with self.subTest(language=language):
+                self.assertTrue(button_translations[language]["referral"].startswith("💰 "))
+                self.assertTrue(HOSTED_TRANSLATIONS[language]["invite_and_earn_button"].startswith("💰 "))
+
     def test_dynamic_owner_messages_format_in_every_language(self):
         for language in HOSTED_TRANSLATIONS:
             with self.subTest(language=language):

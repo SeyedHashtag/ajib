@@ -34,7 +34,7 @@ BUTTON_TRANSLATIONS = {
         "card_to_card": "📄 Card to Card (Iran)",
         "payment_link": "🔗 Payment Link",
         "check_status": "🔄 Check Status",
-        "referral": "🎁 Invite & Earn",
+        "referral": "💰 Invite & Earn",
         "reseller_panel": "💼 Reseller Panel",
         "request_reseller": "📝 Request Reseller Access",
         "generate_config": "⚡ Generate Config",
@@ -70,7 +70,7 @@ BUTTON_TRANSLATIONS = {
         "card_to_card": "📄 کارت به کارت (ایران)",
         "payment_link": "🔗 لینک پرداخت",
         "check_status": "🔄 بررسی وضعیت",
-        "referral": "🎁 دعوت و کسب درآمد",
+        "referral": "💰 دعوت و کسب درآمد",
         "reseller_panel": "💼 پنل نمایندگی",
         "request_reseller": "📝 درخواست نمایندگی",
         "generate_config": "⚡ ایجاد کانفیگ",
@@ -106,7 +106,7 @@ BUTTON_TRANSLATIONS = {
         "card_to_card": "📄 Karta kart (Eýran)",
         "payment_link": "🔗 Töleg baglanyşygy",
         "check_status": "🔄 Statusy barlaň",
-        "referral": "🎁 Çagyr we gazan",
+        "referral": "💰 Çagyr we gazan",
         "reseller_panel": "💼 Satyjy paneli",
         "request_reseller": "📝 Satyjy bolmak",
         "generate_config": "⚡ Sazlama döret",
@@ -142,7 +142,7 @@ BUTTON_TRANSLATIONS = {
         "card_to_card": "📄 Карта на карту (Иран)",
         "payment_link": "🔗 Ссылка на оплату",
         "check_status": "🔄 Проверить статус",
-        "referral": "🎁 Пригласи и заработай",
+        "referral": "💰 Пригласи и заработай",
         "reseller_panel": "💼 Панель реселлера",
         "request_reseller": "📝 Запрос на реселлерство",
         "generate_config": "⚡ Создать конфиг",
@@ -162,7 +162,7 @@ BUTTON_TRANSLATIONS = {
 # Messages translations
 MESSAGE_TRANSLATIONS = {
     "en": {
-        "referral_stats": "🎁 **Invite & Earn**\n\n🚀 **How it works:**\n1️⃣ Share your unique invitation link.\n2️⃣ Your friend saves **{buyer_discount}%** on their first completed purchase.\n3️⃣ You receive **20%** of the amount they actually pay.\n4️⃣ Withdraw to your **Litecoin (LTC)** wallet when your balance reaches **$2.00**.\n\n📊 **Your Progress:**\n👥 Invited: {count}\n✅ First purchases: {first_purchases}\n💰 Total earnings: ${total_earnings:.2f}\n💳 Reward available: ${available_balance:.2f}\n{wallet_info}\n\n🔗 **Your Invitation Link:**\n`{referral_link}`",
+        "referral_stats": "💰 **Invite & Earn**\n\n🚀 **How it works:**\n1️⃣ Share your unique invitation link.\n2️⃣ Your friend saves **{buyer_discount}%** on their first completed purchase.\n3️⃣ You receive **20%** of the amount they actually pay.\n4️⃣ Withdraw to your **Litecoin (LTC)** wallet when your balance reaches **$2.00**.\n\n📊 **Your Progress:**\n👥 Invited: {count}\n✅ First purchases: {first_purchases}\n💰 Total earnings: ${total_earnings:.2f}\n💳 Reward available: ${available_balance:.2f}\n{wallet_info}\n\n🔗 **Your Invitation Link:**\n`{referral_link}`",
         "wallet_info": "💼 Wallet: `{wallet}`",
         "wallet_not_set": "💼 Wallet: Not Set",
         "enter_wallet": "Please enter your Litecoin (LTC) wallet address:",
@@ -489,7 +489,7 @@ MESSAGE_TRANSLATIONS = {
         "reseller_customer_status_unavailable": "Status unavailable"
     },
     "ru": {
-        "referral_stats": "🎁 **Пригласи и заработай**\n\n🚀 **Как это работает:**\n1️⃣ Поделитесь своей уникальной ссылкой.\n2️⃣ Ваш друг получит скидку **{buyer_discount}%** на первую завершённую покупку.\n3️⃣ Вы получите **20%** от суммы, которую он фактически оплатит.\n4️⃣ Выведите средства на кошелёк **Litecoin (LTC)**, когда баланс достигнет **$2.00**.\n\n📊 **Ваш прогресс:**\n👥 Приглашено: {count}\n✅ Первых покупок: {first_purchases}\n💰 Всего заработано: ${total_earnings:.2f}\n💳 Доступная награда: ${available_balance:.2f}\n{wallet_info}\n\n🔗 **Ваша ссылка-приглашение:**\n`{referral_link}`",
+        "referral_stats": "💰 **Пригласи и заработай**\n\n🚀 **Как это работает:**\n1️⃣ Поделитесь своей уникальной ссылкой.\n2️⃣ Ваш друг получит скидку **{buyer_discount}%** на первую завершённую покупку.\n3️⃣ Вы получите **20%** от суммы, которую он фактически оплатит.\n4️⃣ Выведите средства на кошелёк **Litecoin (LTC)**, когда баланс достигнет **$2.00**.\n\n📊 **Ваш прогресс:**\n👥 Приглашено: {count}\n✅ Первых покупок: {first_purchases}\n💰 Всего заработано: ${total_earnings:.2f}\n💳 Доступная награда: ${available_balance:.2f}\n{wallet_info}\n\n🔗 **Ваша ссылка-приглашение:**\n`{referral_link}`",
         "wallet_info": "💼 Кошелек: `{wallet}`",
         "wallet_not_set": "💼 Кошелек: не указан",
         "enter_wallet": "Введите адрес вашего Litecoin (LTC) кошелька:",
@@ -816,7 +816,7 @@ MESSAGE_TRANSLATIONS = {
         "reseller_customer_status_unavailable": "Статус недоступен"
     },
     "fa": {
-        "referral_stats": "🎁 **دعوت و کسب درآمد**\n\n🚀 **نحوه کار:**\n۱️⃣ لینک دعوت اختصاصی خود را به اشتراک بگذارید.\n۲️⃣ دوست شما در اولین خرید تکمیل‌شده **{buyer_discount}٪** تخفیف می‌گیرد.\n۳️⃣ شما **۲۰٪** از مبلغی را دریافت می‌کنید که او واقعاً پرداخت کرده است.\n۴️⃣ وقتی موجودی به **۲ دلار** رسید، آن را به کیف پول **لایت‌کوین (LTC)** برداشت کنید.\n\n📊 **پیشرفت شما:**\n👥 دعوت‌شده: {count}\n✅ اولین خریدها: {first_purchases}\n💰 مجموع درآمد: ${total_earnings:.2f}\n💳 پاداش قابل برداشت: ${available_balance:.2f}\n{wallet_info}\n\n🔗 **لینک دعوت شما:**\n`{referral_link}`",
+        "referral_stats": "💰 **دعوت و کسب درآمد**\n\n🚀 **نحوه کار:**\n۱️⃣ لینک دعوت اختصاصی خود را به اشتراک بگذارید.\n۲️⃣ دوست شما در اولین خرید تکمیل‌شده **{buyer_discount}٪** تخفیف می‌گیرد.\n۳️⃣ شما **۲۰٪** از مبلغی را دریافت می‌کنید که او واقعاً پرداخت کرده است.\n۴️⃣ وقتی موجودی به **۲ دلار** رسید، آن را به کیف پول **لایت‌کوین (LTC)** برداشت کنید.\n\n📊 **پیشرفت شما:**\n👥 دعوت‌شده: {count}\n✅ اولین خریدها: {first_purchases}\n💰 مجموع درآمد: ${total_earnings:.2f}\n💳 پاداش قابل برداشت: ${available_balance:.2f}\n{wallet_info}\n\n🔗 **لینک دعوت شما:**\n`{referral_link}`",
         "wallet_info": "💼 کیف پول: `{wallet}`",
         "wallet_not_set": "💼 کیف پول: تنظیم نشده",
         "enter_wallet": "لطفاً آدرس کیف پول Litecoin (LTC) خود را وارد کنید:",
@@ -1143,7 +1143,7 @@ MESSAGE_TRANSLATIONS = {
         "reseller_customer_status_unavailable": "وضعیت در دسترس نیست"
     },
     "tk": {
-        "referral_stats": "🎁 **Çagyr we gazan**\n\n🚀 **Bu nähili işleýär:**\n1️⃣ Ýörite çakylyk baglanyşygyňyzy paýlaşyň.\n2️⃣ Dostuňyz ilkinji tamamlanan satyn alyşynda **{buyer_discount}%** arzanladyş alar.\n3️⃣ Siz onuň hakykatdan tölän möçberiniň **20%**-ini alarsyňyz.\n4️⃣ Balansyňyz **$2.00** ýetende ony **Litecoin (LTC)** gapjygyňyza çykaryň.\n\n📊 **Öňe gidişiňiz:**\n👥 Çagyrylan: {count}\n✅ Ilkinji satyn alyşlar: {first_purchases}\n💰 Jemi gazanç: ${total_earnings:.2f}\n💳 Elýeterli sylag: ${available_balance:.2f}\n{wallet_info}\n\n🔗 **Çakylyk baglanyşygyňyz:**\n`{referral_link}`",
+        "referral_stats": "💰 **Çagyr we gazan**\n\n🚀 **Bu nähili işleýär:**\n1️⃣ Ýörite çakylyk baglanyşygyňyzy paýlaşyň.\n2️⃣ Dostuňyz ilkinji tamamlanan satyn alyşynda **{buyer_discount}%** arzanladyş alar.\n3️⃣ Siz onuň hakykatdan tölän möçberiniň **20%**-ini alarsyňyz.\n4️⃣ Balansyňyz **$2.00** ýetende ony **Litecoin (LTC)** gapjygyňyza çykaryň.\n\n📊 **Öňe gidişiňiz:**\n👥 Çagyrylan: {count}\n✅ Ilkinji satyn alyşlar: {first_purchases}\n💰 Jemi gazanç: ${total_earnings:.2f}\n💳 Elýeterli sylag: ${available_balance:.2f}\n{wallet_info}\n\n🔗 **Çakylyk baglanyşygyňyz:**\n`{referral_link}`",
         "wallet_info": "💼 Gapjyk: `{wallet}`",
         "wallet_not_set": "💼 Gapjyk: sazlanmadyk",
         "enter_wallet": "Litecoin (LTC) gapjyk salgyňyzy giriziň:",
