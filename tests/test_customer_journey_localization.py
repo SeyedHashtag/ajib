@@ -116,6 +116,15 @@ def test_invite_and_earn_heading_uses_money_bag_emoji_in_every_language():
         assert catalogs[language]["referral_stats"].startswith("💰 ")
 
 
+def test_persian_referral_steps_use_valid_ascii_keycap_emoji():
+    referral_stats = _load_translations().MESSAGE_TRANSLATIONS["fa"]["referral_stats"]
+
+    for valid_keycap in ("1️⃣", "2️⃣", "3️⃣", "4️⃣"):
+        assert valid_keycap in referral_stats
+    for invalid_keycap in ("۱️⃣", "۲️⃣", "۳️⃣", "۴️⃣"):
+        assert invalid_keycap not in referral_stats
+
+
 def test_customer_journey_placeholders_match_english_catalog():
     translations = _load_translations()
     catalogs = translations.MESSAGE_TRANSLATIONS
