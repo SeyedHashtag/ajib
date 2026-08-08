@@ -1565,16 +1565,17 @@ def _plan_button_text(user_id, plan_id, plan, quote, label_key=None, exchange_ra
     )
 
 
-def _show_plans(chat_id, user_id, message_id=None, show_all=False, event_key=None):
+def _show_plans(chat_id, user_id, message_id=None, event_key=None):
     markup = types.InlineKeyboardMarkup(row_width=1)
     settings = get_settings(OWNER_ID)
     plans = _sellable_plans()
     exchange_rate = get_exchange_rate()
-    if show_all:
-        choices = [(plan_id, None) for plan_id in sorted(plans, key=lambda value: int(value))]
-    else:
-        choices = _quick_pick_plans(plans, settings)
-    for plan_id, label_key in choices:
+    quick_pick_labels = dict(_quick_pick_plans(plans, settings))
+    choices = sorted(
+        plans,
+        key=lambda plan_id: (int(plans[plan_id].get("gb", plan_id)), int(plan_id)),
+    )
+    for plan_id in choices:
         plan = plans[plan_id]
         quote = _hosted_plan_quote(plan, settings)
         markup.add(types.InlineKeyboardButton(
@@ -1583,18 +1584,13 @@ def _show_plans(chat_id, user_id, message_id=None, show_all=False, event_key=Non
                 plan_id,
                 plan,
                 quote,
-                label_key=label_key,
+                label_key=quick_pick_labels.get(plan_id),
                 exchange_rate=exchange_rate,
             ),
             callback_data=f"hb:buy:{plan_id}",
         ))
-    if plans and not show_all and len(choices) < len(plans):
-        markup.add(types.InlineKeyboardButton(
-            _hosted_message(user_id, "see_all_plans"),
-            callback_data="hb:plans:all",
-        ))
     text = (
-        _hosted_message(user_id, "all_plans_title" if show_all else "quick_plans_title")
+        _hosted_message(user_id, "all_plans_title")
         if markup.keyboard else _message(user_id, "plan_not_found")
     )
     _record_growth(
@@ -1602,7 +1598,7 @@ def _show_plans(chat_id, user_id, message_id=None, show_all=False, event_key=Non
         user_id,
         deduplication_key=(
             event_key
-            or f"hosted-plan-viewed:{OWNER_ID}:{user_id}:{message_id or 'direct'}:{'all' if show_all else 'quick'}"
+            or f"hosted-plan-viewed:{OWNER_ID}:{user_id}:{message_id or 'direct'}:catalog"
         ),
     )
     if message_id is not None:
@@ -1858,7 +1854,7 @@ def plans(message):
     _show_plans(
         message.chat.id,
         message.from_user.id,
-        event_key=f"hosted-plan-viewed:{OWNER_ID}:{message.from_user.id}:message:{message.message_id}:quick",
+        event_key=f"hosted-plan-viewed:{OWNER_ID}:{message.from_user.id}:message:{message.message_id}:catalog",
     )
 
 
@@ -1869,7 +1865,7 @@ def plans_back(call):
         call.message.chat.id,
         call.from_user.id,
         call.message.message_id,
-        event_key=f"hosted-plan-viewed:{OWNER_ID}:{call.from_user.id}:callback:{call.message.message_id}:quick",
+        event_key=f"hosted-plan-viewed:{OWNER_ID}:{call.from_user.id}:callback:{call.message.message_id}:catalog",
     )
 
 
@@ -1880,8 +1876,7 @@ def plans_all(call):
         call.message.chat.id,
         call.from_user.id,
         call.message.message_id,
-        show_all=True,
-        event_key=f"hosted-plan-viewed:{OWNER_ID}:{call.from_user.id}:callback:{call.message.message_id}:all",
+        event_key=f"hosted-plan-viewed:{OWNER_ID}:{call.from_user.id}:callback:{call.message.message_id}:catalog",
     )
 
 

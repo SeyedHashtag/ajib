@@ -1588,44 +1588,34 @@ def send_admin_payment_notification(
     except Exception as e:
         print(f"Error in send_admin_payment_notification: {str(e)}")
 
-def show_plans(chat_id, user_id, message_id=None, show_all=False):
+def show_plans(chat_id, user_id, message_id=None):
     language = get_user_language(user_id)
     record_main_growth_event(
         "plan_viewed",
         user_id,
         language=language,
-        deduplication_key=f"main:plan_viewed:{user_id}:{'all' if show_all else 'quick'}",
-        catalog="all" if show_all else "quick",
+        deduplication_key=f"main:plan_viewed:{user_id}:catalog",
+        catalog="all",
     )
     plans = load_plans()
     exchange_rate = get_exchange_rate()
     customer_plans = _customer_plan_items(plans)
     markup = types.InlineKeyboardMarkup(row_width=1)
-    visible_plans = (
-        [(None, gb, details) for gb, details in customer_plans]
-        if show_all
-        else select_quick_pick_plans(plans)
-    )
-    for label_key, gb, details in visible_plans:
+    quick_pick_labels = {
+        gb: label_key
+        for label_key, gb, _details in select_quick_pick_plans(plans)
+    }
+    for gb, details in customer_plans:
         button_text = _plan_button_text(
             language,
             gb,
             details,
             exchange_rate,
-            label_key=label_key,
+            label_key=quick_pick_labels.get(gb),
         )
         markup.add(types.InlineKeyboardButton(button_text, callback_data=f"purchase:{gb}"))
 
-    if not show_all and len(customer_plans) > len(visible_plans):
-        markup.add(types.InlineKeyboardButton(
-            get_button_text(language, "see_all_plans"),
-            callback_data="show_all_plans",
-        ))
-
-    text = get_message_text(
-        language,
-        "all_plans_title" if show_all else "quick_plans_title",
-    )
+    text = get_message_text(language, "all_plans_title")
     
     if message_id:
         bot.edit_message_text(
@@ -1666,7 +1656,6 @@ def handle_show_all_plans(call):
             call.message.chat.id,
             call.from_user.id,
             call.message.message_id,
-            show_all=True,
         )
     except Exception as e:
         print(f"Error showing all plans: {e}")

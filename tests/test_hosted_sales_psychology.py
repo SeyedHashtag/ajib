@@ -160,6 +160,98 @@ class HostedSalesPsychologyWorkerTests(unittest.TestCase):
             [("5", "pick_cheapest"), ("20", "pick_recommended"), ("50", "pick_best_value")],
         )
 
+    def test_plan_selector_lists_all_plans_in_size_order_with_labels(self):
+        class Markup:
+            def __init__(self, *args, **kwargs):
+                self.keyboard = []
+
+            def add(self, *buttons):
+                self.keyboard.extend([button] for button in buttons)
+
+        class Button:
+            def __init__(self, text, callback_data):
+                self.text = text
+                self.callback_data = callback_data
+
+        class Bot:
+            def __init__(self):
+                self.sent = []
+
+            def send_message(self, *args, **kwargs):
+                self.sent.append((args, kwargs))
+
+        plans = {
+            "50": {"price": 20, "gb": 50},
+            "10": {"price": 18, "gb": 35},
+            "90": {"price": 5, "gb": 5},
+            "20": {"price": 12, "gb": 20},
+        }
+        bot = Bot()
+        growth_events = []
+
+        def plan_button_text(
+            _user_id,
+            _plan_id,
+            plan,
+            _quote,
+            label_key=None,
+            exchange_rate=None,
+        ):
+            return f"{label_key or 'plain'}:{plan['gb']}"
+
+        namespace = {
+            "types": type("Types", (), {
+                "InlineKeyboardMarkup": Markup,
+                "InlineKeyboardButton": Button,
+            }),
+            "OWNER_ID": 7,
+            "get_settings": lambda _owner_id: {"recommended_plan_id": "20"},
+            "_sellable_plans": lambda: plans,
+            "get_exchange_rate": lambda: 1,
+            "_hosted_plan_quote": lambda plan, _settings: {"retail": float(plan["price"])},
+            "_plan_button_text": plan_button_text,
+            "_hosted_message": lambda _user_id, key: key,
+            "_message": lambda _user_id, key: key,
+            "_record_growth": lambda *args, **kwargs: growth_events.append((args, kwargs)),
+            "bot": bot,
+        }
+        module = ast.Module(
+            body=[worker_function("_quick_pick_plans"), worker_function("_show_plans")],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), "hosted_worker.py", "exec"), namespace)
+
+        namespace["_show_plans"](555, 1988)
+
+        args, kwargs = bot.sent[0]
+        self.assertEqual(args, (555, "all_plans_title"))
+        buttons = [row[0] for row in kwargs["reply_markup"].keyboard]
+        self.assertEqual(
+            [button.callback_data for button in buttons],
+            ["hb:buy:90", "hb:buy:20", "hb:buy:10", "hb:buy:50"],
+        )
+        self.assertEqual(
+            [button.text for button in buttons],
+            ["pick_cheapest:5", "pick_recommended:20", "plain:35", "pick_best_value:50"],
+        )
+        self.assertNotIn("hb:plans:all", [button.callback_data for button in buttons])
+        self.assertEqual(
+            growth_events,
+            [(("plan_viewed", 1988), {
+                "deduplication_key": "hosted-plan-viewed:7:1988:direct:catalog",
+            })],
+        )
+
+    def test_legacy_hosted_all_plans_callback_uses_unified_selector(self):
+        source = ast.get_source_segment(WORKER_SOURCE, worker_function("plans_all"))
+
+        self.assertIn(
+            '@bot.callback_query_handler(func=lambda c: c.data == "hb:plans:all")',
+            WORKER_SOURCE,
+        )
+        self.assertIn("_show_plans(", source)
+        self.assertNotIn("show_all", source)
+
     def test_checkout_records_exact_discount_attribution_and_growth_hooks(self):
         payment_method = ast.get_source_segment(WORKER_SOURCE, worker_function("payment_method"))
         purchase_options = ast.get_source_segment(WORKER_SOURCE, worker_function("_purchase_options"))

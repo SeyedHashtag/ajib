@@ -43,6 +43,79 @@ def test_missing_recommendation_uses_truthful_balanced_label():
     assert all(label != "quick_pick_recommended" for label, _plan_id, _ in picks)
 
 
+def test_plan_selector_lists_every_customer_plan_once_on_one_page():
+    bot = DummyBot()
+    module = load_purchase_plan(bot, [])
+    module.load_plans = lambda: {
+        "60": {"price": 5, "days": 30},
+        "10": {"price": 2, "days": 30},
+        "20": {"price": 3, "days": 30, "recommended": True},
+        "40": {"price": 4, "days": 30},
+        "100": {"price": 1, "days": 30, "target": "reseller"},
+        "invalid": {"price": 1, "days": 30},
+    }
+    module.get_exchange_rate = lambda: 1
+    messages = {
+        "all_plans_title": "All available plans",
+        "customer_plan_button": "{label}{plan_gb} GB · {price_pair} · {days} days",
+        "plan_price_pair_usd_first": "${usd} / {toman}",
+        "quick_pick_cheapest": "Lowest price",
+        "quick_pick_recommended": "Recommended",
+        "quick_pick_balanced": "Balanced",
+        "quick_pick_best_value": "Best value",
+    }
+    module.get_message_text = lambda _language, key: messages[key]
+    growth_events = []
+    module.record_main_growth_event = lambda *args, **kwargs: growth_events.append(
+        (args, kwargs)
+    )
+
+    with patch.dict(os.environ, {"AJIB_RECOMMENDED_PLAN_ID": ""}):
+        module.show_plans(555, 1988)
+
+    args, kwargs = bot.sent_messages[0]
+    assert args == (555, "All available plans")
+    buttons = kwargs["reply_markup"].buttons
+    assert [button.kwargs["callback_data"] for button in buttons] == [
+        "purchase:10",
+        "purchase:20",
+        "purchase:40",
+        "purchase:60",
+    ]
+    assert "Lowest price" in buttons[0].args[0]
+    assert "Recommended" in buttons[1].args[0]
+    assert buttons[2].args[0].startswith("40 GB")
+    assert "Best value" in buttons[3].args[0]
+    assert all(button.kwargs["callback_data"] != "show_all_plans" for button in buttons)
+    assert growth_events == [
+        (("plan_viewed", 1988), {
+            "language": "en",
+            "deduplication_key": "main:plan_viewed:1988:catalog",
+            "catalog": "all",
+        })
+    ]
+
+
+def test_legacy_all_plans_callback_opens_the_unified_selector():
+    bot = DummyBot()
+    module = load_purchase_plan(bot, [])
+    module.load_plans = lambda: {
+        "20": {"price": 3, "days": 30},
+        "10": {"price": 2, "days": 30},
+    }
+    module.get_exchange_rate = lambda: 1
+
+    module.handle_show_all_plans(make_call("show_all_plans"))
+
+    assert len(bot.edited_messages) == 1
+    buttons = bot.edited_messages[0][1]["reply_markup"].buttons
+    assert [button.kwargs["callback_data"] for button in buttons] == [
+        "purchase:10",
+        "purchase:20",
+    ]
+    assert len(bot.callback_answers) == 1
+
+
 def test_persian_price_pair_and_totals_are_toman_first():
     module = load_purchase_plan(DummyBot(), [])
     messages = {
