@@ -21,6 +21,7 @@ class DummyBot:
         self.edits = []
         self.answers = []
         self.sent_messages = []
+        self.sent_photos = []
         self.message_handlers = []
 
     def message_handler(self, *args, **kwargs):
@@ -41,6 +42,9 @@ class DummyBot:
 
     def send_message(self, *args, **kwargs):
         self.sent_messages.append((args, kwargs))
+
+    def send_photo(self, *args, **kwargs):
+        self.sent_photos.append((args, kwargs))
 
 
 class DummyMarkup:
@@ -201,6 +205,11 @@ def install_stubs():
         "reseller_config_subscription_caption": (
             "{details}\n\n{ipv4_info}Subscription URL:\n{sub_url}{reservation_status}"
         ),
+        "reseller_config_created": (
+            "Config created successfully!\n\nUsername: `{username}`\n"
+            "Plan: {plan_gb} GB\nDuration: {days} days\n\n"
+            "{ipv4_info}Subscription URL:\n{sub_url}"
+        ),
         "renewal_ipv4_line": "IPv4 URL: `{ipv4_url}`\n\n",
     }
     translations_stub = types.ModuleType("utils.translations")
@@ -286,7 +295,7 @@ def install_stubs():
     telegram_safe_stub.safe_delete_message = lambda bot, *args, **kwargs: None
     telegram_safe_stub.safe_edit_message_text = lambda bot, *args, **kwargs: bot.edit_message_text(*args, **kwargs)
     telegram_safe_stub.safe_send_message = lambda bot, *args, **kwargs: bot.send_message(*args, **kwargs)
-    telegram_safe_stub.safe_send_photo = lambda bot, *args, **kwargs: None
+    telegram_safe_stub.safe_send_photo = lambda bot, *args, **kwargs: bot.send_photo(*args, **kwargs)
     telegram_safe_stub.safe_reply_to = lambda bot, *args, **kwargs: None
     sys.modules["utils.telegram_safe"] = telegram_safe_stub
 
@@ -1277,18 +1286,22 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
         callbacks = [button.callback_data for button in edit_kwargs["reply_markup"].buttons]
         self.assertNotIn("reseller:renew:renew-token", callbacks)
 
-    def test_reseller_customer_creation_persists_unlimited_flag(self):
+    def test_reseller_customer_creation_persists_price_but_omits_it_from_delivery(self):
         original_api_client = reseller_handlers.APIClient
         original_create = reseller_handlers._create_reseller_user_with_note
         original_add_debt = reseller_handlers.add_reseller_debt
         original_is_recorded = reseller_handlers.reseller_config_is_recorded
+        original_qrcode_make = reseller_handlers.qrcode.make
         captured_configs = []
 
         class FakeClient:
             server_id = "s1"
 
             def get_user_uri(self, username):
-                return None
+                return {
+                    "normal_sub": f"https://sub.example/{username}",
+                    "ipv4": f"https://ipv4.example/{username}",
+                }
 
         try:
             reseller_handlers.APIClient = FakeClient
@@ -1299,6 +1312,9 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
                 lambda _user_id, _amount, config_data: captured_configs.append(config_data) or True
             )
             reseller_handlers.reseller_config_is_recorded = lambda *args, **kwargs: True
+            reseller_handlers.qrcode.make = lambda *_args, **_kwargs: types.SimpleNamespace(
+                save=lambda output, *_save_args, **_save_kwargs: output.write(b"PNG")
+            )
 
             reseller_handlers._run_reseller_customer_creation(
                 types.SimpleNamespace(chat=types.SimpleNamespace(id=100)),
@@ -1312,8 +1328,18 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
             reseller_handlers._create_reseller_user_with_note = original_create
             reseller_handlers.add_reseller_debt = original_add_debt
             reseller_handlers.reseller_config_is_recorded = original_is_recorded
+            reseller_handlers.qrcode.make = original_qrcode_make
 
         self.assertTrue(captured_configs[0]["unlimited"])
+        self.assertEqual(captured_configs[0]["price"], 1.6)
+        caption = reseller_handlers.bot.sent_photos[-1][1]["caption"]
+        self.assertIn("Username: `r1988a`", caption)
+        self.assertIn("Plan: 1 GB", caption)
+        self.assertIn("Duration: 7 days", caption)
+        self.assertIn("https://ipv4.example/r1988a", caption)
+        self.assertIn("https://sub.example/r1988a", caption)
+        self.assertNotIn("Price", caption)
+        self.assertNotIn("$1.60", caption)
 
     def test_reseller_customer_overview_and_empty_category_include_refresh(self):
         call = types.SimpleNamespace(

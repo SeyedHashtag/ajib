@@ -1022,7 +1022,6 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
             username=username,
             plan_gb=gb,
             days=days,
-            price=format_usd_amount(price),
             sub_url=sub_url or get_message_text(language, "value_not_available"),
             ipv4_info=ipv4_info
         )

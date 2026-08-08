@@ -55,6 +55,7 @@ JOURNEY_KEYS = {
     "reseller_request_check_in_progress",
     "reseller_access_required",
     "reseller_customer_only_plan",
+    "reseller_config_created",
     "reseller_config_accounting_cancelled",
     "reseller_config_creation_failed",
     "reseller_access_inactive",
@@ -118,6 +119,17 @@ def test_customer_journey_placeholders_match_english_catalog():
             assert _placeholders(catalogs[language][key]) == expected, (
                 f"{language}.{key} placeholders do not match English"
             )
+
+
+def test_reseller_config_delivery_omits_price_in_all_supported_languages():
+    catalogs = _load_translations().MESSAGE_TRANSLATIONS
+    expected_placeholders = {"username", "plan_gb", "days", "ipv4_info", "sub_url"}
+
+    for language in ("en", "fa", "ru", "tk"):
+        template = catalogs[language]["reseller_config_created"]
+        assert _placeholders(template) == expected_placeholders
+        assert "{price}" not in template
+        assert "$" not in template
 
 
 def test_changed_customer_journey_copy_is_not_hardcoded_in_handlers():
