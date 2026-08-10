@@ -251,6 +251,18 @@ class ExpiredCleanupTests(unittest.TestCase):
             "note": f"📅 {note_time} | 📝 test_config | ✏️ ",
         }
 
+    def stale_on_hold_test_user(self, note_time="2026-04-01 12:00", status="On-hold"):
+        return {
+            "blocked": False,
+            "expiration_days": 30,
+            "account_creation_date": None,
+            "upload_bytes": 0,
+            "download_bytes": 0,
+            "max_download_bytes": self.cleanup.GB_BYTES,
+            "status": status,
+            "note": f"📅 {note_time} | 📝 test_config | ✏️ ",
+        }
+
     def test_customer_cleanup_notice_includes_renewal_button_when_eligible(self):
         edit_plans_stub = types.ModuleType("utils.edit_plans")
         edit_plans_stub.load_plans = lambda: {"5": {"price": 10.0, "days": 30, "unlimited": False}}
@@ -375,6 +387,56 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertFalse(self.cleanup.is_user_expired(unblocked_exhausted_traffic))
         self.assertFalse(self.cleanup.is_user_expired(blocked_active_user))
 
+    def test_stale_on_hold_test_requires_more_than_sixty_full_days(self):
+        exactly_sixty_days = self.stale_on_hold_test_user(note_time="2026-04-10 12:00:00")
+        older_than_sixty_days = self.stale_on_hold_test_user(note_time="2026-04-10 11:59:59")
+
+        self.assertFalse(
+            self.cleanup.is_stale_on_hold_test("t12345", exactly_sixty_days, now=self.now)
+        )
+        self.assertTrue(
+            self.cleanup.is_stale_on_hold_test("t12345", older_than_sixty_days, now=self.now)
+        )
+
+    def test_stale_on_hold_test_normalizes_panel_status_spelling(self):
+        for status in ("On-hold", "On Hold", "on_hold"):
+            with self.subTest(status=status):
+                self.assertTrue(
+                    self.cleanup.is_stale_on_hold_test(
+                        "t12345",
+                        self.stale_on_hold_test_user(status=status),
+                        now=self.now,
+                    )
+                )
+
+    def test_stale_on_hold_test_fails_closed_when_any_signature_is_missing(self):
+        missing_blocked = self.stale_on_hold_test_user()
+        missing_blocked.pop("blocked")
+        missing_upload = self.stale_on_hold_test_user()
+        missing_upload.pop("upload_bytes")
+        missing_download = self.stale_on_hold_test_user()
+        missing_download.pop("download_bytes")
+        cases = {
+            "blocked": ("t12345", {**self.stale_on_hold_test_user(), "blocked": True}),
+            "missing_blocked": ("t12345", missing_blocked),
+            "used": ("t12345", {**self.stale_on_hold_test_user(), "download_bytes": 1}),
+            "missing_upload": ("t12345", missing_upload),
+            "missing_download": ("t12345", missing_download),
+            "wrong_limit": ("t12345", {**self.stale_on_hold_test_user(), "max_download_bytes": 2 * self.cleanup.GB_BYTES}),
+            "wrong_duration": ("t12345", {**self.stale_on_hold_test_user(), "expiration_days": 7}),
+            "wrong_status": ("t12345", {**self.stale_on_hold_test_user(), "status": "Offline"}),
+            "missing_note_marker": ("t12345", {**self.stale_on_hold_test_user(), "note": "📅 2026-04-01 12:00 | 📝 other | ✏️ "}),
+            "missing_note_time": ("t12345", {**self.stale_on_hold_test_user(), "note": "📝 test_config | ✏️ "}),
+            "malformed_note_time": ("t12345", {**self.stale_on_hold_test_user(), "note": "📅 not-a-date | 📝 test_config | ✏️ "}),
+            "wrong_username": ("trial12345", self.stale_on_hold_test_user()),
+        }
+
+        for label, (username, user_data) in cases.items():
+            with self.subTest(case=label):
+                self.assertFalse(
+                    self.cleanup.is_stale_on_hold_test(username, user_data, now=self.now)
+                )
+
     def test_time_expiry_uses_creation_date_plus_plan_duration(self):
         expired_by_date = {
             "blocked": True,
@@ -395,6 +457,111 @@ class ExpiredCleanupTests(unittest.TestCase):
             self.cleanup.capture_last_state(expired_by_date, now=self.now)["days_remaining"],
             0,
         )
+
+    def test_stale_on_hold_test_is_backfilled_warned_and_labeled(self):
+        self.write_default_files()
+        client = FakeClient("s1", {"t12345": self.stale_on_hold_test_user()})
+        requested_message_keys = []
+        original_get_message_text = self.cleanup.get_message_text
+        self.cleanup.get_message_text = lambda language, key: (
+            requested_message_keys.append(key) or original_get_message_text(language, key)
+        )
+        self.addCleanup(setattr, self.cleanup, "get_message_text", original_get_message_text)
+
+        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
+
+        configs = self.read_json(self.cleanup.TEST_CONFIGS_FILE)
+        state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        records = self.cleanup.get_expired_cleanup_records(filter_key="pending", now=self.now)
+        self.assertEqual(configs["12345"]["historical_configs"][0]["username"], "t12345")
+        self.assertEqual(state["cleanup_status"], "notified")
+        self.assertEqual(state["cleanup_reason"], "stale_on_hold_test")
+        self.assertEqual(state["delete_after"], "2026-06-11 12:00:00")
+        self.assertIn("stale_test_cleanup_notice", requested_message_keys)
+        self.assertEqual(records[0]["cleanup_reason"], "stale_on_hold_test")
+        self.assertEqual(records[0]["reason_code"], "stale_on_hold_test")
+
+    def test_stale_on_hold_current_test_keeps_stale_reason(self):
+        self.write_json(self.cleanup.TEST_CONFIGS_FILE, {
+            "12345": {
+                "telegram_id": 12345,
+                "username": "t12345",
+                "server_id": "s1",
+                "used_at": "2026-04-01 12:00:00",
+            },
+        })
+        self.write_json(self.cleanup.PAYMENTS_FILE, {})
+        self.write_json(self.cleanup.RESELLERS_FILE, {})
+        client = FakeClient("s1", {"t12345": self.stale_on_hold_test_user()})
+
+        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
+
+        state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        saved_test = self.read_json(self.cleanup.TEST_CONFIGS_FILE)["12345"]
+        self.assertEqual(state["cleanup_reason"], "stale_on_hold_test")
+        self.assertEqual(saved_test["cleanup_status"], "notified")
+
+    def test_stale_on_hold_test_is_deleted_after_grace_when_still_eligible(self):
+        self.write_default_files()
+        client = FakeClient("s1", {"t12345": self.stale_on_hold_test_user()})
+
+        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now + timedelta(hours=49),
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.assertEqual(client.deleted, ["t12345"])
+        self.assertEqual(state["cleanup_status"], "deleted")
+        self.assertEqual(state["cleanup_reason"], "stale_on_hold_test")
+
+    def test_stale_on_hold_test_connection_during_grace_cancels_deletion(self):
+        self.write_default_files()
+        client = FakeClient("s1", {"t12345": self.stale_on_hold_test_user()})
+
+        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
+        client.users["t12345"].update({
+            "status": "Offline",
+            "account_creation_date": "2026-06-10 10:00:00",
+        })
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now + timedelta(hours=49),
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        self.assertEqual(client.deleted, [])
+        self.assertEqual(self.read_json(self.cleanup.STATE_FILE), {})
+
+    def test_unmarked_one_gb_on_hold_account_is_ignored(self):
+        self.write_default_files()
+        user = self.stale_on_hold_test_user()
+        user.update({
+            "expiration_days": 7,
+            "note": "📅 2026-04-01 12:00 | 📝 manually_created | ✏️ ",
+        })
+        client = FakeClient("s1", {"trial12345": user})
+
+        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
+
+        self.assertEqual(client.deleted, [])
+        self.assertEqual(self.read_json(self.cleanup.STATE_FILE), {})
+
+    def test_stale_on_hold_test_due_on_unavailable_server_remains_retryable(self):
+        self.write_default_files()
+        client = FakeClient("s1", {"t12345": self.stale_on_hold_test_user()})
+        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
+
+        unavailable_client = FakeClient("s1", unavailable=True)
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now + timedelta(hours=49),
+            multi_api=FakeMultiAPI({"s1": unavailable_client}),
+        )
+
+        state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.assertEqual(unavailable_client.deleted, [])
+        self.assertEqual(state["cleanup_status"], "server_unavailable")
+        self.assertEqual(state["cleanup_reason"], "stale_on_hold_test")
 
     def test_verified_orphan_test_is_backfilled_notified_and_given_full_grace(self):
         self.write_default_files()
@@ -2266,6 +2433,17 @@ class ExpiredCleanupTests(unittest.TestCase):
                 notice = messages[key].lower()
                 for term in renewal_terms:
                     self.assertNotIn(term, notice, f"{language}.{key} mentions renewal")
+
+    def test_stale_test_cleanup_notice_is_complete_in_every_language(self):
+        spec = importlib.util.spec_from_file_location("translations_under_test", TRANSLATIONS_PATH)
+        translations = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(translations)
+
+        for language, messages in translations.MESSAGE_TRANSLATIONS.items():
+            notice = messages["stale_test_cleanup_notice"]
+            self.assertIn("{username}", notice, language)
+            self.assertIn("{grace_hours}", notice, language)
+            self.assertIn("{state_summary}", notice, language)
 
     def test_reseller_expired_cleanup_translations_include_customer_and_config(self):
         spec = importlib.util.spec_from_file_location("translations_under_test", TRANSLATIONS_PATH)

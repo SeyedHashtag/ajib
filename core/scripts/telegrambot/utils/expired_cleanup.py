@@ -67,6 +67,9 @@ GB_BYTES = 1024 ** 3
 TIMESTAMP_FORMAT = '%Y-%m-%d %H:%M:%S'
 CLEANUP_SCAN_INTERVAL_SECONDS = 3600
 EXPIRED_CLEANUP_GRACE_HOURS = 48
+STALE_ON_HOLD_TEST_DAYS = 60
+TEST_ACCOUNT_EXPIRATION_DAYS = 30
+STALE_ON_HOLD_TEST_REASON = 'stale_on_hold_test'
 DELETE_RESULTS = {'deleted', 'already_missing'}
 ADMIN_CLEANUP_PAGE_SIZE = 8
 ADMIN_CLEANUP_FILTERS = (
@@ -136,6 +139,7 @@ ADMIN_CLEANUP_FILTER_DESCRIPTIONS = {
 ADMIN_CLEANUP_REASON_LABELS = {
     'time_expired': 'Time expired',
     'traffic_exhausted': 'Traffic quota exhausted',
+    STALE_ON_HOLD_TEST_REASON: 'Unused test older than 60 days',
     'duplicate_payment': 'Duplicate payment review',
     'missing_on_server': 'User was not found on the VPN server',
     'server_unavailable': 'VPN server was unavailable',
@@ -495,6 +499,16 @@ def _safe_int(value, default=None):
         return default
 
 
+def _strict_nonnegative_int(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and re.fullmatch(r'\d+', value.strip()):
+        return int(value.strip())
+    return None
+
+
 def _safe_bytes(value):
     value = _safe_int(value, 0)
     return max(0, value or 0)
@@ -521,6 +535,59 @@ def _parse_account_creation_time(value):
         return datetime.fromisoformat(text)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_test_note_time(user_data):
+    note = str((user_data or {}).get('note') or '')
+    match = RECOVERED_TEST_NOTE_TIME_RE.search(note)
+    if not match:
+        return None
+    seconds = match.group(3) or '00'
+    return _parse_account_creation_time(
+        f"{match.group(1)} {match.group(2)}:{seconds}"
+    )
+
+
+def _normalize_panel_status(value):
+    return re.sub(r'[^a-z0-9]+', ' ', str(value or '').strip().lower()).strip()
+
+
+def is_stale_on_hold_test(username, user_data, now=None):
+    """Return whether a verified, never-started bot test is over 60 days old."""
+    if not isinstance(user_data, dict):
+        return False
+
+    username = str(username or '').strip()
+    note = str(user_data.get('note') or '')
+    if not RECOVERED_TEST_USERNAME_RE.fullmatch(username):
+        return False
+    if not RECOVERED_TEST_NOTE_RE.search(note):
+        return False
+    if _normalize_panel_status(user_data.get('status')) != 'on hold':
+        return False
+    if user_data.get('blocked') is not False:
+        return False
+    if _strict_nonnegative_int(user_data.get('expiration_days')) != TEST_ACCOUNT_EXPIRATION_DAYS:
+        return False
+    if _strict_nonnegative_int(user_data.get('max_download_bytes')) != GB_BYTES:
+        return False
+    if _strict_nonnegative_int(user_data.get('upload_bytes')) != 0:
+        return False
+    if _strict_nonnegative_int(user_data.get('download_bytes')) != 0:
+        return False
+
+    created_at = _parse_test_note_time(user_data)
+    if created_at is None:
+        return False
+    return (now or datetime.now()) > created_at + timedelta(days=STALE_ON_HOLD_TEST_DAYS)
+
+
+def _cleanup_eligibility_reason(username, user_data, now=None):
+    if is_user_expired(user_data, now=now):
+        return 'expired'
+    if is_stale_on_hold_test(username, user_data, now=now):
+        return STALE_ON_HOLD_TEST_REASON
+    return None
 
 
 def _expiration_deadline(user_data):
@@ -567,6 +634,7 @@ def _candidate_from_state_entry(entry):
         'server_id': entry.get('server_id'),
         'telegram_user_id': entry.get('telegram_user_id'),
         'reseller_id': entry.get('reseller_id'),
+        'cleanup_reason': entry.get('cleanup_reason'),
     }
 
 
@@ -739,6 +807,10 @@ def _cleanup_reason(entry):
     if status == 'already_missing' or delete_result == 'already_missing':
         return 'missing_on_server', ADMIN_CLEANUP_REASON_LABELS['missing_on_server']
 
+    cleanup_reason = str(entry.get('cleanup_reason') or '')
+    if cleanup_reason == STALE_ON_HOLD_TEST_REASON:
+        return cleanup_reason, ADMIN_CLEANUP_REASON_LABELS[cleanup_reason]
+
     last_state = entry.get('last_state')
     if not isinstance(last_state, dict):
         return 'missing_on_server', ADMIN_CLEANUP_REASON_LABELS['missing_on_server']
@@ -783,6 +855,7 @@ def _cleanup_record_from_state(state_key, entry, now=None):
         'delete_result': entry.get('delete_result'),
         'reason_code': reason_code,
         'reason': reason,
+        'cleanup_reason': entry.get('cleanup_reason'),
         'manual_review_reason': entry.get('manual_review_reason'),
         'review_note': entry.get('review_note'),
         'last_state': entry.get('last_state'),
@@ -1320,6 +1393,10 @@ def discover_matching_cleanup_candidates(
                 '_user_data': server_candidate.get('_user_data'),
                 '_lookup_status': server_candidate.get('_lookup_status'),
                 '_api_client': server_candidate.get('_api_client'),
+                'cleanup_reason': (
+                    server_candidate.get('cleanup_reason')
+                    or candidate.get('cleanup_reason')
+                ),
             }
         matched.append(candidate)
     return matched
@@ -1345,6 +1422,7 @@ def discover_state_cleanup_candidates(state):
             'server_id': entry.get('server_id'),
             'telegram_user_id': entry.get('telegram_user_id'),
             'reseller_id': entry.get('reseller_id'),
+            'cleanup_reason': entry.get('cleanup_reason'),
         })
 
     return candidates
@@ -1367,6 +1445,7 @@ def discover_already_missing_cleanup_candidates(state):
             'server_id': entry.get('server_id'),
             'telegram_user_id': entry.get('telegram_user_id'),
             'reseller_id': entry.get('reseller_id'),
+            'cleanup_reason': entry.get('cleanup_reason'),
             '_repair_already_missing': True,
         })
 
@@ -1392,16 +1471,20 @@ def _scan_server_cleanup_candidates(multi_api, now=None):
             continue
 
         for username, user_data in _iter_named_user_records(users):
-            if not username or not is_user_expired(user_data, now=now):
+            cleanup_reason = _cleanup_eligibility_reason(username, user_data, now=now)
+            if not username or cleanup_reason is None:
                 continue
-            candidates.append({
+            candidate = {
                 'source': 'server_user',
                 'username': username,
                 'server_id': server_id,
                 '_user_data': user_data,
                 '_lookup_status': 'found',
                 '_api_client': client,
-            })
+            }
+            if cleanup_reason == STALE_ON_HOLD_TEST_REASON:
+                candidate['cleanup_reason'] = cleanup_reason
+            candidates.append(candidate)
 
     return candidates, lookup_context
 
@@ -1808,11 +1891,14 @@ def _notify_candidate(candidate, grace_hours, last_state=None, missing=False):
 
     try:
         language = get_user_language(int(recipient_id))
-        key = (
-            'expired_cleanup_reseller_notice'
-            if source == 'reseller_customer'
-            else 'expired_cleanup_customer_notice'
-        )
+        if candidate.get('cleanup_reason') == STALE_ON_HOLD_TEST_REASON:
+            key = 'stale_test_cleanup_notice'
+        else:
+            key = (
+                'expired_cleanup_reseller_notice'
+                if source == 'reseller_customer'
+                else 'expired_cleanup_customer_notice'
+            )
         message = get_message_text(language, key).format(
             username=candidate.get('username'),
             customer_name=(
@@ -1872,7 +1958,7 @@ def _notify_candidate(candidate, grace_hours, last_state=None, missing=False):
 
 
 def _state_entry(candidate, now_value, grace_hours, notification_error=None, last_state=None):
-    return {
+    entry = {
         'username': candidate.get('username'),
         'server_id': candidate.get('server_id') or 'primary',
         'source': candidate.get('source'),
@@ -1884,6 +1970,9 @@ def _state_entry(candidate, now_value, grace_hours, notification_error=None, las
         'notification_error': notification_error,
         'last_state': last_state,
     }
+    if candidate.get('cleanup_reason'):
+        entry['cleanup_reason'] = candidate.get('cleanup_reason')
+    return entry
 
 
 def _manual_review_entry(candidate, now_value, last_state=None):
@@ -1899,6 +1988,8 @@ def _manual_review_entry(candidate, now_value, last_state=None):
     for key in ('manual_review_reason', 'review_note', 'payment_id', 'keeper_username'):
         if candidate.get(key):
             entry[key] = candidate.get(key)
+    if candidate.get('cleanup_reason'):
+        entry['cleanup_reason'] = candidate.get('cleanup_reason')
     return entry
 
 
@@ -1947,6 +2038,8 @@ def _mark_deleted(state, key, candidate, status, now_value, last_state=None, del
         'delete_result': delete_result or status,
         'last_state': last_state,
     })
+    if candidate.get('cleanup_reason'):
+        entry['cleanup_reason'] = candidate.get('cleanup_reason')
     fields = _metadata_fields(
         status,
         now_value,
@@ -2053,7 +2146,14 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
                         preferred_server_id=candidate.get('server_id'),
                     )
 
-            user_expired = lookup_status == 'found' and is_user_expired(user_data, now=now)
+            live_cleanup_reason = (
+                _cleanup_eligibility_reason(username, user_data, now=now)
+                if lookup_status == 'found'
+                else None
+            )
+            user_expired = lookup_status == 'found' and live_cleanup_reason is not None
+            if live_cleanup_reason == STALE_ON_HOLD_TEST_REASON:
+                candidate['cleanup_reason'] = live_cleanup_reason
             if entry and entry.get('cleanup_status') == 'deleted':
                 if not user_expired:
                     continue
