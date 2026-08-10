@@ -3,6 +3,7 @@ import json
 import os
 import uuid
 from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 
 from utils.account_state import (
     inspect_account,
@@ -27,6 +28,8 @@ DELETE_RESULTS = {'deleted', 'already_missing'}
 RESERVATION_ACTIVE_STATUSES = {'reserved', 'processing', 'attention'}
 RESERVATION_RETRY_SECONDS = 3600
 RESERVATION_CLAIM_LEASE_SECONDS = 600
+CUSTOMER_RENEWAL_DISCOUNT_PERCENT = Decimal('10')
+MONEY = Decimal('0.01')
 
 
 def _load_json_file(path, default):
@@ -418,7 +421,17 @@ def _build_offer(
     price = full_price
     reseller_level = None
     discount_percent = None
-    if source == 'reseller_customer':
+    renewal_discount_percent = None
+    renewal_discount_amount = 0.0
+    if source == 'customer':
+        full_price_decimal = Decimal(str(full_price)).quantize(MONEY, rounding=ROUND_HALF_UP)
+        renewal_discount_percent = float(CUSTOMER_RENEWAL_DISCOUNT_PERCENT)
+        renewal_discount_decimal = (
+            full_price_decimal * CUSTOMER_RENEWAL_DISCOUNT_PERCENT / Decimal('100')
+        ).quantize(MONEY, rounding=ROUND_HALF_UP)
+        renewal_discount_amount = float(renewal_discount_decimal)
+        price = float(full_price_decimal - renewal_discount_decimal)
+    elif source == 'reseller_customer':
         from utils.reseller import (
             calculate_reseller_wholesale_price,
             get_reseller_level_summary,
@@ -442,6 +455,8 @@ def _build_offer(
         'full_price': full_price,
         'reseller_level': reseller_level,
         'discount_percent': discount_percent,
+        'renewal_discount_percent': renewal_discount_percent,
+        'renewal_discount_amount': renewal_discount_amount,
         'plan': plan,
         'before_state': capture_user_state(user_data, cycle=cycle),
         'expected_after_state': expected_after_state(plan_gb, plan.get('days')),
@@ -772,6 +787,8 @@ def customer_payment_metadata(offer):
         'renewal_business_expired': bool(offer.get('business_expired')),
         'renewal_cycle_fingerprint': offer.get('cycle_fingerprint'),
         'renewal_entitlement_deadline': offer.get('entitlement_deadline'),
+        'renewal_discount_percent': offer.get('renewal_discount_percent'),
+        'renewal_discount_amount': offer.get('renewal_discount_amount'),
         'renewal_plan_snapshot': {
             'plan_gb': offer.get('plan_gb'),
             'days': offer.get('days'),
@@ -780,6 +797,8 @@ def customer_payment_metadata(offer):
             'full_price': offer.get('full_price'),
             'reseller_level': offer.get('reseller_level'),
             'discount_percent': offer.get('discount_percent'),
+            'renewal_discount_percent': offer.get('renewal_discount_percent'),
+            'renewal_discount_amount': offer.get('renewal_discount_amount'),
         },
         'renewal_baseline': offer.get('before_state'),
     }
@@ -1614,6 +1633,21 @@ def format_renewal_offer(language, offer, include_payment_prompt=True):
 
     before = format_state_summary(offer.get('before_state'), language)
     after = format_state_summary(offer.get('expected_after_state'), language)
+    renewal_discount_details = ''
+    renewal_discount_percent = _safe_float(offer.get('renewal_discount_percent'))
+    if offer.get('source') == 'customer' and renewal_discount_percent > 0:
+        renewal_discount_details = get_message_text(
+            language,
+            'renewal_discount_offer_line',
+        ).format(
+            list_price=format_usd_amount(
+                offer.get('full_price', offer.get('price', 0))
+            ),
+            percent=f"{renewal_discount_percent:g}",
+            discount_amount=format_usd_amount(
+                offer.get('renewal_discount_amount', 0)
+            ),
+        )
     payment_prompt = f"\n\n{get_message_text(language, 'select_payment_method')}" if include_payment_prompt else ""
     return get_message_text(language, 'renewal_offer_details').format(
         username=_escape_markdown(offer.get('username')),
@@ -1623,6 +1657,7 @@ def format_renewal_offer(language, offer, include_payment_prompt=True):
         list_price=format_usd_amount(offer.get('full_price', offer.get('price', 0))),
         reseller_level=offer.get('reseller_level') or 1,
         discount_percent=offer.get('discount_percent') or 0,
+        renewal_discount_details=renewal_discount_details,
         before=before,
         after=after,
         payment_prompt=payment_prompt,

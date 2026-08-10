@@ -141,7 +141,11 @@ def load_renewal_module():
     translations_stub.get_message_text = lambda _language, key: {
         "renewal_offer_details": (
             "Renew {username} {plan_gb}GB {days}d ${price}\n"
+            "{renewal_discount_details}"
             "Before\n{before}\nAfter\n{after}{payment_prompt}"
+        ),
+        "renewal_discount_offer_line": (
+            "Catalog ${list_price}; renewal {percent}% (-${discount_amount})\n"
         ),
         "renewal_quota_reset_warning": "Quota resets",
         "renewal_success": (
@@ -232,11 +236,17 @@ class RenewalTests(unittest.TestCase):
         self.assertTrue(offer["eligible"])
         self.assertEqual(offer["username"], "alice")
         self.assertEqual(offer["base_record_id"], "base-1")
-        self.assertEqual(offer["price"], 12.0)
+        self.assertEqual(offer["price"], 10.8)
+        self.assertEqual(offer["full_price"], 12.0)
+        self.assertEqual(offer["renewal_discount_percent"], 10.0)
+        self.assertEqual(offer["renewal_discount_amount"], 1.2)
         self.assertEqual(offer["days"], 30)
         self.assertEqual(offer["before_state"]["gb_limit"], 5.0)
         self.assertEqual(offer["expected_after_state"]["gb_used"], 0.0)
         self.assertEqual(len(offer["token"]), 16)
+        message = self.renewal.format_renewal_offer("en", offer)
+        self.assertIn("Catalog $12.00; renewal 10% (-$1.20)", message)
+        self.assertIn("$10.80", message)
 
     def test_customer_offer_accepts_time_expired_api_duration_shape(self):
         payments = {"base-1": self.base_payment()}
@@ -424,6 +434,12 @@ class RenewalTests(unittest.TestCase):
         self.assertTrue(offer["eligible"])
         self.assertEqual(offer["renewal_mode"], "reserved")
         self.assertEqual(offer["before_state"]["gb_used"], 3.0)
+        self.assertEqual(offer["price"], 10.8)
+        metadata = self.renewal.customer_payment_metadata(offer)
+        self.assertEqual(metadata["renewal_discount_percent"], 10.0)
+        self.assertEqual(metadata["renewal_discount_amount"], 1.2)
+        self.assertEqual(metadata["renewal_plan_snapshot"]["price"], 10.8)
+        self.assertEqual(metadata["renewal_plan_snapshot"]["full_price"], 12.0)
 
         payments["reservation-1"] = {
             **self.base_payment(type="renewal"),
@@ -632,6 +648,8 @@ class RenewalTests(unittest.TestCase):
         self.assertTrue(offer["eligible"])
         self.assertAlmostEqual(offer["price"], 9.6)
         self.assertEqual(offer["full_price"], 12.0)
+        self.assertIsNone(offer["renewal_discount_percent"])
+        self.assertEqual(offer["renewal_discount_amount"], 0.0)
         self.assertTrue(result["success"])
         self.assertEqual(client.reset_calls, ["bob"])
 

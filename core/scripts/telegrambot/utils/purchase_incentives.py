@@ -16,7 +16,6 @@ from utils.referral import (
     redeem_invitee_discount,
     release_invitee_discount,
     reserve_invitee_discount,
-    stacked_discount_percent,
 )
 
 
@@ -50,6 +49,8 @@ def reserve_main_checkout(
     *,
     payment_method,
     payment_discount_percent=0,
+    renewal_discount_percent=0,
+    discount_cap_percent=None,
     payments=None,
     allow_invite_discount=True,
     allow_account_credit=True,
@@ -66,6 +67,7 @@ def reserve_main_checkout(
         raise ValueError("A checkout reservation ID is required")
     original = _money(original_price)
     requested_method_discount = _percent(payment_discount_percent)
+    requested_renewal_discount = _percent(renewal_discount_percent)
     invite_reservation = None
     if allow_invite_discount:
         invite_reservation = reserve_invitee_discount(
@@ -76,23 +78,48 @@ def reserve_main_checkout(
     requested_invite_percent = _percent(
         (invite_reservation or {}).get("percent", 0)
     )
-    total_percent = _percent(
-        stacked_discount_percent(requested_invite_percent, requested_method_discount)
+    effective_cap = min(
+        Decimal('100'),
+        _percent(
+            combined_discount_cap_percent()
+            if discount_cap_percent is None
+            else discount_cap_percent
+        ),
+    )
+    total_percent = min(
+        effective_cap,
+        requested_invite_percent
+        + requested_renewal_discount
+        + requested_method_discount,
     )
     # Persist the components actually applied after the cap, not their nominal
-    # inputs. Invite value is allocated first and the payment-method incentive
-    # uses only the remaining headroom.
+    # inputs. Invite and renewal value are allocated first; the payment-method
+    # incentive uses only the remaining headroom.
     invite_percent = min(requested_invite_percent, total_percent)
-    method_discount = max(Decimal("0"), total_percent - invite_percent)
+    renewal_discount = min(
+        requested_renewal_discount,
+        max(Decimal('0'), total_percent - invite_percent),
+    )
+    method_discount = max(
+        Decimal("0"),
+        total_percent - invite_percent - renewal_discount,
+    )
     discount_amount = (
         original * total_percent / Decimal("100")
     ).quantize(MONEY, rounding=ROUND_HALF_UP)
     invite_discount_amount = (
         original * invite_percent / Decimal("100")
     ).quantize(MONEY, rounding=ROUND_HALF_UP)
+    renewal_discount_amount = min(
+        max(Decimal('0'), discount_amount - invite_discount_amount),
+        (original * renewal_discount / Decimal('100')).quantize(
+            MONEY,
+            rounding=ROUND_HALF_UP,
+        ),
+    )
     payment_discount_amount = max(
         Decimal("0"),
-        discount_amount - invite_discount_amount,
+        discount_amount - invite_discount_amount - renewal_discount_amount,
     ).quantize(MONEY, rounding=ROUND_HALF_UP)
     discounted_total = max(Decimal("0"), original - discount_amount)
 
@@ -126,6 +153,8 @@ def reserve_main_checkout(
         "original_price": float(original),
         "invite_discount_percent": float(invite_percent),
         "invite_discount_amount": float(invite_discount_amount),
+        "renewal_discount_percent": float(renewal_discount),
+        "renewal_discount_amount": float(renewal_discount_amount),
         "payment_discount_percent": float(method_discount),
         "payment_discount_amount": float(payment_discount_amount),
         "crypto_discount_percent": (
@@ -140,8 +169,9 @@ def reserve_main_checkout(
         ),
         "discount_percent": float(total_percent),
         "total_discount_percent": float(total_percent),
-        "discount_cap_percent": float(combined_discount_cap_percent()),
+        "discount_cap_percent": float(effective_cap),
         "discount_amount": float(discount_amount),
+        "total_discount_amount": float(discount_amount),
         "discounted_total": float(discounted_total),
         "account_credit_reserved": float(credit_reserved),
         "account_credit_reservation_id": reservation_key,

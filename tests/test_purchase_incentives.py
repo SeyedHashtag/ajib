@@ -144,6 +144,88 @@ class PurchaseIncentiveTests(unittest.TestCase):
         self.assertEqual(quote["collected_amount"], 10.0)
         self.assertIsNone(quote["referrer_id"])
 
+    def test_direct_renewal_card_and_crypto_discounts_use_catalog_price(self):
+        card_quote = self.incentives.reserve_main_checkout(
+            "20",
+            "renewal-card",
+            12,
+            payment_method="card",
+            renewal_discount_percent=10,
+            discount_cap_percent=15,
+            allow_invite_discount=False,
+            allow_account_credit=False,
+            path=self.path,
+        )
+        crypto_quote = self.incentives.reserve_main_checkout(
+            "20",
+            "renewal-crypto",
+            12,
+            payment_method="crypto",
+            payment_discount_percent=5,
+            renewal_discount_percent=10,
+            discount_cap_percent=15,
+            allow_invite_discount=False,
+            allow_account_credit=False,
+            path=self.path,
+        )
+
+        self.assertEqual(card_quote["original_price"], 12.0)
+        self.assertEqual(card_quote["renewal_discount_percent"], 10.0)
+        self.assertEqual(card_quote["renewal_discount_amount"], 1.2)
+        self.assertEqual(card_quote["crypto_discount_percent"], 0.0)
+        self.assertEqual(card_quote["total_discount_percent"], 10.0)
+        self.assertEqual(card_quote["discounted_total"], 10.8)
+        self.assertEqual(crypto_quote["original_price"], 12.0)
+        self.assertEqual(crypto_quote["renewal_discount_percent"], 10.0)
+        self.assertEqual(crypto_quote["renewal_discount_amount"], 1.2)
+        self.assertEqual(crypto_quote["crypto_discount_percent"], 5.0)
+        self.assertEqual(crypto_quote["crypto_discount_amount"], 0.6)
+        self.assertEqual(crypto_quote["total_discount_percent"], 15.0)
+        self.assertEqual(crypto_quote["discount_amount"], 1.8)
+        self.assertEqual(crypto_quote["total_discount_amount"], 1.8)
+        self.assertEqual(crypto_quote["discounted_total"], 10.2)
+
+    def test_renewal_credit_is_applied_after_the_full_crypto_discount(self):
+        self.credit.credit_account("20", 12, "seed", path=self.path)
+
+        quote = self.incentives.reserve_main_checkout(
+            "20",
+            "renewal-credit",
+            12,
+            payment_method="crypto",
+            payment_discount_percent=5,
+            renewal_discount_percent=10,
+            discount_cap_percent=15,
+            allow_invite_discount=False,
+            path=self.path,
+        )
+
+        self.assertEqual(quote["discounted_total"], 10.2)
+        self.assertEqual(quote["account_credit_reserved"], 10.2)
+        self.assertEqual(quote["collected_amount"], 0.0)
+        self.assertEqual(quote["total_discount_percent"], 15.0)
+
+    def test_renewal_rounding_keeps_discount_amount_components_exact(self):
+        quote = self.incentives.reserve_main_checkout(
+            "20",
+            "renewal-rounding",
+            0.05,
+            payment_method="crypto",
+            payment_discount_percent=5,
+            renewal_discount_percent=10,
+            discount_cap_percent=15,
+            allow_invite_discount=False,
+            allow_account_credit=False,
+            path=self.path,
+        )
+
+        self.assertEqual(quote["discount_amount"], 0.01)
+        self.assertEqual(
+            quote["renewal_discount_amount"] + quote["payment_discount_amount"],
+            quote["discount_amount"],
+        )
+        self.assertEqual(quote["discounted_total"], 0.04)
+
     def test_capped_components_are_actual_and_sum_after_cent_rounding(self):
         self.refer()
         with patch.dict(os.environ, {

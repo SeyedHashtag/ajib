@@ -126,6 +126,9 @@ def _reserve_checkout_incentives(
     original_price,
     payment_method,
     *,
+    renewal_discount_percent=0,
+    discount_cap_percent=None,
+    allow_invite_discount=True,
     allow_account_credit=True,
 ):
     """Build and reserve the auditable main-store checkout quote."""
@@ -133,26 +136,67 @@ def _reserve_checkout_incentives(
         from utils.purchase_incentives import release_main_checkout, reserve_main_checkout
     except ImportError:
         # Compatibility for isolated deployments/tests during a rolling update.
-        legacy = (
-            build_crypto_discount_metadata(original_price)
-            if payment_method == 'crypto'
-            else {
-                'price': float(original_price),
-                'original_price': float(original_price),
-                'discount_percent': 0.0,
-                'discount_amount': 0.0,
-            }
+        original = Decimal(str(original_price)).quantize(
+            Decimal('0.01'),
+            rounding=ROUND_HALF_UP,
         )
+        requested_renewal = Decimal(str(renewal_discount_percent or 0))
+        requested_method = (
+            Decimal(str(CRYPTO_PAYMENT_DISCOUNT_PERCENT))
+            if payment_method == 'crypto'
+            else Decimal('0')
+        )
+        effective_cap = Decimal(str(
+            10 if discount_cap_percent is None else discount_cap_percent
+        ))
+        total_percent = min(
+            Decimal('100'),
+            effective_cap,
+            requested_renewal + requested_method,
+        )
+        applied_renewal = min(requested_renewal, total_percent)
+        applied_method = max(Decimal('0'), total_percent - applied_renewal)
+        total_discount_amount = (
+            original * total_percent / Decimal('100')
+        ).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        renewal_discount_amount = min(
+            total_discount_amount,
+            (original * applied_renewal / Decimal('100')).quantize(
+                Decimal('0.01'),
+                rounding=ROUND_HALF_UP,
+            ),
+        )
+        payment_discount_amount = total_discount_amount - renewal_discount_amount
+        discounted_total = original - total_discount_amount
+        legacy = {
+            'price': float(discounted_total),
+            'original_price': float(original),
+            'renewal_discount_percent': float(applied_renewal),
+            'renewal_discount_amount': float(renewal_discount_amount),
+            'payment_discount_percent': float(applied_method),
+            'payment_discount_amount': float(payment_discount_amount),
+            'crypto_discount_percent': (
+                float(applied_method) if payment_method == 'crypto' else 0.0
+            ),
+            'crypto_discount_amount': (
+                float(payment_discount_amount) if payment_method == 'crypto' else 0.0
+            ),
+            'discount_percent': float(total_percent),
+            'total_discount_percent': float(total_percent),
+            'discount_cap_percent': float(effective_cap),
+            'discount_amount': float(total_discount_amount),
+            'total_discount_amount': float(total_discount_amount),
+            'discounted_total': float(discounted_total),
+        }
         return {
             **legacy,
             'incentive_reservation_id': str(reservation_id),
             'collected_amount': legacy['price'],
             'referral_reward_base': legacy['price'],
-            'payment_discount_percent': (
-                CRYPTO_PAYMENT_DISCOUNT_PERCENT if payment_method == 'crypto' else 0.0
-            ),
             'invite_discount_percent': 0.0,
+            'invite_discount_amount': 0.0,
             'account_credit_reserved': 0.0,
+            'fully_credit_funded': False,
         }
 
     quote = reserve_main_checkout(
@@ -163,13 +207,17 @@ def _reserve_checkout_incentives(
         payment_discount_percent=(
             CRYPTO_PAYMENT_DISCOUNT_PERCENT if payment_method == 'crypto' else 0
         ),
+        renewal_discount_percent=renewal_discount_percent,
+        discount_cap_percent=discount_cap_percent,
         payments=get_user_payments(user_id),
+        allow_invite_discount=allow_invite_discount,
         allow_account_credit=allow_account_credit,
     )
     if (
         payment_method == 'crypto'
         and float(quote.get('price', 0) or 0) <= 0
         and float(quote.get('account_credit_reserved', 0) or 0) > 0
+        and float(quote.get('renewal_discount_percent', 0) or 0) <= 0
     ):
         # A crypto discount is earned only when some crypto is actually paid.
         # Requote without that discount. Credit may still fund part of the
@@ -181,7 +229,10 @@ def _reserve_checkout_incentives(
             original_price,
             payment_method='account_credit',
             payment_discount_percent=0,
+            renewal_discount_percent=renewal_discount_percent,
+            discount_cap_percent=discount_cap_percent,
             payments=get_user_payments(user_id),
+            allow_invite_discount=allow_invite_discount,
             allow_account_credit=allow_account_credit,
         )
     quote['fully_credit_funded'] = bool(
@@ -224,13 +275,19 @@ def _close_unpaid_gateway_checkout(payment_id, payment_record, gateway_status):
     return True
 
 
-def _format_checkout_incentives(language, quote):
+def _format_checkout_incentives(language, quote, *, include_renewal_discount=True):
     lines = []
     invite_percent = float(quote.get('invite_discount_percent', 0) or 0)
     if invite_percent > 0:
         lines.append(get_message_text(language, 'invite_discount_summary').format(
             percent=f"{invite_percent:g}",
             discount_amount=format_usd_amount(quote.get('invite_discount_amount', 0)),
+        ))
+    renewal_percent = float(quote.get('renewal_discount_percent', 0) or 0)
+    if include_renewal_discount and renewal_percent > 0:
+        lines.append(get_message_text(language, 'renewal_discount_summary').format(
+            percent=f"{renewal_percent:g}",
+            discount_amount=format_usd_amount(quote.get('renewal_discount_amount', 0)),
         ))
     credit = float(quote.get('account_credit_reserved', 0) or 0)
     if credit > 0:
@@ -295,6 +352,32 @@ def _reconcile_completed_checkout_incentives():
 
 
 def build_crypto_discount_display(language, discount_metadata):
+    renewal_percent = float(discount_metadata.get('renewal_discount_percent', 0) or 0)
+    if renewal_percent > 0:
+        return {
+            'summary': get_message_text(language, 'renewal_crypto_discount_summary').format(
+                renewal_percent=f"{renewal_percent:g}",
+                renewal_discount_amount=format_usd_amount(
+                    discount_metadata.get('renewal_discount_amount', 0)
+                ),
+                crypto_percent=f"{float(discount_metadata.get('crypto_discount_percent', 0) or 0):g}",
+                crypto_discount_amount=format_usd_amount(
+                    discount_metadata.get('crypto_discount_amount', 0)
+                ),
+                total_percent=f"{float(discount_metadata.get('total_discount_percent', 0) or 0):g}",
+                total_discount_amount=format_usd_amount(
+                    discount_metadata.get(
+                        'total_discount_amount',
+                        discount_metadata.get('discount_amount', 0),
+                    )
+                ),
+                original_price=format_usd_amount(discount_metadata['original_price']),
+                discounted_price=format_usd_amount(
+                    discount_metadata.get('discounted_total', discount_metadata.get('price', 0))
+                ),
+            ),
+            'button_text': get_renewal_crypto_discount_button_text(language),
+        }
     crypto_percent = discount_metadata.get(
         'payment_discount_percent',
         discount_metadata.get('discount_percent', CRYPTO_PAYMENT_DISCOUNT_PERCENT),
@@ -321,6 +404,12 @@ def build_crypto_discount_display(language, discount_metadata):
 def get_crypto_discount_button_text(language):
     return get_message_text(language, "crypto_discount_button").format(
         percent=CRYPTO_PAYMENT_DISCOUNT_PERCENT
+    )
+
+
+def get_renewal_crypto_discount_button_text(language, percent=15):
+    return get_message_text(language, "renewal_crypto_discount_button").format(
+        percent=f"{float(percent):g}"
     )
 
 
@@ -407,33 +496,50 @@ def build_plan_payment_totals(
     exchange_rate,
     *,
     invite_discount_percent=0,
+    renewal_discount_percent=0,
+    discount_cap_percent=None,
 ):
     original = Decimal(str(price))
     invite_percent = Decimal(str(invite_discount_percent or 0))
-    try:
-        from utils.referral import stacked_discount_percent
+    renewal_percent = Decimal(str(renewal_discount_percent or 0))
+    if discount_cap_percent is None:
+        try:
+            from utils.referral import combined_discount_cap_percent
 
-        crypto_percent = Decimal(str(stacked_discount_percent(
-            invite_percent,
-            CRYPTO_PAYMENT_DISCOUNT_PERCENT,
-        )))
-    except ImportError:
-        crypto_percent = min(
-            Decimal('10'),
-            invite_percent + Decimal(str(CRYPTO_PAYMENT_DISCOUNT_PERCENT)),
-        )
+            effective_cap = Decimal(str(combined_discount_cap_percent()))
+        except ImportError:
+            effective_cap = Decimal('10')
+    else:
+        effective_cap = Decimal(str(discount_cap_percent))
+    effective_cap = min(Decimal('100'), effective_cap)
+    card_percent = min(effective_cap, invite_percent + renewal_percent)
+    crypto_percent = min(
+        effective_cap,
+        invite_percent
+        + renewal_percent
+        + Decimal(str(CRYPTO_PAYMENT_DISCOUNT_PERCENT)),
+    )
     card_total = (
-        original * (Decimal('1') - invite_percent / Decimal('100'))
+        original * (Decimal('1') - card_percent / Decimal('100'))
     ).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     crypto_total = (
         original * (Decimal('1') - crypto_percent / Decimal('100'))
     ).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-    key = "plan_payment_totals_toman_first" if language == "fa" else "plan_payment_totals_usd_first"
+    if renewal_percent > 0:
+        key = (
+            "renewal_payment_totals_toman_first"
+            if language == "fa"
+            else "renewal_payment_totals_usd_first"
+        )
+    else:
+        key = "plan_payment_totals_toman_first" if language == "fa" else "plan_payment_totals_usd_first"
     return get_message_text(language, key).format(
         plan_gb=plan_gb,
         card_total=format_toman_amount(float(card_total) * exchange_rate),
         crypto_total=format_usd_amount(crypto_total),
         original_usd=format_usd_amount(price),
+        renewal_percent=f"{float(renewal_percent):g}",
+        card_percent=f"{float(card_percent):g}",
         crypto_percent=f"{float(crypto_percent):g}",
     )
 
@@ -1825,7 +1931,14 @@ def handle_customer_renewal_start(call):
         markup = types.InlineKeyboardMarkup(row_width=1)
         methods_count = 0
         if crypto_configured:
-            markup.add(types.InlineKeyboardButton(get_crypto_discount_button_text(language), callback_data=f"renew_payment_method:crypto:{token}"))
+            renewal_crypto_percent = (
+                float(offer.get('renewal_discount_percent', 0) or 0)
+                + CRYPTO_PAYMENT_DISCOUNT_PERCENT
+            )
+            markup.add(types.InlineKeyboardButton(
+                get_renewal_crypto_discount_button_text(language, renewal_crypto_percent),
+                callback_data=f"renew_payment_method:crypto:{token}",
+            ))
             methods_count += 1
         if card_to_card_configured:
             markup.add(types.InlineKeyboardButton(get_button_text(language, "card_to_card"), callback_data=f"renew_payment_method:card_to_card:{token}"))
@@ -1850,8 +1963,13 @@ def handle_customer_renewal_start(call):
         offer_message += "\n\n" + build_plan_payment_totals(
             language,
             offer['plan_gb'],
-            offer['price'],
+            offer.get('full_price', offer['price']),
             exchange_rate,
+            renewal_discount_percent=offer.get('renewal_discount_percent', 0),
+            discount_cap_percent=(
+                float(offer.get('renewal_discount_percent', 0) or 0)
+                + CRYPTO_PAYMENT_DISCOUNT_PERCENT
+            ),
         )
         offer_message += "\n\n" + get_message_text(language, "purchase_delivery_note")
         bot.edit_message_text(
@@ -1902,8 +2020,14 @@ def _handle_customer_renewal_crypto(call, offer):
     discount_metadata = _reserve_checkout_incentives(
         user_id,
         incentive_reservation_id,
-        offer['price'],
+        offer.get('full_price', offer['price']),
         'crypto',
+        renewal_discount_percent=offer.get('renewal_discount_percent', 0),
+        discount_cap_percent=(
+            float(offer.get('renewal_discount_percent', 0) or 0)
+            + CRYPTO_PAYMENT_DISCOUNT_PERCENT
+        ),
+        allow_invite_discount=False,
     )
     discounted_price = discount_metadata['price']
     safe_answer_callback_query(bot, call.id)
@@ -1974,7 +2098,11 @@ def _handle_customer_renewal_crypto(call, offer):
     )
     if float(discount_metadata.get('payment_discount_percent', 0) or 0) > 0:
         payment_message += "\n\n" + build_crypto_discount_display(language, discount_metadata)['summary']
-    incentive_summary = _format_checkout_incentives(language, discount_metadata)
+    incentive_summary = _format_checkout_incentives(
+        language,
+        discount_metadata,
+        include_renewal_discount=False,
+    )
     if incentive_summary:
         payment_message += "\n\n" + incentive_summary
     payment_message += "\n\n" + get_message_text(language, "renewal_quota_reset_warning")
@@ -2016,8 +2144,14 @@ def _handle_customer_renewal_card_to_card(call, offer):
         quote = _reserve_checkout_incentives(
             user_id,
             incentive_reservation_id,
-            offer['price'],
+            offer.get('full_price', offer['price']),
             'card',
+            renewal_discount_percent=offer.get('renewal_discount_percent', 0),
+            discount_cap_percent=(
+                float(offer.get('renewal_discount_percent', 0) or 0)
+                + CRYPTO_PAYMENT_DISCOUNT_PERCENT
+            ),
+            allow_invite_discount=False,
         )
         price = quote['price']
         if quote.get('fully_credit_funded'):

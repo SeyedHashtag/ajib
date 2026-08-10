@@ -152,6 +152,64 @@ def test_referred_first_purchase_shows_exact_card_and_capped_crypto_totals():
     assert totals == "base=$10.00;crypto=10%:$9.00;card=570000"
 
 
+def test_direct_renewal_shows_ten_percent_card_and_fifteen_percent_crypto_totals():
+    module = load_purchase_plan(DummyBot(), [])
+    messages = {
+        "renewal_payment_totals_usd_first": (
+            "base=${original_usd};card={card_percent}%:{card_total};"
+            "crypto={crypto_percent}%:${crypto_total}"
+        ),
+    }
+    module.get_message_text = lambda _language, key: messages[key]
+
+    totals = module.build_plan_payment_totals(
+        "en",
+        "40",
+        12,
+        60_000,
+        renewal_discount_percent=10,
+        discount_cap_percent=15,
+    )
+
+    assert totals == "base=$12.00;card=10%:648000;crypto=15%:$10.20"
+
+
+def test_direct_renewal_crypto_quote_and_copy_show_both_discount_components():
+    module = load_purchase_plan(DummyBot(), [])
+    messages = {
+        "renewal_crypto_discount_button": "renewal crypto {percent}% total",
+        "renewal_crypto_discount_summary": (
+            "renewal={renewal_percent}%:-${renewal_discount_amount};"
+            "crypto={crypto_percent}%:-${crypto_discount_amount};"
+            "total={total_percent}%:-${total_discount_amount};"
+            "base=${original_price};final=${discounted_price}"
+        ),
+    }
+    module.get_message_text = lambda _language, key: messages[key]
+
+    quote = module._reserve_checkout_incentives(
+        1988,
+        "renewal-crypto",
+        12,
+        "crypto",
+        renewal_discount_percent=10,
+        discount_cap_percent=15,
+        allow_invite_discount=False,
+        allow_account_credit=False,
+    )
+    display = module.build_crypto_discount_display("en", quote)
+
+    assert quote["renewal_discount_amount"] == 1.2
+    assert quote["crypto_discount_amount"] == 0.6
+    assert quote["discount_amount"] == 1.8
+    assert quote["discounted_total"] == 10.2
+    assert display["button_text"] == "renewal crypto 15% total"
+    assert display["summary"] == (
+        "renewal=10%:-$1.20;crypto=5%:-$0.60;total=15%:-$1.80;"
+        "base=$12.00;final=$10.20"
+    )
+
+
 def test_network_disclosure_is_shown_only_on_first_plan_detail():
     bot = DummyBot()
     module = load_purchase_plan(bot, [])
