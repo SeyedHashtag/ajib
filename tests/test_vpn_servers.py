@@ -77,6 +77,11 @@ class FakeMultiServerAPI:
                 "enabled": True,
                 "healthy": True,
                 "active_count": 3,
+                "allocated_count": 5,
+                "connected_count": 3,
+                "hold_count": 2,
+                "blocked_count": 1,
+                "unknown_count": 1,
                 "weight": 1,
                 "load_ratio": 3.0,
             }
@@ -155,6 +160,9 @@ class VpnServersTests(unittest.TestCase):
 
         self.assertEqual(bot.replies[0][0][1], "Loading VPN servers...")
         self.assertIn("Server 1", bot.edits[0][0][0])
+        self.assertIn("Allocated: `5`", bot.edits[0][0][0])
+        self.assertIn("Hold: `2`", bot.edits[0][0][0])
+        self.assertIn("Unknown: `1`", bot.edits[0][0][0])
         self.assertEqual(FakeMultiServerAPI.calls, ["statuses"])
 
 

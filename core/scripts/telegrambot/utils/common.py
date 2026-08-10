@@ -1,5 +1,3 @@
-import datetime
-
 from telebot import types
 
 
@@ -239,19 +237,6 @@ def create_main_markup(is_admin=False, user_id=None):
     return create_main_markup_with_language(language_translations, is_admin=False, user_id=user_id)
 
 
-def _parse_journey_timestamp(value):
-    if not value:
-        return None
-    text = str(value).strip().replace("Z", "+00:00")
-    try:
-        parsed = datetime.datetime.fromisoformat(text)
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone().replace(tzinfo=None)
-        return parsed
-    except (TypeError, ValueError):
-        return None
-
-
 def _customer_payment_records(user_id):
     try:
         from utils.payment_records import get_user_payments
@@ -282,6 +267,8 @@ def _customer_payment_records(user_id):
 
 
 def _payment_looks_expired(record, now=None):
+    from utils.account_state import is_business_expired, resolve_service_cycle
+
     if any(record.get(key) for key in (
         "cleanup_deleted_at",
         "removed_from_vpn",
@@ -295,14 +282,27 @@ def _payment_looks_expired(record, now=None):
     }:
         return True
 
-    started = _parse_journey_timestamp(
-        record.get("completed_at") or record.get("updated_at") or record.get("created_at")
+    cycle = resolve_service_cycle(
+        record,
+        username=record.get("renewal_username") or record.get("username"),
+        server_id=record.get("renewal_server_id") or record.get("server_id"),
+        source="customer_welcome",
     )
-    try:
-        days = int(record.get("days"))
-    except (TypeError, ValueError):
-        return False
-    return bool(started and days > 0 and (now or datetime.datetime.now()) >= started + datetime.timedelta(days=days))
+    return is_business_expired(cycle, now=now)
+
+
+def _payment_entitlement_state(record, now=None):
+    from utils.account_state import resolve_service_cycle
+
+    if _payment_looks_expired(record, now=now):
+        return "expired"
+    cycle = resolve_service_cycle(
+        record,
+        username=record.get("renewal_username") or record.get("username"),
+        server_id=record.get("renewal_server_id") or record.get("server_id"),
+        source="customer_welcome",
+    )
+    return "paid" if cycle is not None else "unknown"
 
 
 def _renewal_token_for_record(user_id, payment_id, record):
@@ -323,7 +323,7 @@ def get_customer_journey_state(user_id, now=None):
     paid_records = _customer_payment_records(user_id)
     if paid_records:
         payment_id, latest = paid_records[0]
-        state = "expired" if _payment_looks_expired(latest, now=now) else "paid"
+        state = _payment_entitlement_state(latest, now=now)
         return {
             "state": state,
             "renewal_token": _renewal_token_for_record(user_id, payment_id, latest),
@@ -393,7 +393,7 @@ def build_customer_welcome(user_id, language):
             get_button_text(language, "my_configs"),
             callback_data="welcome:configs",
         ))
-    else:
+    elif state in {"paid", "expired"}:
         markup.add(types.InlineKeyboardButton(
             get_button_text(language, "my_configs"),
             callback_data="welcome:configs",
@@ -407,6 +407,15 @@ def build_customer_welcome(user_id, language):
                 ),
                 callback_data=f"renew_plan:{renewal_token}",
             ))
+        markup.add(types.InlineKeyboardButton(
+            get_button_text(language, "see_plans"),
+            callback_data="welcome:plans",
+        ))
+    else:
+        markup.add(types.InlineKeyboardButton(
+            get_button_text(language, "my_configs"),
+            callback_data="welcome:configs",
+        ))
         markup.add(types.InlineKeyboardButton(
             get_button_text(language, "see_plans"),
             callback_data="welcome:plans",

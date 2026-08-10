@@ -11,6 +11,7 @@ from utils.common import (
     resolve_admin_menu_view,
 )
 from utils.api_client import APIClient, MultiServerAPI
+from utils.account_state import inspect_account
 
 
 def _escape_markdown(value):
@@ -91,12 +92,20 @@ def process_show_user(message):
 
     server_label = _format_server_label(api_client)
     server_line = f"🌐 Server: {server_label}\n" if server_label else ""
+    shared_state = inspect_account(user_details, source="admin_user_detail")
+    panel_remaining_line = (
+        f"⏱ Panel Time Remaining: {shared_state.panel_days_remaining} days\n"
+        if shared_state.panel_days_remaining is not None
+        else ""
+    )
     formatted_details = (
         f"\n🆔 Name: {actual_username}\n"
         f"{server_line}"
         f"📊 Traffic Limit: {user_details['max_download_bytes'] / (1024 ** 3):.2f} GB\n"
-        f"📅 Days: {user_details['expiration_days']}\n"
-        f"⏳ Creation: {user_details['account_creation_date']}\n"
+        f"🔖 State: {shared_state.state}\n"
+        f"📅 Configured Duration: {shared_state.configured_days if shared_state.configured_days is not None else 'Unknown'} days\n"
+        f"{panel_remaining_line}"
+        f"⏳ Timer Start: {user_details.get('account_creation_date') or 'First connection'}\n"
         f"💡 Blocked: {user_details['blocked']}\n\n"
         f"{traffic_message}"
     )

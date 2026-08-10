@@ -74,7 +74,7 @@ def install_stubs():
     sys.modules["telebot"] = telebot_stub
 
     utils_pkg = types.ModuleType("utils")
-    utils_pkg.__path__ = []
+    utils_pkg.__path__ = [str(MODULE_PATH.parent)]
     sys.modules["utils"] = utils_pkg
 
     command_stub = types.ModuleType("utils.command")
@@ -103,6 +103,10 @@ def install_stubs():
     sys.modules["utils.test_config_store"] = test_config_store_stub
     utils_pkg.test_config_store = test_config_store_stub
 
+    payment_records_stub = types.ModuleType("utils.payment_records")
+    payment_records_stub.load_payments = lambda: {}
+    sys.modules["utils.payment_records"] = payment_records_stub
+
 
 def load_broadcast_module():
     install_stubs()
@@ -119,13 +123,34 @@ class BroadcastTargetingTests(unittest.TestCase):
 
         class FakeMultiServerAPI:
             def iter_all_users(self):
-                yield object(), "s111abc", {"blocked": False}
-                yield object(), "222t", {"blocked": True}
-                yield object(), "sell333t", {"blocked": False}
-                yield object(), "not-a-paid-user", {"blocked": False}
+                client = types.SimpleNamespace(server_id="primary")
+                yield client, "s111abc", {
+                    "blocked": False,
+                    "status": "Offline",
+                    "account_creation_date": "2026-08-01T00:00:00+00:00",
+                    "expiration_days": 30,
+                }
+                yield client, "222t", {"blocked": True, "status": "expired", "expiration_days": 0}
+                yield client, "sell333t", {
+                    "blocked": False,
+                    "status": "Online",
+                    "account_creation_date": "2026-08-01T00:00:00+00:00",
+                    "expiration_days": 30,
+                }
+                yield client, "not-a-paid-user", {"blocked": False}
 
         broadcast.MultiServerAPI = FakeMultiServerAPI
         broadcast.load_failed_broadcast_users = lambda: set()
+        sys.modules["utils.payment_records"].load_payments = lambda: {
+            "p111": {
+                "user_id": 111, "username": "s111abc", "server_id": "primary",
+                "days": 30, "status": "completed", "created_at": "2026-08-01T00:00:00+00:00",
+            },
+            "p333": {
+                "user_id": 333, "username": "sell333t", "server_id": "primary",
+                "days": 30, "status": "completed", "created_at": "2026-08-01T00:00:00+00:00",
+            },
+        }
 
         all_ids, all_excluded = broadcast.get_user_ids("all")
         active_ids, active_excluded = broadcast.get_user_ids("active")
@@ -151,6 +176,84 @@ class BroadcastTargetingTests(unittest.TestCase):
 
         self.assertEqual(user_ids, [])
         self.assertEqual(excluded, {})
+
+    def test_hold_paid_is_separate_and_unknown_is_excluded(self):
+        broadcast = load_broadcast_module()
+
+        class FakeMultiServerAPI:
+            def iter_all_users(self):
+                client = types.SimpleNamespace(server_id="primary")
+                yield client, "s111abc", {
+                    "blocked": False,
+                    "status": "On Hold",
+                    "account_creation_date": None,
+                    "expiration_days": 30,
+                }
+                yield client, "s222abc", {
+                    "blocked": False,
+                    "status": "mystery",
+                    "expiration_days": 30,
+                }
+                yield client, "s333abc", {
+                    "blocked": False,
+                    "status": "On Hold",
+                    "account_creation_date": None,
+                    "expiration_days": 30,
+                }
+
+        broadcast.MultiServerAPI = FakeMultiServerAPI
+        broadcast.load_failed_broadcast_users = lambda: set()
+        sys.modules["utils.payment_records"].load_payments = lambda: {
+            "p111": {
+                "user_id": 111,
+                "username": "s111abc",
+                "server_id": "primary",
+                "days": 30,
+                "status": "completed",
+                "created_at": "2026-01-01T00:00:00+00:00",
+            },
+            "p222": {
+                "user_id": 222,
+                "username": "s222abc",
+                "server_id": "primary",
+                "days": 30,
+                "status": "completed",
+                "created_at": "2026-01-01T00:00:00+00:00",
+            },
+        }
+
+        self.assertEqual(broadcast.get_user_ids("hold")[0], ["111"])
+        self.assertEqual(broadcast.get_user_ids("active")[0], [])
+        self.assertEqual(broadcast.get_user_ids("expired")[0], [])
+        self.assertEqual(broadcast.get_user_ids("all")[0], ["111"])
+
+    def test_unused_hold_test_is_only_in_hold_test_target(self):
+        broadcast = load_broadcast_module()
+
+        class FakeMultiServerAPI:
+            def iter_all_users(self):
+                client = types.SimpleNamespace(server_id="s1")
+                yield client, "t123", {
+                    "blocked": False,
+                    "status": "on_hold",
+                    "account_creation_date": None,
+                    "expiration_days": 30,
+                }
+
+        broadcast.MultiServerAPI = FakeMultiServerAPI
+        broadcast.test_config_store.load_test_configs = lambda path: {
+            "123": {
+                "telegram_id": 123,
+                "used_at": "2020-01-01 12:00:00",
+                "username": "t123",
+                "server_id": "s1",
+            }
+        }
+        broadcast.load_failed_broadcast_users = lambda: set()
+
+        self.assertEqual(broadcast.get_user_ids("hold_test")[0], ["123"])
+        self.assertEqual(broadcast.get_user_ids("active_test")[0], [])
+        self.assertEqual(broadcast.get_user_ids("expired_test")[0], [])
 
     def test_recovered_historical_test_user_is_available_to_broadcasts(self):
         broadcast = load_broadcast_module()

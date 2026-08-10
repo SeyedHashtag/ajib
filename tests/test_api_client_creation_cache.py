@@ -17,6 +17,8 @@ MODULE_PATH = (
     / "utils"
     / "api_client.py"
 )
+if str(MODULE_PATH.parent) not in sys.path:
+    sys.path.insert(0, str(MODULE_PATH.parent))
 
 spec = importlib.util.spec_from_file_location("api_client_under_test", MODULE_PATH)
 api_client = importlib.util.module_from_spec(spec)
@@ -122,6 +124,45 @@ class MultiServerCreationCacheTests(unittest.TestCase):
         self.assertEqual(creation["existing_usernames"], {"a", "b", "c"})
         self.assertEqual(clients["s1"].get_users_calls, 1)
         self.assertEqual(clients["s2"].get_users_calls, 1)
+
+    def test_hold_is_separate_from_active_but_counts_as_allocated_load(self):
+        users = {
+            "active": {
+                "blocked": False,
+                "status": "Offline",
+                "account_creation_date": "2026-08-01T00:00:00+00:00",
+                "expiration_days": 30,
+            },
+            "hold": {
+                "blocked": False,
+                "status": "On Hold",
+                "account_creation_date": None,
+                "expiration_days": 30,
+            },
+            "blocked": {
+                "blocked": True,
+                "status": "On-hold",
+                "expiration_days": 30,
+            },
+            "unknown": {
+                "blocked": False,
+                "status": "unexpected",
+                "expiration_days": 30,
+            },
+        }
+        multi_api = self.make_multi_api({"s1": FakeClient("s1", users)})
+
+        self.assertEqual(multi_api.allocated_user_count(users), 3)
+        self.assertEqual(multi_api.account_state_counts(users), {
+            "active": 1,
+            "hold": 1,
+            "blocked": 1,
+            "unknown": 1,
+        })
+        status = multi_api.get_server_statuses()[0]
+        self.assertEqual(status["allocated_count"], 3)
+        self.assertEqual(status["connected_count"], 1)
+        self.assertEqual(status["hold_count"], 1)
 
     def test_cached_snapshot_prevents_repeated_get_users_inside_ttl(self):
         clients = {

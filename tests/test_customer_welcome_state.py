@@ -43,7 +43,7 @@ def load_common(records=None, trial=None):
     sys.modules["telebot"] = telebot
 
     utils = types.ModuleType("utils")
-    utils.__path__ = []
+    utils.__path__ = [str(MODULE_PATH.parent)]
     sys.modules["utils"] = utils
 
     payments = types.ModuleType("utils.payment_records")

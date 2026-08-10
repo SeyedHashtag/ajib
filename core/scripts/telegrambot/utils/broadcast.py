@@ -2,6 +2,13 @@ from telebot import types
 from utils.command import bot, is_admin, ADMIN_USER_IDS
 from utils.common import admin_action_text, create_main_markup
 from utils.api_client import MultiServerAPI
+from utils.account_state import (
+    EntitlementState,
+    PanelState,
+    inspect_account,
+    parse_timestamp,
+    resolve_service_cycle,
+)
 from utils.reseller import get_all_resellers
 from utils import test_config_store
 import re
@@ -87,7 +94,10 @@ def is_permanent_broadcast_failure(error_msg):
 def iter_paid_user_records():
     """Yield paid-user records from every configured VPN server."""
     multi_api = MultiServerAPI()
-    for _, username, details in multi_api.iter_all_users():
+    for api_client, username, details in multi_api.iter_all_users():
+        if isinstance(details, dict):
+            details = dict(details)
+            details['_ajib_server_id'] = getattr(api_client, 'server_id', None) or 'primary'
         yield username, details
 
 
@@ -197,8 +207,9 @@ def generate_broadcast_log(target_label, total_users, success_users, failed_by_e
 def create_broadcast_markup():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row('👥 All Paid Users', '✅ Active Paid Users')
-    markup.row('⛔️ Expired Paid Users', '🧪 All Test Users')
-    markup.row('✅🧪 Active Test Users', '⛔️🧪 Expired Test Users')
+    markup.row('⏸ Hold Paid Users', '⛔️ Expired Paid Users')
+    markup.row('🧪 All Test Users', '✅🧪 Active Test Users')
+    markup.row('⏸🧪 Hold Test Users', '⛔️🧪 Expired Test Users')
     markup.row('💼 Approved Resellers')
     markup.row('🎯 Specific User IDs')
     markup.row('🔄 Reset Failed Exclusions', '❌ Cancel')
@@ -246,6 +257,31 @@ def _extract_paid_telegram_id(username):
 
 
 def get_user_ids(filter_type):
+    try:
+        from utils.payment_records import load_payments
+        paid_records = load_payments()
+    except Exception:
+        paid_records = {}
+
+    live_records = list(iter_paid_user_records())
+
+    def paid_state(username, details):
+        if not isinstance(details, dict):
+            return inspect_account(None, available=False)
+        telegram_id = _extract_paid_telegram_id(username)
+        owned = {
+            str(record_id): record
+            for record_id, record in (paid_records or {}).items()
+            if isinstance(record, dict) and str(record.get('user_id')) == str(telegram_id)
+        }
+        cycle = resolve_service_cycle(
+            owned,
+            username=username,
+            server_id=details.get('_ajib_server_id'),
+            source='customer',
+        )
+        return inspect_account(details, cycle=cycle)
+
     def get_active_paid_user_ids():
         active_paid_ids = set()
 
@@ -253,11 +289,14 @@ def get_user_ids(filter_type):
             telegram_id = _extract_paid_telegram_id(username)
             if telegram_id is None:
                 return
-            blocked = details.get('blocked', False) if isinstance(details, dict) else False
-            if not blocked:
+            snapshot = paid_state(username, details)
+            if (
+                snapshot.panel_state == PanelState.CONNECTED
+                and snapshot.entitlement_state == EntitlementState.CURRENT
+            ):
                 active_paid_ids.add(telegram_id)
 
-        for username, details in iter_paid_user_records():
+        for username, details in live_records:
             collect_active_paid(username, details)
 
         return active_paid_ids
@@ -282,27 +321,53 @@ def get_user_ids(filter_type):
             print(f"Error getting approved reseller IDs: {str(e)}")
             return [], {}
     
-    if filter_type in ['all_test', 'active_test', 'expired_test']:
+    if filter_type in ['all_test', 'active_test', 'hold_test', 'expired_test']:
         user_ids = set()
         excluded_by_reason = {}
         try:
             test_users = test_config_store.load_test_configs(TEST_CONFIGS_FILE)
-            now = datetime.now()
+            now = parse_timestamp(datetime.now())
+            live_by_identity = {
+                (
+                    str((details or {}).get('_ajib_server_id') or 'primary').lower(),
+                    str(username or '').lower(),
+                ): details
+                for username, details in live_records
+                if isinstance(details, dict)
+            }
             for telegram_id, info in test_users.items():
                 used_at_str = info.get('used_at')
                 if not used_at_str:
                     continue
                 try:
-                    used_at = datetime.strptime(used_at_str, "%Y-%m-%d %H:%M:%S")
+                    used_at = parse_timestamp(used_at_str)
                 except Exception as e:
                     print(f"Invalid date for user {telegram_id}: {used_at_str}")
                     continue
-                expired = (now - used_at) > timedelta(days=30)
+                if used_at is None:
+                    continue
+                expired = now >= used_at + timedelta(days=30)
                 if filter_type == 'all_test':
                     user_ids.add(telegram_id)
-                elif filter_type == 'active_test' and not expired:
+                    continue
+                username = str(info.get('username') or '').strip()
+                server_id = str(info.get('server_id') or 'primary').strip()
+                live = live_by_identity.get((server_id.lower(), username.lower()))
+                snapshot = inspect_account(live, available=live is not None)
+                if filter_type == 'hold_test' and snapshot.panel_state == PanelState.HOLD:
                     user_ids.add(telegram_id)
-                elif filter_type == 'expired_test' and expired:
+                elif (
+                    filter_type == 'active_test'
+                    and snapshot.panel_state == PanelState.CONNECTED
+                    and not expired
+                ):
+                    user_ids.add(telegram_id)
+                elif (
+                    filter_type == 'expired_test'
+                    and snapshot.panel_state != PanelState.HOLD
+                    and snapshot.panel_state != PanelState.UNKNOWN
+                    and expired
+                ):
                     user_ids.add(telegram_id)
 
             total_pool = set(user_ids)  # snapshot before exclusions
@@ -330,23 +395,45 @@ def get_user_ids(filter_type):
         user_ids = set()
 
         def process_user_record(username, details):
-            if not username or filter_type not in ['all', 'active', 'expired']:
+            if not username or filter_type not in ['all', 'active', 'hold', 'expired']:
                 return
 
             telegram_id = _extract_paid_telegram_id(username)
             if telegram_id is None:
                 return
 
-            blocked = details.get('blocked', False) if isinstance(details, dict) else False
+            snapshot = paid_state(username, details)
 
-            if filter_type == 'all':
+            if (
+                filter_type == 'all'
+                and snapshot.panel_state != PanelState.UNKNOWN
+                and snapshot.entitlement_state != EntitlementState.UNKNOWN
+            ):
                 user_ids.add(telegram_id)
-            elif filter_type == 'active' and not blocked:
+            elif (
+                filter_type == 'active'
+                and snapshot.panel_state == PanelState.CONNECTED
+                and snapshot.entitlement_state == EntitlementState.CURRENT
+            ):
                 user_ids.add(telegram_id)
-            elif filter_type == 'expired' and blocked:
+            elif (
+                filter_type == 'hold'
+                and snapshot.panel_state == PanelState.HOLD
+                and snapshot.entitlement_state != EntitlementState.UNKNOWN
+            ):
+                user_ids.add(telegram_id)
+            elif (
+                filter_type == 'expired'
+                and snapshot.panel_state != PanelState.HOLD
+                and snapshot.panel_state != PanelState.UNKNOWN
+                and (
+                    snapshot.panel_state == PanelState.BLOCKED
+                    or snapshot.entitlement_state == EntitlementState.EXPIRED
+                )
+            ):
                 user_ids.add(telegram_id)
 
-        for username, details in iter_paid_user_records():
+        for username, details in live_records:
             process_user_record(username, details)
         
         failed_user_ids = load_failed_broadcast_users()
@@ -395,9 +482,11 @@ def process_broadcast_target(message):
     target_map = {
         '👥 All Paid Users': 'all',
         '✅ Active Paid Users': 'active',
+        '⏸ Hold Paid Users': 'hold',
         '⛔️ Expired Paid Users': 'expired',
         '🧪 All Test Users': 'all_test',
         '✅🧪 Active Test Users': 'active_test',
+        '⏸🧪 Hold Test Users': 'hold_test',
         '⛔️🧪 Expired Test Users': 'expired_test',
         '💼 Approved Resellers': 'approved_resellers'
     }

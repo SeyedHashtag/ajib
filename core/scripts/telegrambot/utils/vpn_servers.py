@@ -36,15 +36,20 @@ VPN_SERVER_MENU_EXECUTOR = ThreadPoolExecutor(
 def _format_status_line(status):
     enabled = "enabled" if status.get("enabled", True) else "disabled"
     health = "healthy" if status.get("healthy") else "unhealthy"
-    active_count = status.get("active_count")
+    allocated_count = status.get("allocated_count", status.get("active_count"))
     load_ratio = status.get("load_ratio")
-    active_text = str(active_count) if active_count is not None else "N/A"
+    allocated_text = str(allocated_count) if allocated_count is not None else "N/A"
+    connected_text = str(status.get("connected_count")) if status.get("connected_count") is not None else "N/A"
+    hold_text = str(status.get("hold_count")) if status.get("hold_count") is not None else "N/A"
+    blocked_text = str(status.get("blocked_count")) if status.get("blocked_count") is not None else "N/A"
+    unknown_text = str(status.get("unknown_count")) if status.get("unknown_count") is not None else "N/A"
     ratio_text = f"{load_ratio:.2f}" if load_ratio is not None else "N/A"
     weight = status.get("weight", 1)
     return (
         f"*{status.get('name', status.get('id'))}* (`{status.get('id')}`)\n"
         f"Status: `{enabled}` | Health: `{health}`\n"
-        f"Active configs: `{active_text}` | Weight: `{weight}` | Load: `{ratio_text}`"
+        f"Allocated: `{allocated_text}` | Active: `{connected_text}` | Hold: `{hold_text}`\n"
+        f"Blocked/expired: `{blocked_text}` | Unknown: `{unknown_text}` | Weight: `{weight}` | Load: `{ratio_text}`"
     )
 
 

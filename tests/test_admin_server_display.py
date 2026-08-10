@@ -65,7 +65,7 @@ def load_edituser():
     sys.modules["qrcode"] = types.SimpleNamespace(make=lambda *_args, **_kwargs: DummyQR())
 
     utils_pkg = types.ModuleType("utils")
-    utils_pkg.__path__ = []
+    utils_pkg.__path__ = [str(EDITUSER_PATH.parent)]
     sys.modules["utils"] = utils_pkg
 
     command_stub = types.ModuleType("utils.command")

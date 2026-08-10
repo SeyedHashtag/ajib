@@ -30,6 +30,7 @@ except ImportError:
     types = _Types()
 
 from utils.api_client import MultiServerAPI
+from utils.account_state import PanelState, inspect_account, remaining_full_days, resolve_service_cycle
 from utils.command import bot
 from utils.language import get_user_language
 from utils.translations import get_button_text, get_message_text
@@ -424,6 +425,8 @@ def monitor_user_traffic():
     for api_client, username, user_data in multi_api.iter_all_users(include_disabled=False):
         if not username or not user_data:
             continue
+        if inspect_account(user_data, source='traffic_monitor').panel_state == PanelState.UNKNOWN:
+            continue
 
         # ── Regular user GB alerts ──────────────────────────────────────────
         telegram_id = _extract_telegram_id(username)
@@ -443,8 +446,16 @@ def monitor_user_traffic():
                 username,
                 server_id=getattr(api_client, 'server_id', None),
             )
-            total_days = _safe_int((payment or {}).get('days'))
-            expiration_days = _safe_int(user_data.get('expiration_days'))
+            cycle = resolve_service_cycle(
+                payments,
+                username=username,
+                server_id=getattr(api_client, 'server_id', None),
+                source='customer',
+            )
+            total_days = cycle.duration_days if cycle else None
+            expiration_days = remaining_full_days(cycle.deadline) if cycle else None
+            if cycle is not None:
+                marker = cycle.fingerprint
 
             reset_cycle = False
             if max_download_bytes > 0:
@@ -572,9 +583,17 @@ def monitor_user_traffic():
         upload_bytes = user_data.get('upload_bytes', 0) or 0
         download_bytes = user_data.get('download_bytes', 0) or 0
         total_usage_bytes = upload_bytes + download_bytes
-        expiration_days = _safe_int(user_data.get('expiration_days'))
-        total_days = _get_reseller_total_days(reseller_config)
+        cycle = resolve_service_cycle(
+            reseller_config,
+            username=username,
+            server_id=getattr(api_client, 'server_id', None),
+            source='reseller_customer',
+        )
+        expiration_days = remaining_full_days(cycle.deadline) if cycle else None
+        total_days = cycle.duration_days if cycle else None
         marker = _cycle_marker(user_data)
+        if cycle is not None:
+            marker = cycle.fingerprint
 
         reset_cycle = False
         if max_download_bytes > 0:

@@ -13,6 +13,13 @@ except ImportError:
     def record_main_growth_event(*args, **kwargs):
         return False
 from utils.api_client import MultiServerAPI
+from utils.account_state import (
+    PanelState,
+    elapsed_full_days,
+    inspect_account,
+    parse_timestamp,
+    remaining_full_days,
+)
 from utils.translations import BUTTON_TRANSLATIONS, get_message_text
 from utils.language import get_user_language
 import qrcode
@@ -34,6 +41,8 @@ TEST_WAITING_LIST_FILE = '/etc/ajib/core/scripts/telegrambot/waiting_test_users.
 TEST_TRAFFIC_GB = 1
 TEST_DAYS = 30
 TEST_CREATION_CLAIM_TIMEOUT_MINUTES = 15
+TEST_REPLACEMENT_ELIGIBILITY_DAYS = 30
+TEST_STALE_CLEANUP_DAYS = 60
 TEST_CONFIG_JOB_LOCK = threading.Lock()
 TEST_CONFIG_INFLIGHT = set()
 
@@ -134,6 +143,85 @@ def _parse_config_time(value):
         return None
 
 
+def _strict_nonnegative_int(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _exact_test_lookup(multi_api, username, server_id):
+    """Resolve one recorded test account without cross-server fallback."""
+    if not multi_api or not username or not server_id:
+        return None, 'unavailable'
+    strict_lookup = getattr(multi_api, 'find_user_on_server', None)
+    if callable(strict_lookup):
+        try:
+            result = strict_lookup(username, server_id)
+        except Exception:
+            return None, 'unavailable'
+        if isinstance(result, tuple) and len(result) == 3:
+            _client, user_data, outcome = result
+            outcome = outcome if isinstance(outcome, dict) else {}
+            return user_data, outcome.get('status') or ('found' if user_data else 'unavailable')
+
+    get_client = getattr(multi_api, 'get_client', None)
+    client = get_client(server_id) if callable(get_client) else None
+    if client is None:
+        return None, 'unavailable'
+    result_method = getattr(client, 'get_user_result', None)
+    if callable(result_method):
+        try:
+            outcome = result_method(username)
+        except Exception:
+            return None, 'unavailable'
+        outcome = outcome if isinstance(outcome, dict) else {}
+        return outcome.get('data'), outcome.get('status') or 'unavailable'
+    try:
+        user_data = client.get_user(username)
+        if user_data is not None:
+            return user_data, 'found'
+        users = client.get_users()
+    except Exception:
+        return None, 'unavailable'
+    if users is None:
+        return None, 'unavailable'
+    if isinstance(users, dict):
+        user_data = users.get(username)
+        return user_data, 'found' if isinstance(user_data, dict) else 'missing'
+    return None, 'missing'
+
+
+def _verified_unused_hold(entry, user_data):
+    if not isinstance(entry, dict) or not isinstance(user_data, dict):
+        return False
+    snapshot = inspect_account(user_data)
+    if snapshot.panel_state != PanelState.HOLD:
+        return False
+    if _strict_nonnegative_int(user_data.get('expiration_days')) != TEST_DAYS:
+        return False
+    if _strict_nonnegative_int(user_data.get('max_download_bytes')) != TEST_TRAFFIC_GB * (1024 ** 3):
+        return False
+    return (
+        _strict_nonnegative_int(user_data.get('upload_bytes')) == 0
+        and _strict_nonnegative_int(user_data.get('download_bytes')) == 0
+    )
+
+
+def _replacement_identity(entry):
+    if not isinstance(entry, dict):
+        return None
+    username = str(entry.get('username') or '').strip()
+    server_id = str(entry.get('server_id') or '').strip()
+    used_at = str(entry.get('used_at') or '').strip()
+    if not username or not server_id or not used_at:
+        return None
+    return username, server_id, used_at
+
+
 def _creation_claim_is_active(entry, now=None):
     if not isinstance(entry, dict):
         return False
@@ -184,15 +272,34 @@ def get_test_config_journey(user_id, now=None):
     entry = load_test_configs().get(str(user_id))
     if not isinstance(entry, dict) or not _has_used_test_config_from({str(user_id): entry}, user_id, now=now):
         return None
-    used_at = _parse_config_time(entry.get("used_at"))
-    remaining_days = TEST_DAYS
-    if used_at:
-        elapsed = max(0, ((now or datetime.datetime.now()) - used_at).days)
-        remaining_days = max(0, TEST_DAYS - elapsed)
+    connected_at = parse_timestamp(entry.get("connected_at"))
+    current = parse_timestamp(now or datetime.datetime.now())
+    used_at_aware = parse_timestamp(entry.get("used_at"))
+    hold_elapsed_days = elapsed_full_days(used_at_aware, now=current)
+    remaining_days = (
+        remaining_full_days(
+            connected_at + datetime.timedelta(days=TEST_DAYS),
+            now=current,
+        )
+        if connected_at is not None
+        else None
+    )
     return {
         "used_at": entry.get("used_at"),
         "connected_at": entry.get("connected_at"),
         "remaining_days": remaining_days,
+        "panel_state": "connected" if connected_at is not None else "hold",
+        "hold_elapsed_days": hold_elapsed_days,
+        "replacement_eligible": bool(
+            connected_at is None
+            and hold_elapsed_days is not None
+            and TEST_REPLACEMENT_ELIGIBILITY_DAYS <= hold_elapsed_days < TEST_STALE_CLEANUP_DAYS
+        ),
+        "stale_cleanup_due": bool(
+            connected_at is None
+            and hold_elapsed_days is not None
+            and hold_elapsed_days >= TEST_STALE_CLEANUP_DAYS
+        ),
         "traffic_gb": TEST_TRAFFIC_GB,
         "username": entry.get("username"),
         "server_id": entry.get("server_id"),
@@ -257,7 +364,46 @@ def _mark_test_config_used_in_memory(
     # Preserve existing history fields (reset_at, reset_count, original used_at, etc.)
     existing = configs.get(key, {})
     entry = dict(existing)
-    entry['used_at'] = used_at or datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    now_value = used_at or datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    archived = None
+    replacement_username = str(entry.get('replacement_from_username') or '').strip()
+    replacement_server = str(entry.get('replacement_from_server_id') or '').strip()
+    replacement_used_at = str(entry.get('replacement_from_used_at') or '').strip()
+    if (
+        entry.get('replacement_eligible_at')
+        and replacement_username
+        and replacement_server
+        and replacement_used_at
+        and username
+        and str(username).lower() != replacement_username.lower()
+    ):
+        history = [item for item in entry.get('historical_configs', []) if isinstance(item, dict)]
+        target = (replacement_server.lower(), replacement_username.lower())
+        history_index = next((
+            index
+            for index, item in enumerate(history)
+            if (
+                str(item.get('server_id') or 'primary').lower(),
+                str(item.get('username') or '').lower(),
+            ) == target
+        ), None)
+        archived = {
+            'username': replacement_username,
+            'server_id': replacement_server,
+            'used_at': replacement_used_at,
+            'superseded_at': now_value,
+            'cleanup_reason': 'superseded_on_hold_test',
+        }
+        if history_index is None:
+            history.append(dict(archived))
+            history_index = len(history) - 1
+        else:
+            history[history_index].update(archived)
+            archived = dict(history[history_index])
+        archived['history_index'] = history_index
+        entry['historical_configs'] = history
+
+    entry['used_at'] = now_value
     entry['telegram_id'] = user_id
     entry.pop('creation_pending_at', None)
     if username:
@@ -269,11 +415,22 @@ def _mark_test_config_used_in_memory(
     if server_id:
         entry['server_id'] = server_id
 
+    for field in (
+        'replacement_eligible_at',
+        'replacement_from_username',
+        'replacement_from_server_id',
+        'replacement_from_used_at',
+        'replacement_validation_status',
+        'replacement_validation_at',
+    ):
+        entry.pop(field, None)
+
     configs[key] = entry
+    return archived
 
 def mark_test_config_used(user_id, username=None, language=None, telegram_username=None, server_id=None):
     def mutate(configs):
-        _mark_test_config_used_in_memory(
+        return _mark_test_config_used_in_memory(
             configs,
             user_id,
             username=username,
@@ -282,7 +439,28 @@ def mark_test_config_used(user_id, username=None, language=None, telegram_userna
             server_id=server_id,
         )
 
-    test_config_store.update_test_configs(TEST_CONFIGS_FILE, mutate)
+    return test_config_store.update_test_configs(TEST_CONFIGS_FILE, mutate)
+
+
+def _queue_superseded_cleanup(user_id, archived, language=None):
+    if not isinstance(archived, dict):
+        return
+    try:
+        from utils.expired_cleanup import queue_superseded_test_cleanup
+
+        queue_superseded_test_cleanup(
+            telegram_user_id=user_id,
+            username=archived.get('username'),
+            server_id=archived.get('server_id'),
+            history_index=archived.get('history_index'),
+            language=language,
+        )
+    except Exception:
+        logging.getLogger('ajib.expired_cleanup').exception(
+            'Failed to queue superseded test cleanup. user_id=%s username=%s',
+            user_id,
+            archived.get('username'),
+        )
 
 
 def _claim_test_config_creation(user_id, now=None):
@@ -319,7 +497,48 @@ def _release_test_config_creation(user_id):
     test_config_store.update_test_configs(TEST_CONFIGS_FILE, mutate)
 
 
-def reset_test_users(mode='expired'):
+def _revoke_replacement_eligibility(user_id, reason):
+    key = str(user_id)
+
+    def mutate(configs):
+        entry = configs.get(key)
+        if not isinstance(entry, dict):
+            return
+        entry.pop('creation_pending_at', None)
+        entry.pop('reset_at', None)
+        for field in (
+            'replacement_eligible_at',
+            'replacement_from_username',
+            'replacement_from_server_id',
+            'replacement_from_used_at',
+        ):
+            entry.pop(field, None)
+        entry['replacement_validation_status'] = str(reason or 'invalid')
+        entry['replacement_validation_at'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    test_config_store.update_test_configs(TEST_CONFIGS_FILE, mutate)
+
+
+def _revalidate_pending_replacement(user_id, multi_api):
+    entry = load_test_configs().get(str(user_id))
+    if not isinstance(entry, dict) or not entry.get('replacement_eligible_at'):
+        return True, False
+    username = str(entry.get('replacement_from_username') or '').strip()
+    server_id = str(entry.get('replacement_from_server_id') or '').strip()
+    used_at = str(entry.get('replacement_from_used_at') or '').strip()
+    if (username, server_id, used_at) != _replacement_identity(entry):
+        _revoke_replacement_eligibility(user_id, 'identity_changed')
+        return False, False
+    user_data, lookup_status = _exact_test_lookup(multi_api, username, server_id)
+    if lookup_status == 'unavailable':
+        return False, True
+    if lookup_status != 'found' or not _verified_unused_hold(entry, user_data):
+        _revoke_replacement_eligibility(user_id, 'no_longer_unused_hold')
+        return False, False
+    return True, False
+
+
+def reset_test_users(mode='expired', now=None, multi_api=None):
     """
     Mark test users as eligible to receive a new test config.
 
@@ -328,8 +547,38 @@ def reset_test_users(mode='expired'):
 
     Returns the number of users that were reset.
     """
-    now = datetime.datetime.now()
+    now = now or datetime.datetime.now()
     reset_ts = now.strftime('%Y-%m-%d %H:%M:%S')
+
+    try:
+        multi_api = multi_api or MultiServerAPI()
+    except Exception:
+        return 0
+
+    snapshot = load_test_configs()
+    verified = {}
+    for key, entry in snapshot.items() if isinstance(snapshot, dict) else []:
+        if not isinstance(entry, dict) or _creation_claim_is_active(entry, now=now):
+            continue
+        if not _has_used_test_config_from(snapshot, key, now=now):
+            continue
+        identity = _replacement_identity(entry)
+        if identity is None:
+            continue
+        username, server_id, used_at_value = identity
+        used_at = _parse_config_time(used_at_value)
+        if mode == 'expired' and (
+            used_at is None
+            or now < used_at + datetime.timedelta(days=TEST_REPLACEMENT_ELIGIBILITY_DAYS)
+            or now >= used_at + datetime.timedelta(days=TEST_STALE_CLEANUP_DAYS)
+        ):
+            continue
+        user_data, lookup_status = _exact_test_lookup(multi_api, username, server_id)
+        if lookup_status != 'found':
+            continue
+        if mode == 'expired' and not _verified_unused_hold(entry, user_data):
+            continue
+        verified[str(key)] = identity
 
     def mutate(configs):
         count = 0
@@ -338,12 +587,15 @@ def reset_test_users(mode='expired'):
                 continue
             if not _has_used_test_config_from(configs, key, now=now):
                 continue
-            if mode == 'expired':
-                used_at = _parse_config_time(entry.get('used_at'))
-                if used_at is None or (now - used_at).days < 30:
-                    continue
+            identity = verified.get(str(key))
+            if identity is None or _replacement_identity(entry) != identity:
+                continue
             entry['reset_at'] = reset_ts
             entry['reset_count'] = entry.get('reset_count', 0) + 1
+            entry['replacement_eligible_at'] = reset_ts
+            entry['replacement_from_username'] = identity[0]
+            entry['replacement_from_server_id'] = identity[1]
+            entry['replacement_from_used_at'] = identity[2]
             count += 1
         return count
 
@@ -646,6 +898,16 @@ def _create_test_config_with_client(
     if not _claim_test_config_creation(user_id):
         return False
 
+    class _SingleClientLookup:
+        @staticmethod
+        def get_client(server_id):
+            return api_client if str(getattr(api_client, 'server_id', '')) == str(server_id) else None
+
+    replacement_valid, _retryable = _revalidate_pending_replacement(user_id, _SingleClientLookup())
+    if not replacement_valid:
+        _release_test_config_creation(user_id)
+        return False
+
     try:
         username = allocate_username("t", user_id, existing_usernames)
         note_payload = build_user_note(
@@ -678,13 +940,14 @@ def _create_test_config_with_client(
         _release_test_config_creation(user_id)
         return False
 
-    mark_test_config_used(
+    archived = mark_test_config_used(
         user_id,
         username=username,
         language=language,
         telegram_username=telegram_username,
         server_id=api_client.server_id,
     )
+    _queue_superseded_cleanup(user_id, archived, language=language)
     _mark_test_config_used_in_memory(
         test_configs,
         user_id,
@@ -746,6 +1009,14 @@ def create_test_config(user_id, chat_id, is_automatic=False, language=None, tele
         _release_test_config_creation(user_id)
         raise
 
+    replacement_revalidator = globals().get('_revalidate_pending_replacement')
+    if callable(replacement_revalidator):
+        replacement_valid, _retryable = replacement_revalidator(user_id, multi_api)
+        if not replacement_valid:
+            _release_test_config_creation(user_id)
+            notify_creation_failed()
+            return False
+
     def allocate(existing_usernames):
         return allocate_username(
             "t",
@@ -784,13 +1055,16 @@ def create_test_config(user_id, chat_id, is_automatic=False, language=None, tele
         _release_test_config_creation(user_id)
         raise
     if result:
-        mark_test_config_used(
+        archived = mark_test_config_used(
             user_id,
             username=username,
             language=language,
             telegram_username=telegram_username,
             server_id=api_client.server_id,
         )
+        queue_superseded = globals().get('_queue_superseded_cleanup')
+        if callable(queue_superseded):
+            queue_superseded(user_id, archived, language=language)
         user_uri_data = api_client.get_user_uri(username)
         _send_created_test_config(
             chat_id,
@@ -831,7 +1105,11 @@ def _build_bulk_test_config_state():
         server_states.append({
             "index": index,
             "client": client,
-            "active_count": multi_api.active_user_count(users),
+            "allocated_count": (
+                multi_api.allocated_user_count(users)
+                if callable(getattr(multi_api, 'allocated_user_count', None))
+                else multi_api.active_user_count(users)
+            ),
             "weight": weight,
         })
 
@@ -842,7 +1120,7 @@ def _select_bulk_server_state(server_states):
         return None
     return min(
         server_states,
-        key=lambda state: (state["active_count"] / state["weight"], state["index"])
+        key=lambda state: (state["allocated_count"] / state["weight"], state["index"])
     )
 
 
@@ -1148,7 +1426,7 @@ def handle_waiting_chunk(call):
                     telegram_username=telegram_username,
                 )
                 if success:
-                    server_state["active_count"] += 1
+                    server_state["allocated_count"] += 1
             elif action == "notify":
                 bot.send_message(user_id, get_message_text(language, "test_config_waitlist_eligible"))
                 success = True

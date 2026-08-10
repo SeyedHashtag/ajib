@@ -50,6 +50,17 @@ except ImportError:
     types = _Types()
 
 from utils.api_client import MultiServerAPI
+from utils.account_state import (
+    PanelState,
+    inspect_account,
+    is_business_expired,
+    normalize_panel_status,
+    panel_deadline,
+    panel_days_remaining,
+    parse_timestamp,
+    resolve_service_cycle,
+    verified_panel_expired,
+)
 from utils.atomic_store import locked_json, read_json
 from utils.command import bot, is_admin
 from utils.common import admin_action_text
@@ -70,6 +81,8 @@ EXPIRED_CLEANUP_GRACE_HOURS = 48
 STALE_ON_HOLD_TEST_DAYS = 60
 TEST_ACCOUNT_EXPIRATION_DAYS = 30
 STALE_ON_HOLD_TEST_REASON = 'stale_on_hold_test'
+ISSUE_DEADLINE_EXPIRED_REASON = 'issue_deadline_expired'
+SUPERSEDED_ON_HOLD_TEST_REASON = 'superseded_on_hold_test'
 DELETE_RESULTS = {'deleted', 'already_missing'}
 ADMIN_CLEANUP_PAGE_SIZE = 8
 ADMIN_CLEANUP_FILTERS = (
@@ -140,6 +153,8 @@ ADMIN_CLEANUP_REASON_LABELS = {
     'time_expired': 'Time expired',
     'traffic_exhausted': 'Traffic quota exhausted',
     STALE_ON_HOLD_TEST_REASON: 'Unused test older than 60 days',
+    ISSUE_DEADLINE_EXPIRED_REASON: 'Issuance-based service deadline expired',
+    SUPERSEDED_ON_HOLD_TEST_REASON: 'Unused test superseded by a replacement',
     'duplicate_payment': 'Duplicate payment review',
     'missing_on_server': 'User was not found on the VPN server',
     'server_unavailable': 'VPN server was unavailable',
@@ -166,9 +181,15 @@ RESELLER_CLEANUP_METADATA_FIELDS = (
     'cleanup_delete_result',
     'cleanup_notification_error',
     'cleanup_last_state',
+    'cleanup_reason',
+    'cleanup_cycle_fingerprint',
+    'cleanup_issued_at',
+    'cleanup_entitlement_deadline',
+    'cleanup_last_successful_observation_at',
 )
 TEST_CLEANUP_METADATA_FIELDS = RESELLER_CLEANUP_METADATA_FIELDS + ('server_id',)
 PAYMENT_CLEANUP_METADATA_FIELDS = TEST_CLEANUP_METADATA_FIELDS
+TEST_HISTORY_CLEANUP_METADATA_FIELDS = RESELLER_CLEANUP_METADATA_FIELDS
 RECOVERED_TEST_USERNAME_RE = re.compile(r'^t([1-9]\d*)([a-z]*)$', re.IGNORECASE)
 RECOVERED_TEST_NOTE_RE = re.compile(r'(?:^|\|\s*)📝\s*test_config\s*(?:\||$)', re.IGNORECASE)
 RECOVERED_TEST_NOTE_TIME_RE = re.compile(r'📅\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})(?::(\d{2}))?')
@@ -331,13 +352,38 @@ def _save_test_cleanup_metadata(stale_configs, dirty_ids):
                 continue
             source_username = str(source.get('username') or '').strip().lower()
             target_username = str(target.get('username') or '').strip().lower()
-            if source_username != target_username:
+            if source_username == target_username:
+                for field in TEST_CLEANUP_METADATA_FIELDS:
+                    if field in source:
+                        target[field] = source[field]
+                    else:
+                        target.pop(field, None)
+
+            target_history = target.get('historical_configs', [])
+            if not isinstance(target_history, list):
                 continue
-            for field in TEST_CLEANUP_METADATA_FIELDS:
-                if field in source:
-                    target[field] = source[field]
-                else:
-                    target.pop(field, None)
+            source_history = source.get('historical_configs', [])
+            for source_item in source_history if isinstance(source_history, list) else []:
+                if not isinstance(source_item, dict) or not source_item.get('username'):
+                    continue
+                identity = (
+                    str(source_item.get('server_id') or 'primary').lower(),
+                    str(source_item.get('username') or '').lower(),
+                )
+                target_item = next((
+                    item for item in target_history
+                    if isinstance(item, dict) and (
+                        str(item.get('server_id') or 'primary').lower(),
+                        str(item.get('username') or '').lower(),
+                    ) == identity
+                ), None)
+                if target_item is None:
+                    continue
+                for field in TEST_HISTORY_CLEANUP_METADATA_FIELDS:
+                    if field in source_item:
+                        target_item[field] = source_item[field]
+                    else:
+                        target_item.pop(field, None)
 
     test_config_store.update_test_configs(TEST_CONFIGS_FILE, mutate)
 
@@ -521,20 +567,7 @@ def _safe_gb(byte_count):
 
 
 def _parse_account_creation_time(value):
-    if isinstance(value, datetime):
-        return value
-    if not value:
-        return None
-
-    text = str(value).strip()
-    if not text:
-        return None
-    if text.endswith('Z'):
-        text = f"{text[:-1]}+00:00"
-    try:
-        return datetime.fromisoformat(text)
-    except (TypeError, ValueError):
-        return None
+    return parse_timestamp(value)
 
 
 def _parse_test_note_time(user_data):
@@ -549,7 +582,7 @@ def _parse_test_note_time(user_data):
 
 
 def _normalize_panel_status(value):
-    return re.sub(r'[^a-z0-9]+', ' ', str(value or '').strip().lower()).strip()
+    return normalize_panel_status(value) or ''
 
 
 def is_stale_on_hold_test(username, user_data, now=None):
@@ -579,7 +612,8 @@ def is_stale_on_hold_test(username, user_data, now=None):
     created_at = _parse_test_note_time(user_data)
     if created_at is None:
         return False
-    return (now or datetime.now()) > created_at + timedelta(days=STALE_ON_HOLD_TEST_DAYS)
+    current = parse_timestamp(now or datetime.now())
+    return bool(current and current > created_at + timedelta(days=STALE_ON_HOLD_TEST_DAYS))
 
 
 def _cleanup_eligibility_reason(username, user_data, now=None):
@@ -591,22 +625,11 @@ def _cleanup_eligibility_reason(username, user_data, now=None):
 
 
 def _expiration_deadline(user_data):
-    if not isinstance(user_data, dict):
-        return None
-    expiration_days = _safe_int(user_data.get('expiration_days'))
-    created_at = _parse_account_creation_time(user_data.get('account_creation_date'))
-    if expiration_days is None or expiration_days < 0 or created_at is None:
-        return None
-    return created_at + timedelta(days=expiration_days)
+    return panel_deadline(user_data)
 
 
 def _days_remaining(user_data, now=None):
-    expiration_days = _safe_int((user_data or {}).get('expiration_days'))
-    deadline = _expiration_deadline(user_data)
-    if deadline is None:
-        return expiration_days
-    current_date = (now or datetime.now()).date()
-    return (deadline.date() - current_date).days
+    return panel_days_remaining(user_data, now=now)
 
 
 def _state_key(server_id, username):
@@ -635,6 +658,10 @@ def _candidate_from_state_entry(entry):
         'telegram_user_id': entry.get('telegram_user_id'),
         'reseller_id': entry.get('reseller_id'),
         'cleanup_reason': entry.get('cleanup_reason'),
+        'cycle_fingerprint': entry.get('cycle_fingerprint'),
+        'issued_at': entry.get('issued_at'),
+        'entitlement_deadline': entry.get('entitlement_deadline'),
+        'last_successful_observation_at': entry.get('last_successful_observation_at'),
     }
 
 
@@ -653,33 +680,10 @@ def _is_already_missing_record(record):
 
 
 def is_user_expired(user_data, now=None):
-    if not isinstance(user_data, dict):
-        return False
-
-    if not bool(user_data.get('blocked', False)):
-        return False
-
-    expiration_days = _safe_int(user_data.get('expiration_days'))
-    if expiration_days is not None and expiration_days <= 0:
-        return True
-
-    deadline = _expiration_deadline(user_data)
-    if deadline is not None and (now or datetime.now()).date() >= deadline.date():
-        return True
-
-    max_download_bytes = _safe_bytes(user_data.get('max_download_bytes'))
-    if max_download_bytes > 0:
-        used_bytes = (
-            _safe_bytes(user_data.get('upload_bytes'))
-            + _safe_bytes(user_data.get('download_bytes'))
-        )
-        if used_bytes >= max_download_bytes:
-            return True
-
-    return False
+    return verified_panel_expired(user_data, now=now)
 
 
-def capture_last_state(user_data, now=None):
+def capture_last_state(user_data, now=None, cycle=None):
     upload_bytes = _safe_bytes(user_data.get('upload_bytes'))
     download_bytes = _safe_bytes(user_data.get('download_bytes'))
     max_download_bytes = _safe_bytes(user_data.get('max_download_bytes'))
@@ -689,9 +693,26 @@ def capture_last_state(user_data, now=None):
     if max_download_bytes > 0:
         remaining_bytes = max(0, max_download_bytes - used_bytes)
 
+    shared_state = inspect_account(user_data, cycle=cycle, now=now)
     return {
         'captured_at': _now_str(now),
         'days_remaining': _days_remaining(user_data, now=now),
+        'configured_days': shared_state.configured_days,
+        'panel_state': shared_state.panel_state.value,
+        'entitlement_state': shared_state.entitlement_state.value,
+        'normalized_state': shared_state.state,
+        'entitlement_issued_at': (
+            shared_state.entitlement_issued_at.isoformat()
+            if shared_state.entitlement_issued_at is not None
+            else None
+        ),
+        'entitlement_deadline': (
+            shared_state.entitlement_deadline.isoformat()
+            if shared_state.entitlement_deadline is not None
+            else None
+        ),
+        'entitlement_days_remaining': shared_state.entitlement_days_remaining,
+        'timer_started': shared_state.timer_started,
         'account_creation_date': user_data.get('account_creation_date'),
         'expiration_date': (
             expiration_deadline.date().isoformat()
@@ -703,10 +724,19 @@ def capture_last_state(user_data, now=None):
         'gb_used': _safe_gb(used_bytes),
         'blocked': bool(user_data.get('blocked', False)),
         'status': user_data.get('status'),
+        'normalized_status': shared_state.normalized_status,
         'upload_bytes': upload_bytes,
         'download_bytes': download_bytes,
         'max_download_bytes': max_download_bytes,
     }
+
+
+def _capture_candidate_state(candidate, user_data, now=None):
+    return capture_last_state(
+        user_data,
+        now=now,
+        cycle=(candidate or {}).get('_service_cycle'),
+    )
 
 
 def _labels_for(language):
@@ -808,7 +838,11 @@ def _cleanup_reason(entry):
         return 'missing_on_server', ADMIN_CLEANUP_REASON_LABELS['missing_on_server']
 
     cleanup_reason = str(entry.get('cleanup_reason') or '')
-    if cleanup_reason == STALE_ON_HOLD_TEST_REASON:
+    if cleanup_reason in {
+        STALE_ON_HOLD_TEST_REASON,
+        ISSUE_DEADLINE_EXPIRED_REASON,
+        SUPERSEDED_ON_HOLD_TEST_REASON,
+    }:
         return cleanup_reason, ADMIN_CLEANUP_REASON_LABELS[cleanup_reason]
 
     last_state = entry.get('last_state')
@@ -837,6 +871,7 @@ def _cleanup_record_from_state(state_key, entry, now=None):
     delete_after = entry.get('delete_after')
     if cleanup_status in {'notified', 'notification_unreachable'}:
         delete_after = _format_time(_effective_delete_after(entry)) or delete_after
+    last_state = entry.get('last_state') if isinstance(entry.get('last_state'), dict) else {}
     return {
         'state_key': state_key,
         'username': entry.get('username'),
@@ -856,6 +891,14 @@ def _cleanup_record_from_state(state_key, entry, now=None):
         'reason_code': reason_code,
         'reason': reason,
         'cleanup_reason': entry.get('cleanup_reason'),
+        'cycle_fingerprint': entry.get('cycle_fingerprint'),
+        'issued_at': entry.get('issued_at'),
+        'entitlement_deadline': entry.get('entitlement_deadline'),
+        'last_successful_observation_at': entry.get('last_successful_observation_at'),
+        'panel_state': last_state.get('panel_state'),
+        'entitlement_state': last_state.get('entitlement_state'),
+        'normalized_state': last_state.get('normalized_state'),
+        'normalized_status': last_state.get('normalized_status'),
         'manual_review_reason': entry.get('manual_review_reason'),
         'review_note': entry.get('review_note'),
         'last_state': entry.get('last_state'),
@@ -933,6 +976,21 @@ def _metadata_fields(status, now_value, notification_error=None, cleanup_error=N
         fields['cleanup_notification_error'] = notification_error
     if last_state is not None:
         fields['cleanup_last_state'] = last_state
+    return fields
+
+
+def _candidate_metadata_fields(candidate):
+    fields = {}
+    mappings = {
+        'cleanup_reason': 'cleanup_reason',
+        'cycle_fingerprint': 'cleanup_cycle_fingerprint',
+        'issued_at': 'cleanup_issued_at',
+        'entitlement_deadline': 'cleanup_entitlement_deadline',
+        'last_successful_observation_at': 'cleanup_last_successful_observation_at',
+    }
+    for source_key, target_key in mappings.items():
+        if candidate.get(source_key) is not None:
+            fields[target_key] = candidate.get(source_key)
     return fields
 
 
@@ -1027,6 +1085,23 @@ def _clear_candidate_delete_metadata(candidate, stores=None):
         return
 
     kind = ref[0]
+    if kind == 'test_history':
+        data = stores.get('test_configs') if isinstance(stores, dict) else _load_current_test_configs_for_cleanup()
+        entry = data.get(ref[1]) if isinstance(data, dict) else None
+        history = entry.get('historical_configs', []) if isinstance(entry, dict) else []
+        try:
+            historical = history[int(ref[2])]
+        except (IndexError, TypeError, ValueError):
+            historical = None
+        if isinstance(historical, dict):
+            for key in ('cleanup_deleted_at', 'cleanup_delete_result', 'cleanup_error'):
+                historical.pop(key, None)
+            if stores is not None:
+                _mark_test_ref_dirty(stores, ('test', str(ref[1])))
+            else:
+                _save_test_cleanup_metadata(data, {str(ref[1])})
+        return
+
     if kind == 'test':
         data = stores.get('test_configs') if isinstance(stores, dict) else _load_current_test_configs_for_cleanup()
         entry = data.get(ref[1]) if isinstance(data, dict) else None
@@ -1233,6 +1308,30 @@ def discover_cleanup_candidates(include_already_missing=False, include_deleted=F
                 '_record_ref': ('test', str(telegram_id)),
                 '_record_was_deleted': was_deleted,
             })
+            history = entry.get('historical_configs', [])
+            for history_index, historical in enumerate(history if isinstance(history, list) else []):
+                if not isinstance(historical, dict):
+                    continue
+                if historical.get('cleanup_reason') != SUPERSEDED_ON_HOLD_TEST_REASON:
+                    continue
+                historical_deleted = _is_deleted_record(historical)
+                if historical_deleted and not include_deleted and not (
+                    include_already_missing and _is_already_missing_record(historical)
+                ):
+                    continue
+                historical_username = str(historical.get('username') or '').strip()
+                if not historical_username:
+                    continue
+                candidates.append({
+                    'source': 'test',
+                    'username': historical_username,
+                    'server_id': historical.get('server_id'),
+                    'telegram_user_id': str(entry.get('telegram_id') or telegram_id),
+                    'cleanup_reason': SUPERSEDED_ON_HOLD_TEST_REASON,
+                    'superseded_at': historical.get('superseded_at'),
+                    '_record_ref': ('test_history', str(telegram_id), history_index),
+                    '_record_was_deleted': historical_deleted,
+                })
 
     payments = stores.get('payments') if isinstance(stores, dict) else _load_json_file(PAYMENTS_FILE, {})
     if isinstance(payments, dict):
@@ -1288,6 +1387,158 @@ def discover_cleanup_candidates(include_already_missing=False, include_deleted=F
         if existing is None or (existing.get('_record_was_deleted') and not candidate.get('_record_was_deleted')):
             deduped[key] = candidate
     return list(deduped.values())
+
+
+def _candidate_service_cycle(candidate, stores):
+    """Return the current locally owned cycle for a paid cleanup candidate."""
+    if not isinstance(candidate, dict) or not isinstance(stores, dict):
+        return None
+    source = candidate.get('source')
+    username = str(candidate.get('username') or '').strip()
+    server_id = candidate.get('server_id') or 'primary'
+    if not username or source not in {'customer', 'reseller_customer'}:
+        return None
+
+    if source == 'customer':
+        records = stores.get('payments')
+    else:
+        ref = candidate.get('_record_ref') or ()
+        if len(ref) < 3 or ref[0] != 'reseller':
+            return None
+        reseller = (stores.get('resellers') or {}).get(str(ref[1]))
+        configs = reseller.get('configs', []) if isinstance(reseller, dict) else []
+        try:
+            records = configs[int(ref[2])]
+        except (IndexError, TypeError, ValueError):
+            return None
+    return resolve_service_cycle(
+        records,
+        username=username,
+        server_id=server_id,
+        source=source,
+    )
+
+
+def _cycle_candidate_fields(candidate, cycle, now):
+    if cycle is None:
+        return dict(candidate)
+    result = {
+        **candidate,
+        'cleanup_reason': ISSUE_DEADLINE_EXPIRED_REASON,
+        'cycle_fingerprint': cycle.fingerprint,
+        'issued_at': cycle.issued_at.isoformat(),
+        'entitlement_deadline': cycle.deadline.isoformat(),
+        'last_successful_observation_at': _now_str(now),
+    }
+    if candidate.get('source') == 'customer':
+        result['_record_ref'] = ('payment', cycle.record_id)
+    return result
+
+
+def _discover_issue_deadline_candidates(local_candidates, lookup_context, stores, now):
+    """Find locally owned paid accounts past their issuance-based deadline."""
+    if not isinstance(lookup_context, dict) or lookup_context.get('unavailable'):
+        return []
+    candidates = []
+    for candidate in local_candidates or []:
+        if candidate.get('source') not in {'customer', 'reseller_customer'}:
+            continue
+        cycle = _candidate_service_cycle(candidate, stores)
+        if not is_business_expired(cycle, now=now):
+            continue
+        api_client, user_data, lookup_status = _lookup_user_from_context(
+            lookup_context,
+            candidate.get('username'),
+            preferred_server_id=candidate.get('server_id'),
+        )
+        if lookup_status != 'found':
+            continue
+        shared_state = inspect_account(user_data, cycle=cycle, now=now)
+        if shared_state.panel_state == PanelState.UNKNOWN:
+            continue
+        candidates.append({
+            **_cycle_candidate_fields(candidate, cycle, now),
+            '_service_cycle': cycle,
+            '_user_data': user_data,
+            '_lookup_status': 'found',
+            '_api_client': api_client,
+        })
+    return candidates
+
+
+def _candidate_issue_deadline_valid(candidate, stores, user_data, now):
+    cycle = _candidate_service_cycle(candidate, stores)
+    if cycle is None or not is_business_expired(cycle, now=now):
+        return False, cycle
+    expected_fingerprint = candidate.get('cycle_fingerprint')
+    if expected_fingerprint and expected_fingerprint != cycle.fingerprint:
+        return False, cycle
+    shared_state = inspect_account(user_data, cycle=cycle, now=now)
+    return shared_state.panel_state != PanelState.UNKNOWN, cycle
+
+
+def _candidate_superseded_test_valid(candidate, stores, user_data):
+    ref = candidate.get('_record_ref') or ()
+    if len(ref) < 3 or ref[0] != 'test_history' or not isinstance(stores, dict):
+        return False
+    entry = (stores.get('test_configs') or {}).get(str(ref[1]))
+    history = entry.get('historical_configs', []) if isinstance(entry, dict) else []
+    try:
+        historical = history[int(ref[2])]
+    except (IndexError, TypeError, ValueError):
+        return False
+    if not isinstance(historical, dict):
+        return False
+    if historical.get('cleanup_reason') != SUPERSEDED_ON_HOLD_TEST_REASON:
+        return False
+    current_username = str(entry.get('username') or '').strip().lower()
+    old_username = str(candidate.get('username') or '').strip().lower()
+    if not current_username or current_username == old_username:
+        return False
+    if (
+        str(historical.get('username') or '').strip().lower() != old_username
+        or str(historical.get('server_id') or 'primary').lower()
+        != str(candidate.get('server_id') or 'primary').lower()
+    ):
+        return False
+    if not isinstance(user_data, dict):
+        return False
+    note = str(user_data.get('note') or '')
+    if not RECOVERED_TEST_USERNAME_RE.fullmatch(str(candidate.get('username') or '')):
+        return False
+    if not RECOVERED_TEST_NOTE_RE.search(note):
+        return False
+    if _strict_nonnegative_int(user_data.get('expiration_days')) != TEST_ACCOUNT_EXPIRATION_DAYS:
+        return False
+    if _strict_nonnegative_int(user_data.get('max_download_bytes')) != GB_BYTES:
+        return False
+    return inspect_account(user_data).panel_state != PanelState.UNKNOWN
+
+
+def _discover_superseded_test_candidates(local_candidates, lookup_context, stores, now):
+    if not isinstance(lookup_context, dict) or lookup_context.get('unavailable'):
+        return []
+    candidates = []
+    for candidate in local_candidates or []:
+        if candidate.get('cleanup_reason') != SUPERSEDED_ON_HOLD_TEST_REASON:
+            continue
+        api_client, user_data, lookup_status = _lookup_user_from_context(
+            lookup_context,
+            candidate.get('username'),
+            preferred_server_id=candidate.get('server_id'),
+        )
+        if lookup_status != 'found' or not _candidate_superseded_test_valid(
+            candidate, stores, user_data
+        ):
+            continue
+        candidates.append({
+            **candidate,
+            '_user_data': user_data,
+            '_lookup_status': 'found',
+            '_api_client': api_client,
+            'last_successful_observation_at': _now_str(now),
+        })
+    return candidates
 
 
 def _iter_server_user_snapshots(multi_api):
@@ -1398,6 +1649,14 @@ def discover_matching_cleanup_candidates(
                     or candidate.get('cleanup_reason')
                 ),
             }
+            for field in (
+                'cycle_fingerprint',
+                'issued_at',
+                'entitlement_deadline',
+                'last_successful_observation_at',
+            ):
+                if server_candidate.get(field) is not None:
+                    candidate[field] = server_candidate.get(field)
         matched.append(candidate)
     return matched
 
@@ -1498,8 +1757,17 @@ def _owned_local_usernames(stores):
     usernames = set()
     test_configs = stores.get('test_configs') if isinstance(stores, dict) else {}
     for entry in test_configs.values() if isinstance(test_configs, dict) else []:
-        if isinstance(entry, dict) and entry.get('username'):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get('username'):
             usernames.add(str(entry['username']).strip().lower())
+        for historical in entry.get('historical_configs', []):
+            if (
+                isinstance(historical, dict)
+                and historical.get('username')
+                and historical.get('recovery_source') != 'verified_orphan_test'
+            ):
+                usernames.add(str(historical['username']).strip().lower())
 
     payments = stores.get('payments') if isinstance(stores, dict) else {}
     for entry in payments.values() if isinstance(payments, dict) else []:
@@ -1724,6 +1992,29 @@ def _update_candidate_record(candidate, fields, stores=None):
         return
 
     kind = ref[0]
+    if kind == 'test_history':
+        data = stores.get('test_configs') if isinstance(stores, dict) else _load_current_test_configs_for_cleanup()
+        entry = data.get(ref[1]) if isinstance(data, dict) else None
+        history = entry.get('historical_configs', []) if isinstance(entry, dict) else []
+        try:
+            historical = history[int(ref[2])]
+        except (IndexError, TypeError, ValueError):
+            historical = None
+        if isinstance(historical, dict):
+            expected_username = str(candidate.get('username') or '').strip().lower()
+            expected_server = str(candidate.get('server_id') or 'primary').strip().lower()
+            if (
+                str(historical.get('username') or '').strip().lower() != expected_username
+                or str(historical.get('server_id') or 'primary').strip().lower() != expected_server
+            ):
+                return
+            _apply_fields(historical, fields)
+            if stores is not None:
+                _mark_test_ref_dirty(stores, ('test', str(ref[1])))
+            else:
+                _save_test_cleanup_metadata(data, {str(ref[1])})
+        return
+
     if kind == 'test':
         data = stores.get('test_configs') if isinstance(stores, dict) else _load_current_test_configs_for_cleanup()
         entry = data.get(ref[1]) if isinstance(data, dict) else None
@@ -1893,6 +2184,10 @@ def _notify_candidate(candidate, grace_hours, last_state=None, missing=False):
         language = get_user_language(int(recipient_id))
         if candidate.get('cleanup_reason') == STALE_ON_HOLD_TEST_REASON:
             key = 'stale_test_cleanup_notice'
+        elif candidate.get('cleanup_reason') == SUPERSEDED_ON_HOLD_TEST_REASON:
+            key = 'superseded_test_cleanup_notice'
+        elif candidate.get('cleanup_reason') == ISSUE_DEADLINE_EXPIRED_REASON:
+            key = 'issue_deadline_cleanup_notice'
         else:
             key = (
                 'expired_cleanup_reseller_notice'
@@ -1972,7 +2267,96 @@ def _state_entry(candidate, now_value, grace_hours, notification_error=None, las
     }
     if candidate.get('cleanup_reason'):
         entry['cleanup_reason'] = candidate.get('cleanup_reason')
+    for field in (
+        'cycle_fingerprint',
+        'issued_at',
+        'entitlement_deadline',
+        'last_successful_observation_at',
+    ):
+        if candidate.get(field) is not None:
+            entry[field] = candidate.get(field)
     return entry
+
+
+def queue_superseded_test_cleanup(
+    telegram_user_id,
+    username,
+    server_id,
+    history_index,
+    language=None,
+    now=None,
+    multi_api=None,
+    grace_hours=EXPIRED_CLEANUP_GRACE_HOURS,
+):
+    """Queue (but never directly delete) a replaced unused test account."""
+    del language  # Recipient language is always resolved at send time.
+    current = now or datetime.now()
+    now_value = _now_str(current)
+    candidate = {
+        'source': 'test',
+        'username': str(username or '').strip(),
+        'server_id': str(server_id or '').strip(),
+        'telegram_user_id': str(telegram_user_id or ''),
+        'cleanup_reason': SUPERSEDED_ON_HOLD_TEST_REASON,
+        'last_successful_observation_at': now_value,
+        '_record_ref': ('test_history', str(telegram_user_id), int(history_index)),
+    }
+    if not candidate['username'] or not candidate['server_id'] or not candidate['telegram_user_id']:
+        return False
+
+    stores = _load_cleanup_record_stores()
+    multi_api = multi_api or MultiServerAPI()
+    api_client, user_data, lookup_status = _get_user_lookup(
+        multi_api,
+        candidate['username'],
+        preferred_server_id=candidate['server_id'],
+    )
+    if lookup_status != 'found' or not _candidate_superseded_test_valid(
+        candidate, stores, user_data
+    ):
+        return False
+    candidate['_api_client'] = api_client
+    candidate['_user_data'] = user_data
+    candidate['_lookup_status'] = 'found'
+    last_state = capture_last_state(user_data, now=current)
+    key = _state_key(candidate['server_id'], candidate['username'])
+
+    with _cleanup_lock:
+        state = _load_json_file(STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+        existing = state.get(key)
+        if isinstance(existing, dict) and existing.get('cleanup_status') not in DELETE_RESULTS:
+            return True
+        notification_error = _notify_candidate(
+            candidate,
+            grace_hours,
+            last_state=last_state,
+            missing=False,
+        )
+        state[key] = _state_entry(
+            candidate,
+            now_value,
+            grace_hours,
+            notification_error=notification_error,
+            last_state=last_state,
+        )
+        _update_candidate_record(
+            candidate,
+            {
+                **_metadata_fields(
+                    'notified',
+                    now_value,
+                    notification_error=notification_error,
+                    last_state=last_state,
+                ),
+                **_candidate_metadata_fields(candidate),
+            },
+            stores=stores,
+        )
+        _save_dirty_cleanup_record_stores(stores)
+        _save_json_file(STATE_FILE, state)
+    return True
 
 
 def _manual_review_entry(candidate, now_value, last_state=None):
@@ -2040,12 +2424,21 @@ def _mark_deleted(state, key, candidate, status, now_value, last_state=None, del
     })
     if candidate.get('cleanup_reason'):
         entry['cleanup_reason'] = candidate.get('cleanup_reason')
+    for field in (
+        'cycle_fingerprint',
+        'issued_at',
+        'entitlement_deadline',
+        'last_successful_observation_at',
+    ):
+        if candidate.get(field) is not None:
+            entry[field] = candidate.get(field)
     fields = _metadata_fields(
         status,
         now_value,
         last_state=last_state,
         delete_result=delete_result or status,
     )
+    fields.update(_candidate_metadata_fields(candidate))
     _update_candidate_record(candidate, fields, stores=stores)
 
 
@@ -2088,6 +2481,23 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
             include_already_missing=True,
             include_deleted=True,
             stores=record_stores,
+        )
+        issue_deadline_candidates = _discover_issue_deadline_candidates(
+            local_candidates,
+            lookup_context,
+            record_stores,
+            now,
+        )
+        superseded_test_candidates = _discover_superseded_test_candidates(
+            local_candidates,
+            lookup_context,
+            record_stores,
+            now,
+        )
+        server_candidates = _merge_cleanup_candidates(
+            superseded_test_candidates,
+            issue_deadline_candidates,
+            server_candidates,
         )
         _migrate_unambiguous_legacy_primary_state(state, lookup_context, local_candidates)
         state_candidates = discover_state_cleanup_candidates(state)
@@ -2146,14 +2556,43 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
                         preferred_server_id=candidate.get('server_id'),
                     )
 
-            live_cleanup_reason = (
-                _cleanup_eligibility_reason(username, user_data, now=now)
-                if lookup_status == 'found'
-                else None
-            )
+            live_cleanup_reason = None
+            if (
+                lookup_status == 'found'
+                and candidate.get('cleanup_reason') == SUPERSEDED_ON_HOLD_TEST_REASON
+                and _candidate_superseded_test_valid(candidate, record_stores, user_data)
+            ):
+                live_cleanup_reason = SUPERSEDED_ON_HOLD_TEST_REASON
+                candidate['last_successful_observation_at'] = now_value
+            if lookup_status == 'found' and candidate.get('cleanup_reason') == ISSUE_DEADLINE_EXPIRED_REASON:
+                issue_valid, current_cycle = _candidate_issue_deadline_valid(
+                    candidate,
+                    record_stores,
+                    user_data,
+                    now,
+                )
+                if issue_valid:
+                    live_cleanup_reason = ISSUE_DEADLINE_EXPIRED_REASON
+                    candidate.update(_cycle_candidate_fields(candidate, current_cycle, now))
+                    candidate['_service_cycle'] = current_cycle
+            if lookup_status == 'found' and live_cleanup_reason is None:
+                live_cleanup_reason = _cleanup_eligibility_reason(username, user_data, now=now)
             user_expired = lookup_status == 'found' and live_cleanup_reason is not None
-            if live_cleanup_reason == STALE_ON_HOLD_TEST_REASON:
+            if live_cleanup_reason in {
+                STALE_ON_HOLD_TEST_REASON,
+                ISSUE_DEADLINE_EXPIRED_REASON,
+                SUPERSEDED_ON_HOLD_TEST_REASON,
+            }:
                 candidate['cleanup_reason'] = live_cleanup_reason
+            if (
+                entry
+                and live_cleanup_reason == ISSUE_DEADLINE_EXPIRED_REASON
+                and entry.get('cycle_fingerprint')
+                and candidate.get('cycle_fingerprint') != entry.get('cycle_fingerprint')
+            ):
+                state.pop(key, None)
+                _clear_candidate_delete_metadata(candidate, stores=record_stores)
+                entry = None
             if entry and entry.get('cleanup_status') == 'deleted':
                 if not user_expired:
                     continue
@@ -2179,12 +2618,12 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
             if lookup_status == 'found' and not user_expired:
                 if entry:
                     if _is_duplicate_payment_manual_review(entry):
-                        entry['last_state'] = capture_last_state(user_data, now=now)
+                        entry['last_state'] = _capture_candidate_state(candidate, user_data, now=now)
                         entry['last_checked_at'] = now_value
                         entry.pop('cleanup_error', None)
                         continue
                     if entry.get('cleanup_status') == 'manual_review':
-                        _mark_renewed(state, key, candidate, now_value, last_state=capture_last_state(user_data, now=now))
+                        _mark_renewed(state, key, candidate, now_value, last_state=_capture_candidate_state(candidate, user_data, now=now))
                     else:
                         state.pop(key, None)
                         _update_candidate_record(
@@ -2211,7 +2650,7 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
                 continue
 
             if candidate.get('_recovered_orphan_test'):
-                last_state = capture_last_state(user_data, now=now)
+                last_state = _capture_candidate_state(candidate, user_data, now=now)
                 notification_error = _notify_candidate(
                     candidate,
                     grace_hours,
@@ -2280,7 +2719,7 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
                 continue
 
             if not entry:
-                last_state = capture_last_state(user_data, now=now) if lookup_status == 'found' else None
+                last_state = _capture_candidate_state(candidate, user_data, now=now) if lookup_status == 'found' else None
                 if candidate.get('source') == 'server_user':
                     state[key] = _manual_review_entry(candidate, now_value, last_state=last_state)
                     continue
@@ -2299,13 +2738,16 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
                 )
                 _update_candidate_record(
                     candidate,
-                    _metadata_fields('notified', now_value, notification_error=notification_error, last_state=last_state),
+                    {
+                        **_metadata_fields('notified', now_value, notification_error=notification_error, last_state=last_state),
+                        **_candidate_metadata_fields(candidate),
+                    },
                     stores=record_stores,
                 )
                 continue
 
             if entry.get('cleanup_status') == 'manual_review':
-                entry['last_state'] = capture_last_state(user_data, now=now) if lookup_status == 'found' else entry.get('last_state')
+                entry['last_state'] = _capture_candidate_state(candidate, user_data, now=now) if lookup_status == 'found' else entry.get('last_state')
                 entry['last_checked_at'] = now_value
                 entry.pop('cleanup_error', None)
                 continue
@@ -2314,7 +2756,7 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
                 entry.update(_manual_review_entry(
                     candidate,
                     now_value,
-                    last_state=capture_last_state(user_data, now=now) if lookup_status == 'found' else entry.get('last_state'),
+                    last_state=_capture_candidate_state(candidate, user_data, now=now) if lookup_status == 'found' else entry.get('last_state'),
                 ))
                 continue
 
@@ -2327,7 +2769,7 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
                 entry['cleanup_status'] = 'notified'
                 entry['last_checked_at'] = now_value
                 if entry.get('delete_result') == 'already_missing':
-                    last_state = capture_last_state(user_data, now=now)
+                    last_state = _capture_candidate_state(candidate, user_data, now=now)
                     entry['last_state'] = last_state
                     _clear_state_delete_metadata(entry)
                     _clear_candidate_delete_metadata(candidate, stores=record_stores)
@@ -2338,7 +2780,7 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
                     )
                 continue
 
-            last_state = entry.get('last_state') or capture_last_state(user_data, now=now)
+            last_state = entry.get('last_state') or _capture_candidate_state(candidate, user_data, now=now)
             entry['last_state'] = last_state
             delete_result = api_client.delete_user(username) if api_client else None
             if delete_result is None:

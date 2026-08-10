@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from telebot import types
 from utils.command import bot
 from utils.api_client import MultiServerAPI
+from utils.account_state import EntitlementState, PanelState, inspect_account, resolve_service_cycle
 from utils.edit_plans import load_plans
 from utils.translations import BUTTON_TRANSLATIONS, get_message_text, get_button_text
 from utils.language import get_user_language
@@ -60,6 +61,26 @@ def _log_renewal_unavailable(source, username, api_client, offer):
         offer.get("username") or username,
         offer.get("server_id") or getattr(api_client, "server_id", None),
         offer.get("reason"),
+    )
+
+
+def _customer_cycle(user_id, username, server_id):
+    try:
+        from utils.payment_records import load_payments
+
+        payments = load_payments()
+    except Exception:
+        return None
+    owned = {
+        str(record_id): record
+        for record_id, record in (payments or {}).items()
+        if isinstance(record, dict) and str(record.get('user_id')) == str(user_id)
+    }
+    return resolve_service_cycle(
+        owned,
+        username=username,
+        server_id=server_id,
+        source='customer',
     )
 
 
@@ -304,6 +325,7 @@ def _show_config_job(call, key):
                 message_id=call.message.message_id,
                 user_id=call.from_user.id,
                 show_cache_notice=True,
+                observation_stale=bool(getattr(multi_api, 'last_user_snapshot_cache_stale', False)),
             )
         else:
             safe_edit_message_text(
@@ -324,11 +346,18 @@ def _show_config_job(call, key):
         with MY_CONFIGS_INFLIGHT_LOCK:
             SHOW_CONFIG_INFLIGHT.discard(key)
 
-def display_config(chat_id, username, user_data, api_client, is_callback=False, message_id=None, user_id=None, show_cache_notice=False):
+def display_config(
+    chat_id,
+    username,
+    user_data,
+    api_client,
+    is_callback=False,
+    message_id=None,
+    user_id=None,
+    show_cache_notice=False,
+    observation_stale=False,
+):
     """Display user configuration details and QR code"""
-    
-    # Check if the user is blocked/expired
-    is_blocked = user_data.get('blocked', False)
     
     try:
         # Extract user statistics with default values to prevent NoneType errors
@@ -336,8 +365,18 @@ def display_config(chat_id, username, user_data, api_client, is_callback=False, 
         download_bytes = user_data.get('download_bytes', 0) or 0  # Convert None to 0
         status = user_data.get('status', 'Unknown')
         max_download_bytes = user_data.get('max_download_bytes', 0) or 0  # Convert None to 0
-        expiration_days = user_data.get('expiration_days', 0)
-        account_creation_date = user_data.get('account_creation_date', 'Unknown')
+        server_id = getattr(api_client, 'server_id', None)
+        is_test = str(username or '').lower().startswith('t')
+        cycle = None if is_test else _customer_cycle(user_id or chat_id, username, server_id)
+        shared_state = inspect_account(
+            user_data,
+            cycle=cycle,
+            available=not observation_stale,
+            stale=observation_stale,
+        )
+        is_blocked = shared_state.panel_state == PanelState.BLOCKED
+        is_expired = is_blocked or shared_state.entitlement_state == EntitlementState.EXPIRED
+        account_creation_date = user_data.get('account_creation_date') or 'Not started'
 
         # Calculate traffic with safety checks
         upload_gb = upload_bytes / (1024 ** 3)  # Convert bytes to GB
@@ -360,16 +399,66 @@ def display_config(chat_id, username, user_data, api_client, is_callback=False, 
 
         traffic_limit_display = f"{max_traffic_gb:.2f} GB" if max_traffic_gb > 0 else "Unlimited"
         
+        if shared_state.panel_state == PanelState.HOLD:
+            status_display = '⏸ On Hold — server timer starts on first connection'
+            days_display = 'Not started'
+        elif shared_state.panel_state == PanelState.CONNECTED:
+            status_display = '✅ Active'
+            days_display = (
+                str(shared_state.panel_days_remaining)
+                if shared_state.panel_days_remaining is not None else 'Unknown'
+            )
+        elif shared_state.panel_state == PanelState.BLOCKED:
+            status_display = '❌ Blocked/Expired'
+            days_display = (
+                str(shared_state.panel_days_remaining)
+                if shared_state.panel_days_remaining is not None else 'Unknown'
+            )
+        else:
+            status_display = '⚠️ Unknown — live status unavailable'
+            days_display = 'Unknown'
+
+        entitlement_line = ''
+        if cycle is not None:
+            entitlement_line = (
+                f"\n🧾 Service deadline: {cycle.deadline.isoformat()}"
+                f"\n📆 Service days remaining: {shared_state.entitlement_days_remaining}"
+            )
+        elif is_test and shared_state.panel_state == PanelState.HOLD:
+            entitlement_line = (
+                '\n🧪 Unused test: replacement can be enabled by an admin after 30 days; '
+                'stale cleanup begins after 60 days.'
+            )
+
         formatted_details = (
             f"\n🆔 Username: {username}\n"
             f"📊 Traffic Limit: {traffic_limit_display}\n"
-            f"📅 Days Remaining: {expiration_days}\n"
+            f"📅 Server Days Remaining: {days_display}\n"
             f"⏳ Creation Date: {account_creation_date}\n"
-            f"💡 Status: {'❌ Blocked/Expired' if is_blocked else '✅ Active'}\n\n"
+            f"💡 Status: {status_display}{entitlement_line}\n\n"
             f"{traffic_message}"
         )
+
+        if shared_state.panel_state == PanelState.UNKNOWN:
+            language = get_user_language(user_id or chat_id)
+            message = _append_my_configs_cache_notice(
+                f"⚠️ Live account status is unavailable. No expiry or renewal action was taken.\n{formatted_details}",
+                language,
+                show_cache_notice,
+            )
+            if is_callback:
+                safe_edit_message_text(
+                    bot,
+                    message,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    parse_mode="Markdown",
+                )
+            else:
+                safe_send_message(bot, chat_id, message, parse_mode="Markdown")
+            return
         
-        if is_blocked:
+        if is_expired:
             # User is blocked/expired
             language = get_user_language(user_id or chat_id)
             renewal_markup = None

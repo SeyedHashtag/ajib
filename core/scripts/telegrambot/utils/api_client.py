@@ -13,6 +13,10 @@ whether the target was missing or its assigned server was unavailable.
 import json
 import os
 import requests
+try:
+    from utils.account_state import PanelState, inspect_account
+except ModuleNotFoundError:  # Standalone diagnostics/tests.
+    from account_state import PanelState, inspect_account
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -564,7 +568,8 @@ class MultiServerAPI:
         self.__class__.invalidate_read_snapshot_cache()
 
     @staticmethod
-    def active_user_count(users) -> int:
+    def allocated_user_count(users) -> int:
+        """Placement load: every unblocked account, including On-hold."""
         count = 0
         if isinstance(users, dict):
             iterable = users.values()
@@ -576,6 +581,32 @@ class MultiServerAPI:
             if isinstance(user, dict) and not bool(user.get("blocked", False)):
                 count += 1
         return count
+
+    @staticmethod
+    def active_user_count(users) -> int:
+        """Backward-compatible alias for the placement allocation count."""
+        return MultiServerAPI.allocated_user_count(users)
+
+    @staticmethod
+    def account_state_counts(users) -> dict:
+        counts = {"active": 0, "hold": 0, "blocked": 0, "unknown": 0}
+        if isinstance(users, dict):
+            iterable = users.values()
+        elif isinstance(users, list):
+            iterable = users
+        else:
+            return counts
+        for user in iterable:
+            snapshot = inspect_account(user if isinstance(user, dict) else None)
+            if snapshot.panel_state == PanelState.CONNECTED:
+                counts["active"] += 1
+            elif snapshot.panel_state == PanelState.HOLD:
+                counts["hold"] += 1
+            elif snapshot.panel_state == PanelState.BLOCKED:
+                counts["blocked"] += 1
+            else:
+                counts["unknown"] += 1
+        return counts
 
     @staticmethod
     def extract_usernames(users) -> set[str]:
@@ -629,7 +660,7 @@ class MultiServerAPI:
             client = entry["client"]
             users = entry["users"]
             healthy = users is not None
-            active_count = self.active_user_count(users) if healthy else None
+            allocated_count = self.allocated_user_count(users) if healthy else None
             weight = _safe_weight(server.get("weight", 1))
             if healthy:
                 usernames.update(self.extract_usernames(users))
@@ -638,9 +669,10 @@ class MultiServerAPI:
                 "client": client,
                 "index": entry["index"],
                 "healthy": healthy,
-                "active_count": active_count,
+                "active_count": allocated_count,
+                "allocated_count": allocated_count,
                 "weight": weight,
-                "load_ratio": (active_count / weight) if healthy else None,
+                "load_ratio": (allocated_count / weight) if healthy else None,
             })
 
         return {
@@ -725,9 +757,13 @@ class MultiServerAPI:
                 if state_server_id != server_id:
                     continue
                 if state.get("healthy"):
-                    state["active_count"] = int(state.get("active_count") or 0) + 1
+                    allocated_count = int(
+                        state.get("allocated_count", state.get("active_count")) or 0
+                    ) + 1
+                    state["active_count"] = allocated_count
+                    state["allocated_count"] = allocated_count
                     weight = _safe_weight(state.get("weight", 1))
-                    state["load_ratio"] = state["active_count"] / weight
+                    state["load_ratio"] = allocated_count / weight
                 break
 
     def create_user_with_retry(
@@ -777,14 +813,22 @@ class MultiServerAPI:
             server = entry["server"]
             users = entry["users"]
             healthy = users is not None
-            active_count = self.active_user_count(users)
+            allocated_count = self.allocated_user_count(users)
+            state_counts = self.account_state_counts(users) if healthy else {
+                "active": None, "hold": None, "blocked": None, "unknown": None,
+            }
             weight = _safe_weight(server.get("weight", 1))
             statuses.append({
                 **server,
                 "index": entry["index"],
                 "healthy": healthy,
-                "active_count": active_count if healthy else None,
-                "load_ratio": (active_count / weight) if healthy else None,
+                "active_count": allocated_count if healthy else None,
+                "allocated_count": allocated_count if healthy else None,
+                "connected_count": state_counts["active"],
+                "hold_count": state_counts["hold"],
+                "blocked_count": state_counts["blocked"],
+                "unknown_count": state_counts["unknown"],
+                "load_ratio": (allocated_count / weight) if healthy else None,
             })
         return statuses
 

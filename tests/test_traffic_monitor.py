@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -69,7 +70,7 @@ def install_stubs():
     sys.modules["telebot"] = telebot_stub
 
     utils_pkg = types.ModuleType("utils")
-    utils_pkg.__path__ = []
+    utils_pkg.__path__ = [str(MODULE_PATH.parent)]
     sys.modules["utils"] = utils_pkg
 
     api_client_stub = types.ModuleType("utils.api_client")
@@ -119,7 +120,21 @@ class TrafficMonitorTests(unittest.TestCase):
         self.tmp_dir.cleanup()
 
     def run_monitor(self, users):
-        multi_api = FakeMultiServerAPI(users)
+        normalized_users = [
+            (
+                enabled,
+                username,
+                {
+                    "blocked": False,
+                    "status": "Offline",
+                    "account_creation_date": "2026-01-01T00:00:00+00:00",
+                    "expiration_days": 30,
+                    **data,
+                },
+            )
+            for enabled, username, data in users
+        ]
+        multi_api = FakeMultiServerAPI(normalized_users)
         self.monitor.MultiServerAPI = lambda: multi_api
         self.monitor.monitor_user_traffic()
         return multi_api
@@ -133,7 +148,12 @@ class TrafficMonitorTests(unittest.TestCase):
             json.dump(alerts, f)
 
     def write_reseller_config(self, reseller_id, username, days=100, customer_name="ali123"):
-        config = {"username": username, "days": days}
+        config = {
+            "username": username,
+            "server_id": "primary",
+            "days": days,
+            "timestamp": (datetime.now() - timedelta(days=95)).strftime("%Y-%m-%d %H:%M:%S"),
+        }
         if customer_name is not None:
             config["customer_name"] = customer_name
         with open(self.monitor.RESELLERS_FILE, "w") as f:
@@ -197,7 +217,7 @@ class TrafficMonitorTests(unittest.TestCase):
         self.write_reseller_config(456, "r456", days=100, customer_name="sara88")
 
         self.run_monitor([
-            (True, "r456", {"expiration_days": 5, "max_download_bytes": 0}),
+            (True, "r456", {"expiration_days": 99, "max_download_bytes": 0}),
         ])
 
         self.assertEqual(len(self.bot.sent_messages), 1)
@@ -253,6 +273,23 @@ class TrafficMonitorTests(unittest.TestCase):
         self.assertEqual(multi_api.include_disabled_calls, [False])
         self.assertEqual(self.bot.sent_messages, [])
 
+    def test_unknown_live_state_sends_no_automated_alert(self):
+        self.run_monitor([
+            (
+                True,
+                "s123",
+                {
+                    "status": "unexpected",
+                    "upload_bytes": 95 * GB,
+                    "download_bytes": 0,
+                    "max_download_bytes": 100 * GB,
+                },
+            ),
+        ])
+
+        self.assertEqual(self.bot.sent_messages, [])
+        self.assertFalse(os.path.exists(self.monitor.ALERTS_FILE))
+
     def test_regular_time_threshold_uses_payment_duration_and_reserved_renewal_action(self):
         events = []
         self.install_customer_context(
@@ -264,6 +301,7 @@ class TrafficMonitorTests(unittest.TestCase):
                     "status": "completed",
                     "plan_gb": "100",
                     "days": 30,
+                    "created_at": (datetime.now() - timedelta(days=24)).strftime("%Y-%m-%d %H:%M:%S"),
                 },
             },
             offer={
@@ -279,7 +317,7 @@ class TrafficMonitorTests(unittest.TestCase):
                 True,
                 "s123",
                 {
-                    "expiration_days": 6,
+                    "expiration_days": 29,
                     "upload_bytes": 10 * GB,
                     "download_bytes": 0,
                     "max_download_bytes": 100 * GB,
@@ -306,6 +344,7 @@ class TrafficMonitorTests(unittest.TestCase):
                 "status": "completed",
                 "plan_gb": "100",
                 "days": 30,
+                "created_at": (datetime.now() - timedelta(days=21)).strftime("%Y-%m-%d %H:%M:%S"),
             },
         }
         self.install_customer_context(payments)
@@ -322,6 +361,9 @@ class TrafficMonitorTests(unittest.TestCase):
                 },
             ),
         ])
+        payments["sale-1"]["created_at"] = (
+            datetime.now() - timedelta(days=27)
+        ).strftime("%Y-%m-%d %H:%M:%S")
         self.run_monitor([
             (
                 True,

@@ -290,6 +290,10 @@ def _collect_vpn_and_live_users(api_client_module=None) -> tuple[dict, dict]:
         "healthy": 0,
         "unhealthy": 0,
         "active_configs": 0,
+        "hold_configs": 0,
+        "blocked_expired_configs": 0,
+        "unknown_configs": 0,
+        "allocated_configs": 0,
         "servers": [],
         "error": None,
     }
@@ -303,7 +307,21 @@ def _collect_vpn_and_live_users(api_client_module=None) -> tuple[dict, dict]:
             server_id = str(server.get("id") or getattr(client, "server_id", None) or f"server{index + 1}")
             users = client.get_users()
             healthy = users is not None
-            active_count = multi_api.active_user_count(users) if healthy else None
+            allocated_count = multi_api.active_user_count(users) if healthy else None
+            if healthy and callable(getattr(multi_api, "account_state_counts", None)):
+                state_counts = multi_api.account_state_counts(users)
+                active_count = state_counts["active"]
+                hold_count = state_counts["hold"]
+                blocked_count = state_counts["blocked"]
+                unknown_count = state_counts["unknown"]
+            elif healthy:
+                active_count = allocated_count
+                hold_count = 0
+                records = list(_iter_named_user_records(users))
+                blocked_count = max(0, len(records) - active_count)
+                unknown_count = 0
+            else:
+                active_count = hold_count = blocked_count = unknown_count = None
             weight = _safe_weight(server.get("weight", 1))
             enabled = bool(server.get("enabled", True))
 
@@ -312,6 +330,10 @@ def _collect_vpn_and_live_users(api_client_module=None) -> tuple[dict, dict]:
             vpn["healthy" if healthy else "unhealthy"] += 1
             if active_count is not None:
                 vpn["active_configs"] += active_count
+                vpn["hold_configs"] += hold_count
+                vpn["blocked_expired_configs"] += blocked_count
+                vpn["unknown_configs"] += unknown_count
+                vpn["allocated_configs"] += allocated_count
 
             server_status = {
                 "id": server_id,
@@ -319,8 +341,12 @@ def _collect_vpn_and_live_users(api_client_module=None) -> tuple[dict, dict]:
                 "enabled": enabled,
                 "healthy": healthy,
                 "active_count": active_count,
+                "hold_count": hold_count,
+                "blocked_count": blocked_count,
+                "unknown_count": unknown_count,
+                "allocated_count": allocated_count,
                 "weight": weight,
-                "load_ratio": (active_count / weight) if healthy else None,
+                "load_ratio": (allocated_count / weight) if healthy else None,
             }
             vpn["servers"].append(server_status)
 
@@ -763,12 +789,19 @@ def _format_tech_section(snapshot: dict) -> list[str]:
         f"Servers: {vpn.get('configured', 0)} configured • {vpn.get('enabled', 0)} enabled • "
         f"{vpn.get('healthy', 0)} healthy • {vpn.get('unhealthy', 0)} unhealthy"
     )
-    output.append(f"Active Configs: {vpn.get('active_configs', 0)}")
+    output.append(
+        f"Configs: {vpn.get('active_configs', 0)} active • {vpn.get('hold_configs', 0)} Hold • "
+        f"{vpn.get('blocked_expired_configs', 0)} blocked/expired • {vpn.get('unknown_configs', 0)} unknown"
+    )
+    output.append(f"Allocated Capacity: {vpn.get('allocated_configs', 0)}")
     for server in _notable_servers(vpn):
         health = "healthy" if server.get("healthy") else "unhealthy"
         load_ratio = server.get("load_ratio")
         load_text = f"{load_ratio:.2f}" if load_ratio is not None else "N/A"
-        output.append(f"- {server.get('name')}: {health} • active {server.get('active_count', 'N/A')} • load {load_text}")
+        output.append(
+            f"- {server.get('name')}: {health} • active {server.get('active_count', 'N/A')} • "
+            f"Hold {server.get('hold_count', 'N/A')} • unknown {server.get('unknown_count', 'N/A')} • load {load_text}"
+        )
     if vpn.get("error"):
         output.append(f"VPN Check: error ({vpn.get('error')})")
     return output
@@ -827,7 +860,10 @@ def _format_overview_section(snapshot: dict) -> list[str]:
     output.append(f"Today Revenue: ${today_bucket.get('revenue', 0):,.2f} • {today_bucket.get('paid', 0)} paid")
     output.append(f"30d Revenue: ${last30_bucket.get('revenue', 0):,.2f} • {last30_bucket.get('paid', 0)} paid")
     output.append(f"Online Users: {_online_text(online)}")
-    output.append(f"Active Configs: {vpn.get('active_configs', 0)}")
+    output.append(
+        f"Configs: {vpn.get('active_configs', 0)} active • {vpn.get('hold_configs', 0)} Hold • "
+        f"{vpn.get('blocked_expired_configs', 0)} blocked/expired • {vpn.get('unknown_configs', 0)} unknown"
+    )
     output.append(f"New Customers: {customers.get('new_today', 0)} today • {customers.get('new_7d', 0)} 7d • {customers.get('new_30d', 0)} 30d")
     output.append(f"Returning Customers 30d: {customers.get('returning_30d', 0)}")
     output.append(f"Top Alert: {alerts[0] if alerts else 'No active alerts.'}")
@@ -890,12 +926,19 @@ def format_server_info(snapshot: dict) -> str:
         f"Servers: {vpn.get('configured', 0)} configured • {vpn.get('enabled', 0)} enabled • "
         f"{vpn.get('healthy', 0)} healthy • {vpn.get('unhealthy', 0)} unhealthy"
     )
-    output.append(f"Active Configs: {vpn.get('active_configs', 0)}")
+    output.append(
+        f"Configs: {vpn.get('active_configs', 0)} active • {vpn.get('hold_configs', 0)} Hold • "
+        f"{vpn.get('blocked_expired_configs', 0)} blocked/expired • {vpn.get('unknown_configs', 0)} unknown"
+    )
+    output.append(f"Allocated Capacity: {vpn.get('allocated_configs', 0)}")
     for server in _notable_servers(vpn):
         health = "healthy" if server.get("healthy") else "unhealthy"
         load_ratio = server.get("load_ratio")
         load_text = f"{load_ratio:.2f}" if load_ratio is not None else "N/A"
-        output.append(f"- {server.get('name')}: {health} • active {server.get('active_count', 'N/A')} • load {load_text}")
+        output.append(
+            f"- {server.get('name')}: {health} • active {server.get('active_count', 'N/A')} • "
+            f"Hold {server.get('hold_count', 'N/A')} • unknown {server.get('unknown_count', 'N/A')} • load {load_text}"
+        )
     if vpn.get("error"):
         output.append(f"VPN Check: error ({vpn.get('error')})")
     output.append("")

@@ -30,6 +30,13 @@ if __name__ == "__main__":
     bootstrap_storage(BOT_DIR)
 
 from utils.api_client import MultiServerAPI
+from utils.account_state import (
+    EntitlementState,
+    PanelState,
+    bot_timezone,
+    inspect_account,
+    resolve_service_cycle,
+)
 from utils import database
 from utils.atomic_store import locked_json, read_json
 from utils.currency_format import format_toman_amount, format_usd_amount
@@ -802,6 +809,32 @@ def _find_customer_configs(user_id):
         and str(item.get("customer_telegram_id")) == str(user_id)
         and not item.get("removed_from_vpn")
     ]
+
+
+def _hosted_service_cycle(config):
+    """Resolve the exact successful tenant/reseller issuance cycle."""
+    if not isinstance(config, dict):
+        return None
+    username = config.get("username")
+    server_id = config.get("server_id")
+    matching_records = []
+    for record in _tenant_payments().values():
+        if not isinstance(record, dict):
+            continue
+        record_username = record.get("renew_username") or record.get("username")
+        record_server = record.get("renewal_server_id") or record.get("server_id")
+        if str(record_username or "").strip().lower() != str(username or "").strip().lower():
+            continue
+        if str(record_server or "primary").strip().lower() != str(server_id or "primary").strip().lower():
+            continue
+        matching_records.append(record)
+    records = matching_records if matching_records else config
+    return resolve_service_cycle(
+        records,
+        username=username,
+        server_id=server_id,
+        source="hosted_customer",
+    )
 
 
 def _resolve_hosted_renewal_checkout(user_id, plan_id, renewal):
@@ -1720,26 +1753,52 @@ def _test_record(user_id):
 def _customer_onboarding_state(user_id):
     configs = _find_customer_configs(user_id)
     if configs:
-        any_active = False
+        states = set()
         for config in configs:
             client, live = MultiServerAPI().find_user(
                 config.get("username"),
                 preferred_server_id=config.get("server_id"),
             )
             if not client or not live:
+                states.add("unknown")
                 continue
-            remaining_time = int(live.get("expiration_days", 0) or 0) > 0
+            cycle = _hosted_service_cycle(config)
+            account = inspect_account(live, cycle=cycle, source="hosted_onboarding")
             maximum = float(live.get("max_download_bytes", 0) or 0)
             used = float(live.get("upload_bytes", 0) or 0) + float(live.get("download_bytes", 0) or 0)
             remaining_traffic = maximum <= 0 or used < maximum
-            if remaining_time and remaining_traffic:
-                any_active = True
-                break
-        return ("paid" if any_active else "expired"), configs
+            if account.panel_state == PanelState.UNKNOWN or account.entitlement_state == EntitlementState.UNKNOWN:
+                states.add("unknown")
+            elif (
+                account.panel_state == PanelState.BLOCKED
+                or account.entitlement_state == EntitlementState.EXPIRED
+                or not remaining_traffic
+            ):
+                states.add("expired")
+            elif account.panel_state == PanelState.HOLD:
+                states.add("paid_hold")
+            else:
+                states.add("paid")
+        for state in ("paid", "paid_hold", "unknown", "expired"):
+            if state in states:
+                return state, configs
+        return "unknown", configs
     test = _test_record(user_id)
     if test.get("used_at"):
-        connected = bool(_journey_state(user_id).get("trial_connected_at"))
-        return ("trial_active" if connected else "trial"), test
+        client, live = MultiServerAPI().find_user(
+            test.get("username"),
+            preferred_server_id=test.get("server_id"),
+        )
+        if not client or not live:
+            return "unknown", test
+        account = inspect_account(live, source="hosted_test_onboarding")
+        if account.panel_state == PanelState.HOLD:
+            return "trial", test
+        if account.panel_state == PanelState.CONNECTED:
+            return "trial_active", test
+        if account.panel_state == PanelState.UNKNOWN:
+            return "unknown", test
+        return "expired", test
     return "new", None
 
 
@@ -1752,24 +1811,39 @@ def _send_onboarding(chat_id, user_id, reply_to=None):
         "trial": "welcome_trial",
         "trial_active": "welcome_trial_active",
         "paid": "welcome_paid",
+        "paid_hold": "welcome_paid_hold",
+        "unknown": "welcome_unknown",
         "expired": "welcome_expired",
     }[state]
     text = _hosted_message(user_id, state_key)
+    if state == "paid_hold" and isinstance(detail, list):
+        for config in detail:
+            cycle = _hosted_service_cycle(config)
+            if cycle is None:
+                continue
+            text += "\n" + _hosted_message(
+                user_id,
+                "paid_hold_deadline",
+                username=config.get("username"),
+                deadline=cycle.deadline.astimezone(bot_timezone()).strftime("%Y-%m-%d %H:%M"),
+            )
     if state == "trial_active" and isinstance(detail, dict) and detail.get("username"):
         _client, live = MultiServerAPI().find_user(
             detail.get("username"),
             preferred_server_id=detail.get("server_id"),
         )
         if live:
+            account = inspect_account(live, source="hosted_test_onboarding")
             maximum = float(live.get("max_download_bytes", 0) or 0)
             used = float(live.get("upload_bytes", 0) or 0) + float(live.get("download_bytes", 0) or 0)
             remaining_gb = max(0.0, maximum - used) / (1024 ** 3) if maximum > 0 else 0.0
-            text += "\n\n" + _hosted_message(
-                user_id,
-                "trial_remaining",
-                days=max(0, int(live.get("expiration_days", 0) or 0)),
-                gb=f"{remaining_gb:.1f}",
-            )
+            if account.panel_days_remaining is not None:
+                text += "\n\n" + _hosted_message(
+                    user_id,
+                    "trial_remaining",
+                    days=account.panel_days_remaining,
+                    gb=f"{remaining_gb:.1f}",
+                )
     if custom_welcome:
         text = f"{custom_welcome}\n\n{text}"
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -1795,7 +1869,7 @@ def _send_onboarding(chat_id, user_id, reply_to=None):
             _hosted_message(user_id, "see_plans"),
             callback_data="hb:plans",
         ))
-    elif state == "expired":
+    elif state == "expired" and isinstance(detail, list):
         markup.add(types.InlineKeyboardButton(
             _hosted_message(user_id, "renew_action"),
             callback_data="hb:renewcfg:0",
@@ -4290,14 +4364,29 @@ def _customer_notification_monitor():
                         ),
                         None,
                     )
-                    expiration = int(live.get("expiration_days", 0) or 0)
-                    cycle = str(config.get("timestamp") or config.get("retail_order_id") or "initial")
-                    if expiration <= 0:
+                    service_cycle = _hosted_service_cycle(config)
+                    account = inspect_account(
+                        live,
+                        cycle=service_cycle,
+                        source="hosted_notification",
+                    )
+                    if (
+                        account.panel_state == PanelState.UNKNOWN
+                        or account.entitlement_state == EntitlementState.UNKNOWN
+                    ):
+                        continue
+                    expiration = account.entitlement_days_remaining
+                    cycle_marker = service_cycle.fingerprint
+                    is_expired = (
+                        account.panel_state == PanelState.BLOCKED
+                        or account.entitlement_state == EntitlementState.EXPIRED
+                    )
+                    if is_expired:
                         from utils.renewal import find_reseller_reservation
 
                         if find_reseller_reservation(config):
                             continue
-                    if expiration <= 0 and sent.get(f"expired:{username}") != cycle:
+                    if is_expired and sent.get(f"expired:{username}") != cycle_marker:
                         markup = types.InlineKeyboardMarkup()
                         if customer_index is not None:
                             markup.add(types.InlineKeyboardButton(
@@ -4310,21 +4399,21 @@ def _customer_notification_monitor():
                             parse_mode="Markdown",
                             reply_markup=markup,
                         )
-                        sent[f"expired:{username}"] = cycle
-                    if expiration <= 0:
+                        sent[f"expired:{username}"] = cycle_marker
+                    if is_expired:
                         continue
                     maximum = float(live.get("max_download_bytes", 0) or 0)
                     used = float(live.get("upload_bytes", 0) or 0) + float(live.get("download_bytes", 0) or 0)
                     progress = []
                     if maximum > 0:
                         progress.append((int((used / maximum) * 100), "traffic"))
-                    plan_days = int(config.get("days", 0) or 0)
-                    if plan_days > 0 and expiration > 0:
+                    plan_days = service_cycle.duration_days
+                    if plan_days > 0 and expiration is not None:
                         progress.append((int((1 - min(expiration, plan_days) / plan_days) * 100), "time"))
                     percent, basis = max(progress, default=(0, "traffic"), key=lambda item: item[0])
                     percent = max(0, min(100, percent))
                     threshold = 90 if percent >= 90 else 80 if percent >= 80 else None
-                    alert_key = f"allowance:{username}:{cycle}"
+                    alert_key = f"allowance:{username}:{cycle_marker}"
                     if threshold and int(sent.get(alert_key, 0) or 0) < threshold:
                         markup = types.InlineKeyboardMarkup()
                         if customer_index is not None:
@@ -4349,7 +4438,7 @@ def _customer_notification_monitor():
                             "renewal_prompted",
                             user_id,
                             plan=config.get("plan_gb") or config.get("gb"),
-                            deduplication_key=f"hosted-renewal-alert:{OWNER_ID}:{username}:{cycle}:{threshold}",
+                            deduplication_key=f"hosted-renewal-alert:{OWNER_ID}:{username}:{cycle_marker}:{threshold}",
                         )
         except Exception as error:
             print(f"Hosted notification monitor failed for reseller {OWNER_ID}: {type(error).__name__}", flush=True)

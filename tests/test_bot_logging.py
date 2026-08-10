@@ -332,6 +332,10 @@ class AdminLogButtonTests(unittest.TestCase):
         )
         sys.modules["telebot"] = telebot_stub
 
+        utils_pkg = types.ModuleType("utils")
+        utils_pkg.__path__ = [str(COMMON_PATH.parent)]
+        sys.modules["utils"] = utils_pkg
+
         spec = importlib.util.spec_from_file_location("common_under_test", COMMON_PATH)
         common = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = common
@@ -344,7 +348,7 @@ class AdminLogButtonTests(unittest.TestCase):
             sys.modules.pop(name, None)
 
         utils_pkg = types.ModuleType("utils")
-        utils_pkg.__path__ = []
+        utils_pkg.__path__ = [str(COMMON_PATH.parent)]
         sys.modules["utils"] = utils_pkg
 
         bot = types.SimpleNamespace(

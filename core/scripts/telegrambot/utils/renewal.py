@@ -4,6 +4,15 @@ import os
 import uuid
 from datetime import datetime, timedelta
 
+from utils.account_state import (
+    inspect_account,
+    is_business_expired,
+    panel_deadline,
+    panel_days_remaining,
+    parse_timestamp,
+    resolve_service_cycle,
+    verified_panel_expired,
+)
 from utils.atomic_store import locked_json, read_json, write_json
 
 
@@ -66,38 +75,15 @@ def _gb_from_bytes(byte_count):
 
 
 def _parse_account_creation_time(value):
-    if isinstance(value, datetime):
-        return value
-    if not value:
-        return None
-
-    text = str(value).strip()
-    if not text:
-        return None
-    if text.endswith('Z'):
-        text = f"{text[:-1]}+00:00"
-    try:
-        return datetime.fromisoformat(text)
-    except (TypeError, ValueError):
-        return None
+    return parse_timestamp(value)
 
 
 def _expiration_deadline(user_data):
-    if not isinstance(user_data, dict):
-        return None
-    expiration_days = _safe_int(user_data.get('expiration_days'))
-    created_at = _parse_account_creation_time(user_data.get('account_creation_date'))
-    if expiration_days is None or expiration_days < 0 or created_at is None:
-        return None
-    return created_at + timedelta(days=expiration_days)
+    return panel_deadline(user_data)
 
 
 def _days_remaining(user_data, now=None):
-    expiration_days = _safe_int((user_data or {}).get('expiration_days'))
-    deadline = _expiration_deadline(user_data)
-    if deadline is None:
-        return expiration_days
-    return (deadline.date() - (now or datetime.now()).date()).days
+    return panel_days_remaining(user_data, now=now)
 
 
 def _now_str():
@@ -181,7 +167,7 @@ def _escape_markdown(value):
     return text
 
 
-def capture_user_state(user_data, now=None):
+def capture_user_state(user_data, now=None, cycle=None):
     user_data = user_data or {}
     upload_bytes = _safe_bytes(user_data.get('upload_bytes'))
     download_bytes = _safe_bytes(user_data.get('download_bytes'))
@@ -191,6 +177,7 @@ def capture_user_state(user_data, now=None):
     if max_download_bytes > 0:
         remaining_bytes = max(0, max_download_bytes - used_bytes)
 
+    shared_state = inspect_account(user_data, cycle=cycle, now=now)
     return {
         'captured_at': _now_str(),
         'account_creation_date': user_data.get('account_creation_date'),
@@ -201,6 +188,20 @@ def capture_user_state(user_data, now=None):
             else None
         ),
         'days_remaining': _days_remaining(user_data, now=now),
+        'configured_days': shared_state.configured_days,
+        'panel_state': shared_state.panel_state.value,
+        'entitlement_state': shared_state.entitlement_state.value,
+        'normalized_state': shared_state.state,
+        'entitlement_issued_at': (
+            shared_state.entitlement_issued_at.isoformat()
+            if shared_state.entitlement_issued_at else None
+        ),
+        'entitlement_deadline': (
+            shared_state.entitlement_deadline.isoformat()
+            if shared_state.entitlement_deadline else None
+        ),
+        'entitlement_days_remaining': shared_state.entitlement_days_remaining,
+        'cycle_fingerprint': shared_state.cycle_fingerprint,
         'gb_remaining': _gb_from_bytes(remaining_bytes),
         'gb_limit': _gb_from_bytes(max_download_bytes) if max_download_bytes > 0 else None,
         'gb_used': _gb_from_bytes(used_bytes),
@@ -227,26 +228,7 @@ def expected_after_state(plan_gb, days):
 
 
 def is_user_expired(user_data, now=None):
-    if not isinstance(user_data, dict):
-        return False
-    if not bool(user_data.get('blocked', False)):
-        return False
-
-    expiration_days = _safe_int(user_data.get('expiration_days'))
-    if expiration_days is not None and expiration_days <= 0:
-        return True
-
-    deadline = _expiration_deadline(user_data)
-    if deadline is not None and (now or datetime.now()).date() >= deadline.date():
-        return True
-
-    max_download_bytes = _safe_bytes(user_data.get('max_download_bytes'))
-    if max_download_bytes > 0:
-        used_bytes = _safe_bytes(user_data.get('upload_bytes')) + _safe_bytes(user_data.get('download_bytes'))
-        if used_bytes >= max_download_bytes:
-            return True
-
-    return False
+    return verified_panel_expired(user_data, now=now)
 
 
 def _is_deleted_record(record):
@@ -381,6 +363,7 @@ def _build_offer(
     reseller_data=None,
     allow_reservation=False,
     lookup_result=None,
+    cycle_records=None,
 ):
     if not api_client or not user_data:
         return {
@@ -391,7 +374,14 @@ def _build_offer(
             'server_id': server_id,
         }
 
-    expired = is_user_expired(user_data)
+    cycle = resolve_service_cycle(
+        cycle_records if cycle_records is not None else record,
+        username=username,
+        server_id=server_id or getattr(api_client, 'server_id', None),
+        source=source,
+    )
+    business_expired = is_business_expired(cycle)
+    expired = is_user_expired(user_data) or business_expired
     if not expired and (not allow_reservation or bool(user_data.get('blocked', False))):
         return {
             'eligible': False,
@@ -399,7 +389,7 @@ def _build_offer(
             'source': source,
             'username': username,
             'server_id': server_id,
-            'before_state': capture_user_state(user_data),
+            'before_state': capture_user_state(user_data, cycle=cycle),
         }
 
     plan, reason = _plan_for_record(record, plans, source)
@@ -410,7 +400,7 @@ def _build_offer(
             'source': source,
             'username': username,
             'server_id': server_id,
-            'before_state': capture_user_state(user_data),
+            'before_state': capture_user_state(user_data, cycle=cycle),
         }
 
     plan_gb = str(record.get('plan_gb') if record.get('plan_gb') is not None else record.get('gb'))
@@ -421,7 +411,7 @@ def _build_offer(
             'source': source,
             'username': username,
             'server_id': server_id,
-            'before_state': capture_user_state(user_data),
+            'before_state': capture_user_state(user_data, cycle=cycle),
         }
 
     full_price = _safe_float(plan.get('price'))
@@ -453,9 +443,12 @@ def _build_offer(
         'reseller_level': reseller_level,
         'discount_percent': discount_percent,
         'plan': plan,
-        'before_state': capture_user_state(user_data),
+        'before_state': capture_user_state(user_data, cycle=cycle),
         'expected_after_state': expected_after_state(plan_gb, plan.get('days')),
         'renewal_mode': 'immediate' if expired else 'reserved',
+        'business_expired': business_expired,
+        'cycle_fingerprint': cycle.fingerprint if cycle else None,
+        'entitlement_deadline': cycle.deadline.isoformat() if cycle else None,
     }
     if extra:
         offer.update(extra)
@@ -546,8 +539,28 @@ def find_customer_renewal_offer(
             'server_id': server_id or getattr(api_client, 'server_id', None),
             'reservation': existing_reservation,
         }
+    matching_records = _matching_customer_records(
+        user_id,
+        username=username,
+        server_id=server_id,
+        payments=payments,
+    )
+    cycle_records = {record_id: record for record_id, record in matching_records}
+    current_cycle = resolve_service_cycle(
+        cycle_records,
+        username=username,
+        server_id=server_id or getattr(api_client, 'server_id', None),
+        source='customer',
+    )
+    if current_cycle is not None:
+        matching_records = [
+            (record_id, record)
+            for record_id, record in matching_records
+            if record_id == current_cycle.record_id
+        ]
+
     first_ineligible_offer = None
-    for record_id, record in _matching_customer_records(user_id, username=username, server_id=server_id, payments=payments):
+    for record_id, record in matching_records:
         record_username = _record_username(record)
         record_server_id = _record_server_id(record) or server_id or getattr(api_client, 'server_id', None)
         token = customer_renewal_token(user_id, record_id, record_username, record_server_id)
@@ -565,6 +578,7 @@ def find_customer_renewal_offer(
                 'base_record': record,
             },
             allow_reservation=allow_reservation,
+            cycle_records=cycle_records,
         )
         if offer.get('eligible'):
             return offer
@@ -594,11 +608,33 @@ def resolve_customer_renewal_token(
 
     multi_api = multi_api or MultiServerAPI()
     payments = payments if payments is not None else _load_json_file(PAYMENTS_FILE, {})
-    for record_id, record in _matching_customer_records(user_id, payments=payments):
+    matching_records = _matching_customer_records(user_id, payments=payments)
+    for record_id, record in matching_records:
         username = _record_username(record)
         server_id = _record_server_id(record)
         if customer_renewal_token(user_id, record_id, username, server_id) != token:
             continue
+        exact_records = {
+            candidate_id: candidate
+            for candidate_id, candidate in matching_records
+            if _record_username(candidate).lower() == username.lower()
+            and str(_record_server_id(candidate) or 'primary').lower()
+            == str(server_id or 'primary').lower()
+        }
+        current_cycle = resolve_service_cycle(
+            exact_records,
+            username=username,
+            server_id=server_id,
+            source='customer',
+        )
+        if current_cycle is not None and current_cycle.record_id != record_id:
+            return {
+                'eligible': False,
+                'reason': 'renewal_ineligible_cycle_changed',
+                'source': 'customer',
+                'username': username,
+                'server_id': server_id,
+            }
         api_client, user_data, lookup_result = lookup_renewal_user(
             multi_api,
             username,
@@ -619,6 +655,7 @@ def resolve_customer_renewal_token(
             },
             allow_reservation=allow_reservation,
             lookup_result=lookup_result,
+            cycle_records=exact_records,
         )
     return {'eligible': False, 'reason': 'renewal_ineligible_missing', 'source': 'customer'}
 
@@ -732,6 +769,9 @@ def customer_payment_metadata(offer):
         'renewal_base_record_id': offer.get('base_record_id'),
         'renewal_before_state': offer.get('before_state'),
         'renewal_mode': offer.get('renewal_mode', 'immediate'),
+        'renewal_business_expired': bool(offer.get('business_expired')),
+        'renewal_cycle_fingerprint': offer.get('cycle_fingerprint'),
+        'renewal_entitlement_deadline': offer.get('entitlement_deadline'),
         'renewal_plan_snapshot': {
             'plan_gb': offer.get('plan_gb'),
             'days': offer.get('days'),
@@ -758,6 +798,9 @@ def reseller_renewal_record(offer, before_state, after_state):
         'before_state': before_state,
         'after_state': after_state,
         'renewal_mode': offer.get('renewal_mode', 'immediate'),
+        'renewal_business_expired': bool(offer.get('business_expired')),
+        'renewal_cycle_fingerprint': offer.get('cycle_fingerprint'),
+        'renewal_entitlement_deadline': offer.get('entitlement_deadline'),
     }
 
 
@@ -1169,7 +1212,7 @@ def process_payment_renewal_reservation(
             'result': result,
         }
 
-    finish_payment_renewal(
+    persisted = finish_payment_renewal(
         payment_id,
         claim['claim_id'],
         'applied',
@@ -1182,6 +1225,8 @@ def process_payment_renewal_reservation(
             'server_id': result.get('server_id'),
         },
     )
+    if persisted:
+        mark_cleanup_state_renewed(result.get('username'), result.get('server_id'))
     return {
         'payment_id': str(payment_id),
         'status': 'applied',
@@ -1334,7 +1379,7 @@ def process_reseller_renewal_reservation(
             'result': result,
         }
 
-    finish_reseller_renewal_reservation(
+    persisted = finish_reseller_renewal_reservation(
         reseller_id,
         reservation_id,
         claim['claim_id'],
@@ -1345,6 +1390,8 @@ def process_reseller_renewal_reservation(
             'after_state': result.get('after_state'),
         },
     )
+    if persisted:
+        mark_cleanup_state_renewed(result.get('username'), result.get('server_id'))
     return {
         'reservation_id': str(reservation_id),
         'reseller_id': str(reseller_id),
@@ -1355,7 +1402,7 @@ def process_reseller_renewal_reservation(
     }
 
 
-def _mark_cleanup_state_renewed(username, server_id):
+def mark_cleanup_state_renewed(username, server_id):
     key = _state_key(server_id, username)
     try:
         with locked_json(STATE_FILE, {}) as state:
@@ -1389,6 +1436,8 @@ def _execute_reset(
     multi_api=None,
     require_expired=True,
     validate_plan=True,
+    business_expired=False,
+    clear_cleanup=True,
 ):
     from utils.api_client import MultiServerAPI
 
@@ -1406,7 +1455,7 @@ def _execute_reset(
         }
 
     before_state = capture_user_state(user_data)
-    if require_expired and not is_user_expired(user_data):
+    if require_expired and not (is_user_expired(user_data) or business_expired):
         return {'success': False, 'reason': 'renewal_ineligible_not_expired', 'before_state': before_state}
 
     if validate_plan and not _live_quota_matches_plan(
@@ -1439,7 +1488,8 @@ def _execute_reset(
 
     after_user = api_client.get_user(username) or user_data
     after_state = capture_user_state(after_user)
-    _mark_cleanup_state_renewed(username, server_id or getattr(api_client, 'server_id', None))
+    if clear_cleanup:
+        mark_cleanup_state_renewed(username, server_id or getattr(api_client, 'server_id', None))
 
     return {
         'success': True,
@@ -1465,7 +1515,14 @@ def execute_customer_renewal(payment_record, plans=None, multi_api=None):
     if reason:
         return {'success': False, 'reason': reason}
 
-    result = _execute_reset(username, server_id, payment_record, 'customer', multi_api=multi_api)
+    result = _execute_reset(
+        username,
+        server_id,
+        payment_record,
+        'customer',
+        multi_api=multi_api,
+        business_expired=bool(payment_record.get('renewal_business_expired')),
+    )
     if result.get('success'):
         _mark_payment_record_renewed(payment_record.get('renewal_base_record_id'), result.get('after_state'))
         _record_renewal_completed(payment_record, result, 'customer')
@@ -1483,6 +1540,8 @@ def execute_reseller_renewal(offer, multi_api=None):
         {'gb': offer.get('plan_gb')},
         'reseller_customer',
         multi_api=multi_api,
+        business_expired=bool(offer.get('business_expired')),
+        clear_cleanup=False,
     )
     if result.get('success'):
         _record_renewal_completed(offer, result, 'reseller_customer')
@@ -1509,6 +1568,7 @@ def execute_reserved_renewal(record, multi_api=None, force=False):
         multi_api=multi_api,
         require_expired=not force,
         validate_plan=not (force or record.get('renewal_reviewed_at')),
+        clear_cleanup=False,
     )
     if result.get('success') and record.get('renewal_base_record_id'):
         _mark_payment_record_renewed(record.get('renewal_base_record_id'), result.get('after_state'))

@@ -128,8 +128,17 @@ def install_common_stubs(bot, payment_records):
     sys.modules["dotenv"] = types.SimpleNamespace(load_dotenv=lambda *args, **kwargs: None)
 
     utils_pkg = types.ModuleType("utils")
-    utils_pkg.__path__ = []
+    utils_pkg.__path__ = [str(RESELLER_HANDLERS_PATH.parent)]
     sys.modules["utils"] = utils_pkg
+
+    # Keep isolated purchase-flow tests on their explicit in-memory fallbacks.
+    # Otherwise a privileged test process can create production-shaped state
+    # under /etc/ajib and leak checkout/disclosure data between tests.
+    atomic_store_stub = types.ModuleType("utils.atomic_store")
+    atomic_store_stub.locked_json = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        ImportError("repository storage is unavailable in this isolated test")
+    )
+    sys.modules["utils.atomic_store"] = atomic_store_stub
 
     command_stub = types.ModuleType("utils.command")
     command_stub.bot = bot

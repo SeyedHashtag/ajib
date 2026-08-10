@@ -27,6 +27,13 @@ from utils.reseller import (
 )
 from utils.edit_plans import load_plans
 from utils.api_client import APIClient, MultiServerAPI
+from utils.account_state import (
+    EntitlementState,
+    PanelState,
+    inspect_account,
+    remaining_full_days,
+    resolve_service_cycle,
+)
 from utils.payments import CryptoPayment
 from utils.payment_records import (
     add_payment_record,
@@ -308,12 +315,7 @@ def _has_active_purchased_config(user_id):
     def _is_active_paid(username, config_data):
         if not username or not any(pattern.match(username) for pattern in paid_patterns):
             return False
-        if bool(config_data.get('blocked', False)):
-            return False
-        try:
-            return int(config_data.get('expiration_days', 0) or 0) > 0
-        except (TypeError, ValueError):
-            return False
+        return inspect_account(config_data).panel_state == PanelState.CONNECTED
 
     for _, username, config_data in _iter_active_reseller_request_users(multi_api):
         if _is_active_paid(username, config_data or {}):
@@ -1435,12 +1437,16 @@ def handle_reseller_levels(call):
 RESELLER_CUSTOMERS_PAGE_SIZE = 5
 RESELLER_CUSTOMERS_CACHE_TTL_SECONDS_DEFAULT = 60
 RESELLER_CUSTOMER_LOW_THRESHOLD = 80
-RESELLER_CUSTOMER_CATEGORY_ORDER = ("active", "low_days", "low_gb", "expired", "deleted")
+RESELLER_CUSTOMER_CATEGORY_ORDER = (
+    "active", "hold", "low_days", "low_gb", "expired", "unknown", "deleted"
+)
 RESELLER_CUSTOMER_CATEGORY_ICONS = {
     "active": "✅",
+    "hold": "⏸",
     "low_days": "📅",
     "low_gb": "📊",
     "expired": "⌛",
+    "unknown": "⚠️",
     "deleted": "🗑",
 }
 
@@ -1571,18 +1577,29 @@ def _traffic_usage_percent(user_config):
 
 
 def _days_usage_percent(cfg, user_config):
-    total_days = _safe_int(cfg.get("days"), 0)
-    expiration_days = _safe_int(user_config.get("expiration_days"), 0)
-    if total_days <= 0:
+    cycle = resolve_service_cycle(
+        cfg,
+        username=cfg.get('username'),
+        server_id=cfg.get('server_id'),
+        source='reseller_customer',
+    )
+    if cycle is None or cycle.duration_days <= 0:
         return 0
-    days_used = max(0, total_days - expiration_days)
-    return (days_used / total_days) * 100
+    remaining = remaining_full_days(cycle.deadline)
+    days_used = max(0, cycle.duration_days - (remaining or 0))
+    return (days_used / cycle.duration_days) * 100
 
 
-def _is_customer_expired(user_config):
+def _is_customer_expired(user_config, cfg=None):
     if bool(user_config.get("blocked", False)):
         return True
-    if _safe_int(user_config.get("expiration_days"), 0) <= 0:
+    cycle = resolve_service_cycle(
+        cfg,
+        username=(cfg or {}).get('username'),
+        server_id=(cfg or {}).get('server_id'),
+        source='reseller_customer',
+    ) if isinstance(cfg, dict) else None
+    if inspect_account(user_config, cycle=cycle).entitlement_state == EntitlementState.EXPIRED:
         return True
     max_download_bytes = user_config.get("max_download_bytes", 0) or 0
     if max_download_bytes > 0:
@@ -1608,15 +1625,35 @@ def _categorize_reseller_customers(configs, force_refresh=False):
 
         if not user_config:
             if server_id and server_id in unavailable_server_ids:
-                enriched["_status_category"] = "active"
+                enriched["_status_category"] = "unknown"
                 enriched["_status_note"] = "status_unavailable"
-                categorized["active"].append(enriched)
+                categorized["unknown"].append(enriched)
             else:
                 enriched["_status_category"] = "deleted"
                 categorized["deleted"].append(enriched)
             continue
 
-        if _is_customer_expired(user_config):
+        cycle = resolve_service_cycle(
+            cfg,
+            username=username,
+            server_id=server_id,
+            source='reseller_customer',
+        )
+        snapshot = inspect_account(user_config, cycle=cycle)
+        enriched['_account_state'] = snapshot.to_dict()
+
+        if snapshot.panel_state == PanelState.HOLD:
+            enriched["_status_category"] = "hold"
+            categorized["hold"].append(enriched)
+            continue
+
+        if snapshot.panel_state == PanelState.UNKNOWN:
+            enriched["_status_category"] = "unknown"
+            enriched["_status_note"] = "status_unavailable"
+            categorized["unknown"].append(enriched)
+            continue
+
+        if _is_customer_expired(user_config, cfg=cfg):
             enriched["_status_category"] = "expired"
             categorized["expired"].append(enriched)
             continue
@@ -2055,11 +2092,25 @@ def _render_reseller_customer_config_job(
         return
 
     # Extract stats
-    is_blocked = bool(user_config.get('blocked', False))
+    cycle = resolve_service_cycle(
+        matched_config,
+        username=username,
+        server_id=preferred_server_id,
+        source='reseller_customer',
+    )
+    shared_state = inspect_account(user_config, cycle=cycle)
+    is_blocked = shared_state.panel_state == PanelState.BLOCKED
+    is_expired = is_blocked or shared_state.entitlement_state == EntitlementState.EXPIRED
     upload_bytes = user_config.get('upload_bytes', 0) or 0
     download_bytes = user_config.get('download_bytes', 0) or 0
     max_download_bytes = user_config.get('max_download_bytes', 0) or 0
-    expiration_days = user_config.get('expiration_days', 0)
+    expiration_days = (
+        shared_state.entitlement_days_remaining
+        if cycle is not None
+        else shared_state.panel_days_remaining
+    )
+    if expiration_days is None:
+        expiration_days = get_message_text(language, "value_unknown")
     account_creation_date = (
         user_config.get('account_creation_date')
         or get_message_text(language, "value_not_available")
@@ -2092,10 +2143,15 @@ def _render_reseller_customer_config_job(
             status=status,
         )
 
-    account_status = get_message_text(
-        language,
-        "reseller_config_status_blocked" if is_blocked else "reseller_config_status_active",
-    )
+    if shared_state.panel_state == PanelState.HOLD:
+        account_status = get_message_text(language, "reseller_config_status_hold")
+    elif shared_state.panel_state == PanelState.UNKNOWN:
+        account_status = get_message_text(language, "reseller_customer_status_unavailable")
+    else:
+        account_status = get_message_text(
+            language,
+            "reseller_config_status_blocked" if is_expired else "reseller_config_status_active",
+        )
     formatted_details = get_message_text(language, "reseller_config_live_details").format(
         username=username,
         traffic_limit=traffic_limit_display,
@@ -2105,7 +2161,18 @@ def _render_reseller_customer_config_job(
         traffic_message=traffic_message,
     )
 
-    if is_blocked:
+    if shared_state.panel_state == PanelState.UNKNOWN:
+        safe_edit_message_text(
+            bot,
+            formatted_details,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=back_markup,
+            parse_mode="Markdown",
+        )
+        return
+
+    if is_expired:
         expired_markup = back_markup
         renewal_unavailable_message = None
         if matched_config_index is not None and _is_reseller_suspended(reseller_data):
@@ -2475,7 +2542,12 @@ def _process_reseller_renewal_confirm_job(call, user_id, language, token):
         )
         return
 
-    from utils.renewal import execute_reseller_renewal, format_renewal_success, reseller_renewal_record
+    from utils.renewal import (
+        execute_reseller_renewal,
+        format_renewal_success,
+        mark_cleanup_state_renewed,
+        reseller_renewal_record,
+    )
     from utils.reseller import add_reseller_renewal_debt
 
     result = execute_reseller_renewal(offer)
@@ -2509,6 +2581,8 @@ def _process_reseller_renewal_confirm_job(call, user_id, language, token):
             parse_mode="Markdown",
         )
         return
+
+    mark_cleanup_state_renewed(offer.get('username'), offer.get('server_id'))
 
     api_client = result.get('api_client')
     user_uri_data = api_client.get_user_uri(offer.get('username')) if api_client else None

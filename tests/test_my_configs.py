@@ -152,7 +152,7 @@ def install_stubs():
     sys.modules["dotenv"] = types.SimpleNamespace(load_dotenv=lambda *args, **kwargs: None)
 
     utils_pkg = types.ModuleType("utils")
-    utils_pkg.__path__ = []
+    utils_pkg.__path__ = [str(MODULE_PATH.parent)]
     sys.modules["utils"] = utils_pkg
 
     command_stub = types.ModuleType("utils.command")
@@ -167,6 +167,10 @@ def install_stubs():
     edit_plans_stub = types.ModuleType("utils.edit_plans")
     edit_plans_stub.load_plans = lambda: {}
     sys.modules["utils.edit_plans"] = edit_plans_stub
+
+    payment_records_stub = types.ModuleType("utils.payment_records")
+    payment_records_stub.load_payments = lambda: {}
+    sys.modules["utils.payment_records"] = payment_records_stub
 
     translations_stub = types.ModuleType("utils.translations")
     translations_stub.BUTTON_TRANSLATIONS = {"en": {"my_configs": "📱 My Configs"}}
@@ -208,6 +212,11 @@ REAL_DISPLAY_CONFIG = my_configs_module.display_config
 
 class MyConfigsTests(unittest.TestCase):
     def setUp(self):
+        payment_records = sys.modules.get("utils.payment_records")
+        if payment_records is None:
+            payment_records = types.ModuleType("utils.payment_records")
+            sys.modules["utils.payment_records"] = payment_records
+        payment_records.load_payments = lambda: {}
         FakeMultiServerAPI.users_by_include_disabled = {True: [], False: []}
         FakeMultiServerAPI.iter_calls = []
         FakeMultiServerAPI.instances = []
@@ -458,7 +467,12 @@ class MyConfigsTests(unittest.TestCase):
             my_configs_module.display_config(
                 456,
                 "s123a",
-                {"blocked": False, "expiration_days": 30},
+                {
+                    "blocked": False,
+                    "status": "Offline",
+                    "account_creation_date": "2026-08-01T00:00:00+00:00",
+                    "expiration_days": 30,
+                },
                 client,
                 user_id=123,
             )
@@ -468,6 +482,92 @@ class MyConfigsTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0][1:], (456, "en"))
+
+    def test_paid_hold_shows_first_connection_timer_and_entitlement_deadline(self):
+        class DummyQR:
+            def save(self, target, image_format):
+                target.write(b"qr")
+
+        client = types.SimpleNamespace(
+            server_id="enabled",
+            get_user_uri=lambda username: {"normal_sub": "https://example.com/sub"},
+        )
+        sys.modules["utils.payment_records"].load_payments = lambda: {
+            "p1": {
+                "status": "completed",
+                "user_id": 123,
+                "username": "s123a",
+                "server_id": "enabled",
+                "days": 30,
+                "completed_at": "2026-08-01T00:00:00+00:00",
+            }
+        }
+        original = self.install_renewal_stub({
+            "eligible": False,
+            "reason": "renewal_ineligible_not_expired",
+        })
+        original_make = my_configs_module.qrcode.make
+        my_configs_module.display_config = REAL_DISPLAY_CONFIG
+        try:
+            my_configs_module.qrcode.make = lambda value: DummyQR()
+            my_configs_module.display_config(
+                456,
+                "s123a",
+                {
+                    "blocked": False,
+                    "status": "On Hold",
+                    "account_creation_date": None,
+                    "expiration_days": 30,
+                    "upload_bytes": 0,
+                    "download_bytes": 0,
+                    "max_download_bytes": 5 * 1024 ** 3,
+                },
+                client,
+                user_id=123,
+            )
+        finally:
+            my_configs_module.qrcode.make = original_make
+            self.restore_renewal_stub(original)
+
+        caption = my_configs_module.bot.sent_photos[-1][1]["caption"]
+        self.assertIn("On Hold — server timer starts on first connection", caption)
+        self.assertIn("Server Days Remaining: Not started", caption)
+        self.assertIn("Service deadline:", caption)
+
+    def test_unused_test_hold_shows_replacement_and_stale_timing(self):
+        class DummyQR:
+            def save(self, target, image_format):
+                target.write(b"qr")
+
+        client = types.SimpleNamespace(
+            server_id="enabled",
+            get_user_uri=lambda username: {"normal_sub": "https://example.com/sub"},
+        )
+        original_make = my_configs_module.qrcode.make
+        my_configs_module.display_config = REAL_DISPLAY_CONFIG
+        try:
+            my_configs_module.qrcode.make = lambda value: DummyQR()
+            my_configs_module.display_config(
+                456,
+                "t123a",
+                {
+                    "blocked": False,
+                    "status": "on_hold",
+                    "account_creation_date": None,
+                    "expiration_days": 30,
+                    "upload_bytes": 0,
+                    "download_bytes": 0,
+                    "max_download_bytes": 1024 ** 3,
+                },
+                client,
+                user_id=123,
+            )
+        finally:
+            my_configs_module.qrcode.make = original_make
+
+        caption = my_configs_module.bot.sent_photos[-1][1]["caption"]
+        self.assertIn("replacement can be enabled by an admin after 30 days", caption)
+        self.assertIn("stale cleanup begins after 60 days", caption)
 
     def test_active_customer_config_offers_one_reserved_renewal(self):
         class DummyQR:
@@ -490,7 +590,12 @@ class MyConfigsTests(unittest.TestCase):
             my_configs_module.display_config(
                 456,
                 "s123a",
-                {"blocked": False, "expiration_days": 30},
+                {
+                    "blocked": False,
+                    "status": "Offline",
+                    "account_creation_date": "2026-08-01T00:00:00+00:00",
+                    "expiration_days": 30,
+                },
                 client,
                 user_id=123,
             )

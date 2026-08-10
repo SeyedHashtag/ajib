@@ -90,7 +90,7 @@ def install_stubs():
     sys.modules["dotenv"] = types.SimpleNamespace(load_dotenv=lambda *args, **kwargs: None)
 
     utils_pkg = types.ModuleType("utils")
-    utils_pkg.__path__ = []
+    utils_pkg.__path__ = [str(MODULE_PATH.parent)]
     sys.modules["utils"] = utils_pkg
 
     command_stub = types.ModuleType("utils.command")
@@ -111,9 +111,11 @@ def install_stubs():
 
     translations = {
         "reseller_customer_category_active": "Active",
+        "reseller_customer_category_hold": "On Hold",
         "reseller_customer_category_low_days": "Low Days",
         "reseller_customer_category_low_gb": "Low GB",
         "reseller_customer_category_expired": "Expired",
+        "reseller_customer_category_unknown": "Unknown",
         "reseller_customer_category_deleted": "Deleted",
         "reseller_customer_status_unavailable": "Status unavailable",
         "reseller_customers_overview": "Customers {total}\n{categories}",
@@ -195,6 +197,7 @@ def install_stubs():
         ),
         "reseller_config_status_blocked": "Blocked or expired",
         "reseller_config_status_active": "Active",
+        "reseller_config_status_hold": "On Hold",
         "reseller_config_live_details": (
             "Username: `{username}`\nTraffic limit: {traffic_limit}\n"
             "Days remaining: {days_remaining}\nCreated: {creation_date}\n"
@@ -513,7 +516,12 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
                     {
                         "server": {"id": "s1"},
                         "client": types.SimpleNamespace(server_id="fallback"),
-                        "users": {"r1988a": {"expiration_days": 20}},
+                        "users": {"r1988a": {
+                            "blocked": False,
+                            "status": "Offline",
+                            "account_creation_date": "2026-06-01 12:00:00",
+                            "expiration_days": 20,
+                        }},
                     },
                     {
                         "server": {"id": "s2"},
@@ -528,7 +536,12 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
 
             live_users, unavailable_server_ids = reseller_handlers._load_reseller_live_users()
 
-            self.assertEqual(live_users, {"r1988a": {"expiration_days": 20}})
+            self.assertEqual(live_users, {"r1988a": {
+                "blocked": False,
+                "status": "Offline",
+                "account_creation_date": "2026-06-01 12:00:00",
+                "expiration_days": 20,
+            }})
             self.assertEqual(unavailable_server_ids, {"s2"})
             self.assertEqual(FakeMultiServerAPI.calls[0]["include_disabled"], True)
             self.assertEqual(FakeMultiServerAPI.calls[0]["force_refresh"], False)
@@ -578,7 +591,12 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
                 return [
                     {
                         "client": types.SimpleNamespace(server_id="s1"),
-                        "users": {"s1988a": {"expiration_days": 10, "blocked": False}},
+                        "users": {"s1988a": {
+                            "expiration_days": 10,
+                            "blocked": False,
+                            "status": "Offline",
+                            "account_creation_date": "2026-08-01T00:00:00+00:00",
+                        }},
                     }
                 ]
 
@@ -705,7 +723,12 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
                     {
                         "server": {"id": "s1"},
                         "client": types.SimpleNamespace(server_id="s1"),
-                        "users": {"r1988a": {"expiration_days": 20}},
+                        "users": {"r1988a": {
+                            "blocked": False,
+                            "status": "Offline",
+                            "account_creation_date": "2026-06-01 12:00:00",
+                            "expiration_days": 20,
+                        }},
                     }
                 ]
 
@@ -720,7 +743,7 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
                         "username": "r1988a",
                         "customer_name": "ali",
                         "gb": 20,
-                        "days": 30,
+                        "days": 365,
                         "price": 1.0,
                         "timestamp": "2026-06-01 12:00:00",
                     }
@@ -773,8 +796,18 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
                     "server": {"id": "s1"},
                     "client": types.SimpleNamespace(server_id="s1"),
                     "users": {
-                        "r1988a": {"expiration_days": 20},
-                        "r1988b": {"expiration_days": 20},
+                        "r1988a": {
+                            "blocked": False,
+                            "status": "Offline",
+                            "account_creation_date": "2026-06-01 12:00:00",
+                            "expiration_days": 20,
+                        },
+                        "r1988b": {
+                            "blocked": False,
+                            "status": "Offline",
+                            "account_creation_date": "2026-06-01 12:00:00",
+                            "expiration_days": 20,
+                        },
                     },
                 }]
 
@@ -819,6 +852,44 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
             reseller_handlers.get_reseller_data = original_get_reseller_data
             reseller_handlers.RESELLER_CUSTOMERS_EXECUTOR = original_executor
 
+    def test_reseller_categories_separate_hold_and_unknown_from_active(self):
+        original_loader = reseller_handlers._load_reseller_live_users
+        try:
+            reseller_handlers._load_reseller_live_users = lambda force_refresh=False: ({
+                "r1988h": {
+                    "blocked": False,
+                    "status": "On-hold",
+                    "account_creation_date": None,
+                    "expiration_days": 30,
+                },
+                "r1988u": {
+                    "blocked": False,
+                    "status": "unexpected",
+                    "expiration_days": 30,
+                },
+            }, set())
+            categorized = reseller_handlers._categorize_reseller_customers([
+                {
+                    "username": "r1988h",
+                    "server_id": "s1",
+                    "days": 30,
+                    "timestamp": "2026-08-01 12:00:00",
+                },
+                {
+                    "username": "r1988u",
+                    "server_id": "s1",
+                    "days": 30,
+                    "timestamp": "2026-08-01 12:00:00",
+                },
+            ])
+        finally:
+            reseller_handlers._load_reseller_live_users = original_loader
+
+        self.assertEqual([item["username"] for item in categorized["hold"]], ["r1988h"])
+        self.assertEqual([item["username"] for item in categorized["unknown"]], ["r1988u"])
+        self.assertEqual(categorized["active"], [])
+        self.assertEqual(categorized["expired"], [])
+
     def test_reseller_customer_config_queues_live_lookup(self):
         original_multi_api = reseller_handlers.MultiServerAPI
         original_get_reseller_data = reseller_handlers.get_reseller_data
@@ -842,7 +913,7 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
                     "max_download_bytes": 20 * 1024 ** 3,
                     "expiration_days": 20,
                     "account_creation_date": "2026-06-01",
-                    "status": "active",
+                    "status": "Offline",
                 }
 
         try:
@@ -1097,7 +1168,7 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
                     "max_download_bytes": 1 * 1024 ** 3,
                     "expiration_days": 7,
                     "account_creation_date": "2026-06-24",
-                    "status": "active",
+                    "status": "Offline",
                 }
 
         try:

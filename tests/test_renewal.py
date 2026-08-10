@@ -263,6 +263,91 @@ class RenewalTests(unittest.TestCase):
         self.assertTrue(offer["eligible"])
         self.assertLessEqual(offer["before_state"]["days_remaining"], 0)
 
+    def test_customer_offer_allows_issuance_expired_paid_hold(self):
+        hold_user = {
+            "blocked": False,
+            "status": "On Hold",
+            "account_creation_date": None,
+            "expiration_days": 30,
+            "upload_bytes": 0,
+            "download_bytes": 0,
+            "max_download_bytes": 5 * GB_BYTES,
+        }
+        payments = {"base-1": self.base_payment(
+            completed_at="2026-01-01 12:00:00",
+        )}
+        client = FakeClient("s1", {"alice": hold_user})
+
+        offer = self.renewal.find_customer_renewal_offer(
+            123,
+            "alice",
+            client,
+            hold_user,
+            self.plans,
+            payments=payments,
+        )
+
+        self.assertTrue(offer["eligible"])
+        self.assertEqual(offer["renewal_mode"], "immediate")
+        self.assertTrue(offer["business_expired"])
+        self.assertEqual(offer["before_state"]["panel_state"], "hold")
+        self.assertEqual(offer["before_state"]["entitlement_state"], "expired")
+
+    def test_customer_offer_does_not_treat_current_paid_hold_as_expired(self):
+        hold_user = {
+            "blocked": False,
+            "status": "on_hold",
+            "account_creation_date": None,
+            "expiration_days": 30,
+            "upload_bytes": 0,
+            "download_bytes": 0,
+            "max_download_bytes": 5 * GB_BYTES,
+        }
+        payments = {"base-1": self.base_payment(
+            completed_at="2099-01-01 12:00:00",
+        )}
+        client = FakeClient("s1", {"alice": hold_user})
+
+        offer = self.renewal.find_customer_renewal_offer(
+            123,
+            "alice",
+            client,
+            hold_user,
+            self.plans,
+            payments=payments,
+        )
+
+        self.assertFalse(offer["eligible"])
+        self.assertEqual(offer["reason"], "renewal_ineligible_not_expired")
+        self.assertEqual(offer["before_state"]["panel_state"], "hold")
+
+    def test_latest_successful_cycle_prevents_offer_from_older_expired_cycle(self):
+        hold_user = {
+            "blocked": False,
+            "status": "On-hold",
+            "account_creation_date": None,
+            "expiration_days": 30,
+            "upload_bytes": 0,
+            "download_bytes": 0,
+            "max_download_bytes": 5 * GB_BYTES,
+        }
+        payments = {
+            "old": self.base_payment(completed_at="2026-01-01 12:00:00"),
+            "new": self.base_payment(
+                completed_at="2026-08-01 12:00:00",
+                updated_at="2026-08-01 12:00:00",
+            ),
+        }
+        client = FakeClient("s1", {"alice": hold_user})
+
+        offer = self.renewal.find_customer_renewal_offer(
+            123, "alice", client, hold_user, self.plans, payments=payments
+        )
+
+        self.assertFalse(offer["eligible"])
+        self.assertEqual(offer["reason"], "renewal_ineligible_not_expired")
+        self.assertEqual(offer["before_state"]["entitlement_state"], "current")
+
     def test_customer_offer_rejects_missing_active_blocked_active_deleted_and_plan_mismatch(self):
         payments = {"base-1": self.base_payment()}
         client = FakeClient("s1", {"alice": self.expired_user()})

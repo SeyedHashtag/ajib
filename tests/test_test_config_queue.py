@@ -87,7 +87,7 @@ def install_stubs():
     sys.modules["telebot"] = telebot_stub
 
     utils_pkg = types.ModuleType("utils")
-    utils_pkg.__path__ = []
+    utils_pkg.__path__ = [str(MODULE_PATH.parent)]
     sys.modules["utils"] = utils_pkg
 
     store_spec = importlib.util.spec_from_file_location("utils.test_config_store", TEST_CONFIG_STORE_PATH)
@@ -179,6 +179,31 @@ class TestConfigQueueTests(unittest.TestCase):
             ),
         )
 
+    @staticmethod
+    def hold_user(**overrides):
+        data = {
+            "status": "On-hold",
+            "blocked": False,
+            "expiration_days": 30,
+            "max_download_bytes": 1024 ** 3,
+            "upload_bytes": 0,
+            "download_bytes": 0,
+        }
+        data.update(overrides)
+        return data
+
+    @staticmethod
+    def exact_api(username="t123", server_id="s1", user_data=None, status="found"):
+        user_data = user_data or TestConfigQueueTests.hold_user()
+
+        class API:
+            def find_user_on_server(self, requested_username, requested_server):
+                if requested_username != username or requested_server != server_id:
+                    return None, None, {"status": "missing"}
+                return object(), user_data if status == "found" else None, {"status": status}
+
+        return API()
+
     def test_confirm_test_config_queues_creation_and_dedupes_duplicate_taps(self):
         call = self.make_call()
 
@@ -237,15 +262,222 @@ class TestConfigQueueTests(unittest.TestCase):
             "123": {
                 "telegram_id": 123,
                 "used_at": "2026-01-01 12:00:00",
+                "username": "t123",
+                "server_id": "s1",
                 "historical_configs": [{"username": "t123", "server_id": "s1"}],
             }
         }), encoding="utf-8")
         self.assertTrue(test_config_module._has_used_test_config_from(test_config_module.load_test_configs(), 123))
 
-        count = test_config_module.reset_test_users(mode="expired")
+        count = test_config_module.reset_test_users(
+            mode="expired",
+            now=datetime(2026, 2, 1, 12, 0, 1),
+            multi_api=self.exact_api(),
+        )
 
         self.assertEqual(count, 1)
         self.assertFalse(test_config_module._has_used_test_config_from(test_config_module.load_test_configs(), 123))
+
+    def test_expired_reset_requires_fresh_exact_unused_hold(self):
+        record = {
+            "123": {
+                "telegram_id": 123,
+                "used_at": "2026-01-01 12:00:00",
+                "username": "t123",
+                "server_id": "s1",
+            }
+        }
+        cases = {
+            "unavailable": self.exact_api(status="unavailable"),
+            "connected": self.exact_api(user_data=self.hold_user(
+                status="Offline",
+                account_creation_date="2026-01-15 12:00:00",
+            )),
+            "used": self.exact_api(user_data=self.hold_user(download_bytes=1)),
+        }
+        for label, api in cases.items():
+            with self.subTest(case=label):
+                Path(test_config_module.TEST_CONFIGS_FILE).write_text(
+                    json.dumps(record), encoding="utf-8"
+                )
+                count = test_config_module.reset_test_users(
+                    mode="expired",
+                    now=datetime(2026, 2, 1, 12, 0, 1),
+                    multi_api=api,
+                )
+                self.assertEqual(count, 0)
+                self.assertNotIn(
+                    "replacement_eligible_at",
+                    test_config_module.load_test_configs()["123"],
+                )
+
+    def test_expired_reset_accepts_exact_thirty_day_boundary(self):
+        Path(test_config_module.TEST_CONFIGS_FILE).write_text(json.dumps({
+            "123": {
+                "telegram_id": 123,
+                "used_at": "2026-01-01 12:00:00",
+                "username": "t123",
+                "server_id": "s1",
+            }
+        }), encoding="utf-8")
+
+        count = test_config_module.reset_test_users(
+            mode="expired",
+            now=datetime(2026, 1, 31, 12, 0, 0),
+            multi_api=self.exact_api(),
+        )
+
+        self.assertEqual(count, 1)
+        entry = test_config_module.load_test_configs()["123"]
+        self.assertEqual(entry["replacement_from_username"], "t123")
+
+    def test_expired_reset_stops_at_sixty_day_boundary(self):
+        Path(test_config_module.TEST_CONFIGS_FILE).write_text(json.dumps({
+            "123": {
+                "telegram_id": 123,
+                "used_at": "2026-01-01 12:00:00",
+                "username": "t123",
+                "server_id": "s1",
+            }
+        }), encoding="utf-8")
+
+        count = test_config_module.reset_test_users(
+            mode="expired",
+            now=datetime(2026, 3, 2, 12, 0, 0),
+            multi_api=self.exact_api(),
+        )
+
+        self.assertEqual(count, 0)
+
+    def test_successful_replacement_archives_and_queues_old_test(self):
+        Path(test_config_module.TEST_CONFIGS_FILE).write_text(json.dumps({
+            "123": {
+                "telegram_id": 123,
+                "used_at": "2026-01-01 12:00:00",
+                "username": "t123",
+                "server_id": "s1",
+            }
+        }), encoding="utf-8")
+        self.assertEqual(test_config_module.reset_test_users(
+            mode="expired",
+            now=datetime(2026, 2, 1, 12, 0, 0),
+            multi_api=self.exact_api(),
+        ), 1)
+
+        class Client:
+            server_id = "s1"
+
+            def get_user(self, username):
+                return TestConfigQueueTests.hold_user() if username == "t123" else None
+
+            def get_users(self):
+                return {"t123": TestConfigQueueTests.hold_user()}
+
+            def add_user(self, *args, **kwargs):
+                return {"ok": True}
+
+            def get_user_uri(self, username):
+                return None
+
+        queued = []
+        original_allocate = test_config_module.allocate_username
+        original_queue = test_config_module._queue_superseded_cleanup
+        try:
+            test_config_module.allocate_username = lambda *args, **kwargs: "t123a"
+            test_config_module._queue_superseded_cleanup = (
+                lambda user_id, archived, language=None: queued.append((user_id, archived))
+            )
+            configs = test_config_module.load_test_configs()
+            success = test_config_module._create_test_config_with_client(
+                123, 456, Client(), {"t123"}, configs, language="en"
+            )
+        finally:
+            test_config_module.allocate_username = original_allocate
+            test_config_module._queue_superseded_cleanup = original_queue
+
+        self.assertTrue(success)
+        entry = test_config_module.load_test_configs()["123"]
+        self.assertEqual(entry["username"], "t123a")
+        archived = entry["historical_configs"][0]
+        self.assertEqual(archived["username"], "t123")
+        self.assertEqual(archived["cleanup_reason"], "superseded_on_hold_test")
+        self.assertEqual(queued[0][1]["username"], "t123")
+
+    def test_replacement_is_revoked_if_old_test_connects_during_grace(self):
+        Path(test_config_module.TEST_CONFIGS_FILE).write_text(json.dumps({
+            "123": {
+                "telegram_id": 123,
+                "used_at": "2026-01-01 12:00:00",
+                "username": "t123",
+                "server_id": "s1",
+            }
+        }), encoding="utf-8")
+        self.assertEqual(test_config_module.reset_test_users(
+            mode="expired",
+            now=datetime(2026, 2, 1, 12, 0, 0),
+            multi_api=self.exact_api(),
+        ), 1)
+
+        valid, retryable = test_config_module._revalidate_pending_replacement(
+            123,
+            self.exact_api(user_data=self.hold_user(
+                status="Online",
+                account_creation_date="2026-02-01 12:05:00",
+            )),
+        )
+
+        self.assertFalse(valid)
+        self.assertFalse(retryable)
+        entry = test_config_module.load_test_configs()["123"]
+        self.assertNotIn("replacement_eligible_at", entry)
+        self.assertEqual(entry["replacement_validation_status"], "no_longer_unused_hold")
+
+    def test_failed_replacement_creation_keeps_old_eligibility_recoverable(self):
+        Path(test_config_module.TEST_CONFIGS_FILE).write_text(json.dumps({
+            "123": {
+                "telegram_id": 123,
+                "used_at": "2026-01-01 12:00:00",
+                "username": "t123",
+                "server_id": "s1",
+            }
+        }), encoding="utf-8")
+        self.assertEqual(test_config_module.reset_test_users(
+            mode="expired",
+            now=datetime(2026, 2, 1, 12, 0, 0),
+            multi_api=self.exact_api(),
+        ), 1)
+
+        class Client:
+            server_id = "s1"
+
+            def get_user(self, username):
+                return TestConfigQueueTests.hold_user() if username == "t123" else None
+
+            def get_users(self):
+                return {"t123": TestConfigQueueTests.hold_user()}
+
+            def add_user(self, *args, **kwargs):
+                return None
+
+        original_allocate = test_config_module.allocate_username
+        try:
+            test_config_module.allocate_username = lambda *args, **kwargs: "t123a"
+            success = test_config_module._create_test_config_with_client(
+                123,
+                456,
+                Client(),
+                {"t123"},
+                test_config_module.load_test_configs(),
+                language="en",
+            )
+        finally:
+            test_config_module.allocate_username = original_allocate
+
+        self.assertFalse(success)
+        entry = test_config_module.load_test_configs()["123"]
+        self.assertEqual(entry["username"], "t123")
+        self.assertIn("replacement_eligible_at", entry)
+        self.assertNotIn("historical_configs", entry)
 
     def test_connected_marker_drives_persisted_trial_journey_state(self):
         used_at = "2026-06-09 12:00:00"
@@ -260,7 +492,8 @@ class TestConfigQueueTests(unittest.TestCase):
 
         before = test_config_module.get_test_config_journey(123, now=now)
         self.assertIsNone(before["connected_at"])
-        self.assertEqual(before["remaining_days"], 29)
+        self.assertEqual(before["panel_state"], "hold")
+        self.assertIsNone(before["remaining_days"])
 
         self.assertTrue(test_config_module.mark_test_config_connected(
             123,
@@ -268,6 +501,8 @@ class TestConfigQueueTests(unittest.TestCase):
         ))
         after = test_config_module.get_test_config_journey(123, now=now)
         self.assertEqual(after["connected_at"], "2026-06-10 12:00:00")
+        self.assertEqual(after["panel_state"], "connected")
+        self.assertEqual(after["remaining_days"], 30)
 
     def test_successful_test_config_sends_three_step_activation_flow(self):
         class DummyQR:
