@@ -1,6 +1,9 @@
 import importlib.util
 import json
+import sys
 import tempfile
+import threading
+import types
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -8,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RESELLER_PATH = ROOT / "core" / "scripts" / "telegrambot" / "utils" / "reseller.py"
+TRANSLATIONS_PATH = ROOT / "core" / "scripts" / "telegrambot" / "utils" / "translations.py"
 
 
 def load_reseller_module():
@@ -49,6 +53,28 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         for total_paid, expected_limit in cases:
             with self.subTest(total_paid=total_paid):
                 self.assertEqual(self.reseller.get_reseller_trust_limit(total_paid), expected_limit)
+
+    def test_debt_lifecycle_and_wallet_messages_exist_in_every_language(self):
+        spec = importlib.util.spec_from_file_location("debt_translations_under_test", TRANSLATIONS_PATH)
+        translations = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(translations)
+        required = {
+            "reseller_debt_opened",
+            "reseller_debt_deletion_warning",
+            "reseller_debt_services_held",
+            "reseller_debt_services_removed",
+            "reseller_debt_recovered",
+            "reseller_wholesale_balance_screen",
+            "admin_reseller_debt_services_held",
+            "admin_reseller_debt_services_removed",
+            "admin_reseller_debt_recovered",
+            "admin_reseller_debt_action_retry",
+            "admin_reseller_credit_outcomes_line",
+        }
+
+        for language in ("en", "ru", "fa", "tk"):
+            with self.subTest(language=language):
+                self.assertTrue(required.issubset(translations.MESSAGE_TRANSLATIONS[language]))
 
     def test_reseller_levels_discount_and_progress_share_trust_thresholds(self):
         cases = [
@@ -436,6 +462,651 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.assertEqual(trust_limit, 5.0)
         self.assertEqual(available_credit, 1.0)
 
+    def test_credit_outcome_weighting_and_three_good_recovery(self):
+        base = {"debt": 0.0, "total_paid": 30.0, "configs": []}
+
+        half_credit = self.reseller.get_reseller_credit_policy({
+            **base,
+            "credit_outcomes": [{"outcome": "late"}],
+        })
+        prepaid = self.reseller.get_reseller_credit_policy({
+            **base,
+            "credit_outcomes": [{"outcome": "default"}],
+        })
+        recovered = self.reseller.get_reseller_credit_policy({
+            **base,
+            "credit_outcomes": [
+                {"outcome": "default"},
+                {"outcome": "good"},
+                {"outcome": "good"},
+                {"outcome": "good"},
+            ],
+        })
+
+        self.assertEqual(half_credit["base_limit"], 20.0)
+        self.assertEqual(half_credit["effective_limit"], 10.0)
+        self.assertEqual(half_credit["mode"], "half_credit")
+        self.assertEqual(prepaid["effective_limit"], 0.0)
+        self.assertEqual(prepaid["mode"], "prepaid_only")
+        self.assertEqual(recovered["effective_limit"], 20.0)
+        self.assertEqual(recovered["mode"], "credit")
+        self.assertEqual(len(recovered["outcomes"]), 3)
+
+    def test_old_credit_outcome_callback_stays_idempotent_after_history_rolls(self):
+        self.write_resellers({
+            "1988": {"status": "approved", "debt": 0.0, "configs": []}
+        })
+        self.assertTrue(self.reseller.record_reseller_credit_outcome(
+            "1988", "default", "test", reference_id="old-default"
+        ))
+        for index in range(3):
+            self.assertTrue(self.reseller.record_reseller_credit_outcome(
+                "1988", "good", "test", reference_id=f"good-{index}"
+            ))
+
+        self.assertFalse(self.reseller.record_reseller_credit_outcome(
+            "1988", "default", "test", reference_id="old-default"
+        ))
+        saved = self.read_resellers()["1988"]
+        self.assertEqual([item["outcome"] for item in saved["credit_outcomes"]], ["good"] * 3)
+
+    def test_notification_claim_retries_after_failure_and_stops_after_delivery(self):
+        self.write_resellers({
+            "1988": {
+                "status": "approved",
+                "debt": 2.0,
+                "debt_since": self.hours_ago(1),
+                "configs": [],
+            }
+        })
+
+        first = self.reseller.evaluate_reseller_debt_policies()
+        leased = self.reseller.evaluate_reseller_debt_policies()
+        self.assertEqual([event["kind"] for event in first], ["opened"])
+        self.assertEqual(leased, [])
+
+        self.assertTrue(self.reseller.complete_reseller_debt_notification(
+            "1988", "opened", "user", delivered=False
+        ))
+        retry = self.reseller.evaluate_reseller_debt_policies()
+        self.assertEqual([event["kind"] for event in retry], ["opened"])
+        self.assertTrue(self.reseller.complete_reseller_debt_notification(
+            "1988", "opened", "user", delivered=True
+        ))
+        self.assertEqual(self.reseller.evaluate_reseller_debt_policies(), [])
+
+    def test_reminder_and_deletion_warning_deadlines(self):
+        cases = (
+            (1, {}, "opened"),
+            (25, {}, "reminder_24h"),
+            (43, {}, "deadline_final"),
+            (145, {"status": "suspended", "suspended_reason": "debt", "debt_services_held_at": self.hours_ago(72)}, "deletion_warning"),
+            (169, {"status": "suspended", "suspended_reason": "debt", "debt_services_held_at": self.hours_ago(96)}, "remove_due"),
+        )
+        for age, fields, expected in cases:
+            with self.subTest(age=age):
+                record = {
+                    "status": "approved",
+                    "debt": 3.0,
+                    "debt_since": self.hours_ago(age),
+                    "configs": [],
+                    **fields,
+                }
+                self.write_resellers({"1988": record})
+                events = self.reseller.evaluate_reseller_debt_policies()
+                self.assertEqual([event["kind"] for event in events], [expected])
+
+    def test_post_deletion_reminders_are_weekly_and_user_only(self):
+        self.write_resellers({
+            "1988": {
+                "status": "suspended",
+                "suspended_reason": "debt",
+                "debt": 3.0,
+                "debt_since": self.hours_ago(400),
+                "debt_cycle_id": "existing-cycle",
+                "debt_services_held_at": self.hours_ago(328),
+                "debt_services_removed_at": self.hours_ago(8 * 24),
+                "configs": [],
+            }
+        })
+
+        events = self.reseller.evaluate_reseller_debt_policies()
+        self.assertEqual([event["kind"] for event in events], ["post_removal_week_1"])
+        self.assertTrue(events[0]["notify_user"])
+        self.assertFalse(events[0]["notify_admin"])
+        self.assertTrue(self.reseller.complete_reseller_debt_notification(
+            "1988", "post_removal_week_1", "user", delivered=True
+        ))
+        self.assertEqual(self.reseller.evaluate_reseller_debt_policies(), [])
+
+    def test_partial_payment_does_not_reset_debt_cycle(self):
+        started_at = self.hours_ago(30)
+        self.write_resellers({
+            "1988": {
+                "status": "approved",
+                "debt": 10.0,
+                "debt_since": started_at,
+                "configs": [],
+            }
+        })
+
+        success, remaining = self.reseller.apply_reseller_payment("1988", 3.0, "partial")
+        saved = self.read_resellers()["1988"]
+
+        self.assertTrue(success)
+        self.assertEqual(remaining, 7.0)
+        self.assertEqual(saved["debt_since"], started_at)
+
+    def test_new_debt_cycle_resets_only_cycle_lifecycle_markers(self):
+        self.write_resellers({
+            "1988": {
+                "status": "approved",
+                "debt": 0.0,
+                "debt_services_held_at": self.hours_ago(20),
+                "debt_services_removed_at": self.hours_ago(10),
+                "credit_outcomes": [{"outcome": "default", "reference_id": "old"}],
+                "configs": [{"username": "historical", "removed_from_vpn": True}],
+            }
+        })
+
+        self.assertTrue(self.reseller.set_reseller_debt("1988", 2.0))
+        saved = self.read_resellers()["1988"]
+
+        self.assertIsNotNone(saved["debt_cycle_id"])
+        self.assertIsNone(saved["debt_services_held_at"])
+        self.assertIsNone(saved["debt_services_removed_at"])
+        self.assertEqual(saved["credit_outcomes"][0]["outcome"], "default")
+        self.assertTrue(saved["configs"][0]["removed_from_vpn"])
+
+    def test_duplicate_payment_callback_does_not_double_apply_or_create_excess(self):
+        self.write_resellers({
+            "1988": {
+                "status": "approved",
+                "debt": 8.0,
+                "total_paid": 0.0,
+                "configs": [],
+            }
+        })
+
+        first = self.reseller.apply_reseller_payment("1988", 8.0, "payment-1")
+        duplicate = self.reseller.apply_reseller_payment("1988", 8.0, "payment-1")
+        saved = self.read_resellers()["1988"]
+
+        self.assertEqual(first, (True, 0.0))
+        self.assertEqual(duplicate, (True, 0.0))
+        self.assertEqual(saved["total_paid"], 8.0)
+        self.assertEqual(len(saved["processed_debt_payments"]), 1)
+        self.assertEqual(saved["pending_wholesale_credits"], [])
+
+    def test_proration_overpayment_credit_is_durable_and_retry_safe(self):
+        failing = types.ModuleType("utils.reseller_wholesale_credit")
+        failing.credit_wholesale_balance = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError())
+        previous = sys.modules.get("utils.reseller_wholesale_credit")
+        sys.modules["utils.reseller_wholesale_credit"] = failing
+        self.addCleanup(
+            lambda: (
+                sys.modules.__setitem__("utils.reseller_wholesale_credit", previous)
+                if previous is not None
+                else sys.modules.pop("utils.reseller_wholesale_credit", None)
+            )
+        )
+        self.write_resellers({
+            "1988": {
+                "status": "suspended",
+                "suspended_reason": "debt",
+                "debt": 4.0,
+                "configs": [],
+            }
+        })
+
+        self.assertEqual(
+            self.reseller.apply_reseller_payment("1988", 10.0, "async-payment"),
+            (True, 0.0),
+        )
+        pending = self.read_resellers()["1988"]["pending_wholesale_credits"]
+        self.assertEqual(pending[0]["amount"], 6.0)
+
+        credited = []
+        failing.credit_wholesale_balance = lambda reseller_id, amount, transaction_id, **kwargs: credited.append(
+            (reseller_id, amount, transaction_id)
+        )
+        self.assertEqual(self.reseller.flush_reseller_pending_wholesale_credits("1988"), 1)
+        self.assertEqual(self.reseller.flush_reseller_pending_wholesale_credits("1988"), 0)
+        self.assertEqual(credited, [("1988", 6.0, "settlement-excess:async-payment")])
+        self.assertEqual(self.read_resellers()["1988"]["pending_wholesale_credits"], [])
+
+    def test_only_outstanding_linked_configs_become_candidates(self):
+        self.write_resellers({
+            "1988": {
+                "status": "suspended",
+                "suspended_reason": "debt",
+                "debt": 7.0,
+                "debt_charges": [
+                    {"id": "paid", "original_amount": 5.0, "outstanding_amount": 0.0},
+                    {"id": "unpaid", "original_amount": 5.0, "outstanding_amount": 5.0},
+                    {"id": "legacy", "original_amount": 2.0, "outstanding_amount": 2.0},
+                ],
+                "configs": [
+                    {"username": "paid-user", "server_id": "s1", "debt_charge_id": "paid"},
+                    {"username": "unpaid-user", "server_id": "s1", "debt_charge_id": "unpaid"},
+                    {"username": "unrelated", "server_id": "s1"},
+                ],
+            }
+        })
+
+        candidates, manual_review = self.reseller.get_reseller_debt_service_candidates(
+            self.reseller.get_reseller_data("1988")
+        )
+
+        self.assertEqual([item["username"] for item in candidates], ["unpaid-user"])
+        self.assertEqual(manual_review, ["legacy"])
+
+    def test_hold_delete_prorates_by_greater_of_time_and_traffic(self):
+        gib = 1024 ** 3
+
+        class FakeClient:
+            server_id = "s1"
+
+            def __init__(self):
+                self.users = {
+                    "customer": {
+                        "username": "customer",
+                        "blocked": False,
+                        "upload_bytes": 2 * gib,
+                        "download_bytes": 3 * gib,
+                        "max_download_bytes": 10 * gib,
+                    }
+                }
+
+            def update_user(self, username, payload):
+                self.users[username].update(payload)
+                return {"ok": True, **payload}
+
+            def delete_user(self, username):
+                self.users.pop(username, None)
+                return {"ok": True}
+
+        class FakeMultiAPI:
+            def __init__(self):
+                self.client = FakeClient()
+
+            def find_user_on_server(self, username, server_id):
+                user = self.client.users.get(username)
+                if user is None:
+                    return self.client, None, {"status": "missing"}
+                return self.client, dict(user), {"status": "found"}
+
+        self.write_resellers({
+            "1988": {
+                "status": "suspended",
+                "suspended_reason": "debt",
+                "debt": 10.0,
+                "debt_since": self.hours_ago(72),
+                "debt_charges": [{
+                    "id": "charge-1",
+                    "original_amount": 10.0,
+                    "outstanding_amount": 10.0,
+                }],
+                "configs": [{
+                    "username": "customer",
+                    "server_id": "s1",
+                    "debt_charge_id": "charge-1",
+                    "timestamp": self.hours_ago(72),
+                    "days": 10,
+                    "gb": 10,
+                    "price": 10.0,
+                }],
+            }
+        })
+        api = FakeMultiAPI()
+
+        held, hold_result = self.reseller.process_reseller_debt_service_action("1988", api, "hold")
+        removed, remove_result = self.reseller.process_reseller_debt_service_action("1988", api, "remove")
+        saved = self.read_resellers()["1988"]
+        calculation = saved["configs"][0]["debt_proration"][0]
+
+        self.assertTrue(held)
+        self.assertEqual(hold_result["completed"], 1)
+        self.assertTrue(removed)
+        self.assertEqual(remove_result["completed"], 1)
+        self.assertAlmostEqual(calculation["time_fraction"], 0.3, places=2)
+        self.assertEqual(calculation["traffic_fraction"], 0.5)
+        self.assertEqual(calculation["used_fraction"], 0.5)
+        self.assertEqual(remove_result["writeoff"], 5.0)
+        self.assertEqual(saved["debt"], 5.0)
+        self.assertTrue(saved["configs"][0]["removed_from_vpn"])
+        self.assertEqual(saved["configs"][0]["removal_reason"], "reseller_debt_default")
+
+    def test_proration_subtracts_payments_already_allocated_to_charge(self):
+        calculation = self.reseller._prorated_collectible(
+            {
+                "id": "charge-1",
+                "original_amount": 10.0,
+                "outstanding_amount": 6.0,
+            },
+            {
+                "kind": "config",
+                "days": 10,
+                "gb": 10,
+                "unlimited": False,
+                "started_at": self.hours_ago(5 * 24),
+            },
+            {
+                "held_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "used_bytes": 0,
+                "quota_bytes": 10 * 1024 ** 3,
+            },
+        )
+
+        self.assertAlmostEqual(calculation["used_fraction"], 0.5, places=2)
+        self.assertEqual(calculation["already_paid"], 4.0)
+        self.assertEqual(calculation["collectible"], 1.0)
+        self.assertEqual(calculation["writeoff"], 5.0)
+
+    def test_unlimited_plan_proration_uses_time_only(self):
+        calculation = self.reseller._prorated_collectible(
+            {"original_amount": 10.0, "outstanding_amount": 10.0},
+            {
+                "kind": "config",
+                "days": 10,
+                "unlimited": True,
+                "started_at": self.hours_ago(24),
+            },
+            {
+                "held_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "used_bytes": 100 * 1024 ** 3,
+                "quota_bytes": 1,
+            },
+        )
+
+        self.assertAlmostEqual(calculation["used_fraction"], 0.1, places=2)
+        self.assertEqual(calculation["traffic_fraction"], 0.0)
+
+    def test_restore_unblocks_only_configs_changed_by_debt_policy(self):
+        class FakeClient:
+            server_id = "s1"
+
+            def __init__(self):
+                self.users = {
+                    "active": {"blocked": False, "max_download_bytes": 1024},
+                    "manual": {"blocked": True, "max_download_bytes": 1024},
+                }
+
+            def update_user(self, username, payload):
+                self.users[username].update(payload)
+                return {"ok": True}
+
+        class FakeMultiAPI:
+            def __init__(self):
+                self.client = FakeClient()
+
+            def find_user_on_server(self, username, server_id):
+                user = self.client.users.get(username)
+                return self.client, dict(user), {"status": "found"}
+
+        charges = []
+        configs = []
+        for index, username in enumerate(("active", "manual"), 1):
+            charge_id = f"charge-{index}"
+            charges.append({
+                "id": charge_id,
+                "original_amount": 5.0,
+                "outstanding_amount": 5.0,
+            })
+            configs.append({
+                "username": username,
+                "server_id": "s1",
+                "debt_charge_id": charge_id,
+                "timestamp": self.hours_ago(24),
+                "days": 30,
+                "gb": 1,
+            })
+        self.write_resellers({
+            "1988": {
+                "status": "suspended",
+                "suspended_reason": "debt",
+                "debt": 10.0,
+                "debt_since": self.hours_ago(73),
+                "debt_charges": charges,
+                "configs": configs,
+            }
+        })
+        api = FakeMultiAPI()
+
+        self.assertTrue(self.reseller.process_reseller_debt_service_action("1988", api, "hold")[0])
+        self.assertTrue(self.reseller.apply_reseller_payment("1988", 10.0, "paid")[0])
+        self.assertTrue(self.reseller.process_reseller_debt_service_action("1988", api, "restore")[0])
+        saved = self.read_resellers()["1988"]
+
+        self.assertFalse(api.client.users["active"]["blocked"])
+        self.assertTrue(api.client.users["manual"]["blocked"])
+        self.assertTrue(all(not item["debt_policy_blocked"] for item in saved["configs"]))
+
+    def test_unsafe_proration_never_calls_delete(self):
+        class FakeClient:
+            server_id = "s1"
+
+            def __init__(self):
+                self.deleted = []
+
+            def delete_user(self, username):
+                self.deleted.append(username)
+                return {"ok": True}
+
+        class FakeMultiAPI:
+            def __init__(self):
+                self.client = FakeClient()
+
+            def find_user_on_server(self, username, server_id):
+                return self.client, {"blocked": True}, {"status": "found"}
+
+        self.write_resellers({
+            "1988": {
+                "status": "suspended",
+                "suspended_reason": "debt",
+                "debt": 4.0,
+                "debt_charges": [{
+                    "id": "legacy",
+                    "original_amount": 4.0,
+                    "outstanding_amount": 4.0,
+                }],
+                "configs": [{
+                    "username": "unsafe",
+                    "server_id": "s1",
+                    "debt_charge_id": "legacy",
+                    "debt_policy_hold_snapshot": None,
+                }],
+            }
+        })
+        api = FakeMultiAPI()
+
+        success, result = self.reseller.process_reseller_debt_service_action("1988", api, "remove")
+        saved = self.read_resellers()["1988"]
+
+        self.assertFalse(success)
+        self.assertEqual(api.client.deleted, [])
+        self.assertIn("legacy", result["manual_review"])
+        self.assertFalse(saved["configs"][0].get("removed_from_vpn", False))
+        self.assertEqual(saved["debt"], 4.0)
+
+    def test_unavailable_exact_server_lookup_keeps_service_and_debt_pending(self):
+        class UnavailableMultiAPI:
+            def find_user_on_server(self, username, server_id):
+                return None, None, {"status": "unavailable", "error": "server_down"}
+
+        self.write_resellers({
+            "1988": {
+                "status": "suspended",
+                "suspended_reason": "debt",
+                "debt": 4.0,
+                "debt_charges": [{
+                    "id": "charge-1",
+                    "original_amount": 4.0,
+                    "outstanding_amount": 4.0,
+                }],
+                "configs": [{
+                    "username": "pending",
+                    "server_id": "s1",
+                    "debt_charge_id": "charge-1",
+                    "timestamp": self.hours_ago(24),
+                    "days": 30,
+                    "gb": 5,
+                    "debt_policy_hold_snapshot": {
+                        "held_at": self.hours_ago(1),
+                        "used_bytes": 0,
+                        "quota_bytes": 5 * 1024 ** 3,
+                    },
+                }],
+            }
+        })
+
+        success, result = self.reseller.process_reseller_debt_service_action(
+            "1988", UnavailableMultiAPI(), "remove"
+        )
+        saved = self.read_resellers()["1988"]
+
+        self.assertFalse(success)
+        self.assertEqual(result["failed"][0]["reason"], "server_down")
+        self.assertEqual(saved["debt"], 4.0)
+        self.assertFalse(saved["configs"][0].get("removed_from_vpn", False))
+
+    def test_payment_and_deletion_are_serialized_without_overwriting_each_other(self):
+        delete_started = threading.Event()
+        allow_delete = threading.Event()
+
+        class BlockingClient:
+            server_id = "s1"
+
+            def delete_user(self, username):
+                delete_started.set()
+                allow_delete.wait(timeout=2)
+                return {"ok": True}
+
+        class FakeMultiAPI:
+            client = BlockingClient()
+
+            def find_user_on_server(self, username, server_id):
+                return self.client, {"blocked": True}, {"status": "found"}
+
+        self.write_resellers({
+            "1988": {
+                "status": "suspended",
+                "suspended_reason": "debt",
+                "debt": 10.0,
+                "debt_since": self.hours_ago(170),
+                "debt_cycle_id": "cycle-race",
+                "debt_charges": [{
+                    "id": "charge-1",
+                    "original_amount": 10.0,
+                    "outstanding_amount": 10.0,
+                }],
+                "configs": [{
+                    "username": "race-user",
+                    "server_id": "s1",
+                    "debt_charge_id": "charge-1",
+                    "timestamp": self.hours_ago(5 * 24),
+                    "days": 10,
+                    "gb": 10,
+                    "debt_policy_blocked": True,
+                    "debt_policy_hold_snapshot": {
+                        "held_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "used_bytes": 0,
+                        "quota_bytes": 10 * 1024 ** 3,
+                    },
+                }],
+            }
+        })
+        action_result = []
+        payment_result = []
+        action_thread = threading.Thread(target=lambda: action_result.append(
+            self.reseller.process_reseller_debt_service_action("1988", FakeMultiAPI(), "remove")
+        ))
+        action_thread.start()
+        self.assertTrue(delete_started.wait(timeout=1))
+        payment_thread = threading.Thread(target=lambda: payment_result.append(
+            self.reseller.apply_reseller_payment("1988", 5.0, "race-payment")
+        ))
+        payment_thread.start()
+        payment_thread.join(timeout=0.05)
+        self.assertTrue(payment_thread.is_alive())
+
+        allow_delete.set()
+        action_thread.join(timeout=2)
+        payment_thread.join(timeout=2)
+        saved = self.read_resellers()["1988"]
+
+        self.assertTrue(action_result[0][0])
+        self.assertEqual(payment_result[0], (True, 0.0))
+        self.assertEqual(saved["debt"], 0.0)
+        self.assertTrue(saved["configs"][0]["removed_from_vpn"])
+
+    def test_unactivated_reserved_renewal_has_zero_usage_and_full_writeoff(self):
+        class FakeClient:
+            server_id = "s1"
+
+            def __init__(self):
+                self.user = {"blocked": False, "upload_bytes": 100, "download_bytes": 200}
+
+            def update_user(self, username, payload):
+                self.user.update(payload)
+                return {"ok": True}
+
+            def delete_user(self, username):
+                self.user = None
+                return {"ok": True}
+
+        class FakeMultiAPI:
+            def __init__(self):
+                self.client = FakeClient()
+
+            def find_user_on_server(self, username, server_id):
+                if self.client.user is None:
+                    return self.client, None, {"status": "missing"}
+                return self.client, dict(self.client.user), {"status": "found"}
+
+        self.write_resellers({
+            "1988": {
+                "status": "suspended",
+                "suspended_reason": "debt",
+                "debt": 4.0,
+                "debt_since": self.hours_ago(72),
+                "debt_cycle_id": "cycle-1",
+                "debt_charges": [{
+                    "id": "renewal-1",
+                    "original_amount": 4.0,
+                    "outstanding_amount": 4.0,
+                }],
+                "configs": [{
+                    "username": "customer",
+                    "server_id": "s1",
+                    "timestamp": self.hours_ago(100),
+                    "renewals": [{
+                        "debt_charge_id": "renewal-1",
+                        "renewal_mode": "reserved",
+                        "renewal_status": "reserved",
+                        "timestamp": self.hours_ago(24),
+                        "days": 30,
+                        "gb": 5,
+                    }],
+                }],
+            }
+        })
+        api = FakeMultiAPI()
+
+        self.assertTrue(self.reseller.process_reseller_debt_service_action("1988", api, "hold")[0])
+        api.client.user = None
+        success, result = self.reseller.process_reseller_debt_service_action("1988", api, "remove")
+        saved = self.read_resellers()["1988"]
+        calculation = saved["configs"][0]["debt_proration"][0]
+
+        self.assertTrue(success)
+        self.assertEqual(calculation["used_fraction"], 0.0)
+        self.assertEqual(result["writeoff"], 4.0)
+        self.assertEqual(saved["debt"], 0.0)
+        self.assertEqual(saved["status"], "approved")
+        self.assertIsNone(saved["debt_cycle_id"])
+        self.assertEqual(saved["configs"][0]["removed_cleanup_status"], "already_missing")
+
     def test_approved_reseller_auto_suspends_after_suspend_deadline(self):
         self.write_resellers({
             "1988": {
@@ -472,7 +1143,24 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         auto_suspended_event = next(event for event in events if event["auto_suspended"])
         self.assertEqual(auto_suspended_event["unlock_amount"], 9.70)
 
-    def test_auto_suspended_reseller_auto_bans_after_ban_deadline(self):
+    def test_large_new_debt_does_not_suspend_before_time_deadline(self):
+        self.write_resellers({
+            "1988": {
+                "status": "approved",
+                "debt": 100.0,
+                "debt_since": self.hours_ago(1),
+                "configs": [],
+            }
+        })
+
+        saved = self.reseller.get_reseller_data("1988")
+        events = self.reseller.evaluate_reseller_debt_policies()
+
+        self.assertEqual(saved["debt_state"], "active")
+        self.assertEqual(saved["status"], "approved")
+        self.assertEqual([event["kind"] for event in events], ["opened"])
+
+    def test_auto_suspended_reseller_moves_to_hold_without_ban(self):
         self.write_resellers({
             "1988": {
                 "status": "suspended",
@@ -486,11 +1174,14 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         events = self.reseller.evaluate_reseller_debt_policies()
         saved = self.read_resellers()["1988"]
 
-        self.assertEqual(saved["status"], "banned")
-        self.assertIsNone(saved["suspended_reason"])
-        self.assertTrue(any(event["auto_banned"] for event in events))
+        self.assertEqual(saved["status"], "suspended")
+        self.assertEqual(saved["suspended_reason"], "debt")
+        self.assertTrue(saved["debt_service_hold_due"])
+        self.assertTrue(any(event["kind"] == "hold_due" for event in events))
+        self.assertFalse(any(event["auto_banned"] for event in events))
+        self.assertEqual(saved["credit_outcomes"][-1]["outcome"], "default")
 
-    def test_banned_reseller_does_not_emit_followup_suspended_alert(self):
+    def test_duplicate_hold_pass_does_not_duplicate_credit_outcomes(self):
         self.write_resellers({
             "1988": {
                 "status": "suspended",
@@ -504,16 +1195,27 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         first_events = self.reseller.evaluate_reseller_debt_policies()
         first_saved = self.read_resellers()["1988"]
 
-        self.assertEqual(first_saved["status"], "banned")
-        self.assertEqual(first_saved["debt_last_admin_alert_level"], "banned")
-        self.assertTrue(any(event["auto_banned"] and event["notify_admin"] for event in first_events))
+        self.assertEqual(first_saved["status"], "suspended")
+        self.assertTrue(any(event["kind"] == "hold_due" for event in first_events))
+        self.assertEqual(
+            [item["outcome"] for item in first_saved["credit_outcomes"]],
+            ["late", "default"],
+        )
 
+        leased_events = self.reseller.evaluate_reseller_debt_policies()
+        self.assertEqual(leased_events, [])
+        self.assertTrue(self.reseller.complete_reseller_debt_service_action_claim(
+            "1988", "hold", completed=False
+        ))
         second_events = self.reseller.evaluate_reseller_debt_policies()
         second_saved = self.read_resellers()["1988"]
 
-        self.assertEqual(second_saved["status"], "banned")
-        self.assertEqual(second_saved["debt_last_admin_alert_level"], "banned")
-        self.assertEqual(second_events, [])
+        self.assertEqual(second_saved["status"], "suspended")
+        self.assertTrue(any(event["kind"] == "hold_due" for event in second_events))
+        self.assertEqual(
+            [item["outcome"] for item in second_saved["credit_outcomes"]],
+            ["late", "default"],
+        )
 
     def test_debtless_banned_reseller_does_not_emit_debt_admin_alert(self):
         self.write_resellers({
@@ -536,6 +1238,25 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.assertEqual(first_saved["debt_last_admin_alert_level"], "none")
         self.assertEqual(second_saved["debt_last_admin_alert_level"], "none")
 
+    def test_existing_banned_reseller_is_untouched_by_debt_lifecycle(self):
+        self.write_resellers({
+            "1988": {
+                "status": "banned",
+                "debt": 12.0,
+                "debt_since": self.hours_ago(500),
+                "configs": [{"username": "preserved", "server_id": "s1", "price": 12.0}],
+            }
+        })
+
+        events = self.reseller.evaluate_reseller_debt_policies()
+        saved = self.read_resellers()["1988"]
+
+        self.assertEqual(events, [])
+        self.assertEqual(saved["status"], "banned")
+        self.assertFalse(saved["debt_service_hold_due"])
+        self.assertFalse(saved["debt_service_remove_due"])
+        self.assertFalse(saved["configs"][0].get("removed_from_vpn", False))
+
     def test_zero_debt_unban_grace_is_repaired_to_approved_after_deadline(self):
         self.write_resellers({
             "1988": {
@@ -553,9 +1274,9 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.assertEqual(saved["status"], "approved")
         self.assertIsNone(saved["suspended_reason"])
         self.assertIsNone(saved["suspended_at"])
-        self.assertEqual(events, [])
+        self.assertEqual([event["kind"] for event in events], ["recovered"])
 
-    def test_positive_debt_unban_grace_auto_bans_after_deadline(self):
+    def test_positive_debt_unban_grace_never_auto_bans(self):
         self.write_resellers({
             "1988": {
                 "status": "suspended",
@@ -569,10 +1290,9 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         events = self.reseller.evaluate_reseller_debt_policies()
         saved = self.read_resellers()["1988"]
 
-        self.assertEqual(saved["status"], "banned")
-        self.assertIsNone(saved["suspended_reason"])
-        self.assertIsNone(saved["suspended_at"])
-        self.assertTrue(any(event["auto_banned"] for event in events))
+        self.assertEqual(saved["status"], "suspended")
+        self.assertEqual(saved["suspended_reason"], self.reseller.SUSPENDED_REASON_UNBAN_GRACE)
+        self.assertFalse(any(event["auto_banned"] for event in events))
 
     def test_unban_with_positive_debt_moves_banned_reseller_to_temporary_suspended(self):
         self.write_resellers({
@@ -614,7 +1334,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.assertIsNone(saved["suspended_reason"])
         self.assertIsNone(saved["suspended_at"])
 
-    def test_explicit_suspension_with_zero_debt_stays_approved(self):
+    def test_explicit_suspension_with_zero_debt_stays_suspended(self):
         self.write_resellers({
             "1988": {
                 "status": "approved",
@@ -626,12 +1346,12 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.reseller.update_reseller_status("1988", "suspended")
         saved = self.read_resellers()["1988"]
 
-        self.assertEqual(saved["status"], "approved")
+        self.assertEqual(saved["status"], "suspended")
         self.assertIsNone(saved["suspended_reason"])
-        self.assertIsNone(saved["suspended_at"])
+        self.assertIsNotNone(saved["suspended_at"])
 
     def test_suspension_restoration_uses_cent_rounded_zero(self):
-        for debt, expected_status in ((0.004, "approved"), (0.005, "suspended")):
+        for debt, expected_status in ((0.004, "suspended"), (0.005, "suspended")):
             with self.subTest(debt=debt):
                 self.write_resellers({
                     "1988": {
@@ -670,7 +1390,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.assertIsNotNone(saved["last_payment_at"])
         self.assertIsNone(saved["suspended_reason"])
 
-    def test_manual_suspension_is_restored_when_debt_is_cleared(self):
+    def test_manual_suspension_is_preserved_when_debt_is_cleared(self):
         self.write_resellers({
             "1988": {
                 "status": "suspended",
@@ -686,7 +1406,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
 
         self.assertTrue(success)
         self.assertEqual(new_debt, 0.0)
-        self.assertEqual(saved["status"], "approved")
+        self.assertEqual(saved["status"], "suspended")
         self.assertIsNone(saved["suspended_reason"])
 
     def test_sub_threshold_positive_debt_keeps_reseller_suspended(self):
@@ -770,9 +1490,9 @@ class ResellerDebtPolicyTests(unittest.TestCase):
 
                 saved = self.read_resellers()["1988"]
                 self.assertEqual(saved["debt"], 0.0)
-                self.assertEqual(saved["status"], "approved")
+                self.assertEqual(saved["status"], "suspended")
                 self.assertIsNone(saved["suspended_reason"])
-                self.assertIsNone(saved["suspended_at"])
+                self.assertIsNotNone(saved["suspended_at"])
 
     def test_cleanup_candidates_include_only_configs_after_last_payment(self):
         candidates = self.reseller.get_banned_reseller_cleanup_candidates({

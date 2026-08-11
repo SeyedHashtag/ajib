@@ -140,6 +140,101 @@ def credit_account(user_id, amount, transaction_id, *, source=None, metadata=Non
         )
 
 
+def transfer_account_credit(
+    source_user_id,
+    destination_user_id,
+    amount,
+    transaction_id,
+    *,
+    source=None,
+    metadata=None,
+    path=None,
+):
+    """Atomically move available credit between two ledger accounts."""
+    requested_cents = _money_cents(amount)
+    if requested_cents <= 0:
+        raise ValueError("A positive transfer amount is required")
+    transfer_id = str(transaction_id or "").strip()
+    if not transfer_id:
+        raise ValueError("A transfer transaction ID is required")
+    reservation_id = f"transfer:{transfer_id}"
+    source_key = _user_key(source_user_id)
+    destination_key = _user_key(destination_user_id)
+    with database.write_transaction(path, operation="account_credit_transfer") as connection:
+        existing = connection.execute(
+            """
+            SELECT amount_cents, payload_json FROM account_credit_transactions
+            WHERE user_id=? AND transaction_id=? AND kind='credit'
+            """,
+            (destination_key, f"transfer-in:{transfer_id}"),
+        ).fetchone()
+        if existing is not None:
+            if int(existing["amount_cents"]) != requested_cents:
+                raise ValueError("Account-credit transfer ID was reused with a different amount")
+            try:
+                existing_payload = json.loads(existing["payload_json"] or "{}")
+            except (TypeError, ValueError):
+                existing_payload = {}
+            if str(existing_payload.get("source_user_id") or "") != source_key:
+                raise ValueError("Account-credit transfer ID was reused with a different source")
+            return _account_from_connection(connection, destination_key)
+        outgoing = connection.execute(
+            """
+            SELECT amount_cents, payload_json FROM account_credit_transactions
+            WHERE user_id=? AND transaction_id=? AND kind='consume'
+            """,
+            (source_key, f"consume:{reservation_id}"),
+        ).fetchone()
+        if outgoing is not None:
+            try:
+                outgoing_payload = json.loads(outgoing["payload_json"] or "{}")
+            except (TypeError, ValueError):
+                outgoing_payload = {}
+            if (
+                -int(outgoing["amount_cents"]) != requested_cents
+                or str(outgoing_payload.get("destination_user_id") or "") != destination_key
+            ):
+                raise ValueError("Account-credit transfer ID was reused with different data")
+            return credit_account(
+                destination_key,
+                amount,
+                f"transfer-in:{transfer_id}",
+                source=source or "account_credit_transfer",
+                metadata={"source_user_id": source_key, **dict(metadata or {})},
+                path=path,
+            )
+        reserved = reserve_account_credit(
+            source_key,
+            reservation_id,
+            amount,
+            order_id=transfer_id,
+            metadata={"destination_user_id": str(destination_user_id)},
+            path=path,
+        )
+        if _money_cents(reserved) != requested_cents:
+            raise ValueError("Insufficient account credit")
+        consumed = consume_account_credit(
+            source_key,
+            reservation_id,
+            order_id=transfer_id,
+            metadata={"destination_user_id": str(destination_user_id)},
+            path=path,
+        )
+        if _money_cents(consumed) != requested_cents:
+            raise RuntimeError("Account-credit transfer could not be consumed")
+        return credit_account(
+            destination_user_id,
+            amount,
+            f"transfer-in:{transfer_id}",
+            source=source or "account_credit_transfer",
+            metadata={
+                "source_user_id": str(source_user_id),
+                **dict(metadata or {}),
+            },
+            path=path,
+        )
+
+
 def reserve_account_credit(
     user_id,
     reservation_id,

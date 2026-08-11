@@ -72,6 +72,36 @@ from utils.reseller import (
     reserve_reseller_renewal,
     sync_reseller_renewal_reservation,
 )
+try:
+    from utils.reseller import get_reseller_credit_policy, record_reseller_credit_outcome
+except ImportError:
+    def get_reseller_credit_policy(data):
+        limit = get_reseller_trust_limit(get_reseller_total_paid(data or {}))
+        return {"base_limit": limit, "effective_limit": limit, "mode": "credit", "outcomes": []}
+
+    def record_reseller_credit_outcome(*_args, **_kwargs):
+        return False
+
+
+def _record_hosted_prepaid_good(payment_id):
+    try:
+        return record_reseller_credit_outcome(
+            OWNER_ID,
+            "good",
+            "hosted_crypto_wholesale_order",
+            reference_id=f"hosted-prepaid:{payment_id}",
+        )
+    except Exception:
+        return False
+from utils.reseller_wholesale_credit import (
+    consume_wholesale_balance,
+    finalize_prepaid_config,
+    finalize_prepaid_reserved_renewal,
+    finalize_prepaid_renewal,
+    get_wholesale_balance,
+    release_wholesale_balance,
+    reserve_wholesale_balance,
+)
 from utils.reseller_level_ui import (
     build_reseller_level_compact,
     present_pending_reseller_level,
@@ -128,6 +158,12 @@ bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=4)
 
 def _now():
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _release_checkout_wholesale(payment_id, record, kind="credit_released"):
+    if isinstance(record, dict) and record.get("wholesale_prepaid"):
+        return release_wholesale_balance(OWNER_ID, payment_id)
+    return release_credit(OWNER_ID, payment_id, kind=kind)
 
 
 def _parse_time(value):
@@ -744,7 +780,8 @@ def _recover_stale_payment_claims():
             record.pop("processing_from_status", None)
             recovered.append(payment_id)
     for reservation_id in release_reservations:
-        release_credit(OWNER_ID, reservation_id, kind="credit_creation_recovered")
+        record = _tenant_payments().get(reservation_id) or {}
+        _release_checkout_wholesale(reservation_id, record, kind="credit_creation_recovered")
     for payment_id, user_id in failed_creations:
         _release_invite_discount(user_id, payment_id)
     return recovered
@@ -1345,25 +1382,40 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
         },
         "renewal_attempts": 0,
     }
-    reserved, detail = reserve_reseller_renewal(
-        OWNER_ID,
-        username,
-        record["wholesale_price"],
-        common,
-        server_id=server_id,
-        funded=funded,
-        enforce_credit=False,
-    )
+    prepaid = bool(record.get("wholesale_prepaid"))
+    effective_funded = funded or prepaid
+    if prepaid:
+        try:
+            reserved, detail = finalize_prepaid_reserved_renewal(
+                OWNER_ID,
+                payment_id,
+                username,
+                record["wholesale_price"],
+                common,
+                server_id=server_id,
+            )
+        except Exception as error:
+            reserved, detail = False, {"reason": str(error)}
+    else:
+        reserved, detail = reserve_reseller_renewal(
+            OWNER_ID,
+            username,
+            record["wholesale_price"],
+            common,
+            server_id=server_id,
+            funded=effective_funded,
+            enforce_credit=False,
+        )
     if not reserved:
         return False, (detail or {}).get("reason", "Reseller accounting failed")
-    if not funded:
+    if not prepaid and not funded:
         release_credit(OWNER_ID, payment_id, kind="renewal_credit_consumed")
     _credit_sale_and_referral(
         payment_id,
         customer_id,
         settlement["referral_reward"],
         common,
-        funded=funded,
+        funded=effective_funded,
         margin=settlement["margin"],
     )
     if not mark_payment_renewal_reserved(
@@ -1378,6 +1430,8 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
         return False, "Reservation persistence failed"
     _record_completed_growth(payment_id, record, renewed=True)
     if funded:
+        _record_hosted_prepaid_good(payment_id)
+    if effective_funded:
         present_pending_reseller_level(
             bot,
             OWNER_ID,
@@ -1395,6 +1449,8 @@ def _provision_payment(payment_id, record, funded):
     except ValueError as error:
         return False, str(error)
     customer_id = int(record["user_id"])
+    prepaid = bool(record.get("wholesale_prepaid"))
+    effective_funded = funded or prepaid
     username = record.get("renew_username")
     client = None
     renewed = bool(username)
@@ -1423,19 +1479,29 @@ def _provision_payment(payment_id, record, funded):
         client, _ = MultiServerAPI().find_user(username, preferred_server_id=existing_config.get("server_id"))
         metadata = {"username": username, "server_id": existing_config.get("server_id"),
                     "retail_order_id": payment_id, "customer_telegram_id": customer_id}
-        if not funded:
+        if prepaid:
+            consumed = consume_wholesale_balance(
+                OWNER_ID,
+                payment_id,
+                metadata={"kind": "hosted_existing_config", "username": username},
+            )
+            if round(float(consumed or 0), 2) != round(float(record["wholesale_price"]), 2):
+                return False, "Prepaid wholesale reservation could not be consumed"
+        elif not funded:
             release_credit(OWNER_ID, payment_id, kind="credit_recovered")
         _credit_sale_and_referral(
             payment_id,
             customer_id,
             settlement["referral_reward"],
             metadata,
-            funded=funded,
+            funded=effective_funded,
             margin=settlement["margin"],
         )
         _save_payment(payment_id, {"status": "completed", "username": username,
                                    "server_id": existing_config.get("server_id")})
         _record_completed_growth(payment_id, record, renewed=renewed)
+        if funded:
+            _record_hosted_prepaid_good(payment_id)
         _deliver_config_safely(customer_id, username, client, renewed=renewed)
         if funded:
             present_pending_reseller_level(
@@ -1505,7 +1571,19 @@ def _provision_payment(payment_id, record, funded):
         "discount_percent": record.get("discount_percent"),
         "plan_gb": record["plan_gb"], "days": record["days"],
     }
-    if funded:
+    if prepaid:
+        try:
+            accounted = (
+                finalize_prepaid_renewal(
+                    OWNER_ID, payment_id, username, record["wholesale_price"], common, server_id
+                )
+                if renewed else finalize_prepaid_config(
+                    OWNER_ID, payment_id, record["wholesale_price"], common
+                )
+            )
+        except Exception:
+            accounted = False
+    elif funded:
         accounted = (record_funded_reseller_renewal(OWNER_ID, username, record["wholesale_price"], common, server_id)
                      if renewed else record_funded_reseller_config(OWNER_ID, record["wholesale_price"], common))
     else:
@@ -1515,7 +1593,7 @@ def _provision_payment(payment_id, record, funded):
         if not renewed and client:
             client.delete_user(username)
         return False, "Reseller accounting failed"
-    if funded:
+    if effective_funded:
         present_pending_reseller_level(
             bot,
             OWNER_ID,
@@ -1527,11 +1605,13 @@ def _provision_payment(payment_id, record, funded):
         customer_id,
         settlement["referral_reward"],
         common,
-        funded=funded,
+        funded=effective_funded,
         margin=settlement["margin"],
     )
     _save_payment(payment_id, {"status": "completed", "username": username, "server_id": server_id})
     _record_completed_growth(payment_id, record, renewed=renewed)
+    if funded:
+        _record_hosted_prepaid_good(payment_id)
     _deliver_config_safely(customer_id, username, client, renewed=renewed)
     return True, username
 
@@ -2099,13 +2179,31 @@ def payment_method(call):
         return
     if method == "card":
         reseller = get_reseller_data(OWNER_ID) or {}
-        _, _, available = can_reseller_add_debt(reseller, 0)
-        if not reserve_credit(OWNER_ID, order_id, quote["wholesale"], available):
+        can_add, _limit, available = can_reseller_add_debt(reseller, quote["wholesale"])
+        prepaid_reserved = False
+        if not can_add:
+            reserved_amount = reserve_wholesale_balance(
+                OWNER_ID,
+                order_id,
+                quote["wholesale"],
+                metadata={"kind": "hosted_card_checkout"},
+            )
+            prepaid_reserved = round(float(reserved_amount or 0), 2) == round(float(quote["wholesale"]), 2)
+        if not can_add and not prepaid_reserved:
+            if float(reserved_amount or 0) > 0:
+                release_wholesale_balance(OWNER_ID, order_id)
             _release_invite_discount(call.from_user.id, order_id)
             _save_payment(order_id, {"status": "failed", "last_error": "Reseller credit is unavailable"})
             bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "credit_unavailable"),
                                       show_alert=True)
             return
+        if can_add and not reserve_credit(OWNER_ID, order_id, quote["wholesale"], available):
+            _release_invite_discount(call.from_user.id, order_id)
+            _save_payment(order_id, {"status": "failed", "last_error": "Reseller credit is unavailable"})
+            bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "credit_unavailable"),
+                                      show_alert=True)
+            return
+        record["wholesale_prepaid"] = prepaid_reserved
         exchange_rate = get_exchange_rate()
         toman_price = quote["card_collected"] * exchange_rate
         record.update({"status": "waiting_receipt", "reservation_id": order_id,
@@ -2225,7 +2323,7 @@ def cancel_card_payment(call):
         bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "already_processed"),
                                   show_alert=True)
         return
-    release_credit(OWNER_ID, payment_id, kind="credit_canceled")
+    _release_checkout_wholesale(payment_id, record, kind="credit_canceled")
     _release_invite_discount(call.from_user.id, payment_id)
     _save_payment(payment_id, {"status": "canceled"})
     _clear_input_state(call.from_user.id, kind="receipt", payment_id=payment_id)
@@ -2303,7 +2401,7 @@ def owner_receipt(call):
         bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "already_processed"), show_alert=True)
         return
     if action == "reject":
-        release_credit(OWNER_ID, payment_id)
+        _release_checkout_wholesale(payment_id, record)
         _release_invite_discount(record["user_id"], payment_id)
         _save_payment(payment_id, {"status": "rejected"})
         bot.send_message(record["user_id"], _hosted_message(record["user_id"], "receipt_rejected"))
@@ -3871,20 +3969,38 @@ def owner_generate_input(message):
     label = (message.text or "customer").strip()[:64] or "customer"
     reseller = get_reseller_data(OWNER_ID) or {}
     pricing = _reseller_plan_pricing(plan, reseller) if plan else None
-    _, _, available = can_reseller_add_debt(reseller, 0)
     reservation_id = f"manual-{uuid.uuid4()}"
-    if not plan or not reserve_credit(
-        OWNER_ID,
-        reservation_id,
-        pricing["wholesale_price"],
-        available,
-    ):
+    can_add, _limit, available = can_reseller_add_debt(
+        reseller, pricing["wholesale_price"] if pricing else 0
+    )
+    prepaid = False
+    prepaid_amount = 0.0
+    reserved = False
+    if plan and can_add:
+        reserved = reserve_credit(
+            OWNER_ID, reservation_id, pricing["wholesale_price"], available
+        )
+    elif plan:
+        prepaid_amount = reserve_wholesale_balance(
+            OWNER_ID,
+            reservation_id,
+            pricing["wholesale_price"],
+            metadata={"kind": "hosted_owner_config"},
+        )
+        prepaid = round(float(prepaid_amount or 0), 2) == round(float(pricing["wholesale_price"]), 2)
+        reserved = prepaid
+    if not plan or not reserved:
+        if plan and not can_add and float(prepaid_amount or 0) > 0:
+            release_wholesale_balance(OWNER_ID, reservation_id)
         bot.reply_to(message, _hosted_message(OWNER_ID, "insufficient_credit"))
         return
     username, result, client = _create_user({"gb": plan_id, "days": plan.get("days", 30),
                                              "unlimited": plan.get("unlimited", False)}, label)
     if result is None:
-        release_credit(OWNER_ID, reservation_id)
+        if prepaid:
+            release_wholesale_balance(OWNER_ID, reservation_id)
+        else:
+            release_credit(OWNER_ID, reservation_id)
         bot.reply_to(message, _hosted_message(OWNER_ID, "vpn_creation_failed"))
         return
     config = {"username": username, "customer_name": label, "server_id": getattr(client, "server_id", None),
@@ -3894,7 +4010,16 @@ def owner_generate_input(message):
               "reseller_level": pricing["reseller_level"],
               "discount_percent": pricing["discount_percent"],
               "retail_order_id": reservation_id}
-    if not consume_credit(OWNER_ID, reservation_id, config):
+    if prepaid:
+        try:
+            accounted = finalize_prepaid_config(
+                OWNER_ID, reservation_id, pricing["wholesale_price"], config
+            )
+        except Exception:
+            accounted = False
+    else:
+        accounted = consume_credit(OWNER_ID, reservation_id, config)
+    if not accounted:
         client.delete_user(username)
         bot.reply_to(message, _hosted_message(OWNER_ID, "accounting_failed"))
         return
@@ -4280,7 +4405,7 @@ def _crypto_monitor():
                             {"waiting_receipt", "pending_approval"},
                         )
                         if claimed:
-                            release_credit(OWNER_ID, payment_id, kind="credit_expired")
+                            _release_checkout_wholesale(payment_id, claimed, kind="credit_expired")
                             _release_invite_discount(current.get("user_id"), payment_id)
                             _save_payment(payment_id, {"status": "expired"})
                             try:

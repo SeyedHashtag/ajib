@@ -101,6 +101,42 @@ class AccountCreditTests(unittest.TestCase):
         self.assertEqual([item["kind"] for item in history], ["credit", "consume"])
         self.assertEqual(history[-1]["amount"], -3.0)
 
+    def test_transfer_is_atomic_idempotent_and_bound_to_destination(self):
+        self.credit.credit_account("7", 10, "seed", path=self.path)
+
+        first = self.credit.transfer_account_credit(
+            "7", "reseller-wholesale:7", 6, "transfer-1", path=self.path
+        )
+        duplicate = self.credit.transfer_account_credit(
+            "7", "reseller-wholesale:7", 6, "transfer-1", path=self.path
+        )
+
+        self.assertEqual(first["available"], 6.0)
+        self.assertEqual(duplicate["available"], 6.0)
+        self.assertEqual(self.credit.get_account_credit("7", path=self.path)["available"], 4.0)
+        with self.assertRaises(ValueError):
+            self.credit.transfer_account_credit(
+                "7", "reseller-wholesale:other", 6, "transfer-1", path=self.path
+            )
+        self.assertEqual(
+            self.credit.get_account_credit("reseller-wholesale:other", path=self.path)["available"],
+            0.0,
+        )
+
+    def test_failed_transfer_rolls_back_partial_reservation(self):
+        self.credit.credit_account("7", 2, "seed", path=self.path)
+
+        with self.assertRaises(ValueError):
+            self.credit.transfer_account_credit(
+                "7", "reseller-wholesale:7", 3, "too-large", path=self.path
+            )
+
+        source = self.credit.get_account_credit("7", path=self.path)
+        destination = self.credit.get_account_credit("reseller-wholesale:7", path=self.path)
+        self.assertEqual(source["available"], 2.0)
+        self.assertEqual(source["reserved"], 0.0)
+        self.assertEqual(destination["available"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,29 @@ from utils.translations import BUTTON_TRANSLATIONS, get_message_text, get_button
 from utils.language import get_user_language
 from utils.referral import add_referral_reward, get_pending_withdrawal_requests
 from utils.reseller import evaluate_reseller_debt_policies, DEBT_WARNING_THRESHOLD, DEBT_SUSPEND_THRESHOLD
+try:
+    from utils.reseller import (
+        claim_reseller_debt_notification,
+        complete_reseller_debt_notification,
+        complete_reseller_debt_service_action_claim,
+        flush_reseller_pending_wholesale_credits,
+        process_reseller_debt_service_action,
+    )
+except ImportError:  # Rolling-upgrade/test compatibility.
+    def claim_reseller_debt_notification(*_args, **_kwargs):
+        return True
+
+    def complete_reseller_debt_notification(*_args, **_kwargs):
+        return True
+
+    def complete_reseller_debt_service_action_claim(*_args, **_kwargs):
+        return True
+
+    def flush_reseller_pending_wholesale_credits(*_args, **_kwargs):
+        return 0
+
+    def process_reseller_debt_service_action(*_args, **_kwargs):
+        return True, {}
 from utils.currency_format import format_toman_amount, format_usd_amount
 from utils.exchange_rate import get_exchange_rate
 from utils.receipt_checker import (
@@ -948,34 +971,29 @@ def _send_reseller_settlement_admin_notification(
     payment_method="Crypto",
     telegram_username=None,
 ):
-    if telegram_username is None:
-        try:
-            chat = bot.get_chat(user_id)
-            telegram_username = chat.username
-        except Exception:
-            telegram_username = None
+    # Settlement payments remain fully auditable in payment records and admin
+    # financial views. Routine and partial settlements intentionally do not DM
+    # admins; lifecycle recovery notifications are emitted only on full recovery.
+    return False
 
-    price = payment_record.get('price')
-    if price is None:
-        price = credited_amount if credited_amount is not None else _settlement_credit_amount(payment_record)
 
-    notification_kwargs = {"telegram_username": telegram_username}
-    if payment_record.get('converted_amount') is not None:
-        notification_kwargs.update({
-            "converted_amount": payment_record.get('converted_amount'),
-            "converted_currency": payment_record.get('converted_currency'),
-            "exchange_rate": payment_record.get('exchange_rate'),
-        })
+def _apply_reseller_wholesale_topup(payment_id, payment_record):
+    from utils.reseller_wholesale_credit import credit_wholesale_balance
 
-    send_admin_payment_notification(
-        user_id,
-        "Settlement",
-        "Settlement",
-        price,
-        payment_id,
-        payment_method,
-        **notification_kwargs,
+    reseller_id = payment_record.get('user_id')
+    amount = float(
+        payment_record.get('wholesale_topup_amount', payment_record.get('price', 0.0)) or 0.0
     )
+    if amount <= 0:
+        return False, 0.0
+    credit_wholesale_balance(
+        reseller_id,
+        amount,
+        f"wholesale-topup:{payment_id}",
+        source=str(payment_record.get('payment_method') or 'payment'),
+        metadata={'payment_id': str(payment_id)},
+    )
+    return True, amount
 
 
 def _renewal_reason_text(language, reason):
@@ -2513,6 +2531,7 @@ def process_receipt_photo(message, plan_gb, price):
         renewal_metadata = None
         incentive_metadata = None
         card_checkout_id = None
+        wholesale_topup_amount = None
         receipt_type = RECEIPT_TYPE_SETTLEMENT if plan_gb == 'Settlement' else RECEIPT_TYPE_REGULAR
         if user_id in user_data:
             receipt_prompt_message_id = user_data[user_id].get('receipt_prompt_message_id')
@@ -2524,6 +2543,7 @@ def process_receipt_photo(message, plan_gb, price):
             renewal_metadata = user_data[user_id].get('renewal_metadata')
             incentive_metadata = user_data[user_id].get('incentive_metadata')
             card_checkout_id = user_data[user_id].get('card_checkout_id')
+            wholesale_topup_amount = user_data[user_id].get('wholesale_topup_amount')
         else:
             settlement_amount = None
         file_id = message.photo[-1].file_id
@@ -2537,7 +2557,26 @@ def process_receipt_photo(message, plan_gb, price):
         with open(photo_path, 'wb') as new_file:
             new_file.write(downloaded_file)
         
-        if plan_gb == 'Settlement':
+        if wholesale_topup_amount is not None:
+             routed_to_checker = should_route_to_receipt_checker(RECEIPT_TYPE_SETTLEMENT)
+             checker_id = get_receipt_checker_user_id() if routed_to_checker else None
+             payment_record = {
+                'user_id': user_id,
+                'language': language,
+                'plan_gb': 'Wholesale',
+                'price': price,
+                'days': 0,
+                'payment_id': payment_id,
+                'status': 'pending_approval',
+                'receipt_path': photo_path,
+                'type': 'reseller_wholesale_topup',
+                'receipt_type': RECEIPT_TYPE_SETTLEMENT,
+                'routed_to_checker': routed_to_checker,
+                'receipt_checker_user_id': checker_id,
+                'payment_method': 'Card to Card',
+                'wholesale_topup_amount': wholesale_topup_amount,
+             }
+        elif plan_gb == 'Settlement':
              routed_to_checker = should_route_to_receipt_checker(RECEIPT_TYPE_SETTLEMENT)
              checker_id = get_receipt_checker_user_id() if routed_to_checker else None
              payment_record = {
@@ -2703,6 +2742,23 @@ def _process_admin_approval_job(call, action, payment_id, payment_record, review
         if action == 'approve':
             _record_review_audit(payment_id, call, action, reviewer_role)
             _record_checker_share_audit(payment_id, payment_record)
+            if payment_record.get('type') == 'reseller_wholesale_topup':
+                 success, amount = _apply_reseller_wholesale_topup(payment_id, payment_record)
+                 if not success:
+                     _release_processing_for_retry(payment_id, 'pending_approval', "wholesale top-up failed")
+                     return
+                 update_payment_status(payment_id, 'completed')
+                 user_to_notify = payment_record['user_id']
+                 bot.send_message(
+                    user_to_notify,
+                    get_message_text(get_user_language(user_to_notify), 'reseller_wholesale_funded').format(amount=amount),
+                 )
+                 _update_receipt_message_refs(
+                    payment_id,
+                    payment_record,
+                    f"✅ Wholesale top-up {payment_id} approved by {call.from_user.first_name}.",
+                 )
+                 return
             if payment_record.get('type') == 'settlement' or payment_record.get('plan_gb') == 'Settlement':
                  success, credited_amount, remaining_debt = _apply_reseller_settlement_payment(
                     payment_record['user_id'],
@@ -2724,17 +2780,13 @@ def _process_admin_approval_job(call, action, payment_id, payment_record, review
                  except:
                     pass
 
-                 send_admin_payment_notification(
-                    user_to_notify, 
-                    "Settlement", 
-                    "Settlement", 
-                    payment_record['price'], 
-                    payment_id, 
-                    payment_record.get('payment_method', 'Card to Card'), 
+                 _send_reseller_settlement_admin_notification(
+                    user_to_notify,
+                    payment_id,
+                    payment_record,
+                    credited_amount=credited_amount,
+                    payment_method=payment_record.get('payment_method', 'Card to Card'),
                     telegram_username=telegram_username,
-                    converted_amount=payment_record.get('converted_amount'),
-                    converted_currency=payment_record.get('converted_currency'),
-                    exchange_rate=payment_record.get('exchange_rate')
                  )
 
                  bot.send_message(
@@ -2997,7 +3049,19 @@ def _process_check_payment_job(call):
         else:
             telegram_username = _payment_owner_username(payment_record)
         plan_gb = payment_record.get('plan_gb')
-        
+
+        if payment_record.get('type') == 'reseller_wholesale_topup':
+            success, amount = _apply_reseller_wholesale_topup(payment_id, payment_record)
+            if not success:
+                _release_processing_for_retry(payment_id, 'pending', "wholesale top-up failed")
+                return
+            update_payment_status(payment_id, 'completed')
+            bot.send_message(
+                user_id,
+                get_message_text(user_language, 'reseller_wholesale_funded').format(amount=amount),
+            )
+            return
+
         if payment_record.get('type') == 'settlement' or plan_gb == 'Settlement':
             success, credited_amount, remaining_debt = _apply_reseller_settlement_payment(user_id, payment_record)
             if not success:
@@ -3196,7 +3260,19 @@ def process_payment_webhook(request_data):
                 user_id = payment_record.get('user_id')
                 user_language = get_user_language(user_id)
                 plan_gb = payment_record.get('plan_gb')
-                
+
+                if payment_record.get('type') == 'reseller_wholesale_topup':
+                    success, amount = _apply_reseller_wholesale_topup(record_key, payment_record)
+                    if not success:
+                        _release_processing_for_retry(record_key, 'pending', "wholesale top-up failed")
+                        return False
+                    update_payment_status(record_key, 'completed')
+                    bot.send_message(
+                        user_id,
+                        get_message_text(user_language, 'reseller_wholesale_funded').format(amount=amount),
+                    )
+                    return True
+
                 if payment_record.get('type') == 'settlement' or plan_gb == 'Settlement':
                     success, credited_amount, remaining_debt = _apply_reseller_settlement_payment(user_id, payment_record)
                     if not success:
@@ -3622,7 +3698,22 @@ def check_pending_payments():
                         # Process payment
                         user_id = record.get('user_id')
                         plan_gb = record.get('plan_gb')
-                        
+
+                        if record.get('type') == 'reseller_wholesale_topup':
+                            success, amount = _apply_reseller_wholesale_topup(payment_id, record)
+                            if not success:
+                                _release_processing_for_retry(payment_id, 'pending', "wholesale top-up failed")
+                                continue
+                            update_payment_status(payment_id, 'completed')
+                            try:
+                                bot.send_message(
+                                    user_id,
+                                    get_message_text(get_user_language(user_id), 'reseller_wholesale_funded').format(amount=amount),
+                                )
+                            except Exception:
+                                pass
+                            continue
+
                         if record.get('type') == 'settlement' or plan_gb == 'Settlement':
                             success, credited_amount, remaining_debt = _apply_reseller_settlement_payment(user_id, record)
                             if not success:
@@ -3743,6 +3834,7 @@ def check_pending_payments():
                     print(f"Error checking pending payment {payment_id}: {e}")
 
         # Also run reseller debt reminders/escalations on the same monitoring cycle.
+        flush_reseller_pending_wholesale_credits()
         debt_events = evaluate_reseller_debt_policies()
         for event in debt_events:
             try:
@@ -3751,51 +3843,125 @@ def check_pending_payments():
                 continue
 
             debt = float(event.get('debt', 0.0))
-            debt_state = str(event.get('debt_state', 'active'))
             debt_age_days = int(event.get('debt_age_days', 0))
             debt_age_hours = float(event.get('debt_age_hours', 0.0))
             unlock_amount = float(event.get('unlock_amount', 0.0))
-            hours_until_ban = float(event.get('hours_until_ban', 0.0))
+            kind = str(event.get('kind') or (
+                'banned' if event.get('auto_banned')
+                else ('suspended' if event.get('auto_suspended') else 'reminder_24h')
+            ))
+            action_result = {}
+            if event.get('service_action'):
+                action_success, action_result = process_reseller_debt_service_action(
+                    reseller_id,
+                    MultiServerAPI(),
+                    event['service_action'],
+                )
+                complete_reseller_debt_service_action_claim(
+                    reseller_id,
+                    event['service_action'],
+                    completed=action_success,
+                )
+                if not action_success:
+                    if event.get('notify_user'):
+                        complete_reseller_debt_notification(reseller_id, kind, 'user', delivered=False)
+                    if event.get('notify_admin'):
+                        complete_reseller_debt_notification(
+                            reseller_id,
+                            kind,
+                            'admin',
+                            delivered=False,
+                        )
+                        admin_delivered = True
+                        retry_kind = f"{kind}_action_failure"
+                        if claim_reseller_debt_notification(reseller_id, retry_kind, 'admin'):
+                            for admin_id in ADMIN_USER_IDS:
+                                try:
+                                    admin_language = get_user_language(admin_id)
+                                    bot.send_message(
+                                        admin_id,
+                                        get_message_text(admin_language, 'admin_reseller_debt_action_retry').format(
+                                            reseller_id=reseller_id,
+                                            action=event['service_action'],
+                                            failed=len(action_result.get('failed', []) or []),
+                                            manual_review=len(action_result.get('manual_review', []) or []),
+                                        ),
+                                        parse_mode='Markdown',
+                                    )
+                                except Exception:
+                                    admin_delivered = False
+                            complete_reseller_debt_notification(
+                                reseller_id,
+                                retry_kind,
+                                'admin',
+                                delivered=admin_delivered,
+                            )
+                    continue
+                if event['service_action'] == 'hold':
+                    kind = 'held'
+                elif event['service_action'] == 'remove':
+                    kind = 'removed'
 
             if event.get('auto_banned') or event.get('auto_suspended') or event.get('notify_user'):
+                delivered = False
                 try:
                     user_language = get_user_language(reseller_id)
                     if event.get('auto_banned'):
                         user_message = get_message_text(user_language, "reseller_auto_banned").format(
                             debt=debt,
                         )
-                    elif event.get('auto_suspended'):
+                    elif kind == 'suspended':
                         user_message = get_message_text(user_language, "reseller_auto_suspended").format(
                             debt=debt,
-                            hours_until_ban=hours_until_ban,
-                        )
-                    elif debt_state == 'suspended':
-                        user_message = get_message_text(user_language, "reseller_debt_reminder_suspended").format(
-                            debt=debt,
-                            debt_age_days=debt_age_days,
-                            unlock_amount=unlock_amount
+                            hours_until_ban=0.0,
                         )
                     else:
-                        user_message = get_message_text(user_language, "reseller_debt_reminder_warning").format(
+                        message_key = {
+                            'opened': 'reseller_debt_opened',
+                            'reminder_24h': 'reseller_debt_reminder_warning',
+                            'deadline_final': 'reseller_deadline_warning',
+                            'deletion_warning': 'reseller_debt_deletion_warning',
+                            'held': 'reseller_debt_services_held',
+                            'removed': 'reseller_debt_services_removed',
+                            'recovered': 'reseller_debt_recovered',
+                        }.get(kind, 'reseller_debt_reminder_suspended')
+                        user_message = get_message_text(user_language, message_key).format(
                             debt=debt,
                             debt_age_days=debt_age_days,
-                            suspend_threshold=DEBT_SUSPEND_THRESHOLD
+                            debt_age_hours=debt_age_hours,
+                            unlock_amount=unlock_amount,
+                            suspend_threshold=DEBT_SUSPEND_THRESHOLD,
+                            hours_until_suspend=float(event.get('hours_until_suspend', 0.0)),
+                            hours_until_hold=float(event.get('hours_until_hold', 0.0)),
+                            hours_until_removal=float(event.get('hours_until_removal', 0.0)),
+                            changed=int(action_result.get('completed', 0) or 0),
+                            writeoff=float(action_result.get('writeoff', 0.0) or 0.0),
+                            remaining_debt=float(action_result.get('remaining_debt', debt) or 0.0),
                         )
 
                     markup = None
-                    if debt > 0 and not event.get('auto_banned'):
+                    message_debt = float(action_result.get('remaining_debt', debt) or 0.0)
+                    if message_debt > 0 and not event.get('auto_banned') and kind != 'recovered':
                         markup = types.InlineKeyboardMarkup()
                         markup.add(
                             types.InlineKeyboardButton(
                                 get_button_text(user_language, "settle_debt"),
-                                callback_data=f"reseller:settle:{debt:.2f}"
+                                callback_data=f"reseller:settle:{message_debt:.2f}"
                             )
                         )
                     bot.send_message(reseller_id, user_message, reply_markup=markup, parse_mode="Markdown")
+                    delivered = True
                 except Exception:
                     pass
+                complete_reseller_debt_notification(
+                    reseller_id,
+                    str(event.get('kind') or kind),
+                    'user',
+                    delivered=delivered,
+                )
 
             if event.get('notify_admin'):
+                admin_delivered = True
                 for admin_id in ADMIN_USER_IDS:
                     try:
                         admin_language = get_user_language(admin_id)
@@ -3805,25 +3971,40 @@ def check_pending_payments():
                                 debt=debt,
                                 debt_age_hours=debt_age_hours,
                             )
-                        elif event.get('auto_suspended'):
+                        elif kind == 'suspended':
                             admin_message = get_message_text(admin_language, "admin_reseller_auto_suspended").format(
                                 reseller_id=reseller_id,
                                 debt=debt,
                                 debt_age_hours=debt_age_hours,
                             )
                         else:
-                            state_text = get_message_text(admin_language, _debt_state_label_key(debt_state))
-                            admin_message = get_message_text(admin_language, "reseller_debt_threshold_crossed_admin").format(
+                            message_key = {
+                                'held': 'admin_reseller_debt_services_held',
+                                'removed': 'admin_reseller_debt_services_removed',
+                                'recovered': 'admin_reseller_debt_recovered',
+                            }.get(kind, 'reseller_debt_threshold_crossed_admin')
+                            state_text = get_message_text(admin_language, _debt_state_label_key(event.get('debt_state', 'active')))
+                            admin_message = get_message_text(admin_language, message_key).format(
                                 reseller_id=reseller_id,
                                 debt_state=state_text,
                                 debt=debt,
+                                remaining_debt=float(action_result.get('remaining_debt', debt) or 0.0),
+                                changed=int(action_result.get('completed', 0) or 0),
+                                writeoff=float(action_result.get('writeoff', 0.0) or 0.0),
+                                manual_review=len(action_result.get('manual_review', []) or []),
                                 debt_age_days=debt_age_days,
                                 warning_threshold=DEBT_WARNING_THRESHOLD,
                                 suspend_threshold=DEBT_SUSPEND_THRESHOLD
                             )
                         bot.send_message(admin_id, admin_message, parse_mode="Markdown")
                     except Exception:
-                        pass
+                        admin_delivered = False
+                complete_reseller_debt_notification(
+                    reseller_id,
+                    str(event.get('kind') or kind),
+                    'admin',
+                    delivered=admin_delivered,
+                )
 
     except Exception as e:
         print(f"Error in check_pending_payments: {e}")

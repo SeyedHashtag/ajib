@@ -38,11 +38,22 @@ DEBT_SUSPEND_THRESHOLD = _safe_float_env('RESELLER_DEBT_SUSPEND_THRESHOLD', 50.0
 DEBT_SETTLEMENT_THRESHOLD = _safe_float_env('RESELLER_SETTLEMENT_THRESHOLD', 1.0)
 DEBT_REMINDER_INTERVAL_HOURS = max(1.0, _safe_float_env('RESELLER_DEBT_REMINDER_INTERVAL_HOURS', 24.0))
 DEBT_SUSPEND_DEADLINE_HOURS = max(1.0, _safe_float_env('RESELLER_DEBT_SUSPEND_DEADLINE_HOURS', 48.0))
-DEBT_BAN_DEADLINE_HOURS = max(1.0, _safe_float_env('RESELLER_DEBT_BAN_DEADLINE_HOURS', 72.0))
-UNBAN_GRACE_BAN_DEADLINE_HOURS = max(1.0, _safe_float_env('RESELLER_UNBAN_GRACE_BAN_DEADLINE_HOURS', 24.0))
+DEBT_HOLD_DEADLINE_HOURS = max(1.0, _safe_float_env('RESELLER_DEBT_HOLD_DEADLINE_HOURS', 72.0))
+DEBT_REMOVAL_DEADLINE_HOURS = max(
+    DEBT_HOLD_DEADLINE_HOURS,
+    _safe_float_env('RESELLER_DEBT_REMOVAL_DEADLINE_HOURS', 168.0),
+)
+DEBT_FINAL_WARNING_HOURS = max(
+    DEBT_HOLD_DEADLINE_HOURS,
+    _safe_float_env('RESELLER_DEBT_FINAL_WARNING_HOURS', 144.0),
+)
+# Kept as a read-only compatibility alias. Debt policy no longer bans resellers.
+DEBT_BAN_DEADLINE_HOURS = DEBT_REMOVAL_DEADLINE_HOURS
+UNBAN_GRACE_BAN_DEADLINE_HOURS = DEBT_HOLD_DEADLINE_HOURS
 SUSPENDED_REASON_DEBT = 'debt'
 SUSPENDED_REASON_UNBAN_GRACE = 'unban_grace'
 REMOVAL_REASON_BANNED_RESELLER_CLEANUP = 'banned_reseller_cleanup'
+REMOVAL_REASON_RESELLER_DEBT_DEFAULT = 'reseller_debt_default'
 REMOVAL_NOTE_BANNED_RESELLER_CLEANUP = 'Removed during banned reseller unpaid user cleanup'
 REMOVAL_STATUS_DELETED_FROM_VPN = 'deleted_from_vpn'
 REMOVAL_STATUS_ALREADY_MISSING = 'already_missing'
@@ -60,6 +71,8 @@ RESELLER_LEVEL_PRESENTATION_LEASE_SECONDS = max(
 )
 MONEY_QUANTUM = Decimal('0.01')
 DEBT_CHARGE_EPSILON = 0.005
+CREDIT_OUTCOME_LIMIT = 3
+CREDIT_OUTCOME_WEIGHTS = {'good': 0, 'late': 1, 'default': 2}
 
 
 def _update_recruitment_milestone(reseller_id, reseller_data):
@@ -380,15 +393,92 @@ def calculate_reseller_wholesale_price(list_price, record):
 def get_reseller_available_credit(record):
     data = record or {}
     debt = _safe_float(data.get('debt', 0.0))
-    trust_limit = get_reseller_trust_limit(get_reseller_total_paid(data))
+    trust_limit = get_reseller_credit_policy(data)['effective_limit']
     return max(0.0, trust_limit - debt)
+
+
+def get_reseller_credit_policy(record):
+    data = record or {}
+    outcomes = data.get('credit_outcomes', [])
+    if not isinstance(outcomes, list):
+        outcomes = []
+    outcomes = [item for item in outcomes[-CREDIT_OUTCOME_LIMIT:] if isinstance(item, dict)]
+    adverse_weight = sum(
+        CREDIT_OUTCOME_WEIGHTS.get(str(item.get('outcome') or ''), 0)
+        for item in outcomes
+    )
+    base_limit = get_reseller_trust_limit(get_reseller_total_paid(data))
+    if adverse_weight >= 2:
+        mode = 'prepaid_only'
+        effective_limit = 0.0
+    elif adverse_weight == 1:
+        mode = 'half_credit'
+        effective_limit = round(base_limit / 2.0, 2)
+    else:
+        mode = 'credit'
+        effective_limit = base_limit
+    return {
+        'base_limit': base_limit,
+        'effective_limit': effective_limit,
+        'mode': mode,
+        'adverse_weight': adverse_weight,
+        'outcomes': [dict(item) for item in outcomes],
+    }
+
+
+def _record_credit_outcome(record, outcome, source, reference_id=None):
+    normalized = str(outcome or '')
+    if normalized not in CREDIT_OUTCOME_WEIGHTS:
+        return False
+    history = record.get('credit_outcomes', [])
+    if not isinstance(history, list):
+        history = []
+    reference = str(reference_id or uuid.uuid4().hex)
+    references = record.get('credit_outcome_references', [])
+    if not isinstance(references, list):
+        references = []
+    if reference in {str(item) for item in references}:
+        return False
+    history.append({
+        'outcome': normalized,
+        'source': str(source or 'unknown'),
+        'reference_id': reference,
+        'recorded_at': _now_str(),
+    })
+    record['credit_outcomes'] = history[-CREDIT_OUTCOME_LIMIT:]
+    record['credit_outcome_references'] = (references + [reference])[-500:]
+    return True
+
+
+def record_reseller_credit_outcome(user_id, outcome, source, reference_id=None):
+    user_id = str(user_id)
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                if user_id not in resellers:
+                    return False
+                current = _ensure_reseller_defaults(resellers[user_id])
+                changed = _record_credit_outcome(
+                    current,
+                    outcome,
+                    source,
+                    reference_id=reference_id,
+                )
+                if changed:
+                    current = _ensure_reseller_defaults(current)
+                    resellers[user_id] = current
+                    _write_resellers_file(resellers)
+                return changed
+        except Exception:
+            return False
 
 
 def can_reseller_add_debt(record, amount):
     data = record or {}
     debt = _safe_float(data.get('debt', 0.0))
     amount_value = _safe_float(amount, 0.0)
-    trust_limit = get_reseller_trust_limit(get_reseller_total_paid(data))
+    trust_limit = get_reseller_credit_policy(data)['effective_limit']
     return debt + amount_value <= trust_limit, trust_limit, max(0.0, trust_limit - debt)
 
 
@@ -480,11 +570,18 @@ def _mark_config_removed(config, cleanup_status):
     return tagged
 
 
-def _compute_debt_state(debt):
+def _compute_debt_state(debt, debt_since=None, now=None):
     debt_amount = _safe_float(debt, 0.0)
-    if debt_amount >= DEBT_SUSPEND_THRESHOLD:
+    if _is_debt_fully_settled(debt_amount):
+        return 'active'
+    started_at = _parse_time(debt_since)
+    age_hours = (
+        max(0.0, ((now or datetime.now()) - started_at).total_seconds() / 3600)
+        if started_at else 0.0
+    )
+    if age_hours >= DEBT_SUSPEND_DEADLINE_HOURS:
         return 'suspended'
-    if debt_amount >= DEBT_WARNING_THRESHOLD:
+    if age_hours >= 24.0:
         return 'warning'
     return 'active'
 
@@ -529,6 +626,47 @@ def _ensure_reseller_defaults(record):
     data.setdefault('debt_last_reminded_at', None)
     data.setdefault('debt_last_admin_alert_level', 'none')
     data.setdefault('debt_last_admin_alert_at', None)
+    if not isinstance(data.get('credit_outcomes'), list):
+        data['credit_outcomes'] = []
+    data['credit_outcomes'] = [
+        item for item in data['credit_outcomes'][-CREDIT_OUTCOME_LIMIT:]
+        if isinstance(item, dict)
+    ]
+    if not isinstance(data.get('credit_outcome_references'), list):
+        data['credit_outcome_references'] = []
+    known_outcome_references = [
+        str(item.get('reference_id'))
+        for item in data['credit_outcomes']
+        if item.get('reference_id')
+    ]
+    data['credit_outcome_references'] = list(dict.fromkeys(
+        [str(item) for item in data['credit_outcome_references'][-500:]]
+        + known_outcome_references
+    ))[-500:]
+    if not isinstance(data.get('debt_notification_state'), dict):
+        data['debt_notification_state'] = {}
+    if not isinstance(data.get('debt_service_action_claims'), dict):
+        data['debt_service_action_claims'] = {}
+    if not isinstance(data.get('processed_debt_payments'), list):
+        data['processed_debt_payments'] = []
+    data['processed_debt_payments'] = [
+        item for item in data['processed_debt_payments'][-200:]
+        if isinstance(item, dict)
+    ]
+    if not isinstance(data.get('pending_wholesale_credits'), list):
+        data['pending_wholesale_credits'] = []
+    data['pending_wholesale_credits'] = [
+        item for item in data['pending_wholesale_credits']
+        if isinstance(item, dict)
+    ]
+    data.setdefault('debt_cycle_id', None)
+    data.setdefault('debt_cycle_late_recorded', False)
+    data.setdefault('debt_cycle_default_recorded', False)
+    data.setdefault('debt_services_held_at', None)
+    data.setdefault('debt_services_removed_at', None)
+    data.setdefault('debt_service_hold_due', False)
+    data.setdefault('debt_service_remove_due', False)
+    data.setdefault('debt_recovery_pending', False)
     try:
         presented_level = int(data.get('last_presented_reseller_level', 0) or 0)
     except (TypeError, ValueError):
@@ -541,14 +679,24 @@ def _ensure_reseller_defaults(record):
         data['reseller_level_presentation_claim'] = None
 
     debt_fully_settled = _is_debt_fully_settled(debt)
-    if not debt_fully_settled and debt >= DEBT_SETTLEMENT_THRESHOLD and not data.get('debt_since'):
+    if not debt_fully_settled and not data.get('debt_since'):
         data['debt_since'] = _now_str()
-    if debt_fully_settled or debt < DEBT_SETTLEMENT_THRESHOLD:
+    if not debt_fully_settled and not data.get('debt_cycle_id'):
+        data['debt_cycle_id'] = uuid.uuid4().hex
+        data['debt_cycle_late_recorded'] = False
+        data['debt_cycle_default_recorded'] = False
+        data['debt_services_held_at'] = None
+        data['debt_services_removed_at'] = None
+        data['debt_service_hold_due'] = False
+        data['debt_service_remove_due'] = False
+        data['debt_service_action_claims'] = {}
+        data['debt_notification_state'] = {}
+    if debt_fully_settled:
         data['debt_since'] = None
         data['debt_last_reminded_at'] = None
         data['debt_last_admin_alert_level'] = 'none'
 
-    data['debt_state'] = _compute_debt_state(debt)
+    data['debt_state'] = _compute_debt_state(debt, data.get('debt_since'))
     return data
 
 
@@ -556,10 +704,39 @@ def _restore_suspended_if_debt_fully_settled(data):
     if (
         _is_debt_fully_settled(data.get('debt', 0.0))
         and data.get('status') == 'suspended'
+        and data.get('suspended_reason') in {
+            SUSPENDED_REASON_DEBT,
+            SUSPENDED_REASON_UNBAN_GRACE,
+        }
     ):
         data['status'] = 'approved'
         data['suspended_reason'] = None
         data['suspended_at'] = None
+        data['debt_recovery_pending'] = True
+    return data
+
+
+def _mark_policy_restore_due_if_needed(data):
+    if not _is_debt_fully_settled(data.get('debt', 0.0)):
+        return data
+    if any(
+        isinstance(config, dict)
+        and config.get('debt_policy_blocked')
+        and not _is_removed_config(config)
+        for config in data.get('configs', [])
+    ):
+        data['debt_restore_services_due'] = True
+        data['debt_recovery_pending'] = True
+    return data
+
+
+def _finish_debt_cycle(data):
+    data['debt_cycle_id'] = None
+    data['debt_cycle_late_recorded'] = False
+    data['debt_cycle_default_recorded'] = False
+    data['debt_service_hold_due'] = False
+    data['debt_service_remove_due'] = False
+    data['debt_notification_state'] = {}
     return data
 
 
@@ -754,7 +931,7 @@ def add_reseller_debt(user_id, amount, config_data):
                     if charge is None:
                         return False
                     current['configs'].append(config_data)
-                    if before < DEBT_SETTLEMENT_THRESHOLD and current['debt'] >= DEBT_SETTLEMENT_THRESHOLD:
+                    if _is_debt_fully_settled(before) and not _is_debt_fully_settled(current['debt']):
                         current['debt_since'] = _now_str()
 
                     current = _ensure_reseller_defaults(current)
@@ -937,7 +1114,7 @@ def add_reseller_renewal_debt(user_id, username, amount, renewal_data, server_id
                 if renewal_record.get('after_state') is not None:
                     configs[target_index]['cleanup_last_state'] = renewal_record.get('after_state')
 
-                if before < DEBT_SETTLEMENT_THRESHOLD and current['debt'] >= DEBT_SETTLEMENT_THRESHOLD:
+                if _is_debt_fully_settled(before) and not _is_debt_fully_settled(current['debt']):
                     current['debt_since'] = _now_str()
 
                 current = _ensure_reseller_defaults(current)
@@ -1047,7 +1224,7 @@ def reserve_reseller_renewal(
                     )
                     if charge is None:
                         return False, {'reason': 'renewal_accounting_failed'}
-                    if before < DEBT_SETTLEMENT_THRESHOLD and current['debt'] >= DEBT_SETTLEMENT_THRESHOLD:
+                    if _is_debt_fully_settled(before) and not _is_debt_fully_settled(current['debt']):
                         current['debt_since'] = _now_str()
 
                 renewals.append(record)
@@ -1318,6 +1495,8 @@ def clear_reseller_debt(user_id):
                     )
                     current['debt'] = 0.0
                     current = _restore_suspended_if_debt_fully_settled(current)
+                    current = _mark_policy_restore_due_if_needed(current)
+                    current = _finish_debt_cycle(current)
                     current = _ensure_reseller_defaults(current)
                     resellers[user_id] = current
                     _write_resellers_file(resellers)
@@ -1356,11 +1535,14 @@ def set_reseller_debt(user_id, amount):
                         )
                     current['debt'] = new_debt
 
-                    if previous_debt < DEBT_SETTLEMENT_THRESHOLD and current['debt'] >= DEBT_SETTLEMENT_THRESHOLD:
+                    if _is_debt_fully_settled(previous_debt) and not _is_debt_fully_settled(current['debt']):
                         current['debt_since'] = _now_str()
-                    if _is_debt_fully_settled(current['debt']) or current['debt'] < DEBT_SETTLEMENT_THRESHOLD:
+                    if _is_debt_fully_settled(current['debt']):
                         current['debt_since'] = None
                     current = _restore_suspended_if_debt_fully_settled(current)
+                    if _is_debt_fully_settled(current['debt']):
+                        current = _mark_policy_restore_due_if_needed(current)
+                        current = _finish_debt_cycle(current)
 
                     current = _ensure_reseller_defaults(current)
                     resellers[user_id] = current
@@ -1532,8 +1714,394 @@ def cleanup_banned_reseller_users(user_id, multi_api):
         }
 
 
+def _debt_service_charge_sources(config):
+    sources = {}
+    if not isinstance(config, dict):
+        return sources
+    charge_id = str(config.get('debt_charge_id') or '')
+    if charge_id:
+        sources[charge_id] = {
+            'days': config.get('days'),
+            'gb': config.get('gb'),
+            'unlimited': bool(config.get('unlimited', False)),
+            'started_at': config.get('timestamp'),
+            'kind': 'config',
+        }
+    for renewal in config.get('renewals', []) if isinstance(config.get('renewals'), list) else []:
+        if not isinstance(renewal, dict):
+            continue
+        renewal_charge_id = str(renewal.get('debt_charge_id') or '')
+        if not renewal_charge_id:
+            continue
+        sources[renewal_charge_id] = {
+            'days': renewal.get('days'),
+            'gb': renewal.get('gb') or renewal.get('plan_gb'),
+            'unlimited': bool(renewal.get('unlimited', False)),
+            'started_at': renewal.get('renewal_applied_at') or renewal.get('timestamp'),
+            'kind': 'renewal',
+            'activated': renewal.get('renewal_status') == 'applied' or not renewal.get('renewal_mode'),
+        }
+    return sources
+
+
+def get_reseller_debt_service_candidates(reseller_data):
+    data = _ensure_reseller_defaults(reseller_data or {})
+    _ensure_debt_charge_ledger(data)
+    charges = {
+        str(charge.get('id') or ''): charge
+        for charge in data.get('debt_charges', [])
+        if isinstance(charge, dict) and _charge_outstanding(charge) > DEBT_CHARGE_EPSILON
+    }
+    candidates = []
+    linked_ids = set()
+    for index, config in enumerate(data.get('configs', [])):
+        if not isinstance(config, dict) or _is_removed_config(config):
+            continue
+        sources = _debt_service_charge_sources(config)
+        outstanding_ids = [charge_id for charge_id in sources if charge_id in charges]
+        if not outstanding_ids:
+            continue
+        linked_ids.update(outstanding_ids)
+        candidates.append({
+            'config_index': index,
+            'username': str(config.get('username') or '').strip(),
+            'server_id': config.get('server_id'),
+            'charge_ids': outstanding_ids,
+            'charge_sources': sources,
+        })
+    manual_review = [
+        charge_id for charge_id in charges
+        if charge_id not in linked_ids
+    ]
+    return candidates, manual_review
+
+
+def _live_usage_snapshot(live, held_at):
+    live = live if isinstance(live, dict) else {}
+    used_bytes = max(
+        0,
+        int(_safe_float(live.get('upload_bytes'), 0))
+        + int(_safe_float(live.get('download_bytes'), 0)),
+    )
+    quota_bytes = max(0, int(_safe_float(live.get('max_download_bytes'), 0)))
+    return {
+        'held_at': held_at,
+        'blocked_before_policy': bool(live.get('blocked', False)),
+        'status_before_policy': live.get('status'),
+        'account_creation_date': live.get('account_creation_date'),
+        'expiration_days': live.get('expiration_days'),
+        'used_bytes': used_bytes,
+        'quota_bytes': quota_bytes,
+    }
+
+
+def _exact_debt_service_lookup(multi_api, username, server_id):
+    if not username or not server_id:
+        return None, None, {'status': 'unavailable', 'error': 'mapping_incomplete'}
+    finder = getattr(multi_api, 'find_user_on_server', None)
+    if callable(finder):
+        return finder(username, str(server_id))
+    client, live = multi_api.find_user(username, preferred_server_id=server_id)
+    if client is None or live is None:
+        return None, None, {'status': 'missing', 'error': None}
+    if str(getattr(client, 'server_id', server_id)) != str(server_id):
+        return None, None, {'status': 'unavailable', 'error': 'server_mismatch'}
+    return client, live, {'status': 'found', 'error': None}
+
+
+def _prorated_collectible(charge, source, snapshot):
+    if not isinstance(charge, dict) or not isinstance(source, dict) or not isinstance(snapshot, dict):
+        return None
+    if source.get('kind') == 'renewal' and not source.get('activated', True):
+        used_fraction = 0.0
+        time_fraction = 0.0
+        traffic_fraction = 0.0
+    else:
+        duration_days = _safe_float(source.get('days'), 0.0)
+        started_at = _parse_time(source.get('started_at'))
+        held_at = _parse_time(snapshot.get('held_at'))
+        if duration_days <= 0 or started_at is None or held_at is None:
+            return None
+        active_hours = max(0.0, (held_at - started_at).total_seconds() / 3600)
+        time_fraction = min(1.0, active_hours / (duration_days * 24.0))
+        traffic_fraction = 0.0
+        if not source.get('unlimited'):
+            quota_bytes = _safe_float(snapshot.get('quota_bytes'), 0.0)
+            if quota_bytes <= 0:
+                try:
+                    quota_bytes = float(source.get('gb')) * 1024 ** 3
+                except (TypeError, ValueError):
+                    quota_bytes = 0.0
+            if quota_bytes > 0:
+                traffic_fraction = min(
+                    1.0,
+                    max(0.0, _safe_float(snapshot.get('used_bytes'), 0.0)) / quota_bytes,
+                )
+        used_fraction = min(1.0, max(time_fraction, traffic_fraction))
+    original = _money_value(charge.get('original_amount', charge.get('amount', 0.0)))
+    outstanding = _charge_outstanding(charge)
+    already_paid = max(0.0, original - outstanding)
+    used_total = round(original * used_fraction, 2)
+    collectible = round(max(0.0, min(outstanding, used_total - already_paid)), 2)
+    return {
+        'time_fraction': time_fraction,
+        'traffic_fraction': traffic_fraction,
+        'used_fraction': used_fraction,
+        'used_total': used_total,
+        'already_paid': already_paid,
+        'collectible': collectible,
+        'writeoff': round(max(0.0, outstanding - collectible), 2),
+    }
+
+
+def process_reseller_debt_service_action(user_id, multi_api, action):
+    """Serialize external debt actions against settlement and policy updates."""
+    with reseller_lock:
+        return _process_reseller_debt_service_action(user_id, multi_api, action)
+
+
+def _process_reseller_debt_service_action(user_id, multi_api, action):
+    """Apply a retry-safe hold, removal, or restoration for debt-linked users."""
+    user_id = str(user_id)
+    if action not in {'hold', 'remove', 'restore'}:
+        return False, {'reason': 'invalid_action'}
+    initial = get_reseller_data(user_id)
+    if not initial:
+        return False, {'reason': 'reseller_missing'}
+    if action != 'restore' and _is_debt_fully_settled(initial.get('debt', 0.0)):
+        return False, {'reason': 'debt_settled'}
+    candidates, manual_review = get_reseller_debt_service_candidates(initial)
+    results = {'changed': [], 'already_missing': [], 'failed': [], 'manual_review': manual_review}
+
+    if action == 'restore':
+        candidates = []
+        for index, config in enumerate(initial.get('configs', [])):
+            if isinstance(config, dict) and config.get('debt_policy_blocked') and not _is_removed_config(config):
+                candidates.append({
+                    'config_index': index,
+                    'username': str(config.get('username') or '').strip(),
+                    'server_id': config.get('server_id'),
+                })
+
+    initial_charges = {
+        str(charge.get('id') or ''): charge
+        for charge in initial.get('debt_charges', [])
+        if isinstance(charge, dict)
+    }
+
+    external = []
+    for candidate in candidates:
+        precomputed_calculations = []
+        if action == 'remove':
+            index = candidate.get('config_index')
+            configs = initial.get('configs', [])
+            config = configs[index] if isinstance(index, int) and 0 <= index < len(configs) else None
+            snapshot = config.get('debt_policy_hold_snapshot') if isinstance(config, dict) else None
+            held_sources = config.get('debt_policy_hold_sources') if isinstance(config, dict) else None
+            sources = held_sources if isinstance(held_sources, dict) else _debt_service_charge_sources(config)
+            unsafe_charge_ids = []
+            for charge_id in candidate.get('charge_ids', []):
+                calculation = _prorated_collectible(
+                    initial_charges.get(str(charge_id)),
+                    sources.get(str(charge_id)),
+                    snapshot,
+                )
+                if calculation is None:
+                    unsafe_charge_ids.append(str(charge_id))
+                else:
+                    precomputed_calculations.append({'charge_id': str(charge_id), **calculation})
+            if unsafe_charge_ids or not precomputed_calculations:
+                results['manual_review'].extend(unsafe_charge_ids or candidate.get('charge_ids', []))
+                results['failed'].append({**candidate, 'reason': 'proration_unsafe'})
+                continue
+        username = candidate.get('username')
+        server_id = candidate.get('server_id')
+        client, live, lookup = _exact_debt_service_lookup(multi_api, username, server_id)
+        lookup_status = str((lookup or {}).get('status') or 'unavailable')
+        if lookup_status == 'unavailable':
+            results['failed'].append({**candidate, 'reason': (lookup or {}).get('error')})
+            continue
+        if lookup_status == 'missing' or client is None or live is None:
+            details = {
+                'snapshot': {
+                    'held_at': _now_str(),
+                    'blocked_before_policy': True,
+                    'status_before_policy': 'missing',
+                    'account_creation_date': None,
+                    'expiration_days': None,
+                    'used_bytes': 0,
+                    'quota_bytes': 0,
+                },
+                'changed_by_policy': False,
+                'calculations': precomputed_calculations,
+                'api_result': {'status': 'already_missing'},
+            }
+            external.append((candidate, 'already_missing', details))
+            results['already_missing'].append(candidate)
+            continue
+        held_at = _now_str()
+        snapshot = _live_usage_snapshot(live, held_at)
+        if action == 'hold':
+            changed_by_policy = not snapshot['blocked_before_policy']
+            api_result = client.update_user(username, {'blocked': True}) if changed_by_policy else {'unchanged': True}
+        elif action == 'restore':
+            config = initial.get('configs', [])[candidate['config_index']]
+            changed_by_policy = bool(config.get('debt_policy_changed_blocked'))
+            api_result = client.update_user(username, {'blocked': False}) if changed_by_policy else {'unchanged': True}
+        else:
+            changed_by_policy = True
+            api_result = client.delete_user(username)
+        if api_result is None:
+            results['failed'].append({**candidate, 'reason': 'api_failed'})
+            continue
+        external.append((candidate, 'changed', {
+            'snapshot': snapshot,
+            'changed_by_policy': changed_by_policy,
+            'calculations': precomputed_calculations,
+            'api_result': api_result,
+        }))
+        results['changed'].append(candidate)
+
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                current = _ensure_reseller_defaults(resellers.get(user_id, {}))
+                if action != 'restore' and _is_debt_fully_settled(current.get('debt', 0.0)):
+                    return False, {'reason': 'debt_settled_during_action', **results}
+                _ensure_debt_charge_ledger(current)
+                charges = {
+                    str(charge.get('id') or ''): charge
+                    for charge in current.get('debt_charges', [])
+                    if isinstance(charge, dict)
+                }
+                total_writeoff = 0.0
+                completed = 0
+                for candidate, outcome, details in external:
+                    index = candidate.get('config_index')
+                    configs = current.get('configs', [])
+                    if not isinstance(index, int) or index < 0 or index >= len(configs):
+                        continue
+                    config = configs[index]
+                    if not isinstance(config, dict):
+                        continue
+                    if action == 'hold':
+                        config['debt_policy_blocked'] = True
+                        config['debt_policy_changed_blocked'] = bool((details or {}).get('changed_by_policy'))
+                        config['debt_policy_hold_snapshot'] = (details or {}).get('snapshot')
+                        config['debt_policy_hold_sources'] = {
+                            str(charge_id): dict(source)
+                            for charge_id, source in _debt_service_charge_sources(config).items()
+                            if str(charge_id) in {str(item) for item in candidate.get('charge_ids', [])}
+                        }
+                        config['debt_policy_hold_charge_allocations'] = [
+                            {
+                                'charge_id': str(charge_id),
+                                'original_amount': _money_value(charges.get(str(charge_id), {}).get('original_amount')),
+                                'outstanding_at_hold': _charge_outstanding(charges.get(str(charge_id))),
+                            }
+                            for charge_id in candidate.get('charge_ids', [])
+                        ]
+                        config['debt_policy_hold_status'] = outcome
+                        completed += 1
+                    elif action == 'restore':
+                        config['debt_policy_blocked'] = False
+                        config['debt_policy_changed_blocked'] = False
+                        config['debt_policy_restored_at'] = _now_str()
+                        completed += 1
+                    elif action == 'remove':
+                        snapshot = config.get('debt_policy_hold_snapshot')
+                        held_sources = config.get('debt_policy_hold_sources')
+                        sources = held_sources if isinstance(held_sources, dict) else _debt_service_charge_sources(config)
+                        calculations = []
+                        safe_to_finalize = bool(candidate.get('charge_ids'))
+                        for charge_id in candidate.get('charge_ids', []):
+                            charge = charges.get(str(charge_id))
+                            calculation = _prorated_collectible(charge, sources.get(str(charge_id)), snapshot)
+                            if calculation is None:
+                                results['manual_review'].append(str(charge_id))
+                                safe_to_finalize = False
+                                continue
+                            writeoff = calculation['writeoff']
+                            if writeoff > 0:
+                                before = _charge_outstanding(charge)
+                                charge['outstanding_amount'] = round(max(0.0, before - writeoff), 2)
+                                charge.setdefault('writeoffs', []).append({
+                                    'kind': 'unused_service_proration',
+                                    'amount': writeoff,
+                                    'created_at': _now_str(),
+                                    **calculation,
+                                })
+                                total_writeoff += writeoff
+                            calculations.append({'charge_id': charge_id, **calculation})
+                        if safe_to_finalize:
+                            config['removed_from_vpn'] = True
+                            config['removal_reason'] = REMOVAL_REASON_RESELLER_DEBT_DEFAULT
+                            config['removal_note'] = 'Removed after reseller debt default deadline'
+                            config['removed_at'] = _now_str()
+                            config['removed_cleanup_status'] = (
+                                REMOVAL_STATUS_ALREADY_MISSING if outcome == 'already_missing'
+                                else REMOVAL_STATUS_DELETED_FROM_VPN
+                            )
+                            config['debt_proration'] = calculations
+                            config['debt_removal_api_result'] = (details or {}).get('api_result')
+                            completed += 1
+                if total_writeoff > 0:
+                    current['debt'] = round(max(0.0, _safe_float(current.get('debt')) - total_writeoff), 2)
+                    _record_debt_allocation(
+                        current,
+                        total_writeoff,
+                        [],
+                        'unused_service_proration',
+                        reference_id=f"proration:{current.get('debt_cycle_id')}",
+                    )
+                stage_completed = not results['failed'] and completed == len(candidates)
+                if action == 'hold' and stage_completed:
+                    current['debt_services_held_at'] = _now_str()
+                    current['debt_service_hold_due'] = False
+                elif action == 'remove' and stage_completed:
+                    current['debt_services_removed_at'] = _now_str()
+                    current['debt_service_remove_due'] = False
+                elif action == 'restore' and stage_completed:
+                    current['debt_services_held_at'] = None
+                    current['debt_restore_services_due'] = False
+                if _is_debt_fully_settled(current.get('debt', 0.0)):
+                    current['debt_since'] = None
+                    current = _restore_suspended_if_debt_fully_settled(current)
+                    current = _mark_policy_restore_due_if_needed(current)
+                    current = _finish_debt_cycle(current)
+                current.setdefault('debt_service_actions', []).append({
+                    'action': action,
+                    'timestamp': _now_str(),
+                    'changed': completed,
+                    'failed': len(results['failed']),
+                    'manual_review': sorted(set(results['manual_review'])),
+                    'writeoff': round(total_writeoff, 2),
+                })
+                current['debt_service_actions'] = current['debt_service_actions'][-50:]
+                current = _ensure_reseller_defaults(current)
+                resellers[user_id] = current
+                _write_resellers_file(resellers)
+                results.update({
+                    'completed': completed,
+                    'stage_completed': stage_completed,
+                    'writeoff': round(total_writeoff, 2),
+                    'remaining_debt': current.get('debt', 0.0),
+                })
+                return stage_completed, results
+        except Exception as error:
+            return False, {'reason': str(error), **results}
+
+
 def apply_reseller_payment(user_id, amount, payment_id=None, allocation_kind='settlement'):
     user_id = str(user_id)
+    paid_amount = _money_value(amount)
+    if paid_amount <= 0:
+        return False, None
+    payment_key = str(payment_id or '').strip() or None
+    duplicate = False
+    saved_current = None
+    new_debt = None
     with reseller_lock:
         try:
             with _resellers_file_lock():
@@ -1544,71 +2112,313 @@ def apply_reseller_payment(user_id, amount, payment_id=None, allocation_kind='se
                 if user_id not in resellers:
                     return False, None
 
-                paid_amount = _money_value(amount)
-                if paid_amount <= 0:
-                    return False, None
-
                 current = _ensure_reseller_defaults(resellers[user_id])
-                current_debt = _safe_float(current.get('debt', 0.0))
-                credited_amount = max(0.0, min(paid_amount, current_debt))
-                new_debt = round(max(0.0, current_debt - paid_amount), 2)
-                _ensure_debt_charge_ledger(current)
-                _allocate_debt_fifo(
-                    current,
-                    credited_amount,
-                    kind=allocation_kind,
-                    reference_id=payment_id,
-                )
-                current['debt'] = new_debt
-
-                if credited_amount > 0:
-                    current['total_paid'] = round(
-                        get_reseller_total_paid(current) + credited_amount,
-                        2,
+                if payment_key:
+                    previous = next(
+                        (
+                            item for item in current.get('processed_debt_payments', [])
+                            if str(item.get('payment_id') or '') == payment_key
+                        ),
+                        None,
                     )
-                    current['last_payment_at'] = _now_str()
-                if _is_debt_fully_settled(new_debt) or new_debt < DEBT_SETTLEMENT_THRESHOLD:
-                    current['debt_since'] = None
-                current = _restore_suspended_if_debt_fully_settled(current)
+                    if previous is not None:
+                        if _money_value(previous.get('amount')) != paid_amount:
+                            return False, None
+                        duplicate = True
+                        new_debt = _safe_float(current.get('debt', 0.0))
+                        saved_current = current
+                if duplicate:
+                    pass
+                else:
+                    current_debt = _safe_float(current.get('debt', 0.0))
+                    cycle_id = str(current.get('debt_cycle_id') or '')
+                    cycle_started = _parse_time(current.get('debt_since'))
+                    cycle_was_late = bool(current.get('debt_cycle_late_recorded'))
+                    credited_amount = max(0.0, min(paid_amount, current_debt))
+                    excess_amount = round(max(0.0, paid_amount - current_debt), 2)
+                    new_debt = round(max(0.0, current_debt - paid_amount), 2)
+                    _ensure_debt_charge_ledger(current)
+                    _allocate_debt_fifo(
+                        current,
+                        credited_amount,
+                        kind=allocation_kind,
+                        reference_id=payment_key,
+                    )
+                    current['debt'] = new_debt
 
-                current = _ensure_reseller_defaults(current)
-                resellers[user_id] = current
-
-                _write_resellers_file(resellers)
-                _update_recruitment_milestone(user_id, current)
-                return True, new_debt
+                    if credited_amount > 0:
+                        current['total_paid'] = round(
+                            get_reseller_total_paid(current) + credited_amount,
+                            2,
+                        )
+                        current['last_payment_at'] = _now_str()
+                    if _is_debt_fully_settled(new_debt):
+                        current['debt_since'] = None
+                        if (
+                            current_debt > 0
+                            and not cycle_was_late
+                            and cycle_started is not None
+                            and (datetime.now() - cycle_started).total_seconds()
+                                < DEBT_SUSPEND_DEADLINE_HOURS * 3600
+                        ):
+                            _record_credit_outcome(
+                                current,
+                                'good',
+                                'on_time_settlement',
+                                reference_id=f"good:{cycle_id or payment_key or uuid.uuid4().hex}",
+                            )
+                    current = _restore_suspended_if_debt_fully_settled(current)
+                    if _is_debt_fully_settled(new_debt):
+                        current = _mark_policy_restore_due_if_needed(current)
+                        current = _finish_debt_cycle(current)
+                    if excess_amount > 0:
+                        excess_id = f"settlement-excess:{payment_key or uuid.uuid4().hex}"
+                        if not any(
+                            str(item.get('id') or '') == excess_id
+                            for item in current.get('pending_wholesale_credits', [])
+                        ):
+                            current.setdefault('pending_wholesale_credits', []).append({
+                                'id': excess_id,
+                                'amount': excess_amount,
+                                'source': 'settlement_excess',
+                                'created_at': _now_str(),
+                            })
+                    if payment_key:
+                        current.setdefault('processed_debt_payments', []).append({
+                            'payment_id': payment_key,
+                            'amount': paid_amount,
+                            'credited_to_debt': round(credited_amount, 2),
+                            'excess_amount': excess_amount,
+                            'debt_after': new_debt,
+                            'processed_at': _now_str(),
+                        })
+                    current = _ensure_reseller_defaults(current)
+                    resellers[user_id] = current
+                    _write_resellers_file(resellers)
+                    saved_current = current
         except Exception:
             return False, None
+    if not duplicate and saved_current is not None:
+        _update_recruitment_milestone(user_id, saved_current)
+    flush_reseller_pending_wholesale_credits(user_id)
+    return True, new_debt
+
+
+def flush_reseller_pending_wholesale_credits(user_id=None):
+    """Retry durable settlement-excess credits without holding the reseller file lock."""
+    target = str(user_id) if user_id is not None else None
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                if not _resellers_store_exists():
+                    return 0
+                resellers = _read_resellers_file()
+                pending = [
+                    (str(reseller_id), dict(item))
+                    for reseller_id, record in resellers.items()
+                    if target is None or str(reseller_id) == target
+                    for item in _ensure_reseller_defaults(record).get('pending_wholesale_credits', [])
+                ]
+        except Exception:
+            return 0
+    completed_ids = set()
+    for reseller_id, item in pending:
+        credit_id = str(item.get('id') or '')
+        amount = _money_value(item.get('amount'))
+        if not credit_id or amount <= 0:
+            continue
+        try:
+            from utils.reseller_wholesale_credit import credit_wholesale_balance
+
+            credit_wholesale_balance(
+                reseller_id,
+                amount,
+                credit_id,
+                source=str(item.get('source') or 'settlement_excess'),
+            )
+            completed_ids.add((reseller_id, credit_id))
+        except Exception:
+            continue
+    if not completed_ids:
+        return 0
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                for reseller_id, credit_id in completed_ids:
+                    if reseller_id not in resellers:
+                        continue
+                    current = _ensure_reseller_defaults(resellers[reseller_id])
+                    current['pending_wholesale_credits'] = [
+                        item for item in current.get('pending_wholesale_credits', [])
+                        if str(item.get('id') or '') != credit_id
+                    ]
+                    resellers[reseller_id] = current
+                _write_resellers_file(resellers)
+        except Exception:
+            return 0
+    return len(completed_ids)
 
 
 def _compute_debt_state_with_deadline(debt, debt_since, now):
-    """Compute debt state considering time-based deadlines.
-    
-    Returns (debt_state, suspend_deadline_passed, ban_deadline_passed)
-    """
+    """Return the time-based debt state without ever banning a reseller."""
     debt_amount = _safe_float(debt, 0.0)
-    
-    if _is_debt_fully_settled(debt_amount) or debt_amount < DEBT_SETTLEMENT_THRESHOLD:
+
+    if _is_debt_fully_settled(debt_amount):
         return 'active', False, False
-    
-    # Calculate time since debt started
+
     debt_since_dt = _parse_time(debt_since)
     hours_in_debt = 0.0
     if debt_since_dt:
-        hours_in_debt = (now - debt_since_dt).total_seconds() / 3600
-    
+        hours_in_debt = max(0.0, (now - debt_since_dt).total_seconds() / 3600)
+
     suspend_deadline_passed = hours_in_debt >= DEBT_SUSPEND_DEADLINE_HOURS
-    ban_deadline_passed = hours_in_debt >= DEBT_BAN_DEADLINE_HOURS
-    
-    if debt_amount >= DEBT_SUSPEND_THRESHOLD:
-        # High debt - always suspended state
-        return 'suspended', suspend_deadline_passed, ban_deadline_passed
+    removal_deadline_passed = hours_in_debt >= DEBT_REMOVAL_DEADLINE_HOURS
+
     if suspend_deadline_passed:
-        return 'suspended', True, ban_deadline_passed
-    if debt_amount >= DEBT_WARNING_THRESHOLD:
-        return 'warning', False, ban_deadline_passed
-    
-    return 'active', False, False
+        return 'suspended', True, removal_deadline_passed
+    if hours_in_debt >= 24:
+        return 'warning', False, removal_deadline_passed
+    return 'active', False, removal_deadline_passed
+
+
+def _notification_claim_due(record, kind, audience, now, lease_minutes=10):
+    state = record.setdefault('debt_notification_state', {})
+    key = f"{kind}:{audience}"
+    item = state.get(key)
+    if not isinstance(item, dict):
+        item = {}
+    if item.get('delivered_at'):
+        return False
+    claimed_at = _parse_time(item.get('claimed_at'))
+    if claimed_at is not None and now - claimed_at < timedelta(minutes=lease_minutes):
+        return False
+    state[key] = {'claimed_at': now.strftime('%Y-%m-%d %H:%M:%S')}
+    return True
+
+
+def _service_action_claim_due(record, action, now, lease_minutes=10):
+    claims = record.setdefault('debt_service_action_claims', {})
+    current_cycle = str(record.get('debt_cycle_id') or '')
+    claim = claims.get(action) if isinstance(claims.get(action), dict) else {}
+    if str(claim.get('cycle_id') or '') != current_cycle:
+        claim = {}
+    claimed_at = _parse_time(claim.get('claimed_at'))
+    if claimed_at is not None and now - claimed_at < timedelta(minutes=lease_minutes):
+        return False
+    claims[action] = {
+        'cycle_id': current_cycle,
+        'claimed_at': now.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    return True
+
+
+def complete_reseller_debt_service_action_claim(user_id, action, completed=True):
+    """Complete or release a hold/remove/restore action lease."""
+    user_id = str(user_id)
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                if user_id not in resellers:
+                    return False
+                current = _ensure_reseller_defaults(resellers[user_id])
+                current.setdefault('debt_service_action_claims', {}).pop(str(action), None)
+                resellers[user_id] = current
+                _write_resellers_file(resellers)
+                return True
+        except Exception:
+            return False
+
+
+def complete_reseller_debt_notification(user_id, kind, audience, delivered=True):
+    user_id = str(user_id)
+    key = f"{kind}:{audience}"
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                if user_id not in resellers:
+                    return False
+                current = _ensure_reseller_defaults(resellers[user_id])
+                state = current.setdefault('debt_notification_state', {})
+                item = state.get(key) if isinstance(state.get(key), dict) else {}
+                if delivered:
+                    item['delivered_at'] = _now_str()
+                    item.pop('claimed_at', None)
+                else:
+                    item.pop('claimed_at', None)
+                state[key] = item
+                if kind == 'recovered' and delivered:
+                    user_done = bool((state.get('recovered:user') or {}).get('delivered_at'))
+                    admin_done = bool((state.get('recovered:admin') or {}).get('delivered_at'))
+                    if user_done and admin_done:
+                        current['debt_recovery_pending'] = False
+                resellers[user_id] = current
+                _write_resellers_file(resellers)
+                return True
+        except Exception:
+            return False
+
+
+def claim_reseller_debt_notification(user_id, kind, audience):
+    user_id = str(user_id)
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                if user_id not in resellers:
+                    return False
+                current = _ensure_reseller_defaults(resellers[user_id])
+                claimed = _notification_claim_due(current, str(kind), str(audience), datetime.now())
+                if claimed:
+                    resellers[user_id] = current
+                    _write_resellers_file(resellers)
+                return claimed
+        except Exception:
+            return False
+
+
+def mark_reseller_debt_service_action(user_id, action, result=None):
+    """Persist a completed external hold/remove/restore action."""
+    user_id = str(user_id)
+    result = dict(result or {})
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                if user_id not in resellers:
+                    return False
+                current = _ensure_reseller_defaults(resellers[user_id])
+                if action == 'hold':
+                    current['debt_services_held_at'] = _now_str()
+                    current['debt_service_hold_due'] = False
+                    skipped = ('opened', 'reminder_24h', 'deadline_final', 'suspended')
+                elif action == 'remove':
+                    current['debt_services_removed_at'] = _now_str()
+                    current['debt_service_remove_due'] = False
+                    skipped = ('opened', 'reminder_24h', 'deadline_final', 'suspended', 'hold_due', 'deletion_warning')
+                elif action == 'restore':
+                    current['debt_services_held_at'] = None
+                    current['debt_restore_services_due'] = False
+                    skipped = ()
+                else:
+                    return False
+                for kind in skipped:
+                    current.setdefault('debt_notification_state', {}).setdefault(
+                        f"{kind}:user", {}
+                    ).setdefault('delivered_at', _now_str())
+                current.setdefault('debt_service_actions', []).append({
+                    'action': action,
+                    'timestamp': _now_str(),
+                    'result': result,
+                })
+                current['debt_service_actions'] = current['debt_service_actions'][-50:]
+                resellers[user_id] = current
+                _write_resellers_file(resellers)
+                return True
+        except Exception:
+            return False
 
 
 def evaluate_reseller_debt_policies():
@@ -1620,7 +2430,6 @@ def evaluate_reseller_debt_policies():
                 resellers = _read_resellers_file()
 
                 now = datetime.now()
-                reminder_delta = timedelta(hours=DEBT_REMINDER_INTERVAL_HOURS)
                 events = []
                 changed = False
 
@@ -1629,105 +2438,129 @@ def evaluate_reseller_debt_policies():
                     current = _restore_suspended_if_debt_fully_settled(current)
                     debt = _safe_float(current.get('debt', 0.0))
                     debt_fully_settled = _is_debt_fully_settled(debt)
-                    
-                    # Track original status before any automatic changes
                     original_status = current.get('status', 'pending')
-                    
-                    if not debt_fully_settled and debt >= DEBT_SETTLEMENT_THRESHOLD and not current.get('debt_since'):
-                        current['debt_since'] = _now_str()
 
-                    # Compute debt state with deadline consideration
+                    # Fraud/abuse bans are explicit admin state. Debt automation
+                    # must neither change nor clean up an already-banned account.
+                    if original_status == 'banned':
+                        if current != record:
+                            changed = True
+                            resellers[user_id] = current
+                        continue
+
+                    if not debt_fully_settled and not current.get('debt_since'):
+                        current['debt_since'] = _now_str()
+                    if not debt_fully_settled and not current.get('debt_cycle_id'):
+                        current['debt_cycle_id'] = uuid.uuid4().hex
+
                     debt_since = current.get('debt_since')
-                    debt_state, suspend_deadline_passed, ban_deadline_passed = _compute_debt_state_with_deadline(
+                    debt_state, suspend_deadline_passed, removal_deadline_passed = _compute_debt_state_with_deadline(
                         debt, debt_since, now
                     )
                     current['debt_state'] = debt_state
-
-                    # Automatic status changes based on deadlines.
                     auto_suspended = False
-                    auto_banned = False
-                    debt_suspended = current.get('suspended_reason') == SUSPENDED_REASON_DEBT
-                    unban_grace_suspended = current.get('suspended_reason') == SUSPENDED_REASON_UNBAN_GRACE
 
-                    if not debt_fully_settled and original_status == 'suspended' and unban_grace_suspended:
-                        suspended_at = _parse_time(current.get('suspended_at'))
-                        if suspended_at and (now - suspended_at) >= timedelta(hours=UNBAN_GRACE_BAN_DEADLINE_HOURS):
-                            current['status'] = 'banned'
-                            current['suspended_reason'] = None
-                            current['suspended_at'] = None
-                            auto_banned = True
-                            changed = True
-                    
-                    if not debt_fully_settled and debt >= DEBT_SETTLEMENT_THRESHOLD and original_status in {'approved', 'suspended'}:
-                        if ban_deadline_passed:
-                            if original_status == 'approved' or debt_suspended:
-                                current['status'] = 'banned'
-                                current['suspended_reason'] = None
-                                current['suspended_at'] = None
-                                auto_banned = True
-                                changed = True
-                        elif suspend_deadline_passed:
-                            if current.get('status') == 'approved':
-                                current['status'] = 'suspended'
-                                current['suspended_reason'] = SUSPENDED_REASON_DEBT
-                                current['suspended_at'] = _now_str()
-                                auto_suspended = True
-                                changed = True
-                    
-                    # Reminder logic
-                    remind_due = False
-                    if not debt_fully_settled and debt >= DEBT_SETTLEMENT_THRESHOLD and debt_state in {'warning', 'suspended'} and current.get('status') in {'approved', 'suspended'}:
-                        last_reminded_at = _parse_time(current.get('debt_last_reminded_at'))
-                        if not last_reminded_at or (now - last_reminded_at) >= reminder_delta:
-                            remind_due = True
-                            current['debt_last_reminded_at'] = _now_str()
-                            changed = True
+                    debt_since_dt = _parse_time(current.get('debt_since'))
+                    debt_age_hours = (
+                        max(0.0, (now - debt_since_dt).total_seconds() / 3600)
+                        if debt_since_dt else 0.0
+                    )
 
-                    # Admin alert logic
-                    alert_level = 'none'
-                    if not debt_fully_settled and debt >= DEBT_SETTLEMENT_THRESHOLD:
-                        if current.get('status') == 'banned':
-                            alert_level = 'banned'
-                        elif debt_state == 'warning':
-                            alert_level = 'warning'
-                        elif debt_state == 'suspended':
-                            alert_level = 'suspended'
-
-                    admin_alert_due = False
-                    previous_alert_level = str(current.get('debt_last_admin_alert_level', 'none'))
-                    if alert_level != previous_alert_level:
-                        if alert_level in {'warning', 'suspended', 'banned'}:
-                            admin_alert_due = True
-                        current['debt_last_admin_alert_level'] = alert_level
-                        current['debt_last_admin_alert_at'] = _now_str()
+                    if (
+                        not debt_fully_settled
+                        and suspend_deadline_passed
+                        and current.get('status') in {'approved', 'suspended'}
+                    ):
+                        if current.get('status') == 'approved':
+                            current['status'] = 'suspended'
+                            current['suspended_reason'] = SUSPENDED_REASON_DEBT
+                            current['suspended_at'] = _now_str()
+                            auto_suspended = True
+                        elif current.get('suspended_reason') == SUSPENDED_REASON_UNBAN_GRACE:
+                            current['suspended_reason'] = SUSPENDED_REASON_DEBT
+                        if not current.get('debt_cycle_late_recorded'):
+                            _record_credit_outcome(
+                                current,
+                                'late',
+                                'debt_deadline',
+                                reference_id=f"late:{current.get('debt_cycle_id')}",
+                            )
+                            current['debt_cycle_late_recorded'] = True
                         changed = True
 
-                    if (debt_fully_settled or debt < DEBT_SETTLEMENT_THRESHOLD) and previous_alert_level != 'none':
-                        current['debt_last_admin_alert_level'] = 'none'
-                        current['debt_last_admin_alert_at'] = _now_str()
+                    if not debt_fully_settled and debt_age_hours >= DEBT_HOLD_DEADLINE_HOURS:
+                        current['debt_service_hold_due'] = not bool(current.get('debt_services_held_at'))
+                        if not current.get('debt_cycle_default_recorded'):
+                            _record_credit_outcome(
+                                current,
+                                'default',
+                                'service_hold_deadline',
+                                reference_id=f"default:{current.get('debt_cycle_id')}",
+                            )
+                            current['debt_cycle_default_recorded'] = True
                         changed = True
+
+                    if not debt_fully_settled and removal_deadline_passed:
+                        current['debt_service_remove_due'] = not bool(current.get('debt_services_removed_at'))
+                        changed = True
+
+                    if debt_fully_settled and current.get('debt_recovery_pending'):
+                        event_kind = 'recovered'
+                    elif not debt_fully_settled and current.get('debt_service_remove_due'):
+                        event_kind = 'remove_due'
+                    elif not debt_fully_settled and debt_age_hours >= DEBT_FINAL_WARNING_HOURS and not current.get('debt_services_removed_at'):
+                        event_kind = 'deletion_warning'
+                    elif not debt_fully_settled and current.get('debt_service_hold_due'):
+                        event_kind = 'hold_due'
+                    elif auto_suspended:
+                        event_kind = 'suspended'
+                    elif not debt_fully_settled and current.get('debt_services_removed_at'):
+                        removed_at = _parse_time(current.get('debt_services_removed_at'))
+                        weeks_after_removal = (
+                            int(max(0.0, (now - removed_at).total_seconds()) // (7 * 24 * 3600))
+                            if removed_at else 0
+                        )
+                        event_kind = (
+                            f'post_removal_week_{weeks_after_removal}'
+                            if weeks_after_removal >= 1 else None
+                        )
+                    elif current.get('status') == 'suspended':
+                        event_kind = None
+                    elif not debt_fully_settled and debt_age_hours >= max(24.0, DEBT_SUSPEND_DEADLINE_HOURS - 6.0):
+                        event_kind = 'deadline_final'
+                    elif not debt_fully_settled and debt_age_hours >= 24.0:
+                        event_kind = 'reminder_24h'
+                    elif not debt_fully_settled:
+                        event_kind = 'opened'
+                    else:
+                        event_kind = None
+
+                    notify_user = False
+                    notify_admin = False
+                    service_action = None
+                    if event_kind:
+                        requested_action = (
+                            'restore' if event_kind == 'recovered' and current.get('debt_restore_services_due')
+                            else ('hold' if event_kind == 'hold_due' else ('remove' if event_kind == 'remove_due' else None))
+                        )
+                        if requested_action and _service_action_claim_due(current, requested_action, now):
+                            service_action = requested_action
+                        if not requested_action or service_action:
+                            notify_user = _notification_claim_due(current, event_kind, 'user', now)
+                            if event_kind in {'suspended', 'recovered', 'hold_due', 'remove_due'}:
+                                notify_admin = _notification_claim_due(current, event_kind, 'admin', now)
 
                     if current != record:
                         changed = True
                         resellers[user_id] = current
 
-                    # Build event for notifications
-                    if remind_due or admin_alert_due or auto_suspended or auto_banned:
-                        debt_since_dt = _parse_time(current.get('debt_since'))
-                        debt_age_hours = 0.0
-                        debt_age_days = 0
-                        if debt_since_dt:
-                            debt_age_hours = (now - debt_since_dt).total_seconds() / 3600
-                            debt_age_days = max(0, (now - debt_since_dt).days)
-
+                    if event_kind and (notify_user or notify_admin or service_action):
+                        debt_age_days = max(0, int(debt_age_hours // 24))
                         unlock_amount = get_reseller_unlock_amount(debt) if debt_state == 'suspended' else 0.0
-
-                        # Calculate time remaining until deadlines
-                        hours_until_suspend = max(0, DEBT_SUSPEND_DEADLINE_HOURS - debt_age_hours)
-                        hours_until_ban = max(0, DEBT_BAN_DEADLINE_HOURS - debt_age_hours)
-
                         events.append({
                             'user_id': str(user_id),
+                            'kind': event_kind,
+                            'cycle_id': current.get('debt_cycle_id'),
                             'debt': debt,
                             'debt_state': debt_state,
                             'status': current.get('status', 'pending'),
@@ -1737,14 +2570,18 @@ def evaluate_reseller_debt_policies():
                             'debt_since': current.get('debt_since'),
                             'last_payment_at': current.get('last_payment_at'),
                             'unlock_amount': unlock_amount,
-                            'notify_user': remind_due,
-                            'notify_admin': admin_alert_due,
+                            'notify_user': notify_user,
+                            'notify_admin': notify_admin,
                             'auto_suspended': auto_suspended,
-                            'auto_banned': auto_banned,
-                            'hours_until_suspend': hours_until_suspend if not suspend_deadline_passed else 0,
-                            'hours_until_ban': hours_until_ban if not ban_deadline_passed else 0,
+                            'auto_banned': False,
+                            'service_action': service_action,
+                            'hours_until_suspend': max(0, DEBT_SUSPEND_DEADLINE_HOURS - debt_age_hours),
+                            'hours_until_hold': max(0, DEBT_HOLD_DEADLINE_HOURS - debt_age_hours),
+                            'hours_until_removal': max(0, DEBT_REMOVAL_DEADLINE_HOURS - debt_age_hours),
+                            'hours_until_ban': 0.0,
                             'suspend_deadline_passed': suspend_deadline_passed,
-                            'ban_deadline_passed': ban_deadline_passed,
+                            'ban_deadline_passed': False,
+                            'credit_policy': get_reseller_credit_policy(current),
                         })
 
                 if changed:
