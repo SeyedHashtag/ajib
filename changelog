@@ -1,3 +1,8 @@
+## v1.19.2
+✨ Notify administrators when reseller settlement payments complete through crypto, account credit, or manual admin flows
+🛠️ Preserve settlement amount, payment method, currency conversion, and reseller identity details in payment notifications
+✅ Expand regression coverage for one-time settlement notifications across approval and polling paths
+
 ## v1.19.1
 🛠️ Treat reseller balances below the configurable debt threshold as settled for automated collection while preserving them in the accounting ledger
 🐛 Close stale debt cycles and restore eligible resellers when balances fall below the threshold
