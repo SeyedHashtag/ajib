@@ -471,11 +471,11 @@ def _notify_checker_of_settlement(checkpoint):
         bot.send_message(
             checker_id,
             (
-                "✅ Checker payout settlement recorded.\n\n"
-                f"Checker Payout: {_format_toman(checkpoint.get('amount_toman'))} Tomans\n"
-                f"Open Account Base: {_format_toman(checkpoint.get('open_account_amount_toman'))} Tomans\n"
-                f"Remaining Checker Balance: {_format_toman(checkpoint.get('unpaid_after_toman'))} Tomans\n"
-                f"Checkpoint ID: {checkpoint.get('id')}"
+                "✅ Settlement payment recorded.\n\n"
+                f"Payout: {_format_toman(checkpoint.get('amount_toman'))} Tomans\n"
+                f"Settlement Base: {_format_toman(checkpoint.get('open_account_amount_toman'))} Tomans\n"
+                f"Remaining Balance: {_format_toman(checkpoint.get('unpaid_after_toman'))} Tomans\n"
+                f"Settlement ID: {checkpoint.get('id')}"
             )
         )
         return True

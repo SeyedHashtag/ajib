@@ -267,10 +267,11 @@ class CheckerStatsPanelTests(unittest.TestCase):
 
         checker_notification = payment_setup.bot.sent_messages[-1]
         self.assertEqual(checker_notification["chat_id"], 42)
-        self.assertIn("Checker Payout: 150,000 Tomans", checker_notification["text"])
-        self.assertIn("Open Account Base: 1,500,000 Tomans", checker_notification["text"])
-        self.assertIn("Remaining Checker Balance: 0 Tomans", checker_notification["text"])
-        self.assertIn("Checkpoint ID: checkpoint-1", checker_notification["text"])
+        self.assertNotIn("Checker", checker_notification["text"])
+        self.assertIn("Payout: 150,000 Tomans", checker_notification["text"])
+        self.assertIn("Settlement Base: 1,500,000 Tomans", checker_notification["text"])
+        self.assertIn("Remaining Balance: 0 Tomans", checker_notification["text"])
+        self.assertIn("Settlement ID: checkpoint-1", checker_notification["text"])
 
     def test_checker_settlement_notification_failure_keeps_checkpoint_and_warns_admin(self):
         payment_setup = load_payment_setup()
