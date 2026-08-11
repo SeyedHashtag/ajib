@@ -224,6 +224,7 @@ class CheckerStatsPanelTests(unittest.TestCase):
             })
             return {
                 "id": "checkpoint-1",
+                "checker_user_id": checker_id,
                 "amount_toman": amount,
                 "open_account_amount_toman": open_account_amount,
                 "unpaid_before_toman": stats_snapshot["unpaid_total"],
@@ -262,6 +263,91 @@ class CheckerStatsPanelTests(unittest.TestCase):
         self.assertIn("Open Account Base: 1,500,000 Tomans", edited_text)
         self.assertIn("Checker Payout: 150,000 Tomans", edited_text)
         self.assertIn("Unpaid After: 0 Tomans", edited_text)
+        self.assertNotIn("notification could not be delivered", edited_text)
+
+        checker_notification = payment_setup.bot.sent_messages[-1]
+        self.assertEqual(checker_notification["chat_id"], 42)
+        self.assertIn("Checker Payout: 150,000 Tomans", checker_notification["text"])
+        self.assertIn("Open Account Base: 1,500,000 Tomans", checker_notification["text"])
+        self.assertIn("Remaining Checker Balance: 0 Tomans", checker_notification["text"])
+        self.assertIn("Checkpoint ID: checkpoint-1", checker_notification["text"])
+
+    def test_checker_settlement_notification_failure_keeps_checkpoint_and_warns_admin(self):
+        payment_setup = load_payment_setup()
+        stats = self.sample_stats()
+        checkpoints = []
+
+        def add_settlement(amount, admin_user_id, stats_snapshot, checker_id=None, open_account_amount=None):
+            checkpoint = {
+                "id": "checkpoint-failed-notification",
+                "checker_user_id": checker_id,
+                "amount_toman": amount,
+                "open_account_amount_toman": open_account_amount,
+                "unpaid_before_toman": stats_snapshot["unpaid_total"],
+                "unpaid_after_toman": stats_snapshot["unpaid_total"] - amount,
+            }
+            checkpoints.append(checkpoint)
+            return checkpoint
+
+        def fail_notification(_chat_id, _text, **_kwargs):
+            raise RuntimeError("checker blocked the bot")
+
+        payment_setup.is_admin = lambda _user_id: True
+        payment_setup.load_payments = lambda: {}
+        payment_setup.build_receipt_checker_stats = lambda *args, **kwargs: stats
+        payment_setup.add_checker_settlement = add_settlement
+        payment_setup.bot.send_message = fail_notification
+
+        call = types.SimpleNamespace(
+            id="cb-notification-failure",
+            data="checker_settlement:confirm:1500000",
+            from_user=types.SimpleNamespace(id=7),
+            message=types.SimpleNamespace(chat=types.SimpleNamespace(id=99), message_id=55),
+        )
+        payment_setup.handle_checker_settlement_callback(call)
+
+        self.assertEqual(len(checkpoints), 1)
+        edited_text = payment_setup.bot.edited_messages[-1]["text"]
+        self.assertIn("✅ Checker settlement checkpoint saved.", edited_text)
+        self.assertIn("Checker notification could not be delivered", edited_text)
+        self.assertIn("The settlement remains saved.", edited_text)
+
+    def test_checker_settlement_missing_checker_keeps_checkpoint_and_warns_admin(self):
+        payment_setup = load_payment_setup()
+        stats = self.sample_stats(checker_id=None)
+        checkpoints = []
+
+        def add_settlement(amount, admin_user_id, stats_snapshot, checker_id=None, open_account_amount=None):
+            checkpoint = {
+                "id": "checkpoint-missing-checker",
+                "checker_user_id": checker_id,
+                "amount_toman": amount,
+                "open_account_amount_toman": open_account_amount,
+                "unpaid_before_toman": stats_snapshot["unpaid_total"],
+                "unpaid_after_toman": stats_snapshot["unpaid_total"] - amount,
+            }
+            checkpoints.append(checkpoint)
+            return checkpoint
+
+        payment_setup.is_admin = lambda _user_id: True
+        payment_setup.load_payments = lambda: {}
+        payment_setup.build_receipt_checker_stats = lambda *args, **kwargs: stats
+        payment_setup.add_checker_settlement = add_settlement
+
+        call = types.SimpleNamespace(
+            id="cb-missing-checker",
+            data="checker_settlement:confirm:1500000",
+            from_user=types.SimpleNamespace(id=7),
+            message=types.SimpleNamespace(chat=types.SimpleNamespace(id=99), message_id=55),
+        )
+        payment_setup.handle_checker_settlement_callback(call)
+
+        self.assertEqual(len(checkpoints), 1)
+        self.assertEqual(payment_setup.bot.sent_messages, [])
+        edited_text = payment_setup.bot.edited_messages[-1]["text"]
+        self.assertIn("✅ Checker settlement checkpoint saved.", edited_text)
+        self.assertIn("Checker notification could not be delivered", edited_text)
+        self.assertIn("The settlement remains saved.", edited_text)
 
     def test_checker_settlement_rejects_open_account_base_over_available_total(self):
         payment_setup = load_payment_setup()

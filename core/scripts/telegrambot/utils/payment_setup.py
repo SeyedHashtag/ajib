@@ -462,6 +462,27 @@ def _build_checker_stats_markup(is_admin_view):
     return markup
 
 
+def _notify_checker_of_settlement(checkpoint):
+    checker_id = checkpoint.get('checker_user_id')
+    if checker_id is None:
+        return False
+
+    try:
+        bot.send_message(
+            checker_id,
+            (
+                "✅ Checker payout settlement recorded.\n\n"
+                f"Checker Payout: {_format_toman(checkpoint.get('amount_toman'))} Tomans\n"
+                f"Open Account Base: {_format_toman(checkpoint.get('open_account_amount_toman'))} Tomans\n"
+                f"Remaining Checker Balance: {_format_toman(checkpoint.get('unpaid_after_toman'))} Tomans\n"
+                f"Checkpoint ID: {checkpoint.get('id')}"
+            )
+        )
+        return True
+    except Exception:
+        return False
+
+
 def show_receipt_checker_stats(message):
     stats = build_receipt_checker_stats(load_payments())
     bot.reply_to(
@@ -587,6 +608,13 @@ def handle_checker_settlement_callback(call):
             open_account_amount=base_amount,
         )
         CHECKER_SETTLEMENT_INPUT_STATE.pop(call.from_user.id, None)
+        checker_notified = _notify_checker_of_settlement(checkpoint)
+        notification_warning = ""
+        if not checker_notified:
+            notification_warning = (
+                "\n\n⚠️ Checker notification could not be delivered. "
+                "The settlement remains saved."
+            )
         bot.edit_message_text(
             (
                 "✅ Checker settlement checkpoint saved.\n\n"
@@ -595,6 +623,7 @@ def handle_checker_settlement_callback(call):
                 f"Unpaid Before: {_format_toman(checkpoint.get('unpaid_before_toman'))} Tomans\n"
                 f"Unpaid After: {_format_toman(checkpoint.get('unpaid_after_toman'))} Tomans\n"
                 f"Checkpoint ID: {checkpoint.get('id')}"
+                f"{notification_warning}"
             ),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id
