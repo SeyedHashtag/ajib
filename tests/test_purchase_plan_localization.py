@@ -127,6 +127,43 @@ def test_purchase_plan_customer_catalog_keys_exist_with_matching_placeholders():
             )
 
 
+def test_customer_pricing_and_hysteria_catalog_copy_are_localized_by_currency_policy():
+    catalogs = _load_translations().MESSAGE_TRANSLATIONS
+    headings = {
+        "en": "**Built for quality, not crowding.** Hysteria connects directly to the server and is sensitive to server load. We keep fewer users on each server for a fast, stable, uninterrupted connection.",
+        "fa": "**کیفیت، نه شلوغی.** پروتکل Hysteria مستقیماً به سرور متصل می‌شود و به بار سرور حساس است. برای ارائهٔ اتصالی سریع، پایدار و بدون قطعی، تعداد کاربران هر سرور را محدود نگه می‌داریم.",
+        "ru": "**Качество без перегрузки.** Протокол Hysteria подключается напрямую к серверу и чувствителен к его нагрузке. Мы ограничиваем число пользователей на каждом сервере, чтобы обеспечить быстрое, стабильное и бесперебойное соединение.",
+        "tk": "**Hil üçin döredildi, aşa ýüklenme üçin däl.** Hysteria serwere gönüden-göni birigýän we onuň ýüküne duýgur protokoldyr. Çalt, durnukly we üznüksiz birikmäni üpjün etmek üçin her serwerdäki ulanyjylaryň sanyny az saklaýarys.",
+    }
+    removed_badges = {
+        "quick_pick_cheapest",
+        "quick_pick_balanced",
+        "quick_pick_best_value",
+    }
+
+    for language, heading in headings.items():
+        catalog = catalogs[language]
+        assert catalog["all_plans_title"].split("\n\n", 1)[1] == heading
+        assert catalog["all_plans_title"].startswith("● ")
+        assert not removed_badges & catalog.keys()
+        assert catalog["quick_pick_recommended"]
+        assert _placeholders(catalog["plan_price_usd_only"]) == {"usd"}
+        assert _placeholders(catalog["plan_payment_totals_crypto_only"]) == {
+            "original_usd", "crypto_percent", "crypto_total"
+        }
+        assert _placeholders(catalog["renewal_payment_totals_crypto_only"]) == {
+            "original_usd", "crypto_percent", "crypto_total"
+        }
+
+    for language in ("en", "fa"):
+        totals = catalogs[language]["plan_payment_totals_usd_first"]
+        renewals = catalogs[language]["renewal_payment_totals_usd_first"]
+        assert totals.index("{crypto_total}") < totals.index("{card_total}")
+        assert renewals.index("{crypto_total}") < renewals.index("{card_total}")
+        assert "🏦" in totals and "🏦" in renewals
+        assert "🇮🇷" not in totals + renewals
+
+
 def test_public_purchase_handlers_have_no_direct_customer_copy_literals():
     source = PURCHASE_PLAN_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)

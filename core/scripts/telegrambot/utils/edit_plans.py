@@ -24,10 +24,30 @@ def save_plans(plans):
     with open(PLANS_FILE, 'w') as f:
         json.dump(plans, f, indent=4)
 
+
+def _customer_plan_eligible(plan):
+    return isinstance(plan, dict) and plan.get("target", "both") != "reseller"
+
+
+def get_recommended_customer_plan_id(plans):
+    eligible = sorted(
+        (
+            (str(plan_id), details)
+            for plan_id, details in (plans or {}).items()
+            if str(plan_id).isdigit() and _customer_plan_eligible(details)
+        ),
+        key=lambda item: int(item[0]),
+    )
+    return next(
+        (plan_id for plan_id, details in eligible if details.get("recommended") is True),
+        None,
+    )
+
 def create_plans_markup():
     markup = types.InlineKeyboardMarkup(row_width=3)
     plans = load_plans()
     sorted_plans = sorted(plans.items(), key=lambda x: int(x[0]))
+    recommended_plan_id = get_recommended_customer_plan_id(plans)
     
     # Create plan list text
     plans_text = "📋 Current Plans:\n\n"
@@ -39,7 +59,8 @@ def create_plans_markup():
             target_text = " [Reseller Only]"
         elif target == "customer":
             target_text = " [Customer Only]"
-        plans_text += f"{i}. {gb}GB - ${details['price']} - {details['days']}d{unlimited_text}{target_text}\n"
+        recommended_text = " ⭐ Recommended" if gb == recommended_plan_id else ""
+        plans_text += f"{i}. {gb}GB - ${details['price']} - {details['days']}d{unlimited_text}{target_text}{recommended_text}\n"
     
     # Create numbered buttons
     buttons = []
@@ -97,11 +118,24 @@ def handle_plan_select(call):
         
         if gb and plan:
             markup = types.InlineKeyboardMarkup(row_width=1)
-            markup.add(
+            action_buttons = [
                 types.InlineKeyboardButton("✏️ Edit", callback_data=f"edit_plan:{gb}"),
+            ]
+            if _customer_plan_eligible(plan):
+                recommendation_label = (
+                    "⭐ Recommended"
+                    if gb == get_recommended_customer_plan_id(plans)
+                    else "☆ Recommend"
+                )
+                action_buttons.append(types.InlineKeyboardButton(
+                    recommendation_label,
+                    callback_data=f"recommend_customer_plan:{gb}",
+                ))
+            action_buttons.extend([
                 types.InlineKeyboardButton("🗑️ Delete", callback_data=f"confirm_delete_plan:{gb}"),
-                types.InlineKeyboardButton("⬅️ Back", callback_data="admin_back_to_plans")
-            )
+                types.InlineKeyboardButton("⬅️ Back", callback_data="admin_back_to_plans"),
+            ])
+            markup.add(*action_buttons)
             
             unlimited_text = "Yes" if plan.get("unlimited") else "Single User"
             target = plan.get("target", "both").capitalize()
@@ -118,6 +152,36 @@ def handle_plan_select(call):
             )
     except Exception as e:
         print(f"DEBUG: Error in handle_plan_select: {str(e)}")
+        bot.answer_callback_query(call.id, text=f"Error: {str(e)}")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("recommend_customer_plan:"))
+def handle_recommend_customer_plan(call):
+    if not is_admin(call.from_user.id):
+        return
+    try:
+        gb = call.data.split(':', 1)[1]
+        plans = load_plans()
+        plan = plans.get(gb)
+        if not _customer_plan_eligible(plan):
+            bot.answer_callback_query(call.id, text="Plan is not available to customers.", show_alert=True)
+            return
+        for details in plans.values():
+            if isinstance(details, dict):
+                details.pop("recommended", None)
+        plan["recommended"] = True
+        save_plans(plans)
+        bot.answer_callback_query(call.id, text="Recommended plan updated.")
+        markup, plans_text, _ = create_plans_markup()
+        plans_text += "\nSelect a plan number to edit:"
+        bot.edit_message_text(
+            plans_text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=markup,
+        )
+    except Exception as e:
+        print(f"DEBUG: Error in handle_recommend_customer_plan: {str(e)}")
         bot.answer_callback_query(call.id, text=f"Error: {str(e)}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_plan:"))
@@ -270,6 +334,8 @@ def handle_update_target(call):
         plans = load_plans()
         if str(gb) in plans:
             plans[str(gb)]['target'] = target
+            if target == "reseller":
+                plans[str(gb)].pop("recommended", None)
             save_plans(plans)
             
             bot.edit_message_text(

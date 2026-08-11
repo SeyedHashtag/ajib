@@ -137,28 +137,20 @@ class HostedSalesPsychologyStateTests(unittest.TestCase):
 
 
 class HostedSalesPsychologyWorkerTests(unittest.TestCase):
-    def test_quick_picks_deduplicate_cheapest_recommended_and_best_value(self):
-        namespace = {
-            "_hosted_plan_quote": lambda plan, settings: {
-                "retail": float(plan["price"]),
-            },
-        }
-        module = ast.Module(body=[worker_function("_quick_pick_plans")], type_ignores=[])
+    def test_recommendation_requires_an_explicit_visible_plan(self):
+        namespace = {}
+        module = ast.Module(body=[worker_function("_recommended_plan_id")], type_ignores=[])
         exec(compile(ast.fix_missing_locations(module), "hosted_worker.py", "exec"), namespace)
 
-        choices = namespace["_quick_pick_plans"](
-            {
-                "5": {"price": 5, "gb": 5},
-                "20": {"price": 12, "gb": 20},
-                "50": {"price": 20, "gb": 50},
-            },
-            {"recommended_plan_id": "20"},
-        )
-
+        plans = {"5": {}, "20": {}, "50": {}}
         self.assertEqual(
-            choices,
-            [("5", "pick_cheapest"), ("20", "pick_recommended"), ("50", "pick_best_value")],
+            namespace["_recommended_plan_id"](plans, {"recommended_plan_id": "20"}),
+            "20",
         )
+        self.assertIsNone(
+            namespace["_recommended_plan_id"](plans, {"recommended_plan_id": "35"})
+        )
+        self.assertIsNone(namespace["_recommended_plan_id"](plans, {}))
 
     def test_plan_selector_lists_all_plans_in_size_order_with_labels(self):
         class Markup:
@@ -207,6 +199,8 @@ class HostedSalesPsychologyWorkerTests(unittest.TestCase):
             "OWNER_ID": 7,
             "get_settings": lambda _owner_id: {"recommended_plan_id": "20"},
             "_sellable_plans": lambda: plans,
+            "_language": lambda _user_id: "en",
+            "_customer_card_pricing_enabled": lambda language: language in {"en", "fa"},
             "get_exchange_rate": lambda: 1,
             "_hosted_plan_quote": lambda plan, _settings: {"retail": float(plan["price"])},
             "_plan_button_text": plan_button_text,
@@ -216,7 +210,7 @@ class HostedSalesPsychologyWorkerTests(unittest.TestCase):
             "bot": bot,
         }
         module = ast.Module(
-            body=[worker_function("_quick_pick_plans"), worker_function("_show_plans")],
+            body=[worker_function("_recommended_plan_id"), worker_function("_show_plans")],
             type_ignores=[],
         )
         exec(compile(ast.fix_missing_locations(module), "hosted_worker.py", "exec"), namespace)
@@ -232,8 +226,9 @@ class HostedSalesPsychologyWorkerTests(unittest.TestCase):
         )
         self.assertEqual(
             [button.text for button in buttons],
-            ["pick_cheapest:5", "pick_recommended:20", "plain:35", "pick_best_value:50"],
+            ["plain:5", "pick_recommended:20", "plain:35", "plain:50"],
         )
+        self.assertEqual(kwargs["parse_mode"], "Markdown")
         self.assertNotIn("hb:plans:all", [button.callback_data for button in buttons])
         self.assertEqual(
             growth_events,

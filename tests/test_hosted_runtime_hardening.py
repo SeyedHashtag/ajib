@@ -696,6 +696,85 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(renewal, {"username": "customer", "server_id": "a"})
         self.assertIsNone(self.worker._consume_renewal_token(second, 100))
 
+    def test_russian_hosted_purchase_and_renewal_are_crypto_only_without_exchange_rate(self):
+        settings = {
+            "card_number": "1234",
+            "crypto_enabled": True,
+            "referral_margin_percent": 20,
+        }
+        quote = {
+            "card_supported": True,
+            "crypto_supported": True,
+            "card_collected": 10.0,
+            "crypto_collected": 9.5,
+            "buyer_discount_percent": 0,
+        }
+        renewal = {"username": "customer", "server_id": "s1"}
+
+        with (
+            mock.patch.object(self.worker, "_language", return_value="ru"),
+            mock.patch.object(self.worker, "_reseller", return_value={"status": "approved"}),
+            mock.patch.object(self.worker, "_sellable_plans", return_value={
+                "10": {"price": 10, "gb": 10, "days": 30}
+            }),
+            mock.patch.object(self.worker, "get_settings", return_value=settings),
+            mock.patch.object(self.worker, "_hosted_plan_quote", return_value=quote),
+            mock.patch.object(self.worker, "_invite_discount_preview", return_value=0),
+            mock.patch.object(self.worker, "_referral_data", return_value={"referrals": {}}),
+            mock.patch.object(self.worker, "_claim_risk_disclosure", return_value=False),
+            mock.patch.object(self.worker, "_record_growth"),
+            mock.patch.object(self.worker, "_store_renewal_token", return_value="renew-token"),
+            mock.patch.object(self.worker, "get_exchange_rate", side_effect=AssertionError("rate requested")),
+            mock.patch.object(self.worker.bot, "edit_message_text") as edit_message,
+            mock.patch.dict(os.environ, {
+                "CRYPTO_MERCHANT_ID": "merchant",
+                "CRYPTO_API_KEY": "key",
+            }),
+        ):
+            self.worker._purchase_options(555, 100, "10", message_id=90)
+            self.worker._purchase_options(555, 100, "10", renewal=renewal, message_id=91)
+
+        self.assertEqual(edit_message.call_count, 2)
+        for checkout_call in edit_message.call_args_list:
+            text = checkout_call.args[0]
+            buttons = [
+                button
+                for row in checkout_call.kwargs["reply_markup"].keyboard
+                for button in row
+            ]
+            self.assertIn("$9.50", text)
+            self.assertNotIn("томан", text.casefold())
+            self.assertFalse(any("hb:pay:card:" in button.callback_data for button in buttons))
+            self.assertTrue(any("hb:pay:crypto:" in button.callback_data for button in buttons))
+
+    def test_russian_hosted_card_callback_is_rejected_before_renewal_token_consumption(self):
+        call = mock.Mock()
+        call.data = "hb:pay:card:10:renew-token"
+        call.id = "callback"
+        call.from_user.id = 100
+
+        with (
+            mock.patch.object(self.worker, "_language", return_value="ru"),
+            mock.patch.object(
+                self.worker,
+                "_consume_renewal_token",
+                side_effect=AssertionError("renewal token consumed"),
+            ),
+            mock.patch.object(
+                self.worker,
+                "get_exchange_rate",
+                side_effect=AssertionError("rate requested"),
+            ),
+            mock.patch.object(self.worker, "_reserve_invite_discount") as reserve_discount,
+            mock.patch.object(self.worker.bot, "answer_callback_query") as answer,
+        ):
+            self.worker.payment_method(call)
+
+        reserve_discount.assert_not_called()
+        answer.assert_called_once()
+        self.assertTrue(answer.call_args.kwargs["show_alert"])
+        self.assertIn("метод", answer.call_args.args[1].casefold())
+
     def test_hosted_renewal_is_revalidated_and_becomes_immediate_if_now_expired(self):
         reseller_data = {
             "status": "approved",

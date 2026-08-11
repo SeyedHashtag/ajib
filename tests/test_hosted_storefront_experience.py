@@ -164,6 +164,35 @@ class HostedStorefrontTranslationTests(unittest.TestCase):
                 self.assertEqual(set(catalog), expected)
                 self.assertTrue(all(str(value).strip() for value in catalog.values()))
 
+    def test_customer_catalog_positioning_and_currency_templates_are_symmetric(self):
+        headings = {
+            "en": "*Built for quality, not crowding.* Hysteria connects directly to the server and is sensitive to server load. We keep fewer users on each server for a fast, stable, uninterrupted connection.",
+            "fa": "*کیفیت، نه شلوغی.* پروتکل Hysteria مستقیماً به سرور متصل می‌شود و به بار سرور حساس است. برای ارائهٔ اتصالی سریع، پایدار و بدون قطعی، تعداد کاربران هر سرور را محدود نگه می‌داریم.",
+            "ru": "*Качество без перегрузки.* Протокол Hysteria подключается напрямую к серверу и чувствителен к его нагрузке. Мы ограничиваем число пользователей на каждом сервере, чтобы обеспечить быстрое, стабильное и бесперебойное соединение.",
+            "tk": "*Hil üçin döredildi, aşa ýüklenme üçin däl.* Hysteria serwere gönüden-göni birigýän we onuň ýüküne duýgur protokoldyr. Çalt, durnukly we üznüksiz birikmäni üpjün etmek üçin her serwerdäki ulanyjylaryň sanyny az saklaýarys.",
+        }
+        removed_badges = {"pick_cheapest", "pick_balanced", "pick_best_value"}
+
+        for language, heading in headings.items():
+            catalog = HOSTED_TRANSLATIONS[language]
+            self.assertEqual(catalog["all_plans_title"].split("\n\n", 1)[1], heading)
+            self.assertTrue(catalog["all_plans_title"].startswith("1️⃣ "))
+            self.assertFalse(removed_badges & catalog.keys())
+            self.assertTrue(catalog["pick_recommended"])
+            self.assertIn("${usd}", catalog["plan_button_usd_only"])
+            self.assertNotIn("{toman}", catalog["plan_button_usd_only"])
+            self.assertIn("${usd}", catalog["crypto_total_usd_only"])
+            self.assertNotIn("{toman}", catalog["crypto_total_usd_only"])
+
+        for language in ("en", "fa"):
+            catalog = HOSTED_TRANSLATIONS[language]
+            self.assertLess(
+                catalog["plan_button_usd_first"].index("${usd}"),
+                catalog["plan_button_usd_first"].index("{toman}"),
+            )
+            self.assertTrue(catalog["card_total_toman"].startswith("🏦"))
+            self.assertNotIn("🇮🇷", catalog["card_total_toman"])
+
     def test_invite_and_earn_buttons_use_money_bag_emoji_in_every_language(self):
         button_translations = _button_translations()
 

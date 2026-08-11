@@ -430,53 +430,37 @@ def _customer_plan_items(plans):
     return sorted(items, key=lambda item: (Decimal(str(item[0])), Decimal(str(item[1]['price']))))
 
 
-def select_quick_pick_plans(plans, configured_plan_id=None):
-    """Select factual, deduplicated entry plans for a lower-friction catalog."""
+def select_recommended_plan_id(plans, configured_plan_id=None):
+    """Return the single explicitly recommended customer plan, if any."""
     items = _customer_plan_items(plans)
     if not items:
-        return []
+        return None
 
-    by_id = dict(items)
-    cheapest = min(items, key=lambda item: (Decimal(str(item[1]['price'])), Decimal(str(item[0]))))
-    best_value = min(
-        items,
-        key=lambda item: (
-            Decimal(str(item[1]['price'])) / Decimal(str(item[0])),
-            Decimal(str(item[1]['price'])),
-        ),
+    stored = next(
+        (plan_id for plan_id, details in items if details.get("recommended") is True),
+        None,
     )
+    if stored is not None:
+        return stored
 
-    recommended_id = str(configured_plan_id or os.getenv("AJIB_RECOMMENDED_PLAN_ID") or "").strip()
-    recommended = by_id.get(recommended_id)
-    if recommended is None:
-        recommended = next(
-            (item for item in items if item[1].get("recommended") is True),
-            None,
-        )
-    recommendation_label = "quick_pick_recommended"
-    if recommended is None:
-        recommended = items[len(items) // 2]
-        recommendation_label = "quick_pick_balanced"
-
-    selected = []
-    seen = set()
-    for label_key, item in (
-        ("quick_pick_cheapest", cheapest),
-        (recommendation_label, recommended),
-        ("quick_pick_best_value", best_value),
-    ):
-        if item[0] in seen:
-            continue
-        seen.add(item[0])
-        selected.append((label_key, item[0], item[1]))
-    return selected
+    fallback = str(
+        configured_plan_id
+        if configured_plan_id is not None
+        else os.getenv("AJIB_RECOMMENDED_PLAN_ID") or ""
+    ).strip()
+    return fallback if fallback in dict(items) else None
 
 
-def _plan_price_pair(language, price, exchange_rate):
+def _customer_card_pricing_enabled(language):
+    return language in {"en", "fa"}
+
+
+def _plan_price_pair(language, price, exchange_rate=None):
     usd = format_usd_amount(price)
+    if not _customer_card_pricing_enabled(language):
+        return get_message_text(language, "plan_price_usd_only").format(usd=usd)
     toman = format_toman_amount(float(price) * exchange_rate)
-    key = "plan_price_pair_toman_first" if language == "fa" else "plan_price_pair_usd_first"
-    return get_message_text(language, key).format(usd=usd, toman=toman)
+    return get_message_text(language, "plan_price_pair_usd_first").format(usd=usd, toman=toman)
 
 
 def _plan_button_text(language, gb, details, exchange_rate, label_key=None):
@@ -525,14 +509,25 @@ def build_plan_payment_totals(
     crypto_total = (
         original * (Decimal('1') - crypto_percent / Decimal('100'))
     ).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-    if renewal_percent > 0:
+    if not _customer_card_pricing_enabled(language):
         key = (
-            "renewal_payment_totals_toman_first"
-            if language == "fa"
-            else "renewal_payment_totals_usd_first"
+            "renewal_payment_totals_crypto_only"
+            if renewal_percent > 0
+            else "plan_payment_totals_crypto_only"
         )
-    else:
-        key = "plan_payment_totals_toman_first" if language == "fa" else "plan_payment_totals_usd_first"
+        return get_message_text(language, key).format(
+            plan_gb=plan_gb,
+            crypto_total=format_usd_amount(crypto_total),
+            original_usd=format_usd_amount(price),
+            renewal_percent=f"{float(renewal_percent):g}",
+            crypto_percent=f"{float(crypto_percent):g}",
+        )
+
+    key = (
+        "renewal_payment_totals_usd_first"
+        if renewal_percent > 0
+        else "plan_payment_totals_usd_first"
+    )
     return get_message_text(language, key).format(
         plan_gb=plan_gb,
         card_total=format_toman_amount(float(card_total) * exchange_rate),
@@ -1704,20 +1699,17 @@ def show_plans(chat_id, user_id, message_id=None):
         catalog="all",
     )
     plans = load_plans()
-    exchange_rate = get_exchange_rate()
+    exchange_rate = get_exchange_rate() if _customer_card_pricing_enabled(language) else None
     customer_plans = _customer_plan_items(plans)
     markup = types.InlineKeyboardMarkup(row_width=1)
-    quick_pick_labels = {
-        gb: label_key
-        for label_key, gb, _details in select_quick_pick_plans(plans)
-    }
+    recommended_plan_id = select_recommended_plan_id(plans)
     for gb, details in customer_plans:
         button_text = _plan_button_text(
             language,
             gb,
             details,
             exchange_rate,
-            label_key=quick_pick_labels.get(gb),
+            label_key="quick_pick_recommended" if gb == recommended_plan_id else None,
         )
         markup.add(types.InlineKeyboardButton(button_text, callback_data=f"purchase:{gb}"))
 
@@ -1792,11 +1784,19 @@ def handle_purchase_selection(call):
             )
             unlimited_text = get_button_text(language, "yes" if plan.get("unlimited") else "no")
             price = float(plan['price'])
-            exchange_rate = get_exchange_rate()
+            exchange_rate = (
+                get_exchange_rate()
+                if _customer_card_pricing_enabled(language)
+                else None
+            )
             invite_discount_percent = _invite_discount_preview(user_id)
             load_dotenv(TELEGRAM_ENV_PATH, override=True)
             crypto_configured = all(os.getenv(key) for key in ['CRYPTO_MERCHANT_ID', 'CRYPTO_API_KEY'])
-            card_to_card_configured = get_card_number_for_receipt_type(RECEIPT_TYPE_REGULAR)
+            card_to_card_configured = (
+                get_card_number_for_receipt_type(RECEIPT_TYPE_REGULAR)
+                if _customer_card_pricing_enabled(language)
+                else None
+            )
             message = get_message_text(language, "purchase_progress_payment") + "\n\n"
             message += get_message_text(language, "plan_details")
             message += get_message_text(language, "data").format(plan_gb=plan_gb)
@@ -1927,7 +1927,11 @@ def handle_customer_renewal_start(call):
 
         load_dotenv(TELEGRAM_ENV_PATH, override=True)
         crypto_configured = all(os.getenv(key) for key in ['CRYPTO_MERCHANT_ID', 'CRYPTO_API_KEY'])
-        card_to_card_configured = get_card_number_for_receipt_type(RECEIPT_TYPE_REGULAR)
+        card_to_card_configured = (
+            get_card_number_for_receipt_type(RECEIPT_TYPE_REGULAR)
+            if _customer_card_pricing_enabled(language)
+            else None
+        )
         markup = types.InlineKeyboardMarkup(row_width=1)
         methods_count = 0
         if crypto_configured:
@@ -1957,7 +1961,11 @@ def handle_customer_renewal_start(call):
         markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="cancel_purchase"))
 
         from utils.renewal import format_renewal_offer
-        exchange_rate = get_exchange_rate()
+        exchange_rate = (
+            get_exchange_rate()
+            if _customer_card_pricing_enabled(language)
+            else None
+        )
         offer_message = get_message_text(language, "purchase_progress_payment") + "\n\n"
         offer_message += format_renewal_offer(language, offer, include_payment_prompt=True)
         offer_message += "\n\n" + build_plan_payment_totals(
@@ -1990,6 +1998,13 @@ def handle_customer_renewal_payment_method(call):
         user_id = call.from_user.id
         language = get_user_language(user_id)
         _, method, token = call.data.split(':', 2)
+        if method == 'card_to_card' and not _customer_card_pricing_enabled(language):
+            bot.answer_callback_query(
+                call.id,
+                text=get_message_text(language, "no_payment_methods"),
+                show_alert=True,
+            )
+            return
         offer = _resolve_customer_renewal_offer_for_call(call, token)
         if not offer.get('eligible'):
             bot.answer_callback_query(
@@ -2128,6 +2143,13 @@ def _handle_customer_renewal_card_to_card(call, offer):
 
     user_id = call.from_user.id
     language = get_user_language(user_id)
+    if not _customer_card_pricing_enabled(language):
+        bot.answer_callback_query(
+            call.id,
+            text=get_message_text(language, "no_payment_methods"),
+            show_alert=True,
+        )
+        return
     load_dotenv(TELEGRAM_ENV_PATH, override=True)
     card_number = get_card_number_for_receipt_type(RECEIPT_TYPE_REGULAR)
     exchange_rate = get_exchange_rate()
@@ -2222,6 +2244,14 @@ def handle_payment_method_selection(call, data=None):
         language = get_user_language(user_id)
         callback_data = data if data else call.data
         _, method, plan_gb = callback_data.split(':')
+        if method == 'card_to_card' and not _customer_card_pricing_enabled(language):
+            safe_answer_callback_query(
+                bot,
+                call.id,
+                text=get_message_text(language, "no_payment_methods"),
+                show_alert=True,
+            )
+            return
         if method == 'crypto':
             queued = _queue_customer_crypto_payment(call, plan_gb)
             safe_answer_callback_query(bot, call.id)
@@ -2381,6 +2411,14 @@ def handle_card_to_card_payment(call, plan_gb):
     try:
         user_id = call.from_user.id
         language = get_user_language(user_id)
+        if not _customer_card_pricing_enabled(language):
+            safe_answer_callback_query(
+                bot,
+                call.id,
+                text=get_message_text(language, "no_payment_methods"),
+                show_alert=True,
+            )
+            return
         load_dotenv(TELEGRAM_ENV_PATH, override=True)
         receipt_type = RECEIPT_TYPE_REGULAR
         card_number = get_card_number_for_receipt_type(receipt_type)

@@ -1550,46 +1550,31 @@ def _provision_claimed_payment(payment_id, record, funded, retry_status):
     return success, detail
 
 
-def _quick_pick_plans(plans, settings):
-    if not plans:
-        return []
-    quoted = {
-        plan_id: _hosted_plan_quote(plan, settings)
-        for plan_id, plan in plans.items()
-    }
-    cheapest = min(plans, key=lambda plan_id: (quoted[plan_id]["retail"], int(plan_id)))
+def _recommended_plan_id(plans, settings):
     recommended = str(settings.get("recommended_plan_id") or "")
-    recommended_label = "pick_recommended"
-    if recommended not in plans:
-        ordered = sorted(plans, key=lambda plan_id: (quoted[plan_id]["retail"], int(plan_id)))
-        recommended = ordered[(len(ordered) - 1) // 2]
-        recommended_label = "pick_balanced"
-    best_value = min(
-        plans,
-        key=lambda plan_id: (
-            quoted[plan_id]["retail"] / max(1, int(plans[plan_id].get("gb", plan_id))),
-            quoted[plan_id]["retail"],
-        ),
-    )
-    result = []
-    for plan_id, label in (
-        (cheapest, "pick_cheapest"),
-        (recommended, recommended_label),
-        (best_value, "pick_best_value"),
-    ):
-        if plan_id not in {item[0] for item in result}:
-            result.append((plan_id, label))
-    return result
+    return recommended if recommended in plans else None
+
+
+def _customer_card_pricing_enabled(language):
+    return language in {"en", "fa"}
 
 
 def _plan_button_text(user_id, plan_id, plan, quote, label_key=None, exchange_rate=None):
     language = _language(user_id)
-    exchange_rate = exchange_rate if exchange_rate is not None else get_exchange_rate()
     label = hosted_text(language, label_key) if label_key else ""
-    template_key = "plan_button_toman_first" if language == "fa" else "plan_button_usd_first"
+    if not _customer_card_pricing_enabled(language):
+        return hosted_text(
+            language,
+            "plan_button_usd_only",
+            label=(f"{label} · " if label else ""),
+            gb=plan.get("gb", plan_id),
+            days=plan.get("days", 30),
+            usd=format_usd_amount(quote["retail"]),
+        )
+    exchange_rate = exchange_rate if exchange_rate is not None else get_exchange_rate()
     return hosted_text(
         language,
-        template_key,
+        "plan_button_usd_first",
         label=(f"{label} · " if label else ""),
         gb=plan.get("gb", plan_id),
         days=plan.get("days", 30),
@@ -1602,8 +1587,9 @@ def _show_plans(chat_id, user_id, message_id=None, event_key=None):
     markup = types.InlineKeyboardMarkup(row_width=1)
     settings = get_settings(OWNER_ID)
     plans = _sellable_plans()
-    exchange_rate = get_exchange_rate()
-    quick_pick_labels = dict(_quick_pick_plans(plans, settings))
+    language = _language(user_id)
+    exchange_rate = get_exchange_rate() if _customer_card_pricing_enabled(language) else None
+    recommended_plan_id = _recommended_plan_id(plans, settings)
     choices = sorted(
         plans,
         key=lambda plan_id: (int(plans[plan_id].get("gb", plan_id)), int(plan_id)),
@@ -1617,7 +1603,7 @@ def _show_plans(chat_id, user_id, message_id=None, event_key=None):
                 plan_id,
                 plan,
                 quote,
-                label_key=quick_pick_labels.get(plan_id),
+                label_key="pick_recommended" if plan_id == recommended_plan_id else None,
                 exchange_rate=exchange_rate,
             ),
             callback_data=f"hb:buy:{plan_id}",
@@ -1635,9 +1621,9 @@ def _show_plans(chat_id, user_id, message_id=None, event_key=None):
         ),
     )
     if message_id is not None:
-        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
     else:
-        bot.send_message(chat_id, text, reply_markup=markup)
+        bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
 
 
 def _purchase_options(chat_id, user_id, plan_id, renewal=None, message_id=None):
@@ -1664,8 +1650,25 @@ def _purchase_options(chat_id, user_id, plan_id, renewal=None, message_id=None):
     if renewal:
         token = _store_renewal_token(user_id, renewal)
         suffix = f":{token}"
-    exchange_rate = get_exchange_rate()
-    if settings.get("card_number") and quote["card_supported"]:
+    card_pricing_enabled = _customer_card_pricing_enabled(language)
+    exchange_rate = get_exchange_rate() if card_pricing_enabled else None
+    crypto_available = bool(
+        settings.get("crypto_enabled")
+        and quote["crypto_supported"]
+        and os.getenv("CRYPTO_MERCHANT_ID")
+        and os.getenv("CRYPTO_API_KEY")
+    )
+    card_available = bool(
+        card_pricing_enabled
+        and settings.get("card_number")
+        and quote["card_supported"]
+    )
+    if crypto_available:
+        markup.add(types.InlineKeyboardButton(
+            _hosted_message(user_id, "crypto_method", amount=format_usd_amount(quote["crypto_collected"])),
+            callback_data=f"hb:pay:crypto:{plan_id}{suffix}",
+        ))
+    if card_available:
         markup.add(types.InlineKeyboardButton(
             _hosted_message(
                 user_id,
@@ -1673,11 +1676,6 @@ def _purchase_options(chat_id, user_id, plan_id, renewal=None, message_id=None):
                 amount=format_toman_amount(quote["card_collected"] * exchange_rate),
             ),
             callback_data=f"hb:pay:card:{plan_id}{suffix}",
-        ))
-    if settings.get("crypto_enabled") and quote["crypto_supported"] and os.getenv("CRYPTO_MERCHANT_ID") and os.getenv("CRYPTO_API_KEY"):
-        markup.add(types.InlineKeyboardButton(
-            _hosted_message(user_id, "crypto_method", amount=format_usd_amount(quote["crypto_collected"])),
-            callback_data=f"hb:pay:crypto:{plan_id}{suffix}",
         ))
     if not markup.keyboard:
         bot.send_message(chat_id, _message(user_id, "no_payment_methods"))
@@ -1690,26 +1688,17 @@ def _purchase_options(chat_id, user_id, plan_id, renewal=None, message_id=None):
         gb=plan.get("gb", plan_id),
         days=plan.get("days", 30),
     )
-    card_key = "card_total_toman_first" if language == "fa" else "card_total_usd_first"
-    crypto_key = "crypto_total_toman_first" if language == "fa" else "crypto_total_usd_first"
-    if settings.get("card_number") and quote["card_supported"]:
+    if crypto_available:
         text += "\n" + _hosted_message(
             user_id,
-            card_key,
-            usd=format_usd_amount(quote["card_collected"]),
-            toman=format_toman_amount(quote["card_collected"] * exchange_rate),
-        )
-    if (
-        settings.get("crypto_enabled")
-        and quote["crypto_supported"]
-        and os.getenv("CRYPTO_MERCHANT_ID")
-        and os.getenv("CRYPTO_API_KEY")
-    ):
-        text += "\n" + _hosted_message(
-            user_id,
-            crypto_key,
+            "crypto_total_usd_only",
             usd=format_usd_amount(quote["crypto_collected"]),
-            toman=format_toman_amount(quote["crypto_collected"] * exchange_rate),
+        )
+    if card_available:
+        text += "\n" + _hosted_message(
+            user_id,
+            "card_total_toman",
+            toman=format_toman_amount(quote["card_collected"] * exchange_rate),
         )
     if buyer_discount_percent:
         text += "\n" + _hosted_message(
@@ -1972,6 +1961,14 @@ def payment_method(call):
         )
         return
     method, plan_id = parts[2], parts[3]
+    language = _language(call.from_user.id)
+    if method == "card" and not _customer_card_pricing_enabled(language):
+        bot.answer_callback_query(
+            call.id,
+            _message(call.from_user.id, "no_payment_methods"),
+            show_alert=True,
+        )
+        return
     plan = _sellable_plans().get(plan_id)
     settings = get_settings(OWNER_ID)
     if not plan or not _reseller(active_only=True):

@@ -6,41 +6,34 @@ from unittest.mock import patch
 from test_crypto_payment_discount import DummyBot, load_purchase_plan, make_call
 
 
-def test_quick_picks_are_factual_and_deduplicated():
+def test_recommendation_prefers_stored_customer_plan_and_deduplicates_legacy_flags():
     module = load_purchase_plan(DummyBot(), [])
     plans = {
-        "10": {"price": 2, "days": 30},
+        "10": {"price": 2, "days": 30, "recommended": True},
         "20": {"price": 3, "days": 30, "recommended": True},
         "40": {"price": 4, "days": 30},
-        "100": {"price": 1, "days": 30, "target": "reseller"},
+        "5": {"price": 1, "days": 30, "target": "reseller", "recommended": True},
     }
 
-    picks = module.select_quick_pick_plans(plans)
-
-    assert [(label, plan_id) for label, plan_id, _details in picks] == [
-        ("quick_pick_cheapest", "10"),
-        ("quick_pick_recommended", "20"),
-        ("quick_pick_best_value", "40"),
-    ]
-
-    plans["40"]["recommended"] = True
-    plans["20"].pop("recommended")
-    deduplicated = module.select_quick_pick_plans(plans)
-    assert [plan_id for _label, plan_id, _details in deduplicated] == ["10", "40"]
+    with patch.dict(os.environ, {"AJIB_RECOMMENDED_PLAN_ID": "40"}):
+        assert module.select_recommended_plan_id(plans) == "10"
 
 
-def test_missing_recommendation_uses_truthful_balanced_label():
+def test_recommendation_uses_valid_environment_fallback_without_automatic_default():
     module = load_purchase_plan(DummyBot(), [])
     plans = {
         "10": {"price": 2, "days": 30},
         "20": {"price": 3, "days": 30},
         "40": {"price": 6, "days": 30},
+        "100": {"price": 1, "days": 30, "target": "reseller"},
     }
 
-    picks = module.select_quick_pick_plans(plans)
-
-    assert any(label == "quick_pick_balanced" and plan_id == "20" for label, plan_id, _ in picks)
-    assert all(label != "quick_pick_recommended" for label, _plan_id, _ in picks)
+    with patch.dict(os.environ, {"AJIB_RECOMMENDED_PLAN_ID": "40"}):
+        assert module.select_recommended_plan_id(plans) == "40"
+    with patch.dict(os.environ, {"AJIB_RECOMMENDED_PLAN_ID": "100"}):
+        assert module.select_recommended_plan_id(plans) is None
+    with patch.dict(os.environ, {"AJIB_RECOMMENDED_PLAN_ID": ""}):
+        assert module.select_recommended_plan_id(plans) is None
 
 
 def test_plan_selector_lists_every_customer_plan_once_on_one_page():
@@ -59,10 +52,7 @@ def test_plan_selector_lists_every_customer_plan_once_on_one_page():
         "all_plans_title": "All available plans",
         "customer_plan_button": "{label}{plan_gb} GB · {price_pair} · {days} days",
         "plan_price_pair_usd_first": "${usd} / {toman}",
-        "quick_pick_cheapest": "Lowest price",
         "quick_pick_recommended": "Recommended",
-        "quick_pick_balanced": "Balanced",
-        "quick_pick_best_value": "Best value",
     }
     module.get_message_text = lambda _language, key: messages[key]
     growth_events = []
@@ -82,10 +72,11 @@ def test_plan_selector_lists_every_customer_plan_once_on_one_page():
         "purchase:40",
         "purchase:60",
     ]
-    assert "Lowest price" in buttons[0].args[0]
+    assert buttons[0].args[0].startswith("10 GB")
     assert "Recommended" in buttons[1].args[0]
     assert buttons[2].args[0].startswith("40 GB")
-    assert "Best value" in buttons[3].args[0]
+    assert buttons[3].args[0].startswith("60 GB")
+    assert sum("Recommended" in button.args[0] for button in buttons) == 1
     assert all(button.kwargs["callback_data"] != "show_all_plans" for button in buttons)
     assert growth_events == [
         (("plan_viewed", 1988), {
@@ -116,20 +107,86 @@ def test_legacy_all_plans_callback_opens_the_unified_selector():
     assert len(bot.callback_answers) == 1
 
 
-def test_persian_price_pair_and_totals_are_toman_first():
+def test_persian_price_pair_and_totals_are_usd_first_and_russian_is_crypto_only():
     module = load_purchase_plan(DummyBot(), [])
     messages = {
-        "plan_price_pair_toman_first": "{toman} toman / ${usd}",
         "plan_price_pair_usd_first": "${usd} / {toman} toman",
-        "plan_payment_totals_toman_first": "card={card_total};crypto=${crypto_total};base=${original_usd}",
+        "plan_price_usd_only": "${usd}",
         "plan_payment_totals_usd_first": "base=${original_usd};crypto=${crypto_total};card={card_total}",
+        "plan_payment_totals_crypto_only": "base=${original_usd};crypto=${crypto_total}",
+        "renewal_payment_totals_crypto_only": "base=${original_usd};renew-crypto=${crypto_total}",
     }
     module.get_message_text = lambda _language, key: messages[key]
 
-    assert module._plan_price_pair("fa", 10, 60_000) == "600000 toman / $10.00"
+    assert module._plan_price_pair("fa", 10, 60_000) == "$10.00 / 600000 toman"
     assert module._plan_price_pair("en", 10, 60_000) == "$10.00 / 600000 toman"
-    assert module.build_plan_payment_totals("fa", "40", 10, 60_000).startswith("card=600000")
+    assert module.build_plan_payment_totals("fa", "40", 10, 60_000).startswith("base=$10.00")
     assert "crypto=$9.50" in module.build_plan_payment_totals("fa", "40", 10, 60_000)
+    assert module._plan_price_pair("ru", 10) == "$10.00"
+    assert module.build_plan_payment_totals("ru", "40", 10, None) == "base=$10.00;crypto=$9.50"
+    assert module.build_plan_payment_totals(
+        "tk",
+        "40",
+        10,
+        None,
+        renewal_discount_percent=10,
+        discount_cap_percent=15,
+    ) == "base=$10.00;renew-crypto=$8.50"
+
+
+def test_russian_catalog_and_purchase_skip_exchange_rate_and_card_method():
+    bot = DummyBot()
+    module = load_purchase_plan(bot, [])
+    module.get_user_language = lambda _user_id: "ru"
+    module.get_exchange_rate = lambda: (_ for _ in ()).throw(AssertionError("rate requested"))
+    module.load_plans = lambda: {
+        "40": {"price": 10, "days": 30, "recommended": True},
+    }
+    original_get_message = module.get_message_text
+    module.get_message_text = lambda language, key: {
+        "all_plans_title": "progress\nquality",
+        "customer_plan_button": "{label}{plan_gb} GB · {price_pair} · {days}d",
+        "plan_price_usd_only": "${usd}",
+        "quick_pick_recommended": "Recommended",
+        "plan_payment_totals_crypto_only": "base=${original_usd};crypto=${crypto_total}",
+    }.get(key, original_get_message(language, key))
+
+    with patch.dict(os.environ, {"CRYPTO_MERCHANT_ID": "merchant", "CRYPTO_API_KEY": "key"}):
+        module.show_plans(555, 1988)
+        module.handle_purchase_selection(make_call("purchase:40"))
+
+    catalog_button = bot.sent_messages[0][1]["reply_markup"].buttons[0]
+    assert "$10.00" in catalog_button.args[0]
+    assert "toman" not in catalog_button.args[0].lower()
+    purchase_text = bot.edited_messages[0][0][0]
+    callbacks = [
+        button.kwargs.get("callback_data")
+        for button in bot.edited_messages[0][1]["reply_markup"].buttons
+    ]
+    assert "base=$10.00;crypto=$9.50" in purchase_text
+    assert all("card_to_card" not in callback for callback in callbacks if callback)
+
+
+def test_russian_card_callbacks_fail_before_purchase_or_renewal_checkout_work():
+    bot = DummyBot()
+    module = load_purchase_plan(bot, [])
+    module.get_user_language = lambda _user_id: "ru"
+    module.get_exchange_rate = lambda: (_ for _ in ()).throw(AssertionError("rate requested"))
+    module._reserve_checkout_incentives = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("discount reserved")
+    )
+    module._resolve_customer_renewal_offer_for_call = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("renewal token resolved")
+    )
+
+    module.handle_payment_method_selection(make_call("payment_method:card_to_card:40"))
+    module.handle_customer_renewal_payment_method(
+        make_call("renew_payment_method:card_to_card:renew-token")
+    )
+
+    assert len(bot.callback_answers) == 2
+    assert all(answer[1]["text"] == "no_payment_methods" for answer in bot.callback_answers)
+    assert all(answer[1]["show_alert"] is True for answer in bot.callback_answers)
 
 
 def test_referred_first_purchase_shows_exact_card_and_capped_crypto_totals():
