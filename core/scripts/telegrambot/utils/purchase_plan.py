@@ -971,10 +971,39 @@ def _send_reseller_settlement_admin_notification(
     payment_method="Crypto",
     telegram_username=None,
 ):
-    # Settlement payments remain fully auditable in payment records and admin
-    # financial views. Routine and partial settlements intentionally do not DM
-    # admins; lifecycle recovery notifications are emitted only on full recovery.
-    return False
+    if telegram_username is None:
+        try:
+            chat = bot.get_chat(user_id)
+            telegram_username = chat.username
+        except Exception:
+            telegram_username = None
+
+    price = payment_record.get('price')
+    try:
+        has_collected_price = float(price or 0.0) > 0
+    except (TypeError, ValueError):
+        has_collected_price = False
+    if not has_collected_price:
+        price = credited_amount if credited_amount is not None else _settlement_credit_amount(payment_record)
+
+    notification_kwargs = {'telegram_username': telegram_username}
+    if payment_record.get('converted_amount') is not None:
+        notification_kwargs.update({
+            'converted_amount': payment_record.get('converted_amount'),
+            'converted_currency': payment_record.get('converted_currency'),
+            'exchange_rate': payment_record.get('exchange_rate'),
+        })
+
+    send_admin_payment_notification(
+        user_id,
+        'Settlement',
+        'Settlement',
+        price,
+        payment_id,
+        payment_method,
+        **notification_kwargs,
+    )
+    return True
 
 
 def _apply_reseller_wholesale_topup(payment_id, payment_record):

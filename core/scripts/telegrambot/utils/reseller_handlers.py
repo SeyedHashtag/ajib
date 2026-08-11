@@ -82,6 +82,11 @@ from utils.purchase_plan import (
     get_exchange_rate,
     user_data,
 )
+try:
+    from utils.purchase_plan import _send_reseller_settlement_admin_notification
+except ImportError:  # Rolling-upgrade/test compatibility.
+    def _send_reseller_settlement_admin_notification(*_args, **_kwargs):
+        return False
 from utils.receipt_checker import RECEIPT_TYPE_SETTLEMENT, get_card_number_for_receipt_type
 from utils.username_utils import (
     allocate_username,
@@ -1520,6 +1525,21 @@ def handle_reseller_payment(call):
         finally:
             with RESELLER_CREDIT_SETTLEMENT_LOCK:
                 RESELLER_CREDIT_SETTLEMENT_INFLIGHT.discard(payment_id)
+        _send_reseller_settlement_admin_notification(
+            user_id,
+            payment_id,
+            {
+                'user_id': user_id,
+                'type': 'settlement',
+                'plan_gb': 'Settlement',
+                'price': 0.0,
+                'settlement_amount': reserved,
+                'payment_method': 'Account Credit',
+            },
+            credited_amount=reserved,
+            payment_method='Account Credit',
+            telegram_username=getattr(call.from_user, 'username', None),
+        )
         safe_answer_callback_query(bot, call.id)
         bot.edit_message_text(
             get_message_text(language, "settlement_payment_approved").format(
@@ -4200,6 +4220,20 @@ def handle_admin_reseller_ui(call):
             normalized,
             notify_user,
             payment_id=payment_id,
+        )
+        _send_reseller_settlement_admin_notification(
+            int(reseller_id) if str(reseller_id).isdigit() else reseller_id,
+            payment_id,
+            {
+                'user_id': reseller_id,
+                'type': 'settlement',
+                'plan_gb': 'Settlement',
+                'price': normalized,
+                'settlement_amount': normalized,
+                'payment_method': 'Manual Admin',
+            },
+            credited_amount=normalized,
+            payment_method='Manual Admin',
         )
         if notify_user and str(reseller_id).isdigit():
             user_language = get_user_language(int(reseller_id))

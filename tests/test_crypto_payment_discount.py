@@ -739,6 +739,10 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         reseller_handlers = load_reseller_handlers(purchase_plan)
         calls = []
         completed = []
+        admin_notifications = []
+        reseller_handlers._send_reseller_settlement_admin_notification = (
+            lambda *args, **kwargs: admin_notifications.append((args, kwargs)) or True
+        )
         reseller_handlers.get_payment_record = lambda _payment_id: None
         reseller_handlers.reserve_account_credit = (
             lambda user_id, reservation_id, amount, **kwargs:
@@ -772,6 +776,9 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         self.assertEqual([call[0] for call in calls], ["reserve", "settle", "consume"])
         self.assertEqual(completed[0][1]["account_credit_consumed"], 5.0)
         self.assertIn("remaining $95.00", bot.edited_messages[-1][0][0])
+        self.assertEqual(len(admin_notifications), 1)
+        self.assertEqual(admin_notifications[0][0][0:2], (1988, payment_id))
+        self.assertEqual(admin_notifications[0][1]["payment_method"], "Account Credit")
 
     def test_approved_settlement_payment_applies_reseller_credit(self):
         bot = DummyBot()
@@ -787,16 +794,19 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         }
         apply_calls = []
         statuses = []
+        admin_notifications = []
         sys.modules["utils.reseller"].apply_reseller_payment = lambda user_id, amount: apply_calls.append((user_id, amount)) or (True, 0.0)
         purchase_plan.is_admin = lambda _user_id: True
         purchase_plan.get_payment_record = lambda _payment_id: payment_record
         purchase_plan.update_payment_status = lambda payment_id, status: statuses.append((payment_id, status))
-        purchase_plan.send_admin_payment_notification = lambda *args, **kwargs: None
+        purchase_plan.send_admin_payment_notification = lambda *args, **kwargs: admin_notifications.append((args, kwargs))
 
         purchase_plan.handle_admin_approval(make_admin_approval_call("approve"))
 
         self.assertEqual(apply_calls, [(1988, 100.0)])
         self.assertEqual(statuses, [("settlement-payment", "completed")])
+        self.assertEqual(len(admin_notifications), 1)
+        self.assertEqual(admin_notifications[0][0][0:6], (1988, "Settlement", "Settlement", 95.0, "settlement-payment", "Crypto"))
         self.assertEqual(bot.sent_messages[-1][0], (1988, "Settlement approved amount $100.00; remaining $0.00"))
 
     def test_rejected_settlement_payment_does_not_apply_reseller_credit(self):
@@ -1356,7 +1366,7 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         self.assertEqual(len(admin_messages), 1)
         self.assertIn("Payment completion persistence failed.", admin_messages[0])
 
-    def test_crypto_settlement_completion_does_not_send_routine_admin_dm(self):
+    def test_crypto_settlement_completion_sends_admin_dm_once(self):
         bot = DummyBot()
         purchase_plan = load_purchase_plan(bot, [])
         store = {
@@ -1393,7 +1403,11 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
 
         self.assertEqual(apply_calls, [(1988, 100.0)])
         self.assertEqual(statuses.count(("settle-payment", "completed")), 1)
-        self.assertEqual(admin_notifications, [])
+        self.assertEqual(len(admin_notifications), 1)
+        self.assertEqual(
+            admin_notifications[0][0],
+            (1988, "Settlement", "Settlement", 95.0, "settle-payment", "Crypto"),
+        )
         approved_messages = [args[1] for args, _kwargs in bot.sent_messages if "Settlement approved" in args[1]]
         self.assertEqual(approved_messages, ["Settlement approved amount $100.00; remaining $0.00"])
         self.assertEqual(store["settle-payment"]["status"], "completed")
@@ -1425,7 +1439,8 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
 
         self.assertEqual(apply_calls, [(1988, 100.0)])
         self.assertEqual(statuses.count(("settle-payment", "completed")), 1)
-        self.assertEqual(admin_notifications, [])
+        self.assertEqual(len(admin_notifications), 1)
+        self.assertEqual(admin_notifications[0][0][4], "settle-payment")
         self.assertEqual(store["settle-payment"]["status"], "completed")
 
     def test_crypto_pending_poller_claim_processes_settlement_once(self):
@@ -1456,7 +1471,8 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
 
         self.assertEqual(apply_calls, [(1988, 100.0)])
         self.assertEqual(statuses.count(("settle-payment", "completed")), 1)
-        self.assertEqual(admin_notifications, [])
+        self.assertEqual(len(admin_notifications), 1)
+        self.assertEqual(admin_notifications[0][0][4], "settle-payment")
         self.assertEqual(store["settle-payment"]["status"], "completed")
 
     def test_auto_suspended_debt_event_uses_lifecycle_notification_once(self):
