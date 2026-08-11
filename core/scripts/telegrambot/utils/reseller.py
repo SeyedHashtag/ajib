@@ -109,7 +109,18 @@ def _money_value(value):
 
 
 def _is_debt_fully_settled(debt):
-    return _money_value(debt) == 0.0
+    """Return whether debt is below the automated collection threshold.
+
+    The balance remains in the auditable debt ledger so later charges can push
+    it back over the threshold, but sub-threshold debt does not keep a debt
+    cycle open or trigger collection actions.  A zero threshold retains exact
+    zero-only settlement semantics.
+    """
+    amount = _money_value(debt)
+    threshold = _money_value(DEBT_SETTLEMENT_THRESHOLD)
+    if threshold == 0.0:
+        return amount == 0.0
+    return amount < threshold
 
 
 def _charge_outstanding(charge):
@@ -2447,6 +2458,10 @@ def evaluate_reseller_debt_policies():
                             changed = True
                             resellers[user_id] = current
                         continue
+
+                    if debt_fully_settled:
+                        current = _mark_policy_restore_due_if_needed(current)
+                        current = _finish_debt_cycle(current)
 
                     if not debt_fully_settled and not current.get('debt_since'):
                         current['debt_since'] = _now_str()

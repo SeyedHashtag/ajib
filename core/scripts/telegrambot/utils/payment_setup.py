@@ -804,11 +804,14 @@ def handle_card_to_card_mode_selection(call):
 
 def setup_reseller_settlement_threshold(message):
     load_dotenv(env_path, override=True)
-    current_threshold = os.getenv('RESELLER_SETTLEMENT_THRESHOLD', '2.0')
+    current_threshold = os.getenv('RESELLER_SETTLEMENT_THRESHOLD', '1.0')
     
-    status_text = "Current Reseller Settlement Threshold:\n"
+    status_text = "Current Reseller Debt Tracking Threshold:\n"
     status_text += f"Amount: {current_threshold} USD\n\n"
-    status_text += "Please enter the new threshold amount in USD (e.g., 2.0 or 5.5):"
+    status_text += (
+        "Balances below this amount stay in accounting but do not trigger debt collection.\n\n"
+        "Please enter the new threshold amount in USD (e.g., 1.0 or 2.0):"
+    )
     
     msg = bot.reply_to(
         message,
@@ -856,7 +859,7 @@ def process_reseller_settlement_threshold(message):
         
         bot.reply_to(
             message,
-            "✅ Reseller Settlement Threshold has been updated successfully!",
+            "✅ Reseller debt tracking threshold has been updated successfully!",
             reply_markup=create_main_markup(is_admin=True)
         )
     except Exception as e:
