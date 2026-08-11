@@ -1,3 +1,9 @@
+## v1.19.1
+🛠️ Treat reseller balances below the configurable debt threshold as settled for automated collection while preserving them in the accounting ledger
+🐛 Close stale debt cycles and restore eligible resellers when balances fall below the threshold
+🛠️ Clarify the admin debt-threshold settings and default the collection threshold to 1 USD
+✅ Expand regression coverage for threshold boundaries, debt-cycle cleanup, partial payments, and reseller recovery
+
 ## v1.19.0
 ✨ Add reseller wholesale credit balances with transfer, reservation, consumption, and release workflows
 ✨ Notify receipt checkers when settlements are recorded and report notification delivery failures to administrators
