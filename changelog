@@ -1,3 +1,9 @@
+## v1.19.3
+🛠️ Use authoritative live VPN state and panel deadlines across customer journeys, renewals, broadcasts, cleanup, and traffic monitoring
+🐛 Distinguish manual blocks from expired service and expire unused on-hold accounts only after their issuance deadline
+📊 Report started, online, offline, blocked, and current sold-traffic figures with safer server attribution and partial-data warnings
+✅ Expand regression coverage for account states, live lookups, cleanup eligibility, customer displays, and server dashboards
+
 ## v1.19.2
 ✨ Notify administrators when reseller settlement payments complete through crypto, account credit, or manual admin flows
 🛠️ Preserve settlement amount, payment method, currency conversion, and reseller identity details in payment notifications
