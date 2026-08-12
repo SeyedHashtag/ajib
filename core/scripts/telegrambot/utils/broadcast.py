@@ -419,17 +419,13 @@ def get_user_ids(filter_type):
             elif (
                 filter_type == 'hold'
                 and snapshot.panel_state == PanelState.HOLD
-                and snapshot.entitlement_state != EntitlementState.UNKNOWN
+                and snapshot.entitlement_state == EntitlementState.CURRENT
             ):
                 user_ids.add(telegram_id)
             elif (
                 filter_type == 'expired'
-                and snapshot.panel_state != PanelState.HOLD
                 and snapshot.panel_state != PanelState.UNKNOWN
-                and (
-                    snapshot.panel_state == PanelState.BLOCKED
-                    or snapshot.entitlement_state == EntitlementState.EXPIRED
-                )
+                and snapshot.entitlement_state == EntitlementState.EXPIRED
             ):
                 user_ids.add(telegram_id)
 

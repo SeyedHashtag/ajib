@@ -30,7 +30,7 @@ except ImportError:
     types = _Types()
 
 from utils.api_client import MultiServerAPI
-from utils.account_state import PanelState, inspect_account, remaining_full_days, resolve_service_cycle
+from utils.account_state import EntitlementState, PanelState, inspect_account, resolve_service_cycle
 from utils.command import bot
 from utils.language import get_user_language
 from utils.translations import get_button_text, get_message_text
@@ -452,10 +452,12 @@ def monitor_user_traffic():
                 server_id=getattr(api_client, 'server_id', None),
                 source='customer',
             )
-            total_days = cycle.duration_days if cycle else None
-            expiration_days = remaining_full_days(cycle.deadline) if cycle else None
-            if cycle is not None:
-                marker = cycle.fingerprint
+            account = inspect_account(user_data, cycle=cycle, source='traffic_monitor')
+            if account.entitlement_state != EntitlementState.CURRENT:
+                continue
+            total_days = account.service_duration_days
+            expiration_days = account.service_days_remaining
+            marker = account.service_marker or marker
 
             reset_cycle = False
             if max_download_bytes > 0:
@@ -589,11 +591,13 @@ def monitor_user_traffic():
             server_id=getattr(api_client, 'server_id', None),
             source='reseller_customer',
         )
-        expiration_days = remaining_full_days(cycle.deadline) if cycle else None
-        total_days = cycle.duration_days if cycle else None
+        account = inspect_account(user_data, cycle=cycle, source='traffic_monitor')
+        if account.entitlement_state != EntitlementState.CURRENT:
+            continue
+        expiration_days = account.service_days_remaining
+        total_days = account.service_duration_days
         marker = _cycle_marker(user_data)
-        if cycle is not None:
-            marker = cycle.fingerprint
+        marker = account.service_marker or marker
 
         reset_cycle = False
         if max_download_bytes > 0:

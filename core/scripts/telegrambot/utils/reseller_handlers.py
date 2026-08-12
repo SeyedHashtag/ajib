@@ -37,7 +37,6 @@ from utils.account_state import (
     EntitlementState,
     PanelState,
     inspect_account,
-    remaining_full_days,
     resolve_service_cycle,
 )
 from utils.payments import CryptoPayment
@@ -1731,7 +1730,7 @@ RESELLER_CUSTOMERS_PAGE_SIZE = 5
 RESELLER_CUSTOMERS_CACHE_TTL_SECONDS_DEFAULT = 60
 RESELLER_CUSTOMER_LOW_THRESHOLD = 80
 RESELLER_CUSTOMER_CATEGORY_ORDER = (
-    "active", "hold", "low_days", "low_gb", "expired", "unknown", "deleted"
+    "active", "hold", "low_days", "low_gb", "expired", "blocked", "unknown", "deleted"
 )
 RESELLER_CUSTOMER_CATEGORY_ICONS = {
     "active": "✅",
@@ -1739,6 +1738,7 @@ RESELLER_CUSTOMER_CATEGORY_ICONS = {
     "low_days": "📅",
     "low_gb": "📊",
     "expired": "⌛",
+    "blocked": "⛔",
     "unknown": "⚠️",
     "deleted": "🗑",
 }
@@ -1852,11 +1852,11 @@ def _load_reseller_live_users(force_refresh=False):
         if isinstance(users, dict):
             for username, data in users.items():
                 if username and isinstance(data, dict):
-                    live_users[str(username)] = data
+                    live_users[(str(server_id).casefold(), str(username).casefold())] = data
         elif isinstance(users, list):
             for data in users:
                 if isinstance(data, dict) and data.get("username"):
-                    live_users[str(data["username"])] = data
+                    live_users[(str(server_id).casefold(), str(data["username"]).casefold())] = data
 
     return live_users, unavailable_server_ids
 
@@ -1876,29 +1876,24 @@ def _days_usage_percent(cfg, user_config):
         server_id=cfg.get('server_id'),
         source='reseller_customer',
     )
-    if cycle is None or cycle.duration_days <= 0:
+    snapshot = inspect_account(user_config, cycle=cycle)
+    if not snapshot.service_duration_days or snapshot.service_days_remaining is None:
         return 0
-    remaining = remaining_full_days(cycle.deadline)
-    days_used = max(0, cycle.duration_days - (remaining or 0))
-    return (days_used / cycle.duration_days) * 100
+    days_used = max(0, snapshot.service_duration_days - snapshot.service_days_remaining)
+    return (days_used / snapshot.service_duration_days) * 100
 
 
 def _is_customer_expired(user_config, cfg=None):
-    if bool(user_config.get("blocked", False)):
-        return True
     cycle = resolve_service_cycle(
         cfg,
         username=(cfg or {}).get('username'),
         server_id=(cfg or {}).get('server_id'),
         source='reseller_customer',
     ) if isinstance(cfg, dict) else None
-    if inspect_account(user_config, cycle=cycle).entitlement_state == EntitlementState.EXPIRED:
-        return True
-    max_download_bytes = user_config.get("max_download_bytes", 0) or 0
-    if max_download_bytes > 0:
-        used_bytes = (user_config.get("upload_bytes", 0) or 0) + (user_config.get("download_bytes", 0) or 0)
-        return used_bytes >= max_download_bytes
-    return False
+    return inspect_account(
+        user_config,
+        cycle=cycle,
+    ).entitlement_state == EntitlementState.EXPIRED
 
 
 def _categorize_reseller_customers(configs, force_refresh=False):
@@ -1907,8 +1902,10 @@ def _categorize_reseller_customers(configs, force_refresh=False):
 
     for cfg in configs:
         username = cfg.get("username")
-        user_config = live_users.get(str(username)) if username else None
         server_id = cfg.get("server_id")
+        user_config = live_users.get(
+            (str(server_id or "primary").casefold(), str(username or "").casefold())
+        ) if username else None
         enriched = {**cfg, "_user_config": user_config}
 
         if _is_removed_config(cfg):
@@ -1935,11 +1932,6 @@ def _categorize_reseller_customers(configs, force_refresh=False):
         snapshot = inspect_account(user_config, cycle=cycle)
         enriched['_account_state'] = snapshot.to_dict()
 
-        if snapshot.panel_state == PanelState.HOLD:
-            enriched["_status_category"] = "hold"
-            categorized["hold"].append(enriched)
-            continue
-
         if snapshot.panel_state == PanelState.UNKNOWN:
             enriched["_status_category"] = "unknown"
             enriched["_status_note"] = "status_unavailable"
@@ -1949,6 +1941,16 @@ def _categorize_reseller_customers(configs, force_refresh=False):
         if _is_customer_expired(user_config, cfg=cfg):
             enriched["_status_category"] = "expired"
             categorized["expired"].append(enriched)
+            continue
+
+        if snapshot.panel_state == PanelState.BLOCKED:
+            enriched["_status_category"] = "blocked"
+            categorized["blocked"].append(enriched)
+            continue
+
+        if snapshot.panel_state == PanelState.HOLD:
+            enriched["_status_category"] = "hold"
+            categorized["hold"].append(enriched)
             continue
 
         enriched["_status_category"] = "active"
@@ -2393,15 +2395,11 @@ def _render_reseller_customer_config_job(
     )
     shared_state = inspect_account(user_config, cycle=cycle)
     is_blocked = shared_state.panel_state == PanelState.BLOCKED
-    is_expired = is_blocked or shared_state.entitlement_state == EntitlementState.EXPIRED
+    is_expired = shared_state.entitlement_state == EntitlementState.EXPIRED
     upload_bytes = user_config.get('upload_bytes', 0) or 0
     download_bytes = user_config.get('download_bytes', 0) or 0
     max_download_bytes = user_config.get('max_download_bytes', 0) or 0
-    expiration_days = (
-        shared_state.entitlement_days_remaining
-        if cycle is not None
-        else shared_state.panel_days_remaining
-    )
+    expiration_days = shared_state.service_days_remaining
     if expiration_days is None:
         expiration_days = get_message_text(language, "value_unknown")
     account_creation_date = (
@@ -2436,10 +2434,14 @@ def _render_reseller_customer_config_job(
             status=status,
         )
 
-    if shared_state.panel_state == PanelState.HOLD:
+    if shared_state.panel_state == PanelState.HOLD and is_expired:
+        account_status = get_message_text(language, "reseller_config_status_unused_expired")
+    elif shared_state.panel_state == PanelState.HOLD:
         account_status = get_message_text(language, "reseller_config_status_hold")
     elif shared_state.panel_state == PanelState.UNKNOWN:
         account_status = get_message_text(language, "reseller_customer_status_unavailable")
+    elif is_blocked and not is_expired:
+        account_status = get_message_text(language, "reseller_config_status_admin_blocked")
     else:
         account_status = get_message_text(
             language,

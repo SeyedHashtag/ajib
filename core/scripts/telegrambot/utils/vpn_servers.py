@@ -39,7 +39,10 @@ def _format_status_line(status):
     allocated_count = status.get("allocated_count", status.get("active_count"))
     load_ratio = status.get("load_ratio")
     allocated_text = str(allocated_count) if allocated_count is not None else "N/A"
-    connected_text = str(status.get("connected_count")) if status.get("connected_count") is not None else "N/A"
+    started_count = status.get("started_count", status.get("connected_count"))
+    started_text = str(started_count) if started_count is not None else "N/A"
+    online_text = str(status.get("online_count")) if status.get("online_count") is not None else "N/A"
+    offline_text = str(status.get("offline_count")) if status.get("offline_count") is not None else "N/A"
     hold_text = str(status.get("hold_count")) if status.get("hold_count") is not None else "N/A"
     blocked_text = str(status.get("blocked_count")) if status.get("blocked_count") is not None else "N/A"
     unknown_text = str(status.get("unknown_count")) if status.get("unknown_count") is not None else "N/A"
@@ -48,8 +51,9 @@ def _format_status_line(status):
     return (
         f"*{status.get('name', status.get('id'))}* (`{status.get('id')}`)\n"
         f"Status: `{enabled}` | Health: `{health}`\n"
-        f"Allocated: `{allocated_text}` | Active: `{connected_text}` | Hold: `{hold_text}`\n"
-        f"Blocked/expired: `{blocked_text}` | Unknown: `{unknown_text}` | Weight: `{weight}` | Load: `{ratio_text}`"
+        f"Allocated: `{allocated_text}` | Started: `{started_text}` | Hold: `{hold_text}`\n"
+        f"Online: `{online_text}` | Offline: `{offline_text}` | Blocked: `{blocked_text}` | Unknown: `{unknown_text}`\n"
+        f"Weight: `{weight}` | Load: `{ratio_text}`"
     )
 
 

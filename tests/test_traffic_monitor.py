@@ -127,7 +127,7 @@ class TrafficMonitorTests(unittest.TestCase):
                 {
                     "blocked": False,
                     "status": "Offline",
-                    "account_creation_date": "2026-01-01T00:00:00+00:00",
+                    "account_creation_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "expiration_days": 30,
                     **data,
                 },
@@ -217,7 +217,11 @@ class TrafficMonitorTests(unittest.TestCase):
         self.write_reseller_config(456, "r456", days=100, customer_name="sara88")
 
         self.run_monitor([
-            (True, "r456", {"expiration_days": 99, "max_download_bytes": 0}),
+            (True, "r456", {
+                "account_creation_date": (datetime.now() - timedelta(days=95)).strftime("%Y-%m-%d %H:%M:%S"),
+                "expiration_days": 100,
+                "max_download_bytes": 0,
+            }),
         ])
 
         self.assertEqual(len(self.bot.sent_messages), 1)
@@ -317,7 +321,8 @@ class TrafficMonitorTests(unittest.TestCase):
                 True,
                 "s123",
                 {
-                    "expiration_days": 29,
+                    "account_creation_date": (datetime.now() - timedelta(days=24)).strftime("%Y-%m-%d %H:%M:%S"),
+                    "expiration_days": 30,
                     "upload_bytes": 10 * GB,
                     "download_bytes": 0,
                     "max_download_bytes": 100 * GB,
@@ -349,45 +354,25 @@ class TrafficMonitorTests(unittest.TestCase):
         }
         self.install_customer_context(payments)
 
-        self.run_monitor([
-            (
-                True,
-                "s123",
-                {
-                    "expiration_days": 9,
-                    "upload_bytes": 85 * GB,
-                    "download_bytes": 0,
-                    "max_download_bytes": 100 * GB,
-                },
-            ),
-        ])
-        payments["sale-1"]["created_at"] = (
-            datetime.now() - timedelta(days=27)
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        self.run_monitor([
-            (
-                True,
-                "s123",
-                {
-                    "expiration_days": 4,
-                    "upload_bytes": 85 * GB,
-                    "download_bytes": 0,
-                    "max_download_bytes": 100 * GB,
-                },
-            ),
-        ])
-        self.run_monitor([
-            (
-                True,
-                "s123",
-                {
-                    "expiration_days": 3,
-                    "upload_bytes": 85 * GB,
-                    "download_bytes": 0,
-                    "max_download_bytes": 100 * GB,
-                },
-            ),
-        ])
+        account_state = sys.modules["utils.account_state"]
+        original_utc_now = account_state.utc_now
+        base_now = original_utc_now()
+        live = {
+            "account_creation_date": (base_now - timedelta(days=21)).isoformat(),
+            "expiration_days": 30,
+            "upload_bytes": 85 * GB,
+            "download_bytes": 0,
+            "max_download_bytes": 100 * GB,
+        }
+        try:
+            account_state.utc_now = lambda: base_now
+            self.run_monitor([(True, "s123", live)])
+            account_state.utc_now = lambda: base_now + timedelta(days=6)
+            self.run_monitor([(True, "s123", live)])
+            account_state.utc_now = lambda: base_now + timedelta(days=7)
+            self.run_monitor([(True, "s123", live)])
+        finally:
+            account_state.utc_now = original_utc_now
 
         self.assertEqual(len(self.bot.sent_messages), 2)
         self.assertIn("regular s123 85", self.bot.sent_messages[0][1])

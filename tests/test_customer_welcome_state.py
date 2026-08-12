@@ -29,7 +29,7 @@ class DummyButton:
         self.callback_data = kwargs.get("callback_data")
 
 
-def load_common(records=None, trial=None):
+def load_common(records=None, trial=None, live=None, lookup_status=None):
     for name in list(sys.modules):
         if name == "utils" or name.startswith("utils."):
             sys.modules.pop(name, None)
@@ -49,6 +49,19 @@ def load_common(records=None, trial=None):
     payments = types.ModuleType("utils.payment_records")
     payments.get_user_payments = lambda _user_id: records or {}
     sys.modules[payments.__name__] = payments
+
+    api_client = types.ModuleType("utils.api_client")
+
+    class FakeMultiServerAPI:
+        def find_user_on_server_cached(self, username, server_id):
+            status = lookup_status or ("found" if live is not None else "missing")
+            return types.SimpleNamespace(server_id=server_id), live, {
+                "status": status,
+                "data": live,
+            }
+
+    api_client.MultiServerAPI = FakeMultiServerAPI
+    sys.modules[api_client.__name__] = api_client
 
     tests = types.ModuleType("utils.test_config")
     tests.get_test_config_journey = lambda _user_id, now=None: trial
@@ -102,17 +115,65 @@ def test_paid_and_expired_states_offer_direct_renewal_token():
             "server_id": "main",
         }
     }
-    active = load_common(records=active_record)
+    connected = {
+        "status": "Online",
+        "blocked": False,
+        "account_creation_date": "2026-08-01T12:00:00+00:00",
+        "expiration_days": 30,
+    }
+    active = load_common(records=active_record, live=connected)
     state = active.get_customer_journey_state(123, now=current)
     assert state["state"] == "paid"
     assert state["renewal_token"] == "123:p1:s123:main"
 
     expired_record = {"p1": {**active_record["p1"], "completed_at": "2026-06-01 12:00:00"}}
-    expired = load_common(records=expired_record)
+    expired_hold = {
+        "status": "On Hold",
+        "blocked": False,
+        "account_creation_date": None,
+        "expiration_days": 30,
+    }
+    expired = load_common(records=expired_record, live=expired_hold)
     state = expired.get_customer_journey_state(123, now=current)
     assert state["state"] == "expired"
     _text, markup = expired.build_customer_welcome(123, "en")
     assert "renew_plan:123:p1:s123:main" in [button.callback_data for button in markup.buttons]
+
+
+def test_connected_welcome_ignores_expired_issuance_and_lookup_failures_are_unknown():
+    current = datetime.datetime(2026, 8, 5, 12, 0, 0)
+    record = {"p1": {
+        "status": "completed",
+        "plan_gb": "40",
+        "days": 30,
+        "completed_at": "2026-01-01 12:00:00",
+        "username": "s123",
+        "server_id": "main",
+    }}
+    connected = {
+        "status": "Offline",
+        "blocked": False,
+        "account_creation_date": "2026-08-01T12:00:00+00:00",
+        "expiration_days": 30,
+    }
+    assert load_common(records=record, live=connected).get_customer_journey_state(
+        123, now=current
+    )["state"] == "paid"
+    assert load_common(records=record, lookup_status="unavailable").get_customer_journey_state(
+        123, now=current
+    )["state"] == "unknown"
+
+    failed_cleanup = {"p1": {**record["p1"], "cleanup_delete_result": "failed"}}
+    assert load_common(
+        records=failed_cleanup,
+        lookup_status="unavailable",
+    ).get_customer_journey_state(123, now=current)["state"] == "unknown"
+
+    deleted = {"p1": {**record["p1"], "cleanup_delete_result": "deleted"}}
+    assert load_common(
+        records=deleted,
+        lookup_status="unavailable",
+    ).get_customer_journey_state(123, now=current)["state"] == "expired"
 
 
 def test_admin_menu_contains_private_growth_funnel_button():

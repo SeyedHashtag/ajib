@@ -196,7 +196,7 @@ def build_online_users_from_userlist(vpn: dict) -> dict:
     if not healthy_servers:
         return {"count": None, "status": "error", "error": "No enabled VPN server userlist available."}
 
-    count = sum(_safe_int(server.get("active_count", 0)) for server in healthy_servers)
+    count = sum(_safe_int(server.get("online_count", 0)) for server in healthy_servers)
     return {"count": count, "status": "ok", "error": None}
 
 
@@ -267,18 +267,17 @@ def _empty_sold_traffic_bucket():
     return {"used_bytes": 0, "sold_bytes": 0, "matched_configs": 0, "sold_configs": 0}
 
 
-def _plan_gb_to_bytes(value) -> int:
-    return int(max(0.0, _safe_float(value, 0.0)) * (1024 ** 3))
-
-
 def _sold_traffic_snapshot():
     return {
         "direct": _empty_sold_traffic_bucket(),
         "reseller": _empty_sold_traffic_bucket(),
+        "unattributed": _empty_sold_traffic_bucket(),
         "total": {"used_bytes": 0, "sold_bytes": 0, "usage_percent": None},
         "missing_configs": 0,
+        "ambiguous_configs": 0,
         "skipped_no_username": 0,
         "unavailable_servers": 0,
+        "partial": False,
     }
 
 
@@ -290,6 +289,9 @@ def _collect_vpn_and_live_users(api_client_module=None) -> tuple[dict, dict]:
         "healthy": 0,
         "unhealthy": 0,
         "active_configs": 0,
+        "started_configs": 0,
+        "online_configs": 0,
+        "offline_configs": 0,
         "hold_configs": 0,
         "blocked_expired_configs": 0,
         "unknown_configs": 0,
@@ -311,17 +313,39 @@ def _collect_vpn_and_live_users(api_client_module=None) -> tuple[dict, dict]:
             if healthy and callable(getattr(multi_api, "account_state_counts", None)):
                 state_counts = multi_api.account_state_counts(users)
                 active_count = state_counts["active"]
+                started_count = state_counts.get("started", active_count)
+                online_count = state_counts.get("online", 0)
+                offline_count = state_counts.get("offline", max(0, started_count - online_count))
                 hold_count = state_counts["hold"]
                 blocked_count = state_counts["blocked"]
                 unknown_count = state_counts["unknown"]
             elif healthy:
-                active_count = allocated_count
-                hold_count = 0
                 records = list(_iter_named_user_records(users))
-                blocked_count = max(0, len(records) - active_count)
-                unknown_count = 0
+                blocked_count = sum(1 for _username, record in records if bool(record.get("blocked", False)))
+                hold_count = sum(
+                    1 for _username, record in records
+                    if not bool(record.get("blocked", False))
+                    and " ".join(str(record.get("status") or "").replace("-", " ").replace("_", " ").lower().split()) == "on hold"
+                    and not record.get("account_creation_date")
+                )
+                online_count = sum(
+                    1 for _username, record in records
+                    if not bool(record.get("blocked", False))
+                    and str(record.get("status") or "").strip().casefold() == "online"
+                    and bool(record.get("account_creation_date"))
+                )
+                offline_count = sum(
+                    1 for _username, record in records
+                    if not bool(record.get("blocked", False))
+                    and str(record.get("status") or "").strip().casefold() == "offline"
+                    and bool(record.get("account_creation_date"))
+                )
+                started_count = online_count + offline_count
+                active_count = started_count
+                unknown_count = max(0, len(records) - blocked_count - hold_count - started_count)
             else:
-                active_count = hold_count = blocked_count = unknown_count = None
+                active_count = started_count = online_count = offline_count = None
+                hold_count = blocked_count = unknown_count = None
             weight = _safe_weight(server.get("weight", 1))
             enabled = bool(server.get("enabled", True))
 
@@ -330,6 +354,9 @@ def _collect_vpn_and_live_users(api_client_module=None) -> tuple[dict, dict]:
             vpn["healthy" if healthy else "unhealthy"] += 1
             if active_count is not None:
                 vpn["active_configs"] += active_count
+                vpn["started_configs"] += started_count
+                vpn["online_configs"] += online_count
+                vpn["offline_configs"] += offline_count
                 vpn["hold_configs"] += hold_count
                 vpn["blocked_expired_configs"] += blocked_count
                 vpn["unknown_configs"] += unknown_count
@@ -341,6 +368,9 @@ def _collect_vpn_and_live_users(api_client_module=None) -> tuple[dict, dict]:
                 "enabled": enabled,
                 "healthy": healthy,
                 "active_count": active_count,
+                "started_count": started_count,
+                "online_count": online_count,
+                "offline_count": offline_count,
                 "hold_count": hold_count,
                 "blocked_count": blocked_count,
                 "unknown_count": unknown_count,
@@ -353,8 +383,8 @@ def _collect_vpn_and_live_users(api_client_module=None) -> tuple[dict, dict]:
             if healthy:
                 for username, user in _iter_named_user_records(users):
                     username_key = username.lower()
-                    live_users["by_server"][(server_id, username_key)] = user
-                    live_users["by_username"].setdefault(username_key, user)
+                    live_users["by_server"][(server_id.casefold(), username_key)] = user
+                    live_users["by_username"].setdefault(username_key, []).append((server_id, user))
             else:
                 live_users["unavailable_servers"].add(server_id)
     except Exception as e:
@@ -372,42 +402,33 @@ def _is_regular_paid_payment(record: dict) -> bool:
     return True
 
 
-def _find_live_sold_user(live_users: dict, server_id, username):
-    username_key = str(username).lower()
+def _sold_record_removed(record: dict) -> bool:
+    return bool(
+        record.get("removed_from_vpn")
+        or record.get("cleanup_deleted_at")
+        or str(record.get("cleanup_status") or "").lower() in {"deleted", "already_missing"}
+        or str(record.get("cleanup_delete_result") or "").lower() in {"deleted", "already_missing"}
+    )
+
+
+def _sold_record_timestamp(record: dict):
+    for field in ("renewal_applied_at", "updated_at", "created_at", "completed_at", "timestamp"):
+        parsed = _parse_datetime(record.get(field))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _live_sold_identity(live_users: dict, server_id, username):
+    username_key = str(username or "").casefold()
     if server_id:
-        matched = live_users.get("by_server", {}).get((str(server_id), username_key))
-        if matched is not None:
-            return matched
-    return live_users.get("by_username", {}).get(username_key)
-
-
-def _add_sold_config(traffic: dict, live_users: dict, seen: set, source: str, username, quota_gb, server_id=None):
-    if not username:
-        traffic["skipped_no_username"] += 1
-        return
-
-    username = str(username)
-    server_key = str(server_id or "")
-    key = (source, server_key, username.lower())
-    if key in seen:
-        return
-    seen.add(key)
-
-    bucket = traffic[source]
-    bucket["sold_configs"] += 1
-    quota_bytes = _plan_gb_to_bytes(quota_gb)
-    bucket["sold_bytes"] += quota_bytes
-    traffic["total"]["sold_bytes"] += quota_bytes
-
-    live_user = _find_live_sold_user(live_users, server_id, username)
-    if not live_user:
-        traffic["missing_configs"] += 1
-        return
-
-    used_bytes = _safe_int(live_user.get("upload_bytes", 0)) + _safe_int(live_user.get("download_bytes", 0))
-    bucket["used_bytes"] += used_bytes
-    bucket["matched_configs"] += 1
-    traffic["total"]["used_bytes"] += used_bytes
+        key = (str(server_id).casefold(), username_key)
+        return key, live_users.get("by_server", {}).get(key), False
+    matches = live_users.get("by_username", {}).get(username_key, [])
+    if len(matches) == 1:
+        matched_server, user = matches[0]
+        return (str(matched_server), username_key), user, False
+    return ("", username_key), None, len(matches) > 1
 
 
 def _load_resellers(reseller_module=None) -> dict:
@@ -424,19 +445,33 @@ def _load_resellers(reseller_module=None) -> dict:
 def _collect_sold_traffic_stats(payments: dict, live_users: dict, reseller_module=None, resellers=None) -> dict:
     traffic = _sold_traffic_snapshot()
     traffic["unavailable_servers"] = len(live_users.get("unavailable_servers", set()))
-    seen = set()
+    traffic["partial"] = traffic["unavailable_servers"] > 0
+    candidates = {}
+
+    def add_candidate(source, record, username, server_id):
+        if not username:
+            traffic["skipped_no_username"] += 1
+            return
+        if _sold_record_removed(record):
+            return
+        identity, live_user, ambiguous_server = _live_sold_identity(
+            live_users, server_id, username
+        )
+        candidates.setdefault(identity, []).append({
+            "source": source,
+            "timestamp": _sold_record_timestamp(record),
+            "live_user": live_user,
+            "ambiguous_server": ambiguous_server,
+        })
 
     for record in (payments or {}).values():
         if not _is_regular_paid_payment(record):
             continue
-        _add_sold_config(
-            traffic,
-            live_users,
-            seen,
+        add_candidate(
             "direct",
-            record.get("username"),
-            record.get("plan_gb"),
-            server_id=record.get("server_id"),
+            record,
+            record.get("renewal_username") or record.get("username"),
+            record.get("renewal_server_id") or record.get("server_id"),
         )
 
     if resellers is None:
@@ -450,15 +485,47 @@ def _collect_sold_traffic_stats(payments: dict, live_users: dict, reseller_modul
             for config in configs:
                 if not isinstance(config, dict):
                     continue
-                _add_sold_config(
-                    traffic,
-                    live_users,
-                    seen,
+                add_candidate(
                     "reseller",
+                    config,
                     config.get("username"),
-                    config.get("gb"),
-                    server_id=config.get("server_id"),
+                    config.get("server_id"),
                 )
+
+    for identity, owned_records in candidates.items():
+        live_user = next(
+            (candidate["live_user"] for candidate in owned_records if candidate["live_user"] is not None),
+            None,
+        )
+        if live_user is None:
+            if any(candidate["ambiguous_server"] for candidate in owned_records):
+                traffic["ambiguous_configs"] += 1
+            else:
+                traffic["missing_configs"] += 1
+            continue
+
+        dated = [candidate for candidate in owned_records if candidate["timestamp"] is not None]
+        if dated:
+            latest_timestamp = max(candidate["timestamp"] for candidate in dated)
+            newest = [candidate for candidate in dated if candidate["timestamp"] == latest_timestamp]
+        else:
+            newest = owned_records
+        sources = {candidate["source"] for candidate in newest}
+        source = next(iter(sources)) if len(sources) == 1 else "unattributed"
+        if source == "unattributed":
+            traffic["ambiguous_configs"] += 1
+
+        used_bytes = max(0, _safe_int(live_user.get("upload_bytes", 0))) + max(
+            0, _safe_int(live_user.get("download_bytes", 0))
+        )
+        quota_bytes = max(0, _safe_int(live_user.get("max_download_bytes", 0)))
+        bucket = traffic[source]
+        bucket["used_bytes"] += used_bytes
+        bucket["sold_bytes"] += quota_bytes
+        bucket["matched_configs"] += 1
+        bucket["sold_configs"] += 1
+        traffic["total"]["used_bytes"] += used_bytes
+        traffic["total"]["sold_bytes"] += quota_bytes
 
     if traffic["total"]["sold_bytes"] > 0:
         traffic["total"]["usage_percent"] = (traffic["total"]["used_bytes"] / traffic["total"]["sold_bytes"]) * 100
@@ -760,8 +827,8 @@ def _format_customers_section(snapshot: dict) -> list[str]:
         output.append(f"Paid Orders Without User ID: {customers.get('paid_orders_without_user_id')}")
     output.append("")
     output.append("👥 **Segments**")
-    output.append(f"Direct Sold Configs: {direct_traffic.get('sold_configs', 0)} sold • {direct_traffic.get('matched_configs', 0)} live")
-    output.append(f"Reseller Sold Configs: {reseller_traffic.get('sold_configs', 0)} sold • {reseller_traffic.get('matched_configs', 0)} live")
+    output.append(f"Current Direct Configs: {direct_traffic.get('matched_configs', 0)} live")
+    output.append(f"Current Reseller Configs: {reseller_traffic.get('matched_configs', 0)} live")
     output.append("")
     output.append("🌐 **Languages**")
     if languages.get("languages"):
@@ -790,8 +857,9 @@ def _format_tech_section(snapshot: dict) -> list[str]:
         f"{vpn.get('healthy', 0)} healthy • {vpn.get('unhealthy', 0)} unhealthy"
     )
     output.append(
-        f"Configs: {vpn.get('active_configs', 0)} active • {vpn.get('hold_configs', 0)} Hold • "
-        f"{vpn.get('blocked_expired_configs', 0)} blocked/expired • {vpn.get('unknown_configs', 0)} unknown"
+        f"Configs: {vpn.get('started_configs', 0)} started • {vpn.get('online_configs', 0)} online • "
+        f"{vpn.get('offline_configs', 0)} offline • {vpn.get('hold_configs', 0)} Hold • "
+        f"{vpn.get('blocked_expired_configs', 0)} blocked • {vpn.get('unknown_configs', 0)} unknown"
     )
     output.append(f"Allocated Capacity: {vpn.get('allocated_configs', 0)}")
     for server in _notable_servers(vpn):
@@ -799,8 +867,10 @@ def _format_tech_section(snapshot: dict) -> list[str]:
         load_ratio = server.get("load_ratio")
         load_text = f"{load_ratio:.2f}" if load_ratio is not None else "N/A"
         output.append(
-            f"- {server.get('name')}: {health} • active {server.get('active_count', 'N/A')} • "
-            f"Hold {server.get('hold_count', 'N/A')} • unknown {server.get('unknown_count', 'N/A')} • load {load_text}"
+            f"- {server.get('name')}: {health} • started {server.get('started_count', 'N/A')} • "
+            f"online {server.get('online_count', 'N/A')} • offline {server.get('offline_count', 'N/A')} • "
+            f"Hold {server.get('hold_count', 'N/A')} • blocked {server.get('blocked_count', 'N/A')} • "
+            f"unknown {server.get('unknown_count', 'N/A')} • load {load_text}"
         )
     if vpn.get("error"):
         output.append(f"VPN Check: error ({vpn.get('error')})")
@@ -812,10 +882,11 @@ def _format_traffic_section(snapshot: dict) -> list[str]:
     total_traffic = traffic.get("total", {})
     direct_traffic = traffic.get("direct", {})
     reseller_traffic = traffic.get("reseller", {})
+    unattributed_traffic = traffic.get("unattributed", {})
     output = ["🚦 **Traffic**"]
     output.append(
-        f"Total Sold: {_format_bytes(total_traffic.get('used_bytes', 0))} served / "
-        f"{_format_bytes(total_traffic.get('sold_bytes', 0))} sold{_traffic_usage_text(total_traffic)}"
+        f"Current Sold Footprint: {_format_bytes(total_traffic.get('used_bytes', 0))} served / "
+        f"{_format_bytes(total_traffic.get('sold_bytes', 0))} allocated{_traffic_usage_text(total_traffic)}"
     )
     output.append(
         f"Direct: {_format_bytes(direct_traffic.get('used_bytes', 0))} / "
@@ -827,12 +898,21 @@ def _format_traffic_section(snapshot: dict) -> list[str]:
         f"{_format_bytes(reseller_traffic.get('sold_bytes', 0))} • "
         f"{reseller_traffic.get('matched_configs', 0)} configs"
     )
+    if unattributed_traffic.get("matched_configs"):
+        output.append(
+            f"Unattributed: {_format_bytes(unattributed_traffic.get('used_bytes', 0))} / "
+            f"{_format_bytes(unattributed_traffic.get('sold_bytes', 0))} • "
+            f"{unattributed_traffic.get('matched_configs', 0)} configs"
+        )
     if traffic.get("missing_configs"):
-        output.append(f"Missing Sold Configs: {traffic.get('missing_configs')}")
+        output.append(f"Historical Local Configs Missing From VPN: {traffic.get('missing_configs')}")
+    if traffic.get("ambiguous_configs"):
+        output.append(f"Ambiguous Current Identities: {traffic.get('ambiguous_configs')}")
     if traffic.get("skipped_no_username"):
         output.append(f"Sold Records Without Username: {traffic.get('skipped_no_username')}")
     if traffic.get("unavailable_servers"):
         output.append(f"Unavailable Servers For Traffic: {traffic.get('unavailable_servers')}")
+        output.append("Traffic Footprint: partial")
     return output
 
 
@@ -861,8 +941,9 @@ def _format_overview_section(snapshot: dict) -> list[str]:
     output.append(f"30d Revenue: ${last30_bucket.get('revenue', 0):,.2f} • {last30_bucket.get('paid', 0)} paid")
     output.append(f"Online Users: {_online_text(online)}")
     output.append(
-        f"Configs: {vpn.get('active_configs', 0)} active • {vpn.get('hold_configs', 0)} Hold • "
-        f"{vpn.get('blocked_expired_configs', 0)} blocked/expired • {vpn.get('unknown_configs', 0)} unknown"
+        f"Configs: {vpn.get('started_configs', 0)} started • {vpn.get('online_configs', 0)} online • "
+        f"{vpn.get('offline_configs', 0)} offline • {vpn.get('hold_configs', 0)} Hold • "
+        f"{vpn.get('blocked_expired_configs', 0)} blocked • {vpn.get('unknown_configs', 0)} unknown"
     )
     output.append(f"New Customers: {customers.get('new_today', 0)} today • {customers.get('new_7d', 0)} 7d • {customers.get('new_30d', 0)} 30d")
     output.append(f"Returning Customers 30d: {customers.get('returning_30d', 0)}")
@@ -908,6 +989,7 @@ def format_server_info(snapshot: dict) -> str:
     total_traffic = traffic.get("total", {})
     direct_traffic = traffic.get("direct", {})
     reseller_traffic = traffic.get("reseller", {})
+    unattributed_traffic = traffic.get("unattributed", {})
     usage_text = _traffic_usage_text(total_traffic)
 
     output = []
@@ -927,8 +1009,9 @@ def format_server_info(snapshot: dict) -> str:
         f"{vpn.get('healthy', 0)} healthy • {vpn.get('unhealthy', 0)} unhealthy"
     )
     output.append(
-        f"Configs: {vpn.get('active_configs', 0)} active • {vpn.get('hold_configs', 0)} Hold • "
-        f"{vpn.get('blocked_expired_configs', 0)} blocked/expired • {vpn.get('unknown_configs', 0)} unknown"
+        f"Configs: {vpn.get('started_configs', 0)} started • {vpn.get('online_configs', 0)} online • "
+        f"{vpn.get('offline_configs', 0)} offline • {vpn.get('hold_configs', 0)} Hold • "
+        f"{vpn.get('blocked_expired_configs', 0)} blocked • {vpn.get('unknown_configs', 0)} unknown"
     )
     output.append(f"Allocated Capacity: {vpn.get('allocated_configs', 0)}")
     for server in _notable_servers(vpn):
@@ -936,16 +1019,18 @@ def format_server_info(snapshot: dict) -> str:
         load_ratio = server.get("load_ratio")
         load_text = f"{load_ratio:.2f}" if load_ratio is not None else "N/A"
         output.append(
-            f"- {server.get('name')}: {health} • active {server.get('active_count', 'N/A')} • "
-            f"Hold {server.get('hold_count', 'N/A')} • unknown {server.get('unknown_count', 'N/A')} • load {load_text}"
+            f"- {server.get('name')}: {health} • started {server.get('started_count', 'N/A')} • "
+            f"online {server.get('online_count', 'N/A')} • offline {server.get('offline_count', 'N/A')} • "
+            f"Hold {server.get('hold_count', 'N/A')} • blocked {server.get('blocked_count', 'N/A')} • "
+            f"unknown {server.get('unknown_count', 'N/A')} • load {load_text}"
         )
     if vpn.get("error"):
         output.append(f"VPN Check: error ({vpn.get('error')})")
     output.append("")
     output.append("🚦 **Traffic**")
     output.append(
-        f"Total Sold: {_format_bytes(total_traffic.get('used_bytes', 0))} served / "
-        f"{_format_bytes(total_traffic.get('sold_bytes', 0))} sold{usage_text}"
+        f"Current Sold Footprint: {_format_bytes(total_traffic.get('used_bytes', 0))} served / "
+        f"{_format_bytes(total_traffic.get('sold_bytes', 0))} allocated{usage_text}"
     )
     output.append(
         f"Direct: {_format_bytes(direct_traffic.get('used_bytes', 0))} / "
@@ -957,12 +1042,21 @@ def format_server_info(snapshot: dict) -> str:
         f"{_format_bytes(reseller_traffic.get('sold_bytes', 0))} • "
         f"{reseller_traffic.get('matched_configs', 0)} configs"
     )
+    if unattributed_traffic.get("matched_configs"):
+        output.append(
+            f"Unattributed: {_format_bytes(unattributed_traffic.get('used_bytes', 0))} / "
+            f"{_format_bytes(unattributed_traffic.get('sold_bytes', 0))} • "
+            f"{unattributed_traffic.get('matched_configs', 0)} configs"
+        )
     if traffic.get("missing_configs"):
-        output.append(f"Missing Sold Configs: {traffic.get('missing_configs')}")
+        output.append(f"Historical Local Configs Missing From VPN: {traffic.get('missing_configs')}")
+    if traffic.get("ambiguous_configs"):
+        output.append(f"Ambiguous Current Identities: {traffic.get('ambiguous_configs')}")
     if traffic.get("skipped_no_username"):
         output.append(f"Sold Records Without Username: {traffic.get('skipped_no_username')}")
     if traffic.get("unavailable_servers"):
         output.append(f"Unavailable Servers For Traffic: {traffic.get('unavailable_servers')}")
+        output.append("Traffic Footprint: partial")
     output.append("")
     output.append("💰 **Sales**")
     output.append(f"Today: {_format_orders(buckets.get('today', _empty_order_bucket()))}")

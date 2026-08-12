@@ -536,7 +536,7 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
 
             live_users, unavailable_server_ids = reseller_handlers._load_reseller_live_users()
 
-            self.assertEqual(live_users, {"r1988a": {
+            self.assertEqual(live_users, {("s1", "r1988a"): {
                 "blocked": False,
                 "status": "Offline",
                 "account_creation_date": "2026-06-01 12:00:00",
@@ -741,6 +741,7 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
                 "configs": [
                     {
                         "username": "r1988a",
+                        "server_id": "s1",
                         "customer_name": "ali",
                         "gb": 20,
                         "days": 365,
@@ -856,13 +857,13 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
         original_loader = reseller_handlers._load_reseller_live_users
         try:
             reseller_handlers._load_reseller_live_users = lambda force_refresh=False: ({
-                "r1988h": {
+                ("s1", "r1988h"): {
                     "blocked": False,
                     "status": "On-hold",
                     "account_creation_date": None,
                     "expiration_days": 30,
                 },
-                "r1988u": {
+                ("s1", "r1988u"): {
                     "blocked": False,
                     "status": "unexpected",
                     "expiration_days": 30,
@@ -889,6 +890,47 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
         self.assertEqual([item["username"] for item in categorized["unknown"]], ["r1988u"])
         self.assertEqual(categorized["active"], [])
         self.assertEqual(categorized["expired"], [])
+
+    def test_reseller_categories_expired_unused_and_manual_block_separately(self):
+        original_loader = reseller_handlers._load_reseller_live_users
+        try:
+            reseller_handlers._load_reseller_live_users = lambda force_refresh=False: ({
+                ("s1", "r1988e"): {
+                    "blocked": False,
+                    "status": "On Hold",
+                    "account_creation_date": None,
+                    "expiration_days": 30,
+                },
+                ("s1", "r1988b"): {
+                    "blocked": True,
+                    "status": "Offline",
+                    "account_creation_date": "2026-08-01T00:00:00+00:00",
+                    "expiration_days": 60,
+                    "max_download_bytes": 100,
+                    "upload_bytes": 0,
+                    "download_bytes": 0,
+                },
+            }, set())
+            categorized = reseller_handlers._categorize_reseller_customers([
+                {
+                    "username": "r1988e",
+                    "server_id": "s1",
+                    "days": 30,
+                    "timestamp": "2026-01-01 12:00:00",
+                },
+                {
+                    "username": "r1988b",
+                    "server_id": "s1",
+                    "days": 60,
+                    "timestamp": "2026-08-01 12:00:00",
+                },
+            ])
+        finally:
+            reseller_handlers._load_reseller_live_users = original_loader
+
+        self.assertEqual([item["username"] for item in categorized["expired"]], ["r1988e"])
+        self.assertEqual([item["username"] for item in categorized["blocked"]], ["r1988b"])
+        self.assertEqual(categorized["active"], [])
 
     def test_reseller_customer_config_queues_live_lookup(self):
         original_multi_api = reseller_handlers.MultiServerAPI

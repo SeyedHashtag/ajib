@@ -154,6 +154,10 @@ class MultiServerCreationCacheTests(unittest.TestCase):
 
         self.assertEqual(multi_api.allocated_user_count(users), 3)
         self.assertEqual(multi_api.account_state_counts(users), {
+            "allocated": 3,
+            "started": 1,
+            "online": 0,
+            "offline": 1,
             "active": 1,
             "hold": 1,
             "blocked": 1,
@@ -162,6 +166,9 @@ class MultiServerCreationCacheTests(unittest.TestCase):
         status = multi_api.get_server_statuses()[0]
         self.assertEqual(status["allocated_count"], 3)
         self.assertEqual(status["connected_count"], 1)
+        self.assertEqual(status["started_count"], 1)
+        self.assertEqual(status["online_count"], 0)
+        self.assertEqual(status["offline_count"], 1)
         self.assertEqual(status["hold_count"], 1)
 
     def test_cached_snapshot_prevents_repeated_get_users_inside_ttl(self):
@@ -177,6 +184,24 @@ class MultiServerCreationCacheTests(unittest.TestCase):
 
         self.assertEqual(clients["s1"].get_users_calls, 1)
         self.assertEqual(clients["s2"].get_users_calls, 1)
+
+    def test_exact_user_lookup_uses_fresh_snapshot_cache(self):
+        clients = {
+            "s1": FakeClient("s1", {"Alice": {"status": "Online"}}),
+        }
+        multi_api = self.make_multi_api(clients)
+        multi_api.get_user_snapshot_entries(include_disabled=True)
+
+        client, user, result = multi_api.find_user_on_server_cached("alice", "s1")
+        _client, missing, missing_result = multi_api.find_user_on_server_cached("bob", "s1")
+
+        self.assertEqual(client.server_id, "s1")
+        self.assertEqual(user, {"status": "Online"})
+        self.assertEqual(result["status"], "found")
+        self.assertEqual(result["source"], "cache")
+        self.assertIsNone(missing)
+        self.assertEqual(missing_result["status"], "missing")
+        self.assertEqual(clients["s1"].get_users_calls, 1)
 
     def test_cached_snapshot_expires_after_ttl(self):
         current_time = [100.0]

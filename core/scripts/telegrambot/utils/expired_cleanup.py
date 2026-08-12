@@ -51,9 +51,9 @@ except ImportError:
 
 from utils.api_client import MultiServerAPI
 from utils.account_state import (
+    EntitlementState,
     PanelState,
     inspect_account,
-    is_business_expired,
     normalize_panel_status,
     panel_deadline,
     panel_days_remaining,
@@ -1381,11 +1381,41 @@ def discover_cleanup_candidates(include_already_missing=False, include_deleted=F
                 })
 
     deduped = {}
-    for candidate in candidates:
+    deduped_ranks = {}
+    for order, candidate in enumerate(candidates):
         key = _state_key(candidate.get('server_id'), candidate['username']).lower()
-        existing = deduped.get(key)
-        if existing is None or (existing.get('_record_was_deleted') and not candidate.get('_record_was_deleted')):
+        ref = candidate.get('_record_ref') or ()
+        record = None
+        if ref and ref[0] == 'payment':
+            record = payments.get(ref[1]) if isinstance(payments, dict) else None
+        elif ref and ref[0] == 'reseller':
+            reseller = resellers.get(ref[1]) if isinstance(resellers, dict) else None
+            configs = reseller.get('configs', []) if isinstance(reseller, dict) else []
+            try:
+                record = configs[int(ref[2])]
+            except (IndexError, TypeError, ValueError):
+                record = None
+
+        issued_at = None
+        if isinstance(record, dict):
+            for field in (
+                'renewal_applied_at',
+                'updated_at',
+                'created_at',
+                'completed_at',
+                'timestamp',
+            ):
+                issued_at = parse_timestamp(record.get(field))
+                if issued_at is not None:
+                    break
+        rank = (
+            issued_at is not None,
+            issued_at.timestamp() if issued_at is not None else 0,
+            order,
+        )
+        if key not in deduped or rank > deduped_ranks[key]:
             deduped[key] = candidate
+            deduped_ranks[key] = rank
     return list(deduped.values())
 
 
@@ -1436,7 +1466,7 @@ def _cycle_candidate_fields(candidate, cycle, now):
 
 
 def _discover_issue_deadline_candidates(local_candidates, lookup_context, stores, now):
-    """Find locally owned paid accounts past their issuance-based deadline."""
+    """Find never-started paid accounts past their issuance-based deadline."""
     if not isinstance(lookup_context, dict) or lookup_context.get('unavailable'):
         return []
     candidates = []
@@ -1444,8 +1474,6 @@ def _discover_issue_deadline_candidates(local_candidates, lookup_context, stores
         if candidate.get('source') not in {'customer', 'reseller_customer'}:
             continue
         cycle = _candidate_service_cycle(candidate, stores)
-        if not is_business_expired(cycle, now=now):
-            continue
         api_client, user_data, lookup_status = _lookup_user_from_context(
             lookup_context,
             candidate.get('username'),
@@ -1454,7 +1482,10 @@ def _discover_issue_deadline_candidates(local_candidates, lookup_context, stores
         if lookup_status != 'found':
             continue
         shared_state = inspect_account(user_data, cycle=cycle, now=now)
-        if shared_state.panel_state == PanelState.UNKNOWN:
+        if (
+            shared_state.panel_state != PanelState.HOLD
+            or shared_state.entitlement_state != EntitlementState.EXPIRED
+        ):
             continue
         candidates.append({
             **_cycle_candidate_fields(candidate, cycle, now),
@@ -1468,13 +1499,16 @@ def _discover_issue_deadline_candidates(local_candidates, lookup_context, stores
 
 def _candidate_issue_deadline_valid(candidate, stores, user_data, now):
     cycle = _candidate_service_cycle(candidate, stores)
-    if cycle is None or not is_business_expired(cycle, now=now):
+    if cycle is None:
         return False, cycle
     expected_fingerprint = candidate.get('cycle_fingerprint')
     if expected_fingerprint and expected_fingerprint != cycle.fingerprint:
         return False, cycle
     shared_state = inspect_account(user_data, cycle=cycle, now=now)
-    return shared_state.panel_state != PanelState.UNKNOWN, cycle
+    return (
+        shared_state.panel_state == PanelState.HOLD
+        and shared_state.entitlement_state == EntitlementState.EXPIRED
+    ), cycle
 
 
 def _candidate_superseded_test_valid(candidate, stores, user_data):

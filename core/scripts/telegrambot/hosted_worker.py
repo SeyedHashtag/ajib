@@ -4497,12 +4497,9 @@ def _customer_notification_monitor():
                         or account.entitlement_state == EntitlementState.UNKNOWN
                     ):
                         continue
-                    expiration = account.entitlement_days_remaining
-                    cycle_marker = service_cycle.fingerprint
-                    is_expired = (
-                        account.panel_state == PanelState.BLOCKED
-                        or account.entitlement_state == EntitlementState.EXPIRED
-                    )
+                    expiration = account.service_days_remaining
+                    cycle_marker = account.service_marker
+                    is_expired = account.entitlement_state == EntitlementState.EXPIRED
                     if is_expired:
                         from utils.renewal import find_reseller_reservation
 
@@ -4529,8 +4526,8 @@ def _customer_notification_monitor():
                     progress = []
                     if maximum > 0:
                         progress.append((int((used / maximum) * 100), "traffic"))
-                    plan_days = service_cycle.duration_days
-                    if plan_days > 0 and expiration is not None:
+                    plan_days = account.service_duration_days
+                    if plan_days and plan_days > 0 and expiration is not None:
                         progress.append((int((1 - min(expiration, plan_days) / plan_days) * 100), "time"))
                     percent, basis = max(progress, default=(0, "traffic"), key=lambda item: item[0])
                     percent = max(0, min(100, percent))

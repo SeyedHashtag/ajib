@@ -531,8 +531,60 @@ class MyConfigsTests(unittest.TestCase):
 
         caption = my_configs_module.bot.sent_photos[-1][1]["caption"]
         self.assertIn("On Hold — server timer starts on first connection", caption)
-        self.assertIn("Server Days Remaining: Not started", caption)
-        self.assertIn("Service deadline:", caption)
+        self.assertRegex(caption, r"Server Days Remaining: \d+")
+        self.assertIn("Unused-service deadline:", caption)
+        self.assertIn("Days remaining before use:", caption)
+
+    def test_connected_config_ignores_old_issuance_and_shows_panel_days(self):
+        class DummyQR:
+            def save(self, target, image_format):
+                target.write(b"qr")
+
+        client = types.SimpleNamespace(
+            server_id="enabled",
+            get_user_uri=lambda username: {"normal_sub": "https://example.com/sub"},
+        )
+        sys.modules["utils.payment_records"].load_payments = lambda: {
+            "p1": {
+                "status": "completed",
+                "user_id": 123,
+                "username": "s123a",
+                "server_id": "enabled",
+                "days": 30,
+                "completed_at": "2026-01-01T00:00:00+00:00",
+            }
+        }
+        original = self.install_renewal_stub({
+            "eligible": False,
+            "reason": "renewal_ineligible_not_expired",
+        })
+        original_make = my_configs_module.qrcode.make
+        my_configs_module.display_config = REAL_DISPLAY_CONFIG
+        try:
+            my_configs_module.qrcode.make = lambda value: DummyQR()
+            my_configs_module.display_config(
+                456,
+                "s123a",
+                {
+                    "blocked": False,
+                    "status": "Online",
+                    "account_creation_date": "2026-08-01T00:00:00+00:00",
+                    "expiration_days": 60,
+                    "upload_bytes": 0,
+                    "download_bytes": 0,
+                    "max_download_bytes": 5 * 1024 ** 3,
+                },
+                client,
+                user_id=123,
+            )
+        finally:
+            my_configs_module.qrcode.make = original_make
+            self.restore_renewal_stub(original)
+
+        caption = my_configs_module.bot.sent_photos[-1][1]["caption"]
+        self.assertIn("Status: ✅ Active", caption)
+        self.assertRegex(caption, r"Server Days Remaining: \d+")
+        self.assertNotIn("Unused-service deadline", caption)
 
     def test_unused_test_hold_shows_replacement_and_stale_timing(self):
         class DummyQR:

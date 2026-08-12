@@ -67,7 +67,7 @@ def load_cli_api(payments=None, servers=None, clients=None, online_response=None
     ]
     clients = clients or {
         "primary": FakeClient({
-            "a": {"blocked": False, "upload_bytes": GB, "download_bytes": 2 * GB, "max_download_bytes": 10 * GB},
+            "a": {"blocked": False, "status": "Online", "account_creation_date": "2026-06-01", "expiration_days": 30, "upload_bytes": GB, "download_bytes": 2 * GB, "max_download_bytes": 10 * GB},
             "b": {"blocked": True, "upload_bytes": 512 * 1024 * 1024, "download_bytes": 512 * 1024 * 1024, "max_download_bytes": 2 * GB},
         }),
         "backup": FakeClient(None),
@@ -177,24 +177,73 @@ class ServerInfoDashboardTests(unittest.TestCase):
         traffic = snapshot["traffic"]
         text = cli_api.format_server_info(snapshot)
 
-        self.assertEqual(traffic["direct"]["sold_configs"], 3)
+        self.assertEqual(traffic["direct"]["sold_configs"], 2)
         self.assertEqual(traffic["direct"]["matched_configs"], 2)
         self.assertEqual(traffic["direct"]["used_bytes"], 7 * GB)
-        self.assertEqual(traffic["direct"]["sold_bytes"], 35 * GB)
-        self.assertEqual(traffic["reseller"]["sold_configs"], 2)
+        self.assertEqual(traffic["direct"]["sold_bytes"], 30 * GB)
+        self.assertEqual(traffic["reseller"]["sold_configs"], 1)
         self.assertEqual(traffic["reseller"]["matched_configs"], 1)
         self.assertEqual(traffic["reseller"]["used_bytes"], 10 * GB)
-        self.assertEqual(traffic["reseller"]["sold_bytes"], 42 * GB)
+        self.assertEqual(traffic["reseller"]["sold_bytes"], 40 * GB)
         self.assertEqual(traffic["total"]["used_bytes"], 17 * GB)
-        self.assertEqual(traffic["total"]["sold_bytes"], 77 * GB)
-        self.assertAlmostEqual(traffic["total"]["usage_percent"], 17 / 77 * 100)
+        self.assertEqual(traffic["total"]["sold_bytes"], 70 * GB)
+        self.assertAlmostEqual(traffic["total"]["usage_percent"], 17 / 70 * 100)
         self.assertEqual(traffic["missing_configs"], 2)
         self.assertEqual(traffic["skipped_no_username"], 1)
-        self.assertIn("Total Sold: 17.00GB served / 77.00GB sold (22.1%)", text)
-        self.assertIn("Direct: 7.00GB / 35.00GB • 2 configs", text)
-        self.assertIn("Reseller: 10.00GB / 42.00GB • 1 configs", text)
-        self.assertIn("Missing Sold Configs: 2", text)
+        self.assertIn("Current Sold Footprint: 17.00GB served / 70.00GB allocated (24.3%)", text)
+        self.assertIn("Direct: 7.00GB / 30.00GB • 2 configs", text)
+        self.assertIn("Reseller: 10.00GB / 40.00GB • 1 configs", text)
+        self.assertIn("Historical Local Configs Missing From VPN: 2", text)
         self.assertNotIn("200.00GB", text)
+
+    def test_sold_footprint_uses_live_quota_for_recycled_username(self):
+        payments = {
+            "old": {"status": "completed", "username": "same", "server_id": "primary", "plan_gb": 1, "updated_at": "2026-01-01"},
+            "new": {"status": "completed", "username": "same", "server_id": "primary", "plan_gb": 100, "updated_at": "2026-08-01"},
+        }
+        clients = {
+            "primary": FakeClient({
+                "same": {"blocked": False, "upload_bytes": 5 * GB, "download_bytes": 0, "max_download_bytes": 120 * GB},
+            }),
+            "backup": FakeClient(None),
+        }
+        cli_api = load_cli_api(payments=payments, clients=clients)
+
+        traffic = cli_api.build_server_info_snapshot(
+            now=datetime(2026, 8, 12, 12, 0, 0)
+        )["traffic"]
+
+        self.assertEqual(traffic["direct"]["matched_configs"], 1)
+        self.assertEqual(traffic["direct"]["sold_bytes"], 120 * GB)
+        self.assertEqual(traffic["direct"]["used_bytes"], 5 * GB)
+
+    def test_cross_source_tie_is_counted_once_as_unattributed(self):
+        timestamp = "2026-08-01 12:00:00"
+        payments = {
+            "direct": {"status": "completed", "username": "shared", "server_id": "primary", "plan_gb": 10, "updated_at": timestamp},
+        }
+        resellers = {"42": {"configs": [
+            {"username": "shared", "server_id": "primary", "gb": 20, "timestamp": timestamp},
+        ]}}
+        clients = {
+            "primary": FakeClient({
+                "shared": {"blocked": False, "upload_bytes": 3 * GB, "download_bytes": 0, "max_download_bytes": 50 * GB},
+            }),
+            "backup": FakeClient(None),
+        }
+        cli_api = load_cli_api(
+            payments=payments,
+            clients=clients,
+            resellers=resellers,
+        )
+
+        traffic = cli_api.build_server_info_snapshot(
+            now=datetime(2026, 8, 12, 12, 0, 0)
+        )["traffic"]
+
+        self.assertEqual(traffic["total"]["sold_bytes"], 50 * GB)
+        self.assertEqual(traffic["unattributed"]["matched_configs"], 1)
+        self.assertEqual(traffic["ambiguous_configs"], 1)
 
     def test_customer_growth_counts_unique_regular_paid_customers(self):
         payments = {
@@ -290,16 +339,16 @@ class ServerInfoDashboardTests(unittest.TestCase):
         ]
         clients = {
             "primary": FakeClient({
-                "a": {"blocked": False},
+                "a": {"blocked": False, "status": "Online", "account_creation_date": "2026-06-01", "expiration_days": 30},
                 "b": {"blocked": True},
             }),
             "backup": FakeClient([
-                {"username": "c", "blocked": False},
-                {"username": "d", "blocked": False},
+                {"username": "c", "blocked": False, "status": "Online", "account_creation_date": "2026-06-01", "expiration_days": 30},
+                {"username": "d", "blocked": False, "status": "Offline", "account_creation_date": "2026-06-01", "expiration_days": 30},
                 {"username": "e", "blocked": True},
             ]),
             "disabled": FakeClient({
-                "ignored": {"blocked": False},
+                "ignored": {"blocked": False, "status": "Online", "account_creation_date": "2026-06-01", "expiration_days": 30},
             }),
         }
         cli_api = load_cli_api(servers=servers, clients=clients)
@@ -307,9 +356,9 @@ class ServerInfoDashboardTests(unittest.TestCase):
         snapshot = cli_api.build_server_info_snapshot(now=datetime(2026, 6, 4, 12, 0, 0))
         text = cli_api.format_server_info(snapshot)
 
-        self.assertEqual(snapshot["online"]["count"], 3)
+        self.assertEqual(snapshot["online"]["count"], 2)
         self.assertEqual(snapshot["online"]["status"], "ok")
-        self.assertIn("Online Users: 3", text)
+        self.assertIn("Online Users: 2", text)
 
     def test_online_userlist_partial_failure_still_formats_count(self):
         cli_api = load_cli_api()
@@ -321,6 +370,8 @@ class ServerInfoDashboardTests(unittest.TestCase):
         self.assertEqual(snapshot["online"]["status"], "ok")
         self.assertIn("Online Users: 1", text)
         self.assertNotIn("Online Users: N/A", text)
+        self.assertTrue(snapshot["traffic"]["partial"])
+        self.assertIn("Traffic Footprint: partial", text)
 
     def test_online_failure_formats_as_na_not_zero(self):
         servers = [

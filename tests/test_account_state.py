@@ -158,6 +158,45 @@ class AccountStateTests(unittest.TestCase):
         self.assertEqual(before.entitlement_state.value, "current")
         self.assertEqual(at_deadline.entitlement_state.value, "expired")
         self.assertEqual(at_deadline.state, "expired")
+        self.assertEqual(at_deadline.deadline_source.value, "issuance")
+        self.assertEqual(at_deadline.service_days_remaining, 0)
+
+    def test_connected_account_ignores_old_issuance_and_uses_panel_deadline(self):
+        cycle = self.state.resolve_service_cycle({
+            "old": {
+                "username": "alice",
+                "server_id": "s1",
+                "days": 30,
+                "status": "completed",
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }
+        }, username="alice", server_id="s1", source="customer")
+        snapshot = self.state.inspect_account({
+            "status": "Online",
+            "blocked": False,
+            "account_creation_date": "2026-07-21T00:00:00+00:00",
+            "expiration_days": 60,
+        }, cycle=cycle, now=datetime(2026, 8, 12, tzinfo=timezone.utc))
+
+        self.assertEqual(snapshot.entitlement_state.value, "current")
+        self.assertEqual(snapshot.deadline_source.value, "panel")
+        self.assertEqual(snapshot.service_days_remaining, 38)
+        self.assertEqual(snapshot.service_deadline, snapshot.panel_deadline)
+        self.assertNotEqual(snapshot.service_marker, cycle.fingerprint)
+
+    def test_manual_block_is_not_expired(self):
+        snapshot = self.state.inspect_account({
+            "status": "Offline",
+            "blocked": True,
+            "account_creation_date": "2026-08-01T00:00:00+00:00",
+            "expiration_days": 30,
+            "max_download_bytes": 1024,
+            "upload_bytes": 1,
+            "download_bytes": 0,
+        }, now=datetime(2026, 8, 12, tzinfo=timezone.utc))
+        self.assertEqual(snapshot.panel_state.value, "blocked")
+        self.assertEqual(snapshot.entitlement_state.value, "unknown")
+        self.assertEqual(snapshot.state, "blocked")
 
     def test_verified_blocked_panel_expiration_is_shared_state(self):
         snapshot = self.state.inspect_account({

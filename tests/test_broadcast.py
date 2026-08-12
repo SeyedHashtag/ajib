@@ -210,7 +210,7 @@ class BroadcastTargetingTests(unittest.TestCase):
                 "server_id": "primary",
                 "days": 30,
                 "status": "completed",
-                "created_at": "2026-01-01T00:00:00+00:00",
+                "created_at": "2099-01-01T00:00:00+00:00",
             },
             "p222": {
                 "user_id": 222,
@@ -218,7 +218,7 @@ class BroadcastTargetingTests(unittest.TestCase):
                 "server_id": "primary",
                 "days": 30,
                 "status": "completed",
-                "created_at": "2026-01-01T00:00:00+00:00",
+                "created_at": "2099-01-01T00:00:00+00:00",
             },
         }
 

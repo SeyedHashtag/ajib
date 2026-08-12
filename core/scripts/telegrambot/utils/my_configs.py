@@ -375,7 +375,7 @@ def display_config(
             stale=observation_stale,
         )
         is_blocked = shared_state.panel_state == PanelState.BLOCKED
-        is_expired = is_blocked or shared_state.entitlement_state == EntitlementState.EXPIRED
+        is_expired = shared_state.entitlement_state == EntitlementState.EXPIRED
         account_creation_date = user_data.get('account_creation_date') or 'Not started'
 
         # Calculate traffic with safety checks
@@ -399,30 +399,36 @@ def display_config(
 
         traffic_limit_display = f"{max_traffic_gb:.2f} GB" if max_traffic_gb > 0 else "Unlimited"
         
-        if shared_state.panel_state == PanelState.HOLD:
+        if shared_state.panel_state == PanelState.HOLD and is_expired:
+            status_display = '❌ Unused service expired'
+            days_display = '0'
+        elif shared_state.panel_state == PanelState.HOLD:
             status_display = '⏸ On Hold — server timer starts on first connection'
-            days_display = 'Not started'
+            days_display = (
+                str(shared_state.service_days_remaining)
+                if shared_state.service_days_remaining is not None else 'Unknown'
+            )
         elif shared_state.panel_state == PanelState.CONNECTED:
             status_display = '✅ Active'
             days_display = (
-                str(shared_state.panel_days_remaining)
-                if shared_state.panel_days_remaining is not None else 'Unknown'
+                str(shared_state.service_days_remaining)
+                if shared_state.service_days_remaining is not None else 'Unknown'
             )
         elif shared_state.panel_state == PanelState.BLOCKED:
-            status_display = '❌ Blocked/Expired'
+            status_display = '❌ Expired' if is_expired else '⛔ Blocked by administrator'
             days_display = (
-                str(shared_state.panel_days_remaining)
-                if shared_state.panel_days_remaining is not None else 'Unknown'
+                str(shared_state.service_days_remaining)
+                if shared_state.service_days_remaining is not None else 'Unknown'
             )
         else:
             status_display = '⚠️ Unknown — live status unavailable'
             days_display = 'Unknown'
 
         entitlement_line = ''
-        if cycle is not None:
+        if shared_state.deadline_source.value == 'issuance' and shared_state.service_deadline is not None:
             entitlement_line = (
-                f"\n🧾 Service deadline: {cycle.deadline.isoformat()}"
-                f"\n📆 Service days remaining: {shared_state.entitlement_days_remaining}"
+                f"\n🧾 Unused-service deadline: {shared_state.service_deadline.isoformat()}"
+                f"\n📆 Days remaining before use: {shared_state.service_days_remaining}"
             )
         elif is_test and shared_state.panel_state == PanelState.HOLD:
             entitlement_line = (
@@ -443,6 +449,26 @@ def display_config(
             language = get_user_language(user_id or chat_id)
             message = _append_my_configs_cache_notice(
                 f"⚠️ Live account status is unavailable. No expiry or renewal action was taken.\n{formatted_details}",
+                language,
+                show_cache_notice,
+            )
+            if is_callback:
+                safe_edit_message_text(
+                    bot,
+                    message,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    parse_mode="Markdown",
+                )
+            else:
+                safe_send_message(bot, chat_id, message, parse_mode="Markdown")
+            return
+
+        if is_blocked and not is_expired:
+            language = get_user_language(user_id or chat_id)
+            message = _append_my_configs_cache_notice(
+                f"⛔ **This configuration is blocked by an administrator.**\n"
+                f"It was not classified as expired. Please contact support.\n{formatted_details}",
                 language,
                 show_cache_notice,
             )

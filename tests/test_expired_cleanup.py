@@ -616,6 +616,124 @@ class ExpiredCleanupTests(unittest.TestCase):
         deleted = self.read_json(self.cleanup.STATE_FILE)["s1:s1988"]
         self.assertEqual(deleted["cleanup_reason"], "issue_deadline_expired")
 
+    def test_connected_paid_account_ignores_expired_issuance_cycle(self):
+        self.write_json(self.cleanup.TEST_CONFIGS_FILE, {})
+        self.write_json(self.cleanup.RESELLERS_FILE, {})
+        self.write_json(self.cleanup.PAYMENTS_FILE, {
+            "p1": {
+                "status": "completed",
+                "user_id": 1988,
+                "username": "s1988",
+                "server_id": "s1",
+                "days": 30,
+                "completed_at": "2026-04-01 12:00:00",
+            }
+        })
+        live = {
+            "blocked": False,
+            "status": "Online",
+            "account_creation_date": "2026-05-20 12:00:00",
+            "expiration_days": 60,
+            "upload_bytes": 0,
+            "download_bytes": self.cleanup.GB_BYTES,
+            "max_download_bytes": 20 * self.cleanup.GB_BYTES,
+        }
+        client = FakeClient("s1", {"s1988": live})
+
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now,
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        self.assertEqual(client.deleted, [])
+        self.assertEqual(self.read_json(self.cleanup.STATE_FILE), {})
+        self.assertEqual(self.cleanup._test_bot.sent_messages, [])
+
+    def test_connecting_cancels_pending_issuance_deadline_cleanup(self):
+        self.write_json(self.cleanup.TEST_CONFIGS_FILE, {})
+        self.write_json(self.cleanup.RESELLERS_FILE, {})
+        self.write_json(self.cleanup.PAYMENTS_FILE, {
+            "p1": {
+                "status": "completed",
+                "user_id": 1988,
+                "username": "s1988",
+                "server_id": "s1",
+                "days": 30,
+                "completed_at": "2026-04-01 12:00:00",
+            }
+        })
+        live = {
+            "blocked": False,
+            "status": "On Hold",
+            "account_creation_date": None,
+            "expiration_days": 30,
+            "upload_bytes": 0,
+            "download_bytes": 0,
+            "max_download_bytes": 20 * self.cleanup.GB_BYTES,
+        }
+        client = FakeClient("s1", {"s1988": live})
+        api = FakeMultiAPI({"s1": client})
+        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=api)
+
+        live.update({
+            "status": "Offline",
+            "account_creation_date": "2026-06-09 13:00:00",
+            "download_bytes": 1,
+        })
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now + timedelta(hours=49),
+            multi_api=api,
+        )
+
+        self.assertEqual(client.deleted, [])
+        self.assertEqual(self.read_json(self.cleanup.STATE_FILE), {})
+        saved = self.read_json(self.cleanup.PAYMENTS_FILE)["p1"]
+        self.assertEqual(saved["cleanup_status"], "renewed")
+
+    def test_reused_reseller_username_uses_newest_local_record(self):
+        self.write_json(self.cleanup.TEST_CONFIGS_FILE, {})
+        self.write_json(self.cleanup.PAYMENTS_FILE, {})
+        self.write_json(self.cleanup.RESELLERS_FILE, {
+            "303": {
+                "configs": [
+                    {
+                        "username": "r303",
+                        "server_id": "s1",
+                        "days": 7,
+                        "created_at": "2026-04-01 12:00:00",
+                    },
+                    {
+                        "username": "r303",
+                        "server_id": "s1",
+                        "days": 60,
+                        "created_at": "2026-06-01 12:00:00",
+                    },
+                ]
+            }
+        })
+        live = {
+            "blocked": False,
+            "status": "On-hold",
+            "account_creation_date": None,
+            "expiration_days": 60,
+            "upload_bytes": 0,
+            "download_bytes": 0,
+            "max_download_bytes": 100 * self.cleanup.GB_BYTES,
+        }
+        client = FakeClient("s1", {"r303": live})
+
+        candidates = self.cleanup.discover_cleanup_candidates()
+        self.assertEqual(candidates[0]["_record_ref"], ("reseller", "303", 1))
+
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now,
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        self.assertEqual(client.deleted, [])
+        self.assertEqual(self.read_json(self.cleanup.STATE_FILE), {})
+        self.assertEqual(self.cleanup._test_bot.sent_messages, [])
+
     def test_new_successful_cycle_cancels_old_issue_deadline_cleanup(self):
         self.write_json(self.cleanup.TEST_CONFIGS_FILE, {})
         self.write_json(self.cleanup.RESELLERS_FILE, {})

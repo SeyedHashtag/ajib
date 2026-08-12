@@ -266,43 +266,50 @@ def _customer_payment_records(user_id):
     return records
 
 
-def _payment_looks_expired(record, now=None):
-    from utils.account_state import is_business_expired, resolve_service_cycle
-
-    if any(record.get(key) for key in (
-        "cleanup_deleted_at",
-        "removed_from_vpn",
-        "cleanup_delete_result",
-    )):
+def _payment_cleanup_proves_deleted(record):
+    if record.get("cleanup_deleted_at") or record.get("removed_from_vpn"):
         return True
-    if str(record.get("cleanup_status", "")).lower() in {
-        "deleted",
-        "already_missing",
-        "expired",
-    }:
+    delete_results = {"deleted", "already_missing"}
+    if str(record.get("cleanup_delete_result", "")).lower() in delete_results:
         return True
-
-    cycle = resolve_service_cycle(
-        record,
-        username=record.get("renewal_username") or record.get("username"),
-        server_id=record.get("renewal_server_id") or record.get("server_id"),
-        source="customer_welcome",
-    )
-    return is_business_expired(cycle, now=now)
+    if str(record.get("cleanup_status", "")).lower() in delete_results:
+        return True
+    return False
 
 
-def _payment_entitlement_state(record, now=None):
-    from utils.account_state import resolve_service_cycle
+def _payment_entitlement_state(record, now=None, multi_api=None):
+    from utils.account_state import EntitlementState, inspect_account, resolve_service_cycle
+    from utils.api_client import MultiServerAPI
 
-    if _payment_looks_expired(record, now=now):
+    if _payment_cleanup_proves_deleted(record):
         return "expired"
+    username = record.get("renewal_username") or record.get("username")
+    server_id = record.get("renewal_server_id") or record.get("server_id") or "primary"
+    if not username:
+        return "unknown"
     cycle = resolve_service_cycle(
         record,
-        username=record.get("renewal_username") or record.get("username"),
-        server_id=record.get("renewal_server_id") or record.get("server_id"),
+        username=username,
+        server_id=server_id,
         source="customer_welcome",
     )
-    return "paid" if cycle is not None else "unknown"
+    try:
+        api = multi_api or MultiServerAPI()
+        finder = getattr(api, "find_user_on_server_cached", None)
+        if callable(finder):
+            _client, live, lookup = finder(username, server_id)
+        else:
+            _client, live, lookup = api.find_user_on_server(username, server_id)
+    except Exception:
+        return "unknown"
+    if not isinstance(lookup, dict) or lookup.get("status") != "found" or not isinstance(live, dict):
+        return "unknown"
+    snapshot = inspect_account(live, cycle=cycle, now=now, source="customer_welcome")
+    if snapshot.entitlement_state == EntitlementState.EXPIRED:
+        return "expired"
+    if snapshot.entitlement_state == EntitlementState.CURRENT:
+        return "paid"
+    return "unknown"
 
 
 def _renewal_token_for_record(user_id, payment_id, record):
@@ -318,12 +325,12 @@ def _renewal_token_for_record(user_id, payment_id, record):
         return None
 
 
-def get_customer_journey_state(user_id, now=None):
-    """Return a lightweight customer state without making a VPN API request."""
+def get_customer_journey_state(user_id, now=None, multi_api=None):
+    """Return a fail-closed customer state from the exact live VPN identity."""
     paid_records = _customer_payment_records(user_id)
     if paid_records:
         payment_id, latest = paid_records[0]
-        state = _payment_entitlement_state(latest, now=now)
+        state = _payment_entitlement_state(latest, now=now, multi_api=multi_api)
         return {
             "state": state,
             "renewal_token": _renewal_token_for_record(user_id, payment_id, latest),

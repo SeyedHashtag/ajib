@@ -589,7 +589,18 @@ class MultiServerAPI:
 
     @staticmethod
     def account_state_counts(users) -> dict:
-        counts = {"active": 0, "hold": 0, "blocked": 0, "unknown": 0}
+        counts = {
+            "allocated": 0,
+            "started": 0,
+            "online": 0,
+            "offline": 0,
+            "hold": 0,
+            "blocked": 0,
+            "unknown": 0,
+            # Compatibility alias: state snapshots historically called every
+            # started (Online or Offline) account "active".
+            "active": 0,
+        }
         if isinstance(users, dict):
             iterable = users.values()
         elif isinstance(users, list):
@@ -598,8 +609,15 @@ class MultiServerAPI:
             return counts
         for user in iterable:
             snapshot = inspect_account(user if isinstance(user, dict) else None)
+            if snapshot.blocked is False:
+                counts["allocated"] += 1
             if snapshot.panel_state == PanelState.CONNECTED:
+                counts["started"] += 1
                 counts["active"] += 1
+                if snapshot.normalized_status == "online":
+                    counts["online"] += 1
+                elif snapshot.normalized_status == "offline":
+                    counts["offline"] += 1
             elif snapshot.panel_state == PanelState.HOLD:
                 counts["hold"] += 1
             elif snapshot.panel_state == PanelState.BLOCKED:
@@ -815,7 +833,14 @@ class MultiServerAPI:
             healthy = users is not None
             allocated_count = self.allocated_user_count(users)
             state_counts = self.account_state_counts(users) if healthy else {
-                "active": None, "hold": None, "blocked": None, "unknown": None,
+                "allocated": None,
+                "started": None,
+                "online": None,
+                "offline": None,
+                "active": None,
+                "hold": None,
+                "blocked": None,
+                "unknown": None,
             }
             weight = _safe_weight(server.get("weight", 1))
             statuses.append({
@@ -825,6 +850,9 @@ class MultiServerAPI:
                 "active_count": allocated_count if healthy else None,
                 "allocated_count": allocated_count if healthy else None,
                 "connected_count": state_counts["active"],
+                "started_count": state_counts["started"],
+                "online_count": state_counts["online"],
+                "offline_count": state_counts["offline"],
                 "hold_count": state_counts["hold"],
                 "blocked_count": state_counts["blocked"],
                 "unknown_count": state_counts["unknown"],
@@ -930,6 +958,63 @@ class MultiServerAPI:
             "error": "server_not_configured",
         }
         return None, None, result
+
+    def find_user_on_server_cached(
+        self,
+        username: str,
+        server_id: str,
+        cache_ttl_seconds: float | None = None,
+    ):
+        """Resolve an exact identity from a fresh snapshot cache, then live."""
+        target_server_id = str(server_id or "").strip()
+        cached_entries = self.get_cached_user_snapshot_entries(
+            include_disabled=True,
+            cache_ttl_seconds=cache_ttl_seconds,
+            allow_expired=False,
+        )
+        if cached_entries is not None and target_server_id:
+            for entry in cached_entries:
+                server = entry.get("server") or {}
+                client = entry.get("client")
+                entry_server_id = server.get("id") or getattr(client, "server_id", "")
+                if str(entry_server_id) != target_server_id:
+                    continue
+                users = entry.get("users")
+                if users is None:
+                    return client, None, {
+                        "status": "unavailable",
+                        "data": None,
+                        "http_status": None,
+                        "error": "cached_server_unavailable",
+                        "source": "cache",
+                    }
+                target = str(username or "").casefold()
+                if isinstance(users, dict):
+                    user = users.get(username)
+                    if user is None:
+                        user = next(
+                            (value for name, value in users.items() if str(name).casefold() == target),
+                            None,
+                        )
+                elif isinstance(users, list):
+                    user = next(
+                        (
+                            value for value in users
+                            if isinstance(value, dict)
+                            and str(value.get("username") or "").casefold() == target
+                        ),
+                        None,
+                    )
+                else:
+                    user = None
+                return client, user, {
+                    "status": "found" if user is not None else "missing",
+                    "data": user,
+                    "http_status": 200,
+                    "error": None,
+                    "source": "cache",
+                }
+        return self.find_user_on_server(username, target_server_id)
 
     def iter_all_users(
         self,

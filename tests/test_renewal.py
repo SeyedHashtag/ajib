@@ -331,6 +331,61 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(offer["reason"], "renewal_ineligible_not_expired")
         self.assertEqual(offer["before_state"]["panel_state"], "hold")
 
+    def test_connected_offer_ignores_expired_issuance_and_reserves_renewal(self):
+        connected_user = {
+            "blocked": False,
+            "status": "Online",
+            "account_creation_date": "2026-08-01T00:00:00+00:00",
+            "expiration_days": 60,
+            "upload_bytes": 0,
+            "download_bytes": 0,
+            "max_download_bytes": 5 * GB_BYTES,
+        }
+        payments = {"base-1": self.base_payment(
+            completed_at="2026-01-01 12:00:00",
+        )}
+        client = FakeClient("s1", {"alice": connected_user})
+
+        offer = self.renewal.find_customer_renewal_offer(
+            123,
+            "alice",
+            client,
+            connected_user,
+            self.plans,
+            payments=payments,
+            allow_reservation=True,
+        )
+
+        self.assertTrue(offer["eligible"])
+        self.assertEqual(offer["renewal_mode"], "reserved")
+        self.assertFalse(offer["business_expired"])
+        self.assertEqual(offer["before_state"]["deadline_source"], "panel")
+
+    def test_hold_without_verifiable_issuance_cannot_reserve_renewal(self):
+        hold_user = {
+            "blocked": False,
+            "status": "On Hold",
+            "account_creation_date": None,
+            "expiration_days": 30,
+            "upload_bytes": 0,
+            "download_bytes": 0,
+            "max_download_bytes": 5 * GB_BYTES,
+        }
+        client = FakeClient("s1", {"alice": hold_user})
+
+        offer = self.renewal.find_customer_renewal_offer(
+            123,
+            "alice",
+            client,
+            hold_user,
+            self.plans,
+            payments={"base-1": self.base_payment()},
+            allow_reservation=True,
+        )
+
+        self.assertFalse(offer["eligible"])
+        self.assertEqual(offer["reason"], "renewal_ineligible_state_unknown")
+
     def test_latest_successful_cycle_prevents_offer_from_older_expired_cycle(self):
         hold_user = {
             "blocked": False,
@@ -367,7 +422,13 @@ class RenewalTests(unittest.TestCase):
         )
         self.assertEqual(missing_offer["reason"], "renewal_ineligible_missing")
 
-        active_user = dict(self.expired_user(), blocked=False, expiration_days=12)
+        active_user = dict(
+            self.expired_user(),
+            blocked=False,
+            status="Offline",
+            account_creation_date="2026-08-01T00:00:00+00:00",
+            expiration_days=60,
+        )
         active_offer = self.renewal.find_customer_renewal_offer(
             123, "alice", client, active_user, self.plans, payments=payments
         )
@@ -377,7 +438,7 @@ class RenewalTests(unittest.TestCase):
         blocked_offer = self.renewal.find_customer_renewal_offer(
             123, "alice", client, manually_blocked_user, self.plans, payments=payments
         )
-        self.assertEqual(blocked_offer["reason"], "renewal_ineligible_not_expired")
+        self.assertEqual(blocked_offer["reason"], "renewal_ineligible_state_unknown")
 
         deleted_offer = self.renewal.find_customer_renewal_offer(
             123,
@@ -412,11 +473,12 @@ class RenewalTests(unittest.TestCase):
     def test_active_customer_offer_is_reservable_and_duplicate_is_rejected(self):
         active_user = {
             "blocked": False,
-            "expiration_days": 12,
+            "expiration_days": 60,
             "upload_bytes": GB_BYTES,
             "download_bytes": 2 * GB_BYTES,
             "max_download_bytes": 5 * GB_BYTES,
-            "status": "active",
+            "status": "Offline",
+            "account_creation_date": "2026-08-01T00:00:00+00:00",
         }
         client = FakeClient("s1", {"alice": active_user})
         payments = {"base-1": self.base_payment()}

@@ -37,6 +37,12 @@ class EntitlementState(str, Enum):
     UNKNOWN = "unknown"
 
 
+class DeadlineSource(str, Enum):
+    ISSUANCE = "issuance"
+    PANEL = "panel"
+    NONE = "none"
+
+
 @dataclass(frozen=True)
 class ServiceCycle:
     issued_at: datetime
@@ -69,6 +75,11 @@ class AccountState:
     entitlement_deadline: datetime | None
     entitlement_days_remaining: int | None
     cycle_fingerprint: str | None
+    service_deadline: datetime | None
+    service_days_remaining: int | None
+    service_duration_days: int | None
+    deadline_source: DeadlineSource
+    service_marker: str | None
     observed_at: datetime
     source: str
     stale: bool = False
@@ -77,11 +88,13 @@ class AccountState:
         result = asdict(self)
         result["panel_state"] = self.panel_state.value
         result["entitlement_state"] = self.entitlement_state.value
+        result["deadline_source"] = self.deadline_source.value
         for key in (
             "panel_started_at",
             "panel_deadline",
             "entitlement_issued_at",
             "entitlement_deadline",
+            "service_deadline",
             "observed_at",
         ):
             value = result.get(key)
@@ -393,16 +406,64 @@ def inspect_account(
     else:
         panel_state_value = PanelState.UNKNOWN
 
-    if not available or stale:
+    service_deadline = None
+    service_days = None
+    service_duration = None
+    deadline_source = DeadlineSource.NONE
+    service_marker = None
+
+    if not available or stale or panel_state_value == PanelState.UNKNOWN:
         entitlement = EntitlementState.UNKNOWN
+    elif panel_state_value == PanelState.HOLD:
+        # Before first use, the panel timer has not started.  Only the local
+        # issuance cycle can bound how long the unused allocation is valid.
+        if cycle is None:
+            entitlement = EntitlementState.UNKNOWN
+        else:
+            entitlement = (
+                EntitlementState.EXPIRED
+                if current >= cycle.deadline
+                else EntitlementState.CURRENT
+            )
+            service_deadline = cycle.deadline
+            service_days = remaining_full_days(cycle.deadline, now=current)
+            service_duration = cycle.duration_days
+            deadline_source = DeadlineSource.ISSUANCE
+            service_marker = cycle.fingerprint
+    elif panel_state_value == PanelState.CONNECTED:
+        # Once the account starts, the live panel is authoritative.  A local
+        # issuance timestamp may describe an older, recycled username.
+        entitlement = EntitlementState.CURRENT
+        service_deadline = deadline
+        service_days = remaining_full_days(deadline, now=current)
+        service_duration = duration
+        deadline_source = DeadlineSource.PANEL
     elif verified_panel_expired(data, now=current):
         entitlement = EntitlementState.EXPIRED
-    elif cycle is None:
-        entitlement = EntitlementState.UNKNOWN
-    elif current >= cycle.deadline:
-        entitlement = EntitlementState.EXPIRED
+        service_deadline = deadline
+        service_days = 0
+        service_duration = duration
+        deadline_source = DeadlineSource.PANEL
     else:
-        entitlement = EntitlementState.CURRENT
+        # A manual/administrative block is not proof of service expiration.
+        entitlement = EntitlementState.UNKNOWN
+        service_deadline = deadline
+        service_days = remaining_full_days(deadline, now=current)
+        service_duration = duration
+        deadline_source = DeadlineSource.PANEL if deadline is not None else DeadlineSource.NONE
+
+    if deadline_source == DeadlineSource.PANEL:
+        marker_source = json.dumps(
+            {
+                "source": deadline_source.value,
+                "started_at": started_at.isoformat() if started_at else None,
+                "deadline": deadline.isoformat() if deadline else None,
+                "duration_days": duration,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        service_marker = hashlib.sha256(marker_source.encode("utf-8")).hexdigest()[:24]
 
     if panel_state_value == PanelState.UNKNOWN:
         normalized_state = "unknown"
@@ -428,6 +489,11 @@ def inspect_account(
             remaining_full_days(cycle.deadline, now=current) if cycle else None
         ),
         cycle_fingerprint=cycle.fingerprint if cycle else None,
+        service_deadline=service_deadline,
+        service_days_remaining=service_days,
+        service_duration_days=service_duration,
+        deadline_source=deadline_source,
+        service_marker=service_marker,
         observed_at=observation,
         source=source,
         stale=bool(stale or not available),

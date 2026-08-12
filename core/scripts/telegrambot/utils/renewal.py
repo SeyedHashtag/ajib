@@ -6,8 +6,9 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 from utils.account_state import (
+    EntitlementState,
+    PanelState,
     inspect_account,
-    is_business_expired,
     panel_deadline,
     panel_days_remaining,
     parse_timestamp,
@@ -205,6 +206,14 @@ def capture_user_state(user_data, now=None, cycle=None):
         ),
         'entitlement_days_remaining': shared_state.entitlement_days_remaining,
         'cycle_fingerprint': shared_state.cycle_fingerprint,
+        'service_deadline': (
+            shared_state.service_deadline.isoformat()
+            if shared_state.service_deadline else None
+        ),
+        'service_days_remaining': shared_state.service_days_remaining,
+        'service_duration_days': shared_state.service_duration_days,
+        'deadline_source': shared_state.deadline_source.value,
+        'service_marker': shared_state.service_marker,
         'gb_remaining': _gb_from_bytes(remaining_bytes),
         'gb_limit': _gb_from_bytes(max_download_bytes) if max_download_bytes > 0 else None,
         'gb_used': _gb_from_bytes(used_bytes),
@@ -383,8 +392,18 @@ def _build_offer(
         server_id=server_id or getattr(api_client, 'server_id', None),
         source=source,
     )
-    business_expired = is_business_expired(cycle)
-    expired = is_user_expired(user_data) or business_expired
+    shared_state = inspect_account(user_data, cycle=cycle)
+    if shared_state.entitlement_state == EntitlementState.UNKNOWN:
+        return {
+            'eligible': False,
+            'reason': 'renewal_ineligible_state_unknown',
+            'source': source,
+            'username': username,
+            'server_id': server_id,
+            'before_state': capture_user_state(user_data, cycle=cycle),
+        }
+    expired = shared_state.entitlement_state == EntitlementState.EXPIRED
+    business_expired = expired and shared_state.panel_state == PanelState.HOLD
     if not expired and (not allow_reservation or bool(user_data.get('blocked', False))):
         return {
             'eligible': False,
@@ -463,7 +482,10 @@ def _build_offer(
         'renewal_mode': 'immediate' if expired else 'reserved',
         'business_expired': business_expired,
         'cycle_fingerprint': cycle.fingerprint if cycle else None,
-        'entitlement_deadline': cycle.deadline.isoformat() if cycle else None,
+        'entitlement_deadline': (
+            shared_state.service_deadline.isoformat()
+            if shared_state.service_deadline else None
+        ),
     }
     if extra:
         offer.update(extra)
