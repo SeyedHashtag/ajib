@@ -1,3 +1,10 @@
+## v1.19.4
+🛠️ Use stable lifecycle timestamps in payment reports and timezone-safe timestamps for reserved renewals
+🐛 Recover stale or failed renewal claims safely, schedule automatic retries, and improve operator logging
+🐛 Restore admin controls after canceled checker settlements and make reseller detail rendering more resilient
+🛠️ Accept verified unused test accounts with unavailable traffic counters and log expired-cleanup transitions
+✅ Expand regression coverage for payment reporting, renewal recovery, reseller displays, checker settlements, and expired cleanup
+
 ## v1.19.3
 🛠️ Use authoritative live VPN state and panel deadlines across customer journeys, renewals, broadcasts, cleanup, and traffic monitoring
 🐛 Distinguish manual blocks from expired service and expire unused on-hold accounts only after their issuance deadline
