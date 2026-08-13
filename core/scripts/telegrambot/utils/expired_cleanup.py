@@ -1,6 +1,7 @@
 import io
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
@@ -68,6 +69,8 @@ from utils.language import get_user_language
 from utils.translations import get_button_text, get_message_text
 
 
+CLEANUP_LOGGER = logging.getLogger('ajib.expired_cleanup')
+
 TEST_CONFIGS_FILE = '/etc/ajib/core/scripts/telegrambot/test_configs.json'
 PAYMENTS_FILE = '/etc/ajib/core/scripts/telegrambot/payments.json'
 RESELLERS_FILE = '/etc/ajib/core/scripts/telegrambot/resellers.json'
@@ -81,6 +84,8 @@ EXPIRED_CLEANUP_GRACE_HOURS = 48
 STALE_ON_HOLD_TEST_DAYS = 60
 TEST_ACCOUNT_EXPIRATION_DAYS = 30
 STALE_ON_HOLD_TEST_REASON = 'stale_on_hold_test'
+STALE_TEST_TRAFFIC_ZERO = 'zero_counters'
+STALE_TEST_TRAFFIC_NULL_ZERO_ONLINE = 'null_counters_zero_online'
 ISSUE_DEADLINE_EXPIRED_REASON = 'issue_deadline_expired'
 SUPERSEDED_ON_HOLD_TEST_REASON = 'superseded_on_hold_test'
 DELETE_RESULTS = {'deleted', 'already_missing'}
@@ -555,6 +560,31 @@ def _strict_nonnegative_int(value):
     return None
 
 
+def _stale_test_traffic_evidence(user_data):
+    """Return the strict no-usage evidence used for stale test cleanup."""
+    if not isinstance(user_data, dict):
+        return None
+    traffic_fields = ('upload_bytes', 'download_bytes')
+    if any(field not in user_data for field in traffic_fields):
+        return None
+
+    traffic_values = [user_data[field] for field in traffic_fields]
+    has_null_counter = any(value is None for value in traffic_values)
+    for value in traffic_values:
+        if value is not None and _strict_nonnegative_int(value) != 0:
+            return None
+
+    if 'online_count' in user_data:
+        if _strict_nonnegative_int(user_data.get('online_count')) != 0:
+            return None
+    elif has_null_counter:
+        return None
+
+    if has_null_counter:
+        return STALE_TEST_TRAFFIC_NULL_ZERO_ONLINE
+    return STALE_TEST_TRAFFIC_ZERO
+
+
 def _safe_bytes(value):
     value = _safe_int(value, 0)
     return max(0, value or 0)
@@ -604,9 +634,7 @@ def is_stale_on_hold_test(username, user_data, now=None):
         return False
     if _strict_nonnegative_int(user_data.get('max_download_bytes')) != GB_BYTES:
         return False
-    if _strict_nonnegative_int(user_data.get('upload_bytes')) != 0:
-        return False
-    if _strict_nonnegative_int(user_data.get('download_bytes')) != 0:
+    if _stale_test_traffic_evidence(user_data) is None:
         return False
 
     created_at = _parse_test_note_time(user_data)
@@ -638,6 +666,59 @@ def _state_key(server_id, username):
 
 def _state_record_id(state_key):
     return hashlib.sha1(str(state_key).encode('utf-8')).hexdigest()[:16]
+
+
+def _cleanup_transition_snapshot(state):
+    snapshot = {}
+    for key, entry in (state or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        snapshot[key] = {
+            'cleanup_status': entry.get('cleanup_status'),
+            'cleanup_reason': entry.get('cleanup_reason'),
+            'server_id': entry.get('server_id') or 'primary',
+        }
+    return snapshot
+
+
+def _log_cleanup_state_transitions(previous, current):
+    logged_statuses = {
+        'notified',
+        'deleted',
+        'already_missing',
+        'delete_failed',
+        'renewed',
+    }
+    transition_counts = {}
+    current_snapshot = _cleanup_transition_snapshot(current)
+    for key in sorted(set(previous) | set(current_snapshot)):
+        before = previous.get(key) or {}
+        after = current_snapshot.get(key) or {}
+        previous_status = before.get('cleanup_status')
+        current_status = after.get('cleanup_status')
+        if current_status == previous_status:
+            continue
+
+        context = after or before
+        if current_status is None:
+            if previous_status not in {'notified', 'server_unavailable', 'delete_failed'}:
+                continue
+            current_status = 'canceled'
+        elif current_status not in logged_statuses:
+            continue
+
+        transition_counts[current_status] = transition_counts.get(current_status, 0) + 1
+        level = logging.WARNING if current_status == 'delete_failed' else logging.INFO
+        CLEANUP_LOGGER.log(
+            level,
+            'cleanup_transition record_id=%s server_id=%s reason=%s previous_status=%s status=%s',
+            _state_record_id(key),
+            context.get('server_id') or 'primary',
+            context.get('cleanup_reason') or 'unknown',
+            previous_status or 'none',
+            current_status,
+        )
+    return transition_counts
 
 
 def _find_state_key_by_record_id(record_id):
@@ -1777,6 +1858,7 @@ def _scan_server_cleanup_candidates(multi_api, now=None):
             }
             if cleanup_reason == STALE_ON_HOLD_TEST_REASON:
                 candidate['cleanup_reason'] = cleanup_reason
+                candidate['_stale_test_traffic_evidence'] = _stale_test_traffic_evidence(user_data)
             candidates.append(candidate)
 
     return candidates, lookup_context
@@ -2484,10 +2566,16 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
         state = _load_json_file(STATE_FILE, {})
         if not isinstance(state, dict):
             state = {}
+        previous_state = _cleanup_transition_snapshot(state)
 
         multi_api = multi_api or MultiServerAPI()
         record_stores = _load_cleanup_record_stores()
         server_candidates, lookup_context = _scan_server_cleanup_candidates(multi_api, now=now)
+        null_counter_accepted = sum(
+            1
+            for candidate in server_candidates
+            if candidate.get('_stale_test_traffic_evidence') == STALE_TEST_TRAFFIC_NULL_ZERO_ONLINE
+        )
         recovered_test_candidates = _discover_verified_orphan_tests(
             server_candidates,
             lookup_context,
@@ -2832,13 +2920,33 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
 
         _save_dirty_cleanup_record_stores(record_stores)
         _save_json_file(STATE_FILE, state)
-        if recovery_stats['verified']:
-            print(
-                "[ExpiredCleanup] recovered_tests "
-                f"verified={recovery_stats['verified']} selected={recovery_stats['selected']} "
-                f"notified={recovery_stats['notified']} failed={recovery_stats['notification_failed']} "
-                f"backfill_created={recovery_stats['backfill_created']} "
-                f"history_added={recovery_stats['history_added']}"
+        transition_counts = _log_cleanup_state_transitions(previous_state, state)
+        recovery_changed = any(
+            recovery_stats[field]
+            for field in (
+                'notified',
+                'notification_failed',
+                'backfill_created',
+                'history_added',
+            )
+        )
+        if transition_counts or recovery_changed:
+            transition_summary = ','.join(
+                f'{status}:{count}'
+                for status, count in sorted(transition_counts.items())
+            ) or 'none'
+            CLEANUP_LOGGER.info(
+                'cleanup_scan transitions=%s null_counter_accepted=%d '
+                'recovered_verified=%d recovered_selected=%d recovered_notified=%d '
+                'recovered_notification_failed=%d backfill_created=%d history_added=%d',
+                transition_summary,
+                null_counter_accepted,
+                recovery_stats['verified'],
+                recovery_stats['selected'],
+                recovery_stats['notified'],
+                recovery_stats['notification_failed'],
+                recovery_stats['backfill_created'],
+                recovery_stats['history_added'],
             )
         return state
 

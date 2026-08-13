@@ -6,6 +6,7 @@ import types
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = (
@@ -409,6 +410,88 @@ class ExpiredCleanupTests(unittest.TestCase):
                     )
                 )
 
+    def test_stale_on_hold_test_accepts_explicit_null_traffic_with_zero_online_count(self):
+        cases = {
+            "both_null": {
+                "upload_bytes": None,
+                "download_bytes": None,
+                "online_count": 0,
+            },
+            "upload_null": {
+                "upload_bytes": None,
+                "download_bytes": 0,
+                "online_count": "0",
+            },
+            "download_null": {
+                "upload_bytes": "0",
+                "download_bytes": None,
+                "online_count": 0,
+            },
+            "numeric_strings": {
+                "upload_bytes": "0",
+                "download_bytes": "0",
+                "online_count": "0",
+            },
+        }
+
+        for label, traffic in cases.items():
+            with self.subTest(case=label):
+                user = {**self.stale_on_hold_test_user(), **traffic}
+                self.assertTrue(
+                    self.cleanup.is_stale_on_hold_test("t12345", user, now=self.now)
+                )
+
+    def test_stale_on_hold_test_rejects_unsafe_null_or_online_evidence(self):
+        null_traffic = {
+            **self.stale_on_hold_test_user(),
+            "upload_bytes": None,
+            "download_bytes": None,
+        }
+        missing_upload = dict(null_traffic)
+        missing_upload.pop("upload_bytes")
+        missing_download = dict(null_traffic)
+        missing_download.pop("download_bytes")
+        cases = {
+            "null_without_online_count": null_traffic,
+            "missing_upload": {**missing_upload, "online_count": 0},
+            "missing_download": {**missing_download, "online_count": 0},
+            "null_online_count": {**null_traffic, "online_count": None},
+            "boolean_online_count": {**null_traffic, "online_count": False},
+            "negative_online_count": {**null_traffic, "online_count": -1},
+            "malformed_online_count": {**null_traffic, "online_count": "none"},
+            "nonzero_online_count": {**null_traffic, "online_count": 1},
+            "zero_traffic_but_online": {
+                **self.stale_on_hold_test_user(),
+                "online_count": 1,
+            },
+            "boolean_traffic": {
+                **self.stale_on_hold_test_user(),
+                "upload_bytes": False,
+                "online_count": 0,
+            },
+            "negative_traffic": {
+                **self.stale_on_hold_test_user(),
+                "download_bytes": -1,
+                "online_count": 0,
+            },
+            "malformed_traffic": {
+                **self.stale_on_hold_test_user(),
+                "download_bytes": "none",
+                "online_count": 0,
+            },
+            "used_traffic": {
+                **self.stale_on_hold_test_user(),
+                "download_bytes": 1,
+                "online_count": 0,
+            },
+        }
+
+        for label, user in cases.items():
+            with self.subTest(case=label):
+                self.assertFalse(
+                    self.cleanup.is_stale_on_hold_test("t12345", user, now=self.now)
+                )
+
     def test_stale_on_hold_test_fails_closed_when_any_signature_is_missing(self):
         missing_blocked = self.stale_on_hold_test_user()
         missing_blocked.pop("blocked")
@@ -515,6 +598,86 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(client.deleted, ["t12345"])
         self.assertEqual(state["cleanup_status"], "deleted")
         self.assertEqual(state["cleanup_reason"], "stale_on_hold_test")
+
+    def test_null_counter_test_waits_silently_then_revalidates_and_deletes(self):
+        self.write_default_files()
+        user = {
+            **self.stale_on_hold_test_user(),
+            "upload_bytes": None,
+            "download_bytes": None,
+            "online_count": 0,
+        }
+        client = FakeClient("s1", {"t12345": user})
+
+        with (
+            mock.patch.object(self.cleanup.CLEANUP_LOGGER, "log") as transition_log,
+            mock.patch.object(self.cleanup.CLEANUP_LOGGER, "info") as summary_log,
+        ):
+            self.cleanup.run_expired_user_cleanup(
+                now=self.now,
+                multi_api=FakeMultiAPI({"s1": client}),
+            )
+
+            state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+            self.assertEqual(state["cleanup_status"], "notified")
+            self.assertEqual(state["delete_after"], "2026-06-11 12:00:00")
+            self.assertEqual(client.deleted, [])
+            self.assertTrue(transition_log.called)
+            self.assertTrue(summary_log.called)
+            summary_args = summary_log.call_args.args
+            self.assertIn("null_counter_accepted=%d", summary_args[0])
+            self.assertEqual(summary_args[2], 1)
+            for call in transition_log.call_args_list:
+                self.assertNotIn("t12345", call.args)
+                self.assertNotIn("12345", call.args)
+                self.assertFalse(any(isinstance(value, dict) for value in call.args))
+
+            transition_log.reset_mock()
+            summary_log.reset_mock()
+            self.cleanup.run_expired_user_cleanup(
+                now=self.now + timedelta(hours=1),
+                multi_api=FakeMultiAPI({"s1": client}),
+            )
+            self.assertFalse(transition_log.called)
+            self.assertFalse(summary_log.called)
+            self.assertEqual(client.deleted, [])
+
+            self.cleanup.run_expired_user_cleanup(
+                now=self.now + timedelta(hours=49),
+                multi_api=FakeMultiAPI({"s1": client}),
+            )
+            self.assertEqual(client.deleted, ["t12345"])
+            self.assertEqual(
+                self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]["cleanup_status"],
+                "deleted",
+            )
+            self.assertTrue(any(call.args[-1] == "deleted" for call in transition_log.call_args_list))
+
+    def test_null_counter_test_usage_during_grace_cancels_deletion(self):
+        self.write_default_files()
+        user = {
+            **self.stale_on_hold_test_user(),
+            "upload_bytes": None,
+            "download_bytes": None,
+            "online_count": 0,
+        }
+        client = FakeClient("s1", {"t12345": user})
+
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now,
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+        client.users["t12345"].update({
+            "upload_bytes": 0,
+            "download_bytes": 1,
+        })
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now + timedelta(hours=49),
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        self.assertEqual(client.deleted, [])
+        self.assertEqual(self.read_json(self.cleanup.STATE_FILE), {})
 
     def test_stale_on_hold_test_connection_during_grace_cancels_deletion(self):
         self.write_default_files()
@@ -1868,7 +2031,8 @@ class ExpiredCleanupTests(unittest.TestCase):
         client = FakeClient("s1", {"t101": self.expired_user()}, delete_result=None)
 
         self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
-        self.cleanup.run_expired_user_cleanup(now=self.now + timedelta(hours=49), multi_api=FakeMultiAPI({"s1": client}))
+        with mock.patch.object(self.cleanup.CLEANUP_LOGGER, "log") as transition_log:
+            self.cleanup.run_expired_user_cleanup(now=self.now + timedelta(hours=49), multi_api=FakeMultiAPI({"s1": client}))
 
         state = self.read_json(self.cleanup.STATE_FILE)
         saved_test = self.read_json(self.cleanup.TEST_CONFIGS_FILE)["101"]
@@ -1876,6 +2040,11 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(state["s1:t101"]["cleanup_status"], "delete_failed")
         self.assertEqual(saved_test["cleanup_status"], "delete_failed")
         self.assertIn("cleanup_last_state", saved_test)
+        self.assertTrue(any(
+            call.args[0] == self.cleanup.logging.WARNING
+            and call.args[-1] == "delete_failed"
+            for call in transition_log.call_args_list
+        ))
 
     def test_unavailable_server_keeps_pending_cleanup_retryable(self):
         self.write_json(self.cleanup.TEST_CONFIGS_FILE, {
