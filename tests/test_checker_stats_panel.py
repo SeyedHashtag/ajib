@@ -58,6 +58,10 @@ class DummyMarkup:
         return self
 
 
+class DummyMainMarkup(DummyMarkup):
+    pass
+
+
 class DummyButton:
     def __init__(self, text, **kwargs):
         self.text = text
@@ -95,7 +99,7 @@ def load_payment_setup():
     common_stub.admin_action_text = lambda key: {
         "payment_settings": "💳 Payment Settings",
     }[key]
-    common_stub.create_main_markup = lambda *args, **kwargs: DummyMarkup()
+    common_stub.create_main_markup = lambda *args, **kwargs: DummyMainMarkup()
     sys.modules["utils.common"] = common_stub
 
     payment_records_stub = types.ModuleType("utils.payment_records")
@@ -265,13 +269,42 @@ class CheckerStatsPanelTests(unittest.TestCase):
         self.assertIn("Unpaid After: 0 Tomans", edited_text)
         self.assertNotIn("notification could not be delivered", edited_text)
 
-        checker_notification = payment_setup.bot.sent_messages[-1]
+        checker_notification = next(
+            item for item in payment_setup.bot.sent_messages if item["chat_id"] == 42
+        )
         self.assertEqual(checker_notification["chat_id"], 42)
         self.assertNotIn("Checker", checker_notification["text"])
         self.assertIn("Payout: 150,000 Tomans", checker_notification["text"])
         self.assertIn("Settlement Base: 1,500,000 Tomans", checker_notification["text"])
         self.assertIn("Remaining Balance: 0 Tomans", checker_notification["text"])
         self.assertIn("Settlement ID: checkpoint-1", checker_notification["text"])
+
+        admin_menu = payment_setup.bot.sent_messages[-1]
+        self.assertEqual(admin_menu["chat_id"], 99)
+        self.assertIsInstance(admin_menu["kwargs"]["reply_markup"], DummyMainMarkup)
+
+    def test_checker_settlement_inline_cancel_restores_admin_keyboard(self):
+        payment_setup = load_payment_setup()
+        payment_setup.is_admin = lambda _user_id: True
+        payment_setup.CHECKER_SETTLEMENT_INPUT_STATE[7] = {
+            "state": "waiting_open_account_amount"
+        }
+
+        call = types.SimpleNamespace(
+            id="cb-cancel",
+            data="checker_settlement:cancel",
+            from_user=types.SimpleNamespace(id=7),
+            message=types.SimpleNamespace(
+                chat=types.SimpleNamespace(id=99), message_id=55
+            ),
+        )
+        payment_setup.handle_checker_settlement_callback(call)
+
+        self.assertNotIn(7, payment_setup.CHECKER_SETTLEMENT_INPUT_STATE)
+        admin_menu = payment_setup.bot.sent_messages[-1]
+        self.assertEqual(admin_menu["chat_id"], 99)
+        self.assertEqual(admin_menu["text"], "Operation canceled.")
+        self.assertIsInstance(admin_menu["kwargs"]["reply_markup"], DummyMainMarkup)
 
     def test_checker_settlement_notification_failure_keeps_checkpoint_and_warns_admin(self):
         payment_setup = load_payment_setup()
@@ -290,8 +323,12 @@ class CheckerStatsPanelTests(unittest.TestCase):
             checkpoints.append(checkpoint)
             return checkpoint
 
-        def fail_notification(_chat_id, _text, **_kwargs):
-            raise RuntimeError("checker blocked the bot")
+        original_send_message = payment_setup.bot.send_message
+
+        def fail_notification(chat_id, text, **kwargs):
+            if chat_id == 42:
+                raise RuntimeError("checker blocked the bot")
+            return original_send_message(chat_id, text, **kwargs)
 
         payment_setup.is_admin = lambda _user_id: True
         payment_setup.load_payments = lambda: {}
@@ -344,7 +381,13 @@ class CheckerStatsPanelTests(unittest.TestCase):
         payment_setup.handle_checker_settlement_callback(call)
 
         self.assertEqual(len(checkpoints), 1)
-        self.assertEqual(payment_setup.bot.sent_messages, [])
+        self.assertFalse(
+            any(item["chat_id"] == 42 for item in payment_setup.bot.sent_messages)
+        )
+        self.assertIsInstance(
+            payment_setup.bot.sent_messages[-1]["kwargs"]["reply_markup"],
+            DummyMainMarkup,
+        )
         edited_text = payment_setup.bot.edited_messages[-1]["text"]
         self.assertIn("✅ Checker settlement checkpoint saved.", edited_text)
         self.assertIn("Checker notification could not be delivered", edited_text)

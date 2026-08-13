@@ -524,6 +524,11 @@ def handle_checker_settlement_callback(call):
         except Exception:
             pass
         bot.answer_callback_query(call.id, text="Canceled.")
+        bot.send_message(
+            call.message.chat.id,
+            "Operation canceled.",
+            reply_markup=create_main_markup(is_admin=True),
+        )
         return
 
     stats = build_receipt_checker_stats(load_payments())
@@ -627,6 +632,14 @@ def handle_checker_settlement_callback(call):
             ),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id
+        )
+        # Editing an inline-keyboard message does not replace Telegram's
+        # persistent reply keyboard. Restore the admin keyboard explicitly so
+        # the amount-entry Cancel button does not remain after settlement.
+        bot.send_message(
+            call.message.chat.id,
+            "↩️ Returned to the admin menu.",
+            reply_markup=create_main_markup(is_admin=True),
         )
 
 
