@@ -64,6 +64,7 @@ class PaymentRecordsTests(unittest.TestCase):
         self.assertEqual(record["username"], "s1988a")
         self.assertEqual(record["server_id"], "server2")
         self.assertIn("updated_at", record)
+        self.assertEqual(record["completed_at"], record["updated_at"])
         self.assertEqual(record["updates"][-1]["status"], "completed")
         self.assertEqual(record["updates"][-1]["previous_status"], "processing")
         self.assertIn("timestamp", record["updates"][-1])
@@ -86,6 +87,41 @@ class PaymentRecordsTests(unittest.TestCase):
         self.assertEqual(record["status"], "expired")
         self.assertEqual(record["updates"][-1]["previous_status"], "pending")
         self.assertEqual(record["updates"][-1]["status"], "expired")
+
+    def test_successful_status_transition_sets_completed_at_once(self):
+        self.write_payments({"pay-1": {"status": "pending", "updates": []}})
+
+        self.assertTrue(self.payment_records.update_payment_status("pay-1", "paid"))
+        first_record = self.read_payments()["pay-1"]
+        completed_at = first_record["completed_at"]
+        self.assertEqual(completed_at, first_record["updated_at"])
+
+        self.assertTrue(self.payment_records.update_payment_status("pay-1", "succeeded"))
+        second_record = self.read_payments()["pay-1"]
+        self.assertEqual(second_record["completed_at"], completed_at)
+
+    def test_later_field_and_completion_updates_preserve_completed_at(self):
+        completed_at = "2026-08-12 17:33:57"
+        self.write_payments({
+            "pay-1": {
+                "status": "completed",
+                "completed_at": completed_at,
+                "updated_at": completed_at,
+                "updates": [],
+            }
+        })
+
+        self.assertTrue(self.payment_records.update_payment_record_fields(
+            "pay-1",
+            {"renewal_status": "processing"},
+        ))
+        self.assertTrue(self.payment_records.complete_payment_record(
+            "pay-1",
+            {"renewal_status": "reserved"},
+        ))
+
+        record = self.read_payments()["pay-1"]
+        self.assertEqual(record["completed_at"], completed_at)
 
     def test_failed_serialization_does_not_damage_existing_payment_database(self):
         original = {"pay-1": {"status": "completed", "updates": []}}

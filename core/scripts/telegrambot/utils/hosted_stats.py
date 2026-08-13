@@ -5,6 +5,11 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
+try:
+    from utils.payment_lifecycle import parse_payment_timestamp, payment_lifecycle_timestamp
+except ImportError:  # Support direct module loading in maintenance tools and tests.
+    from payment_lifecycle import parse_payment_timestamp, payment_lifecycle_timestamp
+
 
 OPEN_STATUSES = {
     "creating",
@@ -20,25 +25,8 @@ COMPLETED_STATUSES = {"completed"}
 PAYMENT_METHODS = ("card", "crypto", "other")
 
 
-def _parse_datetime(value):
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, date):
-        return datetime.combine(value, datetime.min.time())
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    if raw.endswith("Z"):
-        raw = f"{raw[:-1]}+00:00"
-    try:
-        parsed = datetime.fromisoformat(raw)
-        return parsed.replace(tzinfo=None)
-    except ValueError:
-        return None
-
-
 def _coerce_date(value):
-    parsed = _parse_datetime(value)
+    parsed = parse_payment_timestamp(value)
     if parsed is None:
         raise ValueError("A valid report end date is required")
     return parsed.date()
@@ -80,20 +68,8 @@ def _empty_bucket(bucket_date=None):
 
 
 def _bucket_for(buckets, timestamp):
-    parsed = _parse_datetime(timestamp)
+    parsed = parse_payment_timestamp(timestamp)
     return buckets.get(parsed.date()) if parsed is not None else None
-
-
-def _completed_timestamp(payment):
-    return (
-        payment.get("completed_at")
-        or payment.get("updated_at")
-        or payment.get("created_at")
-    )
-
-
-def _terminal_timestamp(payment):
-    return payment.get("updated_at") or payment.get("created_at")
 
 
 def _payment_financials(payment):
@@ -198,21 +174,23 @@ def build_hosted_stats(payments, reseller_configs, end_date=None, origin_bot_id=
         if started_bucket is not None:
             started_bucket["started"] += 1
 
+        lifecycle_timestamp = payment_lifecycle_timestamp(payment)
         if status in COMPLETED_STATUSES:
-            _record_completed(_bucket_for(buckets, _completed_timestamp(payment)), payment)
+            _record_completed(_bucket_for(buckets, lifecycle_timestamp), payment)
         elif status in OPEN_STATUSES:
-            if started_bucket is not None:
-                started_bucket["open"] += 1
+            open_bucket = _bucket_for(buckets, lifecycle_timestamp)
+            if open_bucket is not None:
+                open_bucket["open"] += 1
         elif status in ATTENTION_STATUSES:
-            attention_bucket = _bucket_for(buckets, _terminal_timestamp(payment))
+            attention_bucket = _bucket_for(buckets, lifecycle_timestamp)
             if attention_bucket is not None:
                 attention_bucket["attention"] += 1
         elif status in FAILED_STATUSES:
-            failed_bucket = _bucket_for(buckets, _terminal_timestamp(payment))
+            failed_bucket = _bucket_for(buckets, lifecycle_timestamp)
             if failed_bucket is not None:
                 failed_bucket["failed"] += 1
         elif status in EXPIRED_STATUSES:
-            expired_bucket = _bucket_for(buckets, _terminal_timestamp(payment))
+            expired_bucket = _bucket_for(buckets, lifecycle_timestamp)
             if expired_bucket is not None:
                 expired_bucket["expired"] += 1
 

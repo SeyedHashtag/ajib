@@ -1,6 +1,7 @@
 import ast
 import importlib.util
 import os
+import sys
 import unittest
 import uuid
 from contextlib import contextmanager
@@ -10,6 +11,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BOT_DIR = ROOT / "core" / "scripts" / "telegrambot"
+UTILS_DIR = BOT_DIR / "utils"
+if str(UTILS_DIR) not in sys.path:
+    sys.path.insert(0, str(UTILS_DIR))
 STATS_PATH = BOT_DIR / "utils" / "hosted_stats.py"
 STATS_SPEC = importlib.util.spec_from_file_location("hosted_stats", STATS_PATH)
 HOSTED_STATS = importlib.util.module_from_spec(STATS_SPEC)
@@ -227,6 +231,30 @@ class HostedStatsAggregationTests(unittest.TestCase):
         self.assertEqual(snapshot["last30"]["revenue"], 10.01)
         self.assertEqual(snapshot["last30"]["gross_profit"], 6.0)
         self.assertEqual(snapshot["last30"]["net_profit"], 5.0)
+
+    def test_completed_renewal_does_not_move_when_operational_timestamp_changes(self):
+        snapshot = HOSTED_STATS.build_hosted_stats(
+            {
+                "renewal": {
+                    "status": "completed",
+                    "created_at": "2026-08-12 17:25:07",
+                    "completed_at": "2026-08-12 17:33:57",
+                    "updated_at": "2026-08-13 17:39:22",
+                    "renewal_status": "processing",
+                    "retail_price": 4.05,
+                    "user_id": 1,
+                    "renew_username": "s6985678513",
+                },
+            },
+            [],
+            end_date="2026-08-13",
+        )
+        by_date = {item["date"]: item for item in snapshot["days"]}
+
+        self.assertEqual(by_date["2026-08-12"]["completed"], 1)
+        self.assertEqual(by_date["2026-08-12"]["revenue"], 4.05)
+        self.assertEqual(by_date["2026-08-13"]["completed"], 0)
+        self.assertEqual(by_date["2026-08-13"]["revenue"], 0)
 
 
 class HostedStatsWorkerTests(unittest.TestCase):

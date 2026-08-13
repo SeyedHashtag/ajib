@@ -200,9 +200,7 @@ def build_online_users_from_userlist(vpn: dict) -> dict:
     return {"count": count, "status": "ok", "error": None}
 
 
-def _collect_payment_stats(payments: dict, now: datetime) -> dict:
-    current_month = now.strftime('%Y-%m')
-    current_day = now.strftime('%Y-%m-%d')
+def _collect_payment_stats(payments: dict, now: datetime, timestamp_resolver) -> dict:
     last_30_days_start = now - timedelta(days=30)
     seven_day_start = now.date() - timedelta(days=6)
 
@@ -228,11 +226,13 @@ def _collect_payment_stats(payments: dict, now: datetime) -> dict:
             continue
         status = str(payment.get('status', '')).lower()
         price = _safe_float(payment.get('price', 0))
-        date_to_check = payment.get('updated_at') or payment.get('created_at') or ''
-        payment_dt = _parse_datetime(date_to_check)
-        in_month = str(date_to_check).startswith(current_month) if date_to_check else False
-        in_today = str(date_to_check).startswith(current_day) if date_to_check else False
-        in_last30 = payment_dt is not None and payment_dt >= last_30_days_start
+        payment_dt = timestamp_resolver(payment)
+        if payment_dt is None:
+            continue
+        not_future = payment_dt <= now
+        in_month = not_future and (payment_dt.year, payment_dt.month) == (now.year, now.month)
+        in_today = not_future and payment_dt.date() == now.date()
+        in_last30 = not_future and payment_dt >= last_30_days_start
 
         _bump_order_bucket(buckets['all'], status, price)
         if in_month:
@@ -243,7 +243,7 @@ def _collect_payment_stats(payments: dict, now: datetime) -> dict:
             _bump_order_bucket(buckets['last30'], status, price)
 
         if status in PAID_STATUSES:
-            if payment_dt and seven_day_start <= payment_dt.date() <= now.date():
+            if not_future and seven_day_start <= payment_dt.date() <= now.date():
                 daily_sales_by_date[payment_dt.date()]["revenue"] += price
                 daily_sales_by_date[payment_dt.date()]["paid"] += 1
             plan = str(payment.get('plan_gb') or 'Unknown')
@@ -563,7 +563,7 @@ def _collect_reseller_financials(resellers: dict) -> dict:
     return {"outstanding_debt": outstanding_debt}
 
 
-def _collect_customer_growth_stats(payments: dict, now: datetime) -> dict:
+def _collect_customer_growth_stats(payments: dict, now: datetime, timestamp_resolver) -> dict:
     today = now.date()
     seven_day_start = today - timedelta(days=6)
     last_30_days_start = now - timedelta(days=30)
@@ -577,13 +577,13 @@ def _collect_customer_growth_stats(payments: dict, now: datetime) -> dict:
     for record in (payments or {}).values():
         if not _is_regular_paid_payment(record):
             continue
+        payment_dt = timestamp_resolver(record)
+        if payment_dt is None or payment_dt > now:
+            continue
         regular_paid_orders += 1
-        payment_dt = _parse_datetime(record.get('updated_at') or record.get('created_at'))
         user_id = str(record.get('user_id') or '').strip()
         if not user_id:
             paid_orders_without_user_id += 1
-            continue
-        if not payment_dt:
             continue
         current_first = first_purchase_by_user.get(user_id)
         if current_first is None or payment_dt < current_first:
@@ -649,7 +649,16 @@ def _collect_language_stats(language_module, translations_module) -> dict:
 def build_server_info_snapshot(now=None) -> dict:
     '''Collects server information as structured data.'''
     _ensure_telegram_utils_path()
-    from utils import payment_records, referral, language, translations, api_client, reseller, receipt_checker
+    from utils import (
+        api_client,
+        language,
+        payment_lifecycle,
+        payment_records,
+        receipt_checker,
+        referral,
+        reseller,
+        translations,
+    )
 
     now = now or datetime.now()
     ram = psutil.virtual_memory()
@@ -661,8 +670,12 @@ def build_server_info_snapshot(now=None) -> dict:
     resellers = _load_resellers(reseller)
     vpn, live_users = _collect_vpn_and_live_users(api_client)
     traffic = _collect_sold_traffic_stats(payments, live_users, resellers=resellers)
-    sales = _collect_payment_stats(payments, now)
-    customers = _collect_customer_growth_stats(payments, now)
+    sales = _collect_payment_stats(payments, now, payment_lifecycle.payment_lifecycle_timestamp)
+    customers = _collect_customer_growth_stats(
+        payments,
+        now,
+        payment_lifecycle.payment_lifecycle_timestamp,
+    )
     online = build_online_users_from_userlist(vpn)
     referrals = _collect_referral_stats(referral)
     languages = _collect_language_stats(language, translations)

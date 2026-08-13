@@ -2,6 +2,7 @@ import sqlite3
 from datetime import datetime
 
 from utils.atomic_store import locked_json, read_json
+from utils.payment_lifecycle import PAID_STATUSES
 
 
 PAYMENTS_FILE = '/etc/ajib/core/scripts/telegrambot/payments.json'
@@ -62,6 +63,8 @@ def update_payment_status(payment_id, status):
             }
             payment['status'] = status
             payment['updated_at'] = current_time
+            if str(status or '').strip().lower() in PAID_STATUSES and not payment.get('completed_at'):
+                payment['completed_at'] = current_time
             updates = payment.setdefault('updates', [])
             if not isinstance(updates, list):
                 updates = []
@@ -103,6 +106,8 @@ def complete_payment_record(payment_id, fields, status='completed'):
             payment.update(fields)
             payment['status'] = status
             payment['updated_at'] = current_time
+            if str(status or '').strip().lower() in PAID_STATUSES and not payment.get('completed_at'):
+                payment['completed_at'] = current_time
 
             updates = payment.setdefault('updates', [])
             if not isinstance(updates, list):

@@ -42,7 +42,7 @@ def load_cli_api(payments=None, servers=None, clients=None, online_response=None
     )
 
     utils_pkg = types.ModuleType("utils")
-    utils_pkg.__path__ = []
+    utils_pkg.__path__ = [str(ROOT / "core" / "scripts" / "telegrambot" / "utils")]
     sys.modules["utils"] = utils_pkg
 
     payment_records_stub = types.ModuleType("utils.payment_records")
@@ -136,6 +136,62 @@ class ServerInfoDashboardTests(unittest.TestCase):
         self.assertNotIn("Online Check: error (HTTP 401)", text)
         self.assertIn("⚠️ Pending Payments: 1", text)
         self.assertIn("Backup: unhealthy", text)
+
+    def test_completed_renewal_keeps_its_original_sales_day_after_worker_updates(self):
+        payments = {
+            "affected-renewal": {
+                "status": "completed",
+                "price": 4.05,
+                "created_at": "2026-08-12 17:25:07",
+                "completed_at": "2026-08-12 17:33:57",
+                "updated_at": "2026-08-13 17:39:22",
+                "renewal_status": "processing",
+                "user_id": 1,
+                "plan_gb": 100,
+            },
+            **{
+                f"aug12-{index}": {
+                    "status": "completed",
+                    "price": price,
+                    "completed_at": f"2026-08-12 18:{index:02d}:00",
+                    "updated_at": f"2026-08-12 18:{index:02d}:00",
+                    "user_id": index + 1,
+                    "plan_gb": 100,
+                }
+                for index, price in enumerate([2, 2, 2, 2, 2, 2, 2.28], start=1)
+            },
+            "real-aug13-sale": {
+                "status": "completed",
+                "price": 2,
+                "completed_at": "2026-08-13 09:24:16",
+                "updated_at": "2026-08-13 09:24:16",
+                "user_id": 9,
+                "plan_gb": 70,
+            },
+            "malformed-sale": {
+                "status": "completed",
+                "price": 99,
+                "completed_at": "bad",
+                "updated_at": "also-bad",
+                "created_at": "still-bad",
+                "user_id": 10,
+                "plan_gb": 100,
+            },
+        }
+        cli_api = load_cli_api(payments=payments)
+
+        snapshot = cli_api.build_server_info_snapshot(now=datetime(2026, 8, 13, 9, 29, 1))
+        sales = snapshot["sales"]
+
+        self.assertEqual(sales["buckets"]["today"]["paid"], 1)
+        self.assertEqual(sales["buckets"]["today"]["revenue"], 2)
+        self.assertEqual(sales["daily_sales"][0]["paid"], 1)
+        self.assertEqual(sales["daily_sales"][0]["revenue"], 2)
+        self.assertEqual(sales["daily_sales"][1]["paid"], 8)
+        self.assertAlmostEqual(sales["daily_sales"][1]["revenue"], 18.33)
+        self.assertEqual(sales["buckets"]["all"]["paid"], 9)
+        self.assertAlmostEqual(sales["buckets"]["all"]["revenue"], 20.33)
+        self.assertEqual(snapshot["customers"]["new_today"], 1)
 
     def test_sold_traffic_counts_direct_and_reseller_configs_only(self):
         payments = {
