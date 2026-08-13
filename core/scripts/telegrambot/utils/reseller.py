@@ -1,9 +1,10 @@
 import json
+import logging
 import math
 import os
 import threading
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
@@ -20,6 +21,11 @@ except ImportError:  # pragma: no cover - Windows fallback
 
 RESELLERS_FILE = '/etc/ajib/core/scripts/telegrambot/resellers.json'
 reseller_lock = threading.RLock()
+RENEWAL_LOGGER = logging.getLogger('ajib.renewals')
+RENEWAL_INTERNAL_ERROR_FIELDS = (
+    'renewal_internal_error_type',
+    'renewal_internal_error_at',
+)
 
 
 def _sqlite_managed():
@@ -504,6 +510,51 @@ def _parse_time(value):
         return datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
     except (TypeError, ValueError):
         return None
+
+
+def _parse_renewal_time(value):
+    """Parse renewal timestamps as aware UTC without changing legacy parsers."""
+    try:
+        from utils.account_state import parse_timestamp
+    except ImportError:  # Direct module loading in compatibility tests/tools.
+        from zoneinfo import ZoneInfo
+
+        if isinstance(value, datetime):
+            parsed = value
+        elif value is None:
+            return None
+        else:
+            text = str(value).strip()
+            if text.endswith('Z'):
+                text = f'{text[:-1]}+00:00'
+            try:
+                parsed = datetime.fromisoformat(text)
+            except (TypeError, ValueError):
+                return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo(os.getenv('AJIB_TIMEZONE') or 'Asia/Tehran'))
+        return parsed.astimezone(timezone.utc)
+    return parse_timestamp(value)
+
+
+def _renewal_current_time(value=None):
+    current = _parse_renewal_time(value if value is not None else datetime.now(timezone.utc))
+    if current is None:
+        raise ValueError('Invalid renewal timestamp')
+    return current
+
+
+def _format_renewal_time(value):
+    current = _renewal_current_time(value)
+    try:
+        from utils.account_state import bot_timezone
+
+        local_timezone = bot_timezone()
+    except ImportError:  # Direct module loading in compatibility tests/tools.
+        from zoneinfo import ZoneInfo
+
+        local_timezone = ZoneInfo(os.getenv('AJIB_TIMEZONE') or 'Asia/Tehran')
+    return current.astimezone(local_timezone).strftime('%Y-%m-%d %H:%M:%S')
 
 
 def _resellers_lock_path():
@@ -1297,7 +1348,7 @@ def claim_reseller_renewal_reservation(
     lease_seconds=600,
 ):
     user_id = str(user_id)
-    current_time = now or datetime.now()
+    current_time = _renewal_current_time(now)
     with reseller_lock:
         try:
             with _resellers_file_lock():
@@ -1311,11 +1362,22 @@ def claim_reseller_renewal_reservation(
                             continue
                         status = reservation.get('renewal_status')
                         if status == 'processing':
-                            claimed_at = _parse_time(reservation.get('renewal_claimed_at'))
-                            if claimed_at is not None and 0 <= (current_time - claimed_at).total_seconds() < lease_seconds:
+                            claimed_at = _parse_renewal_time(reservation.get('renewal_claimed_at'))
+                            claim_age = (
+                                (current_time - claimed_at).total_seconds()
+                                if claimed_at is not None
+                                else None
+                            )
+                            if claim_age is not None and 0 <= claim_age < lease_seconds:
                                 return None
+                            RENEWAL_LOGGER.warning(
+                                'renewal_stale_claim_reclaimed kind=reseller reservation_id=%s '
+                                'claim_age_seconds=%s',
+                                reservation_id,
+                                int(claim_age) if claim_age is not None else 'unknown',
+                            )
                         elif status == 'attention':
-                            next_attempt = _parse_time(reservation.get('renewal_next_attempt_at'))
+                            next_attempt = _parse_renewal_time(reservation.get('renewal_next_attempt_at'))
                             if not force and (
                                 reservation.get('renewal_attention_reason') == 'external_renewal'
                                 or (next_attempt is not None and next_attempt > current_time)
@@ -1327,7 +1389,7 @@ def claim_reseller_renewal_reservation(
                         reservation['renewal_processing_from'] = status
                         reservation['renewal_status'] = 'processing'
                         reservation['renewal_claim_id'] = claim_id
-                        reservation['renewal_claimed_at'] = current_time.strftime('%Y-%m-%d %H:%M:%S')
+                        reservation['renewal_claimed_at'] = _format_renewal_time(current_time)
                         resellers[user_id] = _ensure_reseller_defaults(current)
                         _write_resellers_file(resellers)
                         return {'claim_id': claim_id, 'reservation': dict(reservation), 'config': dict(config), 'reseller': current}
@@ -1348,7 +1410,7 @@ def finish_reseller_renewal_reservation(
     if status not in {'reserved', 'attention', 'applied'}:
         return False
     user_id = str(user_id)
-    current_time = now or datetime.now()
+    current_time = _renewal_current_time(now)
     with reseller_lock:
         try:
             with _resellers_file_lock():
@@ -1368,12 +1430,14 @@ def finish_reseller_renewal_reservation(
                         reservation.pop('renewal_claimed_at', None)
                         reservation.pop('renewal_processing_from', None)
                         if status == 'applied':
-                            reservation['renewal_applied_at'] = current_time.strftime('%Y-%m-%d %H:%M:%S')
+                            reservation['renewal_applied_at'] = _format_renewal_time(current_time)
                             reservation.pop('renewal_attention_reason', None)
                             reservation.pop('renewal_last_error', None)
                             reservation.pop('renewal_next_attempt_at', None)
                             reservation.pop('renewal_api_error', None)
                             reservation.pop('renewal_api_http_status', None)
+                            for field in RENEWAL_INTERNAL_ERROR_FIELDS:
+                                reservation.pop(field, None)
                             config['cleanup_status'] = 'renewed'
                             config['cleanup_error'] = None
                             if reservation.get('after_state') is not None:
@@ -1384,11 +1448,13 @@ def finish_reseller_renewal_reservation(
                             reservation.pop('renewal_next_attempt_at', None)
                             reservation.pop('renewal_api_error', None)
                             reservation.pop('renewal_api_http_status', None)
+                            for field in RENEWAL_INTERNAL_ERROR_FIELDS:
+                                reservation.pop(field, None)
                         elif retry:
                             reservation['renewal_attempts'] = int(reservation.get('renewal_attempts', 0) or 0) + 1
-                            reservation['renewal_next_attempt_at'] = (
+                            reservation['renewal_next_attempt_at'] = _format_renewal_time(
                                 current_time + timedelta(hours=1)
-                            ).strftime('%Y-%m-%d %H:%M:%S')
+                            )
                         resellers[user_id] = _ensure_reseller_defaults(current)
                         _write_resellers_file(resellers)
                         return True
@@ -1413,6 +1479,8 @@ def refresh_reseller_renewal_baseline(user_id, reservation_id, user_data):
                             reservation.pop('renewal_attention_reason', None)
                             reservation.pop('renewal_last_error', None)
                             reservation.pop('renewal_next_attempt_at', None)
+                            for field in RENEWAL_INTERNAL_ERROR_FIELDS:
+                                reservation.pop(field, None)
                             resellers[user_id] = _ensure_reseller_defaults(current)
                             _write_resellers_file(resellers)
                             return True
@@ -1423,7 +1491,7 @@ def refresh_reseller_renewal_baseline(user_id, reservation_id, user_data):
 
 def mark_reseller_renewal_alerted(user_id, reservation_id, now=None, audience=None):
     user_id = str(user_id)
-    timestamp = (now or datetime.now()).strftime('%Y-%m-%d %H:%M:%S')
+    timestamp = _format_renewal_time(_renewal_current_time(now))
     with reseller_lock:
         try:
             with _resellers_file_lock():
@@ -1469,6 +1537,8 @@ def sync_reseller_renewal_reservation(user_id, reservation_id, status, fields=No
                             reservation.pop('renewal_next_attempt_at', None)
                             reservation.pop('renewal_api_error', None)
                             reservation.pop('renewal_api_http_status', None)
+                            for field in RENEWAL_INTERNAL_ERROR_FIELDS:
+                                reservation.pop(field, None)
                             config['cleanup_status'] = 'renewed'
                             config['cleanup_error'] = None
                             if reservation.get('after_state') is not None:
@@ -1479,6 +1549,8 @@ def sync_reseller_renewal_reservation(user_id, reservation_id, status, fields=No
                             reservation.pop('renewal_next_attempt_at', None)
                             reservation.pop('renewal_api_error', None)
                             reservation.pop('renewal_api_http_status', None)
+                            for field in RENEWAL_INTERNAL_ERROR_FIELDS:
+                                reservation.pop(field, None)
                         resellers[user_id] = _ensure_reseller_defaults(current)
                         _write_resellers_file(resellers)
                         return True

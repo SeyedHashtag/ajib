@@ -146,6 +146,9 @@ def install_stubs():
             "Average Config Value: ${average_config_value}\nLast Config: {last_config_at}\n"
             "Joined: {created_at}\nLast Payment: {last_payment_at}\nOldest Unpaid: {debt_since}"
         ),
+        "reseller_effective_credit_line": "Credit: ${effective_limit} ({credit_mode})",
+        "reseller_wholesale_balance_line": "Balance: ${balance}",
+        "admin_reseller_credit_outcomes_line": "Outcomes: {outcomes}",
         "admin_username_unknown": "N/A",
         "admin_debt_cancel": "Cancel",
         "admin_reseller_action_confirm": "Confirm {action} for {user_id}",
@@ -406,6 +409,96 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
         self.assertTrue(predicate(message(1, "💼 مدیریت نمایندگان")))
         self.assertFalse(predicate(message(2, "💼 Manage Resellers")))
         self.assertFalse(predicate(message(1, None)))
+
+    def test_admin_detail_escapes_dynamic_credit_mode_and_outcomes(self):
+        original_policy = reseller_handlers.get_reseller_credit_policy
+        original_balance = reseller_handlers.get_wholesale_balance
+        self.addCleanup(setattr, reseller_handlers, "get_reseller_credit_policy", original_policy)
+        self.addCleanup(setattr, reseller_handlers, "get_wholesale_balance", original_balance)
+        reseller_handlers.get_reseller_credit_policy = lambda _data: {
+            "effective_limit": 5,
+            "mode": "prepaid_only",
+            "outcomes": [{"outcome": "half_credit"}],
+        }
+        reseller_handlers.get_wholesale_balance = lambda _reseller_id: {"available": 3}
+
+        detail = reseller_handlers._build_admin_reseller_detail_text(
+            "en",
+            "1988",
+            {"status": "approved", "debt": 0, "configs": []},
+        )
+
+        self.assertIn("prepaid\\_only", detail)
+        self.assertIn("half\\_credit", detail)
+
+    def test_admin_detail_plaintext_fallback_only_for_entity_parse_errors(self):
+        original_get = reseller_handlers.get_reseller_data
+        original_text = reseller_handlers._build_admin_reseller_detail_text
+        original_markup = reseller_handlers._build_admin_reseller_detail_markup
+        original_edit = reseller_handlers.bot.edit_message_text
+        self.addCleanup(setattr, reseller_handlers, "get_reseller_data", original_get)
+        self.addCleanup(setattr, reseller_handlers, "_build_admin_reseller_detail_text", original_text)
+        self.addCleanup(setattr, reseller_handlers, "_build_admin_reseller_detail_markup", original_markup)
+        self.addCleanup(setattr, reseller_handlers.bot, "edit_message_text", original_edit)
+        reseller_handlers.get_reseller_data = lambda _reseller_id: {"status": "approved"}
+        reseller_handlers._build_admin_reseller_detail_text = lambda *args: "detail"
+        reseller_handlers._build_admin_reseller_detail_markup = lambda *args: DummyMarkup()
+        calls = []
+
+        def edit(*args, **kwargs):
+            calls.append((args, kwargs))
+            if len(calls) == 1:
+                raise RuntimeError("Bad Request: can't parse entities")
+
+        reseller_handlers.bot.edit_message_text = edit
+        call = types.SimpleNamespace(
+            id="callback",
+            from_user=types.SimpleNamespace(id=1),
+            message=types.SimpleNamespace(
+                chat=types.SimpleNamespace(id=2),
+                message_id=3,
+            ),
+        )
+
+        with self.assertLogs("ajib.bot.telegram", level="WARNING") as captured:
+            reseller_handlers._render_admin_reseller_detail(call, "1988", "approved", 0)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1]["parse_mode"], "Markdown")
+        self.assertNotIn("parse_mode", calls[1][1])
+        self.assertIn("plaintext_fallback", "\n".join(captured.output))
+
+    def test_admin_detail_network_error_propagates_without_plaintext_retry(self):
+        original_get = reseller_handlers.get_reseller_data
+        original_text = reseller_handlers._build_admin_reseller_detail_text
+        original_markup = reseller_handlers._build_admin_reseller_detail_markup
+        original_edit = reseller_handlers.bot.edit_message_text
+        self.addCleanup(setattr, reseller_handlers, "get_reseller_data", original_get)
+        self.addCleanup(setattr, reseller_handlers, "_build_admin_reseller_detail_text", original_text)
+        self.addCleanup(setattr, reseller_handlers, "_build_admin_reseller_detail_markup", original_markup)
+        self.addCleanup(setattr, reseller_handlers.bot, "edit_message_text", original_edit)
+        reseller_handlers.get_reseller_data = lambda _reseller_id: {"status": "approved"}
+        reseller_handlers._build_admin_reseller_detail_text = lambda *args: "detail"
+        reseller_handlers._build_admin_reseller_detail_markup = lambda *args: DummyMarkup()
+        calls = []
+
+        def edit(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise ConnectionError("network down")
+
+        reseller_handlers.bot.edit_message_text = edit
+        call = types.SimpleNamespace(
+            id="callback",
+            from_user=types.SimpleNamespace(id=1),
+            message=types.SimpleNamespace(
+                chat=types.SimpleNamespace(id=2),
+                message_id=3,
+            ),
+        )
+
+        with self.assertRaises(ConnectionError):
+            reseller_handlers._render_admin_reseller_detail(call, "1988", "approved", 0)
+        self.assertEqual(len(calls), 1)
 
     def install_renewal_stub(self, offer, unavailable="Renewal is not available"):
         original = sys.modules.get("utils.renewal")

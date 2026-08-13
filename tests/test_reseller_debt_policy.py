@@ -5,7 +5,7 @@ import tempfile
 import threading
 import types
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -1706,6 +1706,67 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.assertFalse(saved["configs"][1].get("removed_from_vpn", False))
         self.assertEqual(saved["debt"], 2.0)
         self.assertEqual(result["remaining_debt"], 2.0)
+
+    def test_reseller_claim_retry_boundaries_accept_aware_and_legacy_timestamps(self):
+        current = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+        reservation = {
+            "reservation_id": "boundary",
+            "renewal_mode": "reserved",
+            "renewal_status": "processing",
+            "renewal_claim_id": "worker",
+            "renewal_claimed_at": "2026-08-02 15:20:01",
+        }
+        self.write_resellers({
+            "1988": {
+                "status": "approved",
+                "configs": [{"username": "bob", "renewals": [reservation]}],
+            }
+        })
+
+        self.assertIsNone(self.reseller.claim_reseller_renewal_reservation(
+            "1988", "boundary", now=current
+        ))
+
+        reservation.update({
+            "renewal_status": "attention",
+            "renewal_attention_reason": "renewal_internal_error",
+            "renewal_next_attempt_at": "2026-08-02T15:30:00+03:30",
+        })
+        self.write_resellers({
+            "1988": {
+                "status": "approved",
+                "configs": [{"username": "bob", "renewals": [reservation]}],
+            }
+        })
+        claimed = self.reseller.claim_reseller_renewal_reservation(
+            "1988", "boundary", now=current
+        )
+        self.assertIsNotNone(claimed)
+
+    def test_reseller_finish_clears_internal_error_metadata_on_recovery(self):
+        current = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+        reservation = {
+            "reservation_id": "recovery",
+            "renewal_mode": "reserved",
+            "renewal_status": "processing",
+            "renewal_claim_id": "claim",
+            "renewal_internal_error_type": "RuntimeError",
+            "renewal_internal_error_at": "2026-08-02 15:00:00",
+        }
+        self.write_resellers({
+            "1988": {
+                "status": "approved",
+                "configs": [{"username": "bob", "renewals": [reservation]}],
+            }
+        })
+
+        self.assertTrue(self.reseller.finish_reseller_renewal_reservation(
+            "1988", "recovery", "claim", "reserved", now=current
+        ))
+        saved = self.read_resellers()["1988"]["configs"][0]["renewals"][0]
+        self.assertEqual(saved["renewal_status"], "reserved")
+        self.assertNotIn("renewal_internal_error_type", saved)
+        self.assertNotIn("renewal_internal_error_at", saved)
 
 
 if __name__ == "__main__":

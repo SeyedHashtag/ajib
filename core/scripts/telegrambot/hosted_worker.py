@@ -4156,6 +4156,11 @@ def _sync_hosted_renewal_event(event):
             "renewal_api_error": lookup_result.get("error"),
             "renewal_api_http_status": lookup_result.get("http_status"),
         }
+        if event.get("reason") == "renewal_internal_error":
+            fields.update({
+                "renewal_internal_error_type": (event.get("record") or {}).get("renewal_internal_error_type"),
+                "renewal_internal_error_at": (event.get("record") or {}).get("renewal_internal_error_at"),
+            })
     elif status == "applied":
         result = event.get("result") or {}
         fields = {

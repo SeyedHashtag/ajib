@@ -3077,6 +3077,10 @@ def _escape_markdown(value):
     return str(value).replace("\\", "\\\\").replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
 
 
+def _is_markdown_entity_parse_error(error):
+    return "can't parse entities" in str(error).lower()
+
+
 def _sort_resellers(items):
     def _id_key(reseller_id):
         as_str = str(reseller_id)
@@ -3327,7 +3331,7 @@ def _build_admin_reseller_detail_text(language, reseller_id, reseller_data):
         "\n"
         + get_message_text(language, "reseller_effective_credit_line").format(
             effective_limit=credit_policy["effective_limit"],
-            credit_mode=credit_policy["mode"],
+            credit_mode=_escape_markdown(credit_policy["mode"]),
         )
         + "\n"
         + get_message_text(language, "reseller_wholesale_balance_line").format(
@@ -3335,7 +3339,7 @@ def _build_admin_reseller_detail_text(language, reseller_id, reseller_data):
         )
         + "\n"
         + get_message_text(language, "admin_reseller_credit_outcomes_line").format(
-            outcomes=outcome_summary
+            outcomes=_escape_markdown(outcome_summary)
         )
     )
     return details + policy_details + "\n\n" + build_reseller_level_compact(language, reseller_data)
@@ -3531,13 +3535,18 @@ def _render_admin_reseller_detail(call, reseller_id, return_status, return_page)
             reply_markup=detail_markup,
             parse_mode="Markdown",
         )
-    except Exception:
-        logging.exception("Failed to render admin reseller detail with Markdown. reseller_id=%s", reseller_id)
+    except Exception as error:
+        if not _is_markdown_entity_parse_error(error):
+            raise
         bot.edit_message_text(
             detail_text,
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=detail_markup,
+        )
+        logging.getLogger("ajib.bot.telegram").warning(
+            "admin_reseller_detail_plaintext_fallback reseller_id=%s reason=markdown_entity_parse_error",
+            reseller_id,
         )
 
 

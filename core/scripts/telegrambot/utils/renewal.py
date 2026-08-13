@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 import uuid
 from datetime import datetime, timedelta
@@ -8,6 +9,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from utils.account_state import (
     EntitlementState,
     PanelState,
+    bot_timezone,
     inspect_account,
     panel_deadline,
     panel_days_remaining,
@@ -31,6 +33,12 @@ RESERVATION_RETRY_SECONDS = 3600
 RESERVATION_CLAIM_LEASE_SECONDS = 600
 CUSTOMER_RENEWAL_DISCOUNT_PERCENT = Decimal('10')
 MONEY = Decimal('0.01')
+RENEWAL_LOGGER = logging.getLogger('ajib.renewals')
+INTERNAL_ERROR_REASON = 'renewal_internal_error'
+INTERNAL_ERROR_FIELDS = (
+    'renewal_internal_error_type',
+    'renewal_internal_error_at',
+)
 
 
 def _load_json_file(path, default):
@@ -91,7 +99,7 @@ def _days_remaining(user_data, now=None):
 
 
 def _now_str():
-    return datetime.now().strftime(TIMESTAMP_FORMAT)
+    return _format_time(_current_time())
 
 
 def _state_key(server_id, username):
@@ -870,8 +878,8 @@ def reserved_renewal_record(offer, reservation_id=None, funded=False):
 
 def mark_payment_renewal_reserved(payment_id, payments_file=None, fields=None, now=None):
     path = payments_file or PAYMENTS_FILE
-    current = now or datetime.now()
-    timestamp = current.strftime(TIMESTAMP_FORMAT)
+    current = _current_time(now)
+    timestamp = _format_time(current)
     with locked_json(path, {}) as payments:
         record = payments.get(str(payment_id)) if isinstance(payments, dict) else None
         if not isinstance(record, dict):
@@ -923,24 +931,36 @@ def mark_payment_renewal_reserved(payment_id, payments_file=None, fields=None, n
 
 
 def _parse_time(value):
-    if isinstance(value, datetime):
-        return value
-    if not value:
+    """Return an aware UTC datetime for legacy and ISO timestamp values."""
+    return parse_timestamp(value)
+
+
+def _current_time(value=None):
+    current = _parse_time(value if value is not None else datetime.now(bot_timezone()))
+    if current is None:
+        raise ValueError('Invalid renewal timestamp')
+    return current
+
+
+def _format_time(value):
+    """Persist timestamps in the existing bot-local, offset-free format."""
+    parsed = _parse_time(value)
+    if parsed is None:
+        raise ValueError('Invalid renewal timestamp')
+    return parsed.astimezone(bot_timezone()).strftime(TIMESTAMP_FORMAT)
+
+
+def _claim_age_seconds(record, current):
+    claimed_at = _parse_time(record.get('renewal_claimed_at'))
+    if claimed_at is None:
         return None
-    raw = str(value).strip()
-    if raw.endswith('Z'):
-        raw = f"{raw[:-1]}+00:00"
-    try:
-        return datetime.fromisoformat(raw).replace(tzinfo=None)
-    except (TypeError, ValueError):
-        return None
+    return (current - claimed_at).total_seconds()
 
 
 def _claim_is_live(record, current, lease_seconds):
-    claimed_at = _parse_time(record.get('renewal_claimed_at'))
-    if claimed_at is None:
+    age = _claim_age_seconds(record, current)
+    if age is None:
         return False
-    age = (current - claimed_at).total_seconds()
     return 0 <= age < lease_seconds
 
 
@@ -957,15 +977,22 @@ def claim_payment_renewal(
     lease_seconds=RESERVATION_CLAIM_LEASE_SECONDS,
 ):
     path = payments_file or PAYMENTS_FILE
-    current = now or datetime.now()
-    timestamp = current.strftime(TIMESTAMP_FORMAT)
+    current = _current_time(now)
+    timestamp = _format_time(current)
     with locked_json(path, {}) as payments:
         record = payments.get(str(payment_id)) if isinstance(payments, dict) else None
         if not isinstance(record, dict) or record.get('renewal_mode') != 'reserved':
             return None
         status = str(record.get('renewal_status') or '')
-        if status == 'processing' and _claim_is_live(record, current, lease_seconds):
-            return None
+        if status == 'processing':
+            if _claim_is_live(record, current, lease_seconds):
+                return None
+            claim_age = _claim_age_seconds(record, current)
+            RENEWAL_LOGGER.warning(
+                'renewal_stale_claim_reclaimed kind=payment reservation_id=%s claim_age_seconds=%s',
+                payment_id,
+                int(claim_age) if claim_age is not None else 'unknown',
+            )
         if status == 'attention':
             reason = str(record.get('renewal_attention_reason') or '')
             if not force and (reason == 'external_renewal' or not _retry_is_due(record, current)):
@@ -993,8 +1020,8 @@ def finish_payment_renewal(
     if status not in {'reserved', 'attention', 'applied'}:
         return False
     path = payments_file or PAYMENTS_FILE
-    current = now or datetime.now()
-    timestamp = current.strftime(TIMESTAMP_FORMAT)
+    current = _current_time(now)
+    timestamp = _format_time(current)
     with locked_json(path, {}) as payments:
         record = payments.get(str(payment_id)) if isinstance(payments, dict) else None
         if not isinstance(record, dict) or record.get('renewal_claim_id') != str(claim_id):
@@ -1012,18 +1039,23 @@ def finish_payment_renewal(
             record.pop('renewal_last_error', None)
             record.pop('renewal_api_error', None)
             record.pop('renewal_api_http_status', None)
+            for field in INTERNAL_ERROR_FIELDS:
+                record.pop(field, None)
         elif status == 'reserved':
             record.pop('renewal_next_attempt_at', None)
             record.pop('renewal_attention_reason', None)
             record.pop('renewal_last_error', None)
             record.pop('renewal_api_error', None)
             record.pop('renewal_api_http_status', None)
+            for field in INTERNAL_ERROR_FIELDS:
+                record.pop(field, None)
         elif retry:
             attempts = max(0, _safe_int(record.get('renewal_attempts'), 0) or 0) + 1
             record['renewal_attempts'] = attempts
             record['renewal_next_attempt_at'] = (
                 current + timedelta(seconds=RESERVATION_RETRY_SECONDS)
-            ).strftime(TIMESTAMP_FORMAT)
+            )
+            record['renewal_next_attempt_at'] = _format_time(record['renewal_next_attempt_at'])
         return True
 
 
@@ -1048,7 +1080,7 @@ def reservation_generation_changed(record, user_data):
     if baseline_creation is not None and live_creation is not None and live_creation != baseline_creation:
         return True
     baseline_deadline = _parse_time(baseline.get('expiration_deadline'))
-    live_deadline = _expiration_deadline(user_data)
+    live_deadline = _parse_time(_expiration_deadline(user_data))
     if baseline_deadline is not None and live_deadline is not None and live_deadline > baseline_deadline + timedelta(seconds=1):
         return True
     baseline_days = _safe_int(baseline.get('expiration_days'))
@@ -1088,7 +1120,7 @@ def reservation_expected_time_expired(record, now=None):
     baseline = record.get('renewal_baseline') or record.get('renewal_before_state') or {}
     if not isinstance(baseline, dict):
         return False
-    current = now or datetime.now()
+    current = _current_time(now)
     deadline = _parse_time(baseline.get('expiration_deadline'))
     if deadline is not None:
         return current >= deadline
@@ -1100,7 +1132,7 @@ def reservation_expected_time_expired(record, now=None):
 
 
 def reservation_alert_due(record, now=None, reminder_seconds=86400, audience=None):
-    current = now or datetime.now()
+    current = _current_time(now)
     field = f'renewal_last_{audience}_alert_at' if audience in {'operator', 'buyer'} else 'renewal_last_alert_at'
     last_value = record.get(field)
     if last_value is None and audience in {'operator', 'buyer'}:
@@ -1111,7 +1143,12 @@ def reservation_alert_due(record, now=None, reminder_seconds=86400, audience=Non
 
 def reservation_alert_flags(record, reason, now=None):
     operator_due = reservation_alert_due(record, now=now, audience='operator')
-    buyer_allowed = reason != 'server_unavailable' or reservation_expected_time_expired(record, now=now)
+    if reason == INTERNAL_ERROR_REASON:
+        buyer_allowed = False
+    elif reason == 'server_unavailable':
+        buyer_allowed = reservation_expected_time_expired(record, now=now)
+    else:
+        buyer_allowed = True
     buyer_due = buyer_allowed and reservation_alert_due(record, now=now, audience='buyer')
     return {
         'operator_alert_due': operator_due,
@@ -1132,13 +1169,15 @@ def refresh_payment_renewal_baseline(payment_id, user_data, payments_file=None):
         record.pop('renewal_attention_reason', None)
         record.pop('renewal_last_error', None)
         record.pop('renewal_next_attempt_at', None)
+        for field in INTERNAL_ERROR_FIELDS:
+            record.pop(field, None)
         record['updated_at'] = _now_str()
         return True
 
 
 def mark_payment_renewal_alerted(payment_id, payments_file=None, now=None, audience=None):
     path = payments_file or PAYMENTS_FILE
-    timestamp = (now or datetime.now()).strftime(TIMESTAMP_FORMAT)
+    timestamp = _format_time(_current_time(now))
     with locked_json(path, {}) as payments:
         record = payments.get(str(payment_id)) if isinstance(payments, dict) else None
         if not isinstance(record, dict):
@@ -1153,6 +1192,57 @@ def mark_payment_renewal_alerted(payment_id, payments_file=None, now=None, audie
         return True
 
 
+def _event_record(record, status, fields=None):
+    updated = dict(record or {})
+    updated.update(dict(fields or {}))
+    updated['renewal_status'] = status
+    updated.pop('renewal_claim_id', None)
+    updated.pop('renewal_claimed_at', None)
+    updated.pop('renewal_processing_from', None)
+    if status in {'reserved', 'applied'}:
+        updated.pop('renewal_next_attempt_at', None)
+        updated.pop('renewal_attention_reason', None)
+        updated.pop('renewal_last_error', None)
+        updated.pop('renewal_api_error', None)
+        updated.pop('renewal_api_http_status', None)
+        for field in INTERNAL_ERROR_FIELDS:
+            updated.pop(field, None)
+    return updated
+
+
+def _internal_error_fields(error, current):
+    return {
+        'renewal_attention_reason': INTERNAL_ERROR_REASON,
+        'renewal_last_error': INTERNAL_ERROR_REASON,
+        'renewal_internal_error_type': type(error).__name__,
+        'renewal_internal_error_at': _format_time(current),
+    }
+
+
+def _redacted_exc_info(error):
+    """Keep the traceback while omitting exception text that may contain secrets."""
+    redacted = RuntimeError(f'{type(error).__name__} details redacted')
+    return RuntimeError, redacted, error.__traceback__
+
+
+def _log_renewal_transition(kind, reservation_id, record, status, reason=None, retry=False):
+    level = logging.WARNING if status == 'attention' else logging.INFO
+    attempts = max(0, _safe_int(record.get('renewal_attempts'), 0) or 0)
+    if retry:
+        attempts += 1
+    RENEWAL_LOGGER.log(
+        level,
+        'renewal_transition kind=%s reservation_id=%s from=%s to=%s reason=%s retry=%s attempts=%s',
+        kind,
+        reservation_id,
+        record.get('renewal_processing_from') or 'unknown',
+        status,
+        reason or 'none',
+        bool(retry),
+        attempts,
+    )
+
+
 def process_payment_renewal_reservation(
     payment_id,
     payments_file=None,
@@ -1164,7 +1254,7 @@ def process_payment_renewal_reservation(
     from utils.api_client import MultiServerAPI
 
     path = payments_file or PAYMENTS_FILE
-    current = now or datetime.now()
+    current = _current_time(now)
     claim = claim_payment_renewal(
         payment_id,
         payments_file=path,
@@ -1174,107 +1264,183 @@ def process_payment_renewal_reservation(
     if not claim:
         return None
     record = claim['record']
-    username = _record_username(record)
-    server_id = _record_server_id(record)
-    multi_api = multi_api or MultiServerAPI()
-    api_client, user_data, lookup_result = lookup_renewal_user(
-        multi_api,
-        username,
-        server_id=server_id,
-    )
-    inspection = inspect_reserved_renewal(
-        record,
-        user_data,
-        force_apply=force_apply,
-        lookup_result=lookup_result,
-    )
-    if inspection['action'] == 'wait':
-        finish_payment_renewal(
-            payment_id,
-            claim['claim_id'],
-            'reserved',
-            payments_file=path,
-            now=current,
+    stage = 'api_client'
+    try:
+        username = _record_username(record)
+        server_id = _record_server_id(record)
+        multi_api = multi_api or MultiServerAPI()
+        stage = 'lookup'
+        api_client, user_data, lookup_result = lookup_renewal_user(
+            multi_api,
+            username,
+            server_id=server_id,
         )
-        return {'payment_id': str(payment_id), 'status': 'waiting', 'record': record}
-    if inspection['action'] == 'attention':
-        reason = inspection.get('reason')
-        alert_flags = reservation_alert_flags(record, reason, now=current)
-        finish_payment_renewal(
-            payment_id,
-            claim['claim_id'],
-            'attention',
-            payments_file=path,
-            now=current,
-            retry=bool(inspection.get('retry')),
-            fields={
+        stage = 'inspect'
+        inspection = inspect_reserved_renewal(
+            record,
+            user_data,
+            force_apply=force_apply,
+            lookup_result=lookup_result,
+        )
+        if inspection['action'] == 'wait':
+            stage = 'finish_waiting'
+            persisted = finish_payment_renewal(
+                payment_id,
+                claim['claim_id'],
+                'reserved',
+                payments_file=path,
+                now=current,
+            )
+            if not persisted:
+                raise RuntimeError('Could not persist waiting renewal state')
+            return {
+                'payment_id': str(payment_id),
+                'status': 'waiting',
+                'record': _event_record(record, 'reserved'),
+            }
+        if inspection['action'] == 'attention':
+            reason = inspection.get('reason')
+            retry = bool(inspection.get('retry'))
+            alert_flags = reservation_alert_flags(record, reason, now=current)
+            fields = {
                 'renewal_attention_reason': reason,
                 'renewal_last_error': reason,
                 'renewal_live_state': capture_user_state(user_data) if user_data else None,
                 **_lookup_failure_fields(lookup_result),
-            },
-        )
-        return {
-            'payment_id': str(payment_id),
-            'status': 'attention',
-            'reason': reason,
-            'retry': bool(inspection.get('retry')),
-            **alert_flags,
-            'record': record,
-            'user_data': user_data,
-            'lookup_result': lookup_result,
-        }
+            }
+            stage = 'finish_attention'
+            persisted = finish_payment_renewal(
+                payment_id,
+                claim['claim_id'],
+                'attention',
+                payments_file=path,
+                now=current,
+                retry=retry,
+                fields=fields,
+            )
+            if not persisted:
+                raise RuntimeError('Could not persist renewal attention state')
+            _log_renewal_transition('payment', payment_id, record, 'attention', reason, retry)
+            return {
+                'payment_id': str(payment_id),
+                'status': 'attention',
+                'reason': reason,
+                'retry': retry,
+                **alert_flags,
+                'record': _event_record(record, 'attention', fields),
+                'user_data': user_data,
+                'lookup_result': lookup_result,
+            }
 
-    result = execute_reserved_renewal(record, multi_api=multi_api, force=force_apply)
-    if not result.get('success'):
-        reason = result.get('reason') or 'renewal_reset_failed'
-        alert_flags = reservation_alert_flags(record, reason, now=current)
-        finish_payment_renewal(
-            payment_id,
-            claim['claim_id'],
-            'attention',
-            payments_file=path,
-            now=current,
-            retry=True,
-            fields={
+        stage = 'execute'
+        result = execute_reserved_renewal(record, multi_api=multi_api, force=force_apply)
+        if not result.get('success'):
+            reason = result.get('reason') or 'renewal_reset_failed'
+            alert_flags = reservation_alert_flags(record, reason, now=current)
+            fields = {
                 'renewal_attention_reason': reason,
                 'renewal_last_error': reason,
                 'renewal_before_state': result.get('before_state', record.get('renewal_before_state')),
                 **_lookup_failure_fields(result.get('lookup_result')),
-            },
-        )
-        return {
-            'payment_id': str(payment_id),
-            'status': 'attention',
-            'reason': reason,
-            'retry': True,
-            **alert_flags,
-            'record': record,
-            'result': result,
-        }
+            }
+            stage = 'finish_execute_attention'
+            persisted = finish_payment_renewal(
+                payment_id,
+                claim['claim_id'],
+                'attention',
+                payments_file=path,
+                now=current,
+                retry=True,
+                fields=fields,
+            )
+            if not persisted:
+                raise RuntimeError('Could not persist failed renewal state')
+            _log_renewal_transition('payment', payment_id, record, 'attention', reason, True)
+            return {
+                'payment_id': str(payment_id),
+                'status': 'attention',
+                'reason': reason,
+                'retry': True,
+                **alert_flags,
+                'record': _event_record(record, 'attention', fields),
+                'result': result,
+            }
 
-    persisted = finish_payment_renewal(
-        payment_id,
-        claim['claim_id'],
-        'applied',
-        payments_file=path,
-        now=current,
-        fields={
+        stage = 'finish_applied'
+        applied_fields = {
             'renewal_before_state': result.get('before_state'),
             'renewal_after_state': result.get('after_state'),
             'username': result.get('username'),
             'server_id': result.get('server_id'),
-        },
-    )
-    if persisted:
+        }
+        persisted = finish_payment_renewal(
+            payment_id,
+            claim['claim_id'],
+            'applied',
+            payments_file=path,
+            now=current,
+            fields=applied_fields,
+        )
+        if not persisted:
+            raise RuntimeError('Could not persist applied renewal state')
         mark_cleanup_state_renewed(result.get('username'), result.get('server_id'))
-    return {
-        'payment_id': str(payment_id),
-        'status': 'applied',
-        'record': record,
-        'result': result,
-        'api_client': result.get('api_client') or api_client,
-    }
+        _log_renewal_transition('payment', payment_id, record, 'applied')
+        return {
+            'payment_id': str(payment_id),
+            'status': 'applied',
+            'record': _event_record(record, 'applied', applied_fields),
+            'result': result,
+            'api_client': result.get('api_client') or api_client,
+        }
+    except Exception as error:
+        fields = _internal_error_fields(error, current)
+        try:
+            recovered = finish_payment_renewal(
+                payment_id,
+                claim['claim_id'],
+                'attention',
+                payments_file=path,
+                now=current,
+                retry=True,
+                fields=fields,
+            )
+        except Exception as recovery_error:
+            RENEWAL_LOGGER.critical(
+                'renewal_claim_recovery_error kind=payment reservation_id=%s stage=%s '
+                'error_type=%s recovery_error_type=%s claim_released=false retry_seconds=%s',
+                payment_id,
+                stage,
+                type(error).__name__,
+                type(recovery_error).__name__,
+                RESERVATION_RETRY_SECONDS,
+                exc_info=_redacted_exc_info(recovery_error),
+            )
+            raise
+        log_method = RENEWAL_LOGGER.error if recovered else RENEWAL_LOGGER.critical
+        log_method(
+            'renewal_processing_error kind=payment reservation_id=%s stage=%s error_type=%s '
+            'claim_released=%s retry_seconds=%s',
+            payment_id,
+            stage,
+            type(error).__name__,
+            bool(recovered),
+            RESERVATION_RETRY_SECONDS,
+            exc_info=_redacted_exc_info(error),
+        )
+        if not recovered:
+            raise
+        _log_renewal_transition(
+            'payment', payment_id, record, 'attention', INTERNAL_ERROR_REASON, True
+        )
+        alert_flags = reservation_alert_flags(record, INTERNAL_ERROR_REASON, now=current)
+        return {
+            'payment_id': str(payment_id),
+            'status': 'attention',
+            'reason': INTERNAL_ERROR_REASON,
+            'retry': True,
+            **alert_flags,
+            'record': _event_record(record, 'attention', fields),
+        }
 
 
 def process_reseller_renewal_reservation(
@@ -1292,7 +1458,7 @@ def process_reseller_renewal_reservation(
         is_reseller_debt_charge_paid,
     )
 
-    current = now or datetime.now()
+    current = _current_time(now)
     claim = claim_reseller_renewal_reservation(
         reseller_id,
         reservation_id,
@@ -1311,136 +1477,220 @@ def process_reseller_renewal_reservation(
         'renewal_server_id': config.get('server_id'),
         'renewal_source': reservation.get('renewal_source') or 'reseller_customer',
     }
-    multi_api = multi_api or MultiServerAPI()
-    api_client, user_data, lookup_result = lookup_renewal_user(
-        multi_api,
-        record['renewal_username'],
-        server_id=record.get('renewal_server_id'),
-    )
-    inspection = inspect_reserved_renewal(
-        record,
-        user_data,
-        force_apply=force_apply,
-        lookup_result=lookup_result,
-    )
-    if inspection['action'] == 'wait':
-        finish_reseller_renewal_reservation(
-            reseller_id,
-            reservation_id,
-            claim['claim_id'],
-            'reserved',
-            now=current,
+    stage = 'api_client'
+    try:
+        multi_api = multi_api or MultiServerAPI()
+        stage = 'lookup'
+        api_client, user_data, lookup_result = lookup_renewal_user(
+            multi_api,
+            record['renewal_username'],
+            server_id=record.get('renewal_server_id'),
         )
-        return {'reservation_id': str(reservation_id), 'reseller_id': str(reseller_id), 'status': 'waiting', 'record': record}
-    if inspection['action'] == 'attention':
-        reason = inspection.get('reason')
-        alert_flags = reservation_alert_flags(reservation, reason, now=current)
-        finish_reseller_renewal_reservation(
-            reseller_id,
-            reservation_id,
-            claim['claim_id'],
-            'attention',
-            now=current,
-            retry=bool(inspection.get('retry')),
-            fields={
+        stage = 'inspect'
+        inspection = inspect_reserved_renewal(
+            record,
+            user_data,
+            force_apply=force_apply,
+            lookup_result=lookup_result,
+        )
+        if inspection['action'] == 'wait':
+            stage = 'finish_waiting'
+            persisted = finish_reseller_renewal_reservation(
+                reseller_id,
+                reservation_id,
+                claim['claim_id'],
+                'reserved',
+                now=current,
+            )
+            if not persisted:
+                raise RuntimeError('Could not persist waiting reseller renewal state')
+            return {
+                'reservation_id': str(reservation_id),
+                'reseller_id': str(reseller_id),
+                'status': 'waiting',
+                'record': _event_record(record, 'reserved'),
+            }
+        if inspection['action'] == 'attention':
+            reason = inspection.get('reason')
+            retry = bool(inspection.get('retry'))
+            alert_flags = reservation_alert_flags(reservation, reason, now=current)
+            fields = {
                 'renewal_attention_reason': reason,
                 'renewal_last_error': reason,
                 'renewal_live_state': capture_user_state(user_data) if user_data else None,
                 **_lookup_failure_fields(lookup_result),
-            },
-        )
-        return {
-            'reservation_id': str(reservation_id),
-            'reseller_id': str(reseller_id),
-            'status': 'attention',
-            'reason': reason,
-            'retry': bool(inspection.get('retry')),
-            **alert_flags,
-            'record': record,
-            'user_data': user_data,
-            'lookup_result': lookup_result,
-        }
+            }
+            stage = 'finish_attention'
+            persisted = finish_reseller_renewal_reservation(
+                reseller_id,
+                reservation_id,
+                claim['claim_id'],
+                'attention',
+                now=current,
+                retry=retry,
+                fields=fields,
+            )
+            if not persisted:
+                raise RuntimeError('Could not persist reseller renewal attention state')
+            _log_renewal_transition('reseller', reservation_id, record, 'attention', reason, retry)
+            return {
+                'reservation_id': str(reservation_id),
+                'reseller_id': str(reseller_id),
+                'status': 'attention',
+                'reason': reason,
+                'retry': retry,
+                **alert_flags,
+                'record': _event_record(record, 'attention', fields),
+                'user_data': user_data,
+                'lookup_result': lookup_result,
+            }
 
-    restricted = reseller_data.get('status') != 'approved'
-    charge_id = reservation.get('debt_charge_id')
-    funded = bool(reservation.get('funded_at_checkout')) or not charge_id
-    charge_paid = funded or is_reseller_debt_charge_paid(reseller_data, charge_id)
-    if restricted and not charge_paid and not force_apply:
-        reason = 'reseller_debt_review'
-        alert_flags = reservation_alert_flags(reservation, reason, now=current)
-        finish_reseller_renewal_reservation(
-            reseller_id,
-            reservation_id,
-            claim['claim_id'],
-            'attention',
-            now=current,
-            retry=True,
-            fields={
+        stage = 'debt_policy'
+        restricted = reseller_data.get('status') != 'approved'
+        charge_id = reservation.get('debt_charge_id')
+        funded = bool(reservation.get('funded_at_checkout')) or not charge_id
+        charge_paid = funded or is_reseller_debt_charge_paid(reseller_data, charge_id)
+        if restricted and not charge_paid and not force_apply:
+            reason = 'reseller_debt_review'
+            alert_flags = reservation_alert_flags(reservation, reason, now=current)
+            fields = {
                 'renewal_attention_reason': reason,
                 'renewal_last_error': reason,
                 'renewal_live_state': capture_user_state(user_data),
-            },
-        )
-        return {
-            'reservation_id': str(reservation_id),
-            'reseller_id': str(reseller_id),
-            'status': 'attention',
-            'reason': reason,
-            'retry': True,
-            **alert_flags,
-            'record': record,
-        }
+            }
+            stage = 'finish_debt_attention'
+            persisted = finish_reseller_renewal_reservation(
+                reseller_id,
+                reservation_id,
+                claim['claim_id'],
+                'attention',
+                now=current,
+                retry=True,
+                fields=fields,
+            )
+            if not persisted:
+                raise RuntimeError('Could not persist reseller debt review state')
+            _log_renewal_transition('reseller', reservation_id, record, 'attention', reason, True)
+            return {
+                'reservation_id': str(reservation_id),
+                'reseller_id': str(reseller_id),
+                'status': 'attention',
+                'reason': reason,
+                'retry': True,
+                **alert_flags,
+                'record': _event_record(record, 'attention', fields),
+            }
 
-    result = execute_reserved_renewal(record, multi_api=multi_api, force=force_apply)
-    if not result.get('success'):
-        reason = result.get('reason') or 'renewal_reset_failed'
-        alert_flags = reservation_alert_flags(reservation, reason, now=current)
-        finish_reseller_renewal_reservation(
-            reseller_id,
-            reservation_id,
-            claim['claim_id'],
-            'attention',
-            now=current,
-            retry=True,
-            fields={
+        stage = 'execute'
+        result = execute_reserved_renewal(record, multi_api=multi_api, force=force_apply)
+        if not result.get('success'):
+            reason = result.get('reason') or 'renewal_reset_failed'
+            alert_flags = reservation_alert_flags(reservation, reason, now=current)
+            fields = {
                 'renewal_attention_reason': reason,
                 'renewal_last_error': reason,
                 'before_state': result.get('before_state', reservation.get('before_state')),
                 **_lookup_failure_fields(result.get('lookup_result')),
-            },
+            }
+            stage = 'finish_execute_attention'
+            persisted = finish_reseller_renewal_reservation(
+                reseller_id,
+                reservation_id,
+                claim['claim_id'],
+                'attention',
+                now=current,
+                retry=True,
+                fields=fields,
+            )
+            if not persisted:
+                raise RuntimeError('Could not persist failed reseller renewal state')
+            _log_renewal_transition('reseller', reservation_id, record, 'attention', reason, True)
+            return {
+                'reservation_id': str(reservation_id),
+                'reseller_id': str(reseller_id),
+                'status': 'attention',
+                'reason': reason,
+                'retry': True,
+                **alert_flags,
+                'record': _event_record(record, 'attention', fields),
+                'result': result,
+            }
+
+        stage = 'finish_applied'
+        applied_fields = {
+            'before_state': result.get('before_state'),
+            'after_state': result.get('after_state'),
+        }
+        persisted = finish_reseller_renewal_reservation(
+            reseller_id,
+            reservation_id,
+            claim['claim_id'],
+            'applied',
+            now=current,
+            fields=applied_fields,
         )
+        if not persisted:
+            raise RuntimeError('Could not persist applied reseller renewal state')
+        mark_cleanup_state_renewed(result.get('username'), result.get('server_id'))
+        _log_renewal_transition('reseller', reservation_id, record, 'applied')
+        return {
+            'reservation_id': str(reservation_id),
+            'reseller_id': str(reseller_id),
+            'status': 'applied',
+            'record': _event_record(record, 'applied', applied_fields),
+            'result': result,
+            'api_client': result.get('api_client') or api_client,
+        }
+    except Exception as error:
+        fields = _internal_error_fields(error, current)
+        try:
+            recovered = finish_reseller_renewal_reservation(
+                reseller_id,
+                reservation_id,
+                claim['claim_id'],
+                'attention',
+                now=current,
+                retry=True,
+                fields=fields,
+            )
+        except Exception as recovery_error:
+            RENEWAL_LOGGER.critical(
+                'renewal_claim_recovery_error kind=reseller reservation_id=%s stage=%s '
+                'error_type=%s recovery_error_type=%s claim_released=false retry_seconds=%s',
+                reservation_id,
+                stage,
+                type(error).__name__,
+                type(recovery_error).__name__,
+                RESERVATION_RETRY_SECONDS,
+                exc_info=_redacted_exc_info(recovery_error),
+            )
+            raise
+        log_method = RENEWAL_LOGGER.error if recovered else RENEWAL_LOGGER.critical
+        log_method(
+            'renewal_processing_error kind=reseller reservation_id=%s stage=%s error_type=%s '
+            'claim_released=%s retry_seconds=%s',
+            reservation_id,
+            stage,
+            type(error).__name__,
+            bool(recovered),
+            RESERVATION_RETRY_SECONDS,
+            exc_info=_redacted_exc_info(error),
+        )
+        if not recovered:
+            raise
+        _log_renewal_transition(
+            'reseller', reservation_id, record, 'attention', INTERNAL_ERROR_REASON, True
+        )
+        alert_flags = reservation_alert_flags(reservation, INTERNAL_ERROR_REASON, now=current)
         return {
             'reservation_id': str(reservation_id),
             'reseller_id': str(reseller_id),
             'status': 'attention',
-            'reason': reason,
+            'reason': INTERNAL_ERROR_REASON,
             'retry': True,
             **alert_flags,
-            'record': record,
-            'result': result,
+            'record': _event_record(record, 'attention', fields),
         }
-
-    persisted = finish_reseller_renewal_reservation(
-        reseller_id,
-        reservation_id,
-        claim['claim_id'],
-        'applied',
-        now=current,
-        fields={
-            'before_state': result.get('before_state'),
-            'after_state': result.get('after_state'),
-        },
-    )
-    if persisted:
-        mark_cleanup_state_renewed(result.get('username'), result.get('server_id'))
-    return {
-        'reservation_id': str(reservation_id),
-        'reseller_id': str(reseller_id),
-        'status': 'applied',
-        'record': record,
-        'result': result,
-        'api_client': result.get('api_client') or api_client,
-    }
 
 
 def mark_cleanup_state_renewed(username, server_id):

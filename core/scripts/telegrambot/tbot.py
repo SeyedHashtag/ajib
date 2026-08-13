@@ -202,8 +202,8 @@ def payment_monitoring_thread():
         try:
             from utils.purchase_plan import check_pending_payments
             check_pending_payments()
-        except Exception as e:
-            print(f"Error in payment monitoring: {e}")
+        except Exception:
+            logging.getLogger("ajib.payments").exception("Error in payment monitoring")
         # Check every 5 minutes
         time.sleep(300)
 

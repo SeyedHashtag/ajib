@@ -3552,8 +3552,10 @@ def process_main_reserved_renewals(now=None):
             elif event.get('status') == 'attention' and recipient_id is not None:
                 _notify_reserved_renewal_attention('p', event, recipient_id)
         except Exception as error:
-            logging.getLogger('ajib.renewals').exception(
-                'Failed to process payment renewal reservation %s: %s', payment_id, error
+            logging.getLogger('ajib.renewals').error(
+                'renewal_monitor_error kind=payment reservation_id=%s error_type=%s',
+                payment_id,
+                type(error).__name__,
             )
 
     for item in list_reseller_renewal_reservations():
@@ -3578,11 +3580,10 @@ def process_main_reserved_renewals(now=None):
             elif event.get('status') == 'attention':
                 _notify_reserved_renewal_attention('r', event, int(reseller_id))
         except Exception as error:
-            logging.getLogger('ajib.renewals').exception(
-                'Failed to process reseller renewal reservation %s/%s: %s',
-                reseller_id,
+            logging.getLogger('ajib.renewals').error(
+                'renewal_monitor_error kind=reseller reservation_id=%s error_type=%s',
                 reservation_id,
-                error,
+                type(error).__name__,
             )
     return events
 

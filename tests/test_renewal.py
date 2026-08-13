@@ -4,7 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -881,6 +881,70 @@ class RenewalTests(unittest.TestCase):
 
         self.assertTrue(self.renewal.reservation_generation_changed(record, extended))
 
+    def test_production_offset_baseline_equal_to_date_only_live_deadline_waits(self):
+        now = datetime(2026, 8, 13, 18, 0, tzinfo=timezone.utc)
+        active_user = {
+            "account_creation_date": "2026-07-14",
+            "expiration_days": 60,
+            "blocked": False,
+            "upload_bytes": GB_BYTES,
+            "download_bytes": 2 * GB_BYTES,
+            "max_download_bytes": 5 * GB_BYTES,
+            "status": "Online",
+        }
+        payment = {
+            **self.base_payment(type="renewal"),
+            "renewal_source": "customer",
+            "renewal_username": "alice",
+            "renewal_server_id": "s1",
+            "renewal_mode": "reserved",
+            "renewal_status": "processing",
+            "renewal_claim_id": "stale-production-worker",
+            "renewal_claimed_at": "2026-08-13T17:49:59+00:00",
+            "renewal_baseline": {
+                **self.renewal.capture_user_state(active_user, now=now),
+                "expiration_deadline": "2026-09-11T20:30:00+00:00",
+            },
+            "renewal_plan_snapshot": {"plan_gb": "5", "days": 30, "unlimited": False},
+        }
+        self.write_json(self.renewal.PAYMENTS_FILE, {"production-reservation": payment})
+        client = FakeClient("s1", {"alice": active_user})
+
+        with self.assertLogs("ajib.renewals", level="WARNING") as captured:
+            result = self.renewal.process_payment_renewal_reservation(
+                "production-reservation",
+                payments_file=self.renewal.PAYMENTS_FILE,
+                multi_api=FakeMultiAPI({"s1": client}),
+                now=now,
+            )
+
+        saved = self.read_json(self.renewal.PAYMENTS_FILE)["production-reservation"]
+        self.assertEqual(result["status"], "waiting")
+        self.assertEqual(saved["renewal_status"], "reserved")
+        self.assertNotIn("renewal_claim_id", saved)
+        self.assertEqual(client.reset_calls, [])
+        self.assertIn("renewal_stale_claim_reclaimed", "\n".join(captured.output))
+
+    def test_real_deadline_extension_is_detected_across_offsets(self):
+        baseline_user = {
+            "account_creation_date": "2026-07-14",
+            "expiration_days": 60,
+            "blocked": False,
+            "upload_bytes": GB_BYTES,
+            "download_bytes": GB_BYTES,
+            "max_download_bytes": 5 * GB_BYTES,
+            "status": "active",
+        }
+        record = {
+            "renewal_baseline": {
+                **self.renewal.capture_user_state(baseline_user),
+                "expiration_deadline": "2026-09-12T00:00:00+03:30",
+            }
+        }
+        live_user = {**baseline_user, "expiration_days": 61}
+
+        self.assertTrue(self.renewal.reservation_generation_changed(record, live_user))
+
     def test_apply_now_consumes_reservation_after_an_external_plan_change(self):
         active_changed_plan = {
             "blocked": False,
@@ -1190,6 +1254,188 @@ class RenewalTests(unittest.TestCase):
         self.assertTrue(self.renewal.reservation_alert_due(
             record, now=now + timedelta(days=1)
         ))
+
+    def test_lease_retry_expiry_and_alert_boundaries_accept_mixed_timestamp_offsets(self):
+        current = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+        payment = {
+            **self.base_payment(type="renewal"),
+            "renewal_mode": "reserved",
+            "renewal_status": "processing",
+            "renewal_claim_id": "live-claim",
+            "renewal_claimed_at": "2026-08-02T15:20:01+03:30",
+        }
+        self.write_json(self.renewal.PAYMENTS_FILE, {"boundary": payment})
+        self.assertIsNone(self.renewal.claim_payment_renewal(
+            "boundary", payments_file=self.renewal.PAYMENTS_FILE, now=current
+        ))
+
+        payment.update({
+            "renewal_status": "attention",
+            "renewal_attention_reason": "server_unavailable",
+            "renewal_next_attempt_at": "2026-08-02T15:30:00+03:30",
+        })
+        self.write_json(self.renewal.PAYMENTS_FILE, {"boundary": payment})
+        self.assertIsNotNone(self.renewal.claim_payment_renewal(
+            "boundary", payments_file=self.renewal.PAYMENTS_FILE, now=current
+        ))
+
+        record = {
+            "renewal_baseline": {"expiration_deadline": "2026-08-02T15:30:00+03:30"},
+            "renewal_last_operator_alert_at": "2026-08-01 15:30:00",
+        }
+        self.assertTrue(self.renewal.reservation_expected_time_expired(record, now=current))
+        self.assertTrue(self.renewal.reservation_alert_due(record, now=current, audience="operator"))
+
+    def test_unexpected_payment_error_releases_claim_and_recovers_after_hourly_retry(self):
+        now = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+        active_user = {
+            "blocked": False,
+            "expiration_days": 12,
+            "upload_bytes": GB_BYTES,
+            "download_bytes": GB_BYTES,
+            "max_download_bytes": 5 * GB_BYTES,
+            "status": "active",
+        }
+        payment = {
+            **self.base_payment(type="renewal"),
+            "renewal_username": "alice",
+            "renewal_server_id": "s1",
+            "renewal_mode": "reserved",
+            "renewal_status": "reserved",
+            "renewal_baseline": self.renewal.capture_user_state(active_user, now=now),
+        }
+        self.write_json(self.renewal.PAYMENTS_FILE, {"internal-error": payment})
+
+        class FailingMultiAPI:
+            message = "private token at https://secret.example/api"
+
+            def find_user_on_server(self, username, server_id):
+                raise RuntimeError(self.message)
+
+        with self.assertLogs("ajib.renewals", level="ERROR") as captured:
+            failed = self.renewal.process_payment_renewal_reservation(
+                "internal-error",
+                payments_file=self.renewal.PAYMENTS_FILE,
+                multi_api=FailingMultiAPI(),
+                now=now,
+            )
+        saved = self.read_json(self.renewal.PAYMENTS_FILE)["internal-error"]
+        logs = "\n".join(captured.output)
+        self.assertEqual(failed["reason"], "renewal_internal_error")
+        self.assertTrue(failed["operator_alert_due"])
+        self.assertFalse(failed["buyer_alert_due"])
+        self.assertEqual(saved["renewal_status"], "attention")
+        self.assertEqual(saved["renewal_attempts"], 1)
+        self.assertEqual(saved["renewal_internal_error_type"], "RuntimeError")
+        self.assertNotIn("renewal_claim_id", saved)
+        self.assertNotIn("secret.example", logs)
+        self.assertIn("stage=lookup", logs)
+        self.assertIn("retry_seconds=3600", logs)
+
+        self.assertTrue(self.renewal.mark_payment_renewal_alerted(
+            "internal-error",
+            payments_file=self.renewal.PAYMENTS_FILE,
+            now=now,
+            audience="operator",
+        ))
+        alerted = self.read_json(self.renewal.PAYMENTS_FILE)["internal-error"]
+        flags = self.renewal.reservation_alert_flags(
+            alerted,
+            "renewal_internal_error",
+            now=now + timedelta(hours=1),
+        )
+        self.assertFalse(flags["operator_alert_due"])
+        self.assertFalse(flags["buyer_alert_due"])
+
+        with self.assertNoLogs("ajib.renewals", level="ERROR"):
+            too_soon = self.renewal.process_payment_renewal_reservation(
+                "internal-error",
+                payments_file=self.renewal.PAYMENTS_FILE,
+                multi_api=FailingMultiAPI(),
+                now=now + timedelta(minutes=59),
+            )
+        self.assertIsNone(too_soon)
+
+        client = FakeClient("s1", {"alice": active_user})
+        recovered = self.renewal.process_payment_renewal_reservation(
+            "internal-error",
+            payments_file=self.renewal.PAYMENTS_FILE,
+            multi_api=FakeMultiAPI({"s1": client}),
+            now=now + timedelta(hours=1),
+        )
+        saved = self.read_json(self.renewal.PAYMENTS_FILE)["internal-error"]
+        self.assertEqual(recovered["status"], "waiting")
+        self.assertEqual(saved["renewal_status"], "reserved")
+        self.assertNotIn("renewal_internal_error_type", saved)
+        self.assertNotIn("renewal_internal_error_at", saved)
+
+    def test_claim_recovery_persistence_failure_is_critical_and_remains_stale(self):
+        now = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+        payment = {
+            **self.base_payment(type="renewal"),
+            "renewal_username": "alice",
+            "renewal_server_id": "s1",
+            "renewal_mode": "reserved",
+            "renewal_status": "reserved",
+            "renewal_baseline": {},
+        }
+        self.write_json(self.renewal.PAYMENTS_FILE, {"recovery-failure": payment})
+        original_finish = self.renewal.finish_payment_renewal
+        self.addCleanup(setattr, self.renewal, "finish_payment_renewal", original_finish)
+        self.renewal.finish_payment_renewal = lambda *args, **kwargs: False
+
+        with self.assertLogs("ajib.renewals", level="CRITICAL") as captured:
+            with self.assertRaises(RuntimeError):
+                self.renewal.process_payment_renewal_reservation(
+                    "recovery-failure",
+                    payments_file=self.renewal.PAYMENTS_FILE,
+                    multi_api=FakeMultiAPI({}),
+                    now=now,
+                )
+
+        saved = self.read_json(self.renewal.PAYMENTS_FILE)["recovery-failure"]
+        self.assertEqual(saved["renewal_status"], "processing")
+        self.assertIn("renewal_claim_id", saved)
+        self.assertIn("claim_released=False", "\n".join(captured.output))
+
+    def test_unexpected_reseller_error_releases_claim_for_hourly_retry(self):
+        now = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+        reseller_stub = sys.modules["utils.reseller"]
+        finished = []
+        reservation = {
+            "reservation_id": "reseller-error",
+            "renewal_mode": "reserved",
+            "renewal_status": "reserved",
+            "renewal_baseline": {},
+        }
+        reseller_stub.claim_reseller_renewal_reservation = lambda *args, **kwargs: {
+            "claim_id": "claim-1",
+            "reservation": reservation,
+            "config": {"username": "bob", "server_id": "s1"},
+            "reseller": {"status": "approved"},
+        }
+        reseller_stub.finish_reseller_renewal_reservation = (
+            lambda *args, **kwargs: finished.append((args, kwargs)) or True
+        )
+        reseller_stub.is_reseller_debt_charge_paid = lambda *_args: True
+
+        class FailingMultiAPI:
+            def find_user_on_server(self, username, server_id):
+                raise ValueError("private payload")
+
+        with self.assertLogs("ajib.renewals", level="ERROR"):
+            event = self.renewal.process_reseller_renewal_reservation(
+                "1988", "reseller-error", multi_api=FailingMultiAPI(), now=now
+            )
+
+        self.assertEqual(event["reason"], "renewal_internal_error")
+        self.assertFalse(event["buyer_alert_due"])
+        self.assertEqual(finished[-1][0][3], "attention")
+        self.assertTrue(finished[-1][1]["retry"])
+        self.assertEqual(
+            finished[-1][1]["fields"]["renewal_internal_error_type"],
+            "ValueError",
+        )
 
     def test_restricted_reseller_requires_its_linked_charge_to_be_paid(self):
         expired = self.expired_user()

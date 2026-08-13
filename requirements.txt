@@ -5,3 +5,4 @@ pyTelegramBotAPI==4.35.0
 python-dotenv==1.2.2
 qrcode==8.2
 requests==2.34.2
+tzdata==2026.3
