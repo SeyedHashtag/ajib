@@ -1031,9 +1031,10 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(self.read_json(self.cleanup.TEST_CONFIGS_FILE), {})
         state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
         self.assertEqual(state["cleanup_status"], "manual_review")
+        self.assertEqual(state["manual_review_reason"], "unowned_server_user")
         self.assertEqual(self.cleanup._test_bot.sent_messages, [])
 
-    def test_verified_orphan_is_not_recovered_while_any_server_is_unavailable(self):
+    def test_verified_orphan_waits_for_all_servers_then_enters_automatic_recovery(self):
         self.write_default_files()
         clients = {
             "s1": FakeClient("s1", {"t12345": self.recovered_test_user()}),
@@ -1045,9 +1046,21 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(self.read_json(self.cleanup.TEST_CONFIGS_FILE), {})
         state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
         self.assertEqual(state["cleanup_status"], "manual_review")
+        self.assertEqual(state["manual_review_reason"], "unowned_server_user")
         self.assertEqual(self.cleanup._test_bot.sent_messages, [])
 
-    def test_recovered_test_notification_failure_stays_manual_until_retry_succeeds(self):
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now + timedelta(hours=1),
+            multi_api=FakeMultiAPI({"s1": clients["s1"]}),
+        )
+
+        recovered = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.assertEqual(recovered["cleanup_status"], "notified")
+        self.assertEqual(recovered["recovery_source"], "verified_orphan_test")
+        self.assertNotIn("manual_review_reason", recovered)
+        self.assertEqual(len(self.cleanup._test_bot.sent_messages), 1)
+
+    def test_recovered_test_notification_failure_stays_pending_until_retry_succeeds(self):
         self.write_default_files()
         client = FakeClient("s1", {"t12345": self.recovered_test_user()})
         original_notify = self.cleanup._notify_candidate
@@ -1057,7 +1070,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
 
         failed = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
-        self.assertEqual(failed["cleanup_status"], "manual_review")
+        self.assertEqual(failed["cleanup_status"], "notification_pending")
         self.assertEqual(failed["cleanup_error"], "notification_failed")
         self.assertNotIn("delete_after", failed)
 
@@ -1071,6 +1084,74 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(notified["cleanup_status"], "notified")
         self.assertEqual(notified["delete_after"], "2026-06-11 13:00:00")
         self.assertEqual(notified["recovery_attempts"], 2)
+
+    def test_legacy_recovered_manual_state_is_adopted_without_resetting_metadata(self):
+        self.write_default_files()
+        self.write_json(self.cleanup.STATE_FILE, {
+            "s1:t12345": {
+                "username": "t12345",
+                "server_id": "s1",
+                "source": "test",
+                "cleanup_status": "manual_review",
+                "cleanup_error": "notification_failed",
+                "notification_error": "latest blocked",
+                "recovery_first_notification_error": "first blocked",
+                "recovery_source": "verified_orphan_test",
+                "recovery_attempts": 2,
+                "first_seen_at": "2026-06-07 11:00:00",
+                "recovery_discovered_at": "2026-06-07 10:59:00",
+            },
+        })
+        client = FakeClient("s1", {"t12345": self.recovered_test_user()})
+        original_notify = self.cleanup._notify_candidate
+        self.cleanup._notify_candidate = lambda *args, **kwargs: None
+        self.addCleanup(setattr, self.cleanup, "_notify_candidate", original_notify)
+
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now,
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.assertEqual(state["cleanup_status"], "notified")
+        self.assertEqual(state["recovery_attempts"], 3)
+        self.assertEqual(state["first_seen_at"], "2026-06-07 11:00:00")
+        self.assertEqual(state["recovery_discovered_at"], "2026-06-07 10:59:00")
+        self.assertEqual(state["recovery_first_notification_error"], "first blocked")
+        self.assertIsNone(state["notification_error"])
+
+    def test_legacy_recovered_manual_retry_logs_automatic_pending_transition(self):
+        self.write_default_files()
+        self.write_json(self.cleanup.STATE_FILE, {
+            "s1:t12345": {
+                "username": "t12345",
+                "server_id": "s1",
+                "source": "test",
+                "cleanup_status": "manual_review",
+                "cleanup_error": "notification_failed",
+                "recovery_source": "verified_orphan_test",
+                "recovery_attempts": 1,
+                "first_seen_at": "2026-06-09 12:00:00",
+            },
+        })
+        client = FakeClient("s1", {"t12345": self.recovered_test_user()})
+        original_notify = self.cleanup._notify_candidate
+        self.cleanup._notify_candidate = lambda *args, **kwargs: "temporary failure"
+        self.addCleanup(setattr, self.cleanup, "_notify_candidate", original_notify)
+
+        with mock.patch.object(self.cleanup.CLEANUP_LOGGER, "log") as transition_log:
+            self.cleanup.run_expired_user_cleanup(
+                now=self.now,
+                multi_api=FakeMultiAPI({"s1": client}),
+            )
+
+        state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.assertEqual(state["cleanup_status"], "notification_pending")
+        self.assertEqual(state["recovery_attempts"], 2)
+        self.assertTrue(any(
+            call.args[-2:] == ("manual_review", "notification_pending")
+            for call in transition_log.call_args_list
+        ))
 
     def test_recovered_permanent_telegram_failure_waits_for_retry_threshold(self):
         self.write_default_files()
@@ -1097,7 +1178,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
 
         state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
-        self.assertEqual(state["cleanup_status"], "manual_review")
+        self.assertEqual(state["cleanup_status"], "notification_pending")
         self.assertEqual(state["cleanup_error"], "notification_failed")
         self.assertEqual(state["recovery_attempts"], 2)
         self.assertNotIn("delete_after", state)
@@ -1128,7 +1209,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
 
         state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
-        self.assertEqual(state["cleanup_status"], "manual_review")
+        self.assertEqual(state["cleanup_status"], "notification_pending")
         self.assertEqual(state["cleanup_error"], "notification_failed")
         self.assertEqual(state["recovery_attempts"], 3)
         self.assertNotIn("delete_after", state)
@@ -1203,7 +1284,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
 
         state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
-        self.assertEqual(state["cleanup_status"], "manual_review")
+        self.assertEqual(state["cleanup_status"], "notification_pending")
         self.assertEqual(state["cleanup_error"], "notification_failed")
         self.assertEqual(state["recovery_attempts"], 10)
         self.assertNotIn("delete_after", state)
@@ -1240,6 +1321,78 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(self.read_json(self.cleanup.STATE_FILE), {})
         self.assertEqual(client.deleted, [])
 
+    def test_notification_pending_resumes_after_server_outage(self):
+        self.write_default_files()
+        self.write_json(self.cleanup.STATE_FILE, {
+            "s1:t12345": {
+                "username": "t12345",
+                "server_id": "s1",
+                "source": "test",
+                "cleanup_status": "notification_pending",
+                "cleanup_error": "notification_failed",
+                "recovery_source": "verified_orphan_test",
+                "recovery_attempts": 1,
+                "first_seen_at": "2026-06-08 12:00:00",
+            },
+        })
+
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now,
+            multi_api=FakeMultiAPI({"s1": FakeClient("s1", unavailable=True)}),
+        )
+        unavailable = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.assertEqual(unavailable["cleanup_status"], "server_unavailable")
+        self.assertEqual(unavailable["cleanup_error"], "server_unavailable")
+
+        client = FakeClient("s1", {"t12345": self.recovered_test_user()})
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now + timedelta(hours=1),
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        recovered = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.assertEqual(recovered["cleanup_status"], "notified")
+        self.assertEqual(recovered["recovery_attempts"], 2)
+        self.assertEqual(recovered["first_seen_at"], "2026-06-08 12:00:00")
+
+    def test_unreachable_deletion_survives_server_outage_without_renotifying(self):
+        self.write_default_files()
+        self.write_json(self.cleanup.STATE_FILE, {
+            "s1:t12345": {
+                "username": "t12345",
+                "server_id": "s1",
+                "source": "test",
+                "cleanup_status": "notification_unreachable",
+                "cleanup_error": "notification_unreachable",
+                "recovery_source": "verified_orphan_test",
+                "recovery_attempts": 3,
+                "recovery_unreachable_queued_at": "2026-06-09 10:00:00",
+                "delete_after": "2026-06-09 10:00:00",
+            },
+        })
+
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now,
+            multi_api=FakeMultiAPI({"s1": FakeClient("s1", unavailable=True)}),
+        )
+        unavailable = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.assertEqual(unavailable["cleanup_status"], "server_unavailable")
+        self.assertEqual(unavailable["delete_after"], "2026-06-09 10:00:00")
+
+        client = FakeClient("s1", {"t12345": self.recovered_test_user()})
+        original_notify = self.cleanup._notify_candidate
+        self.cleanup._notify_candidate = mock.Mock(return_value=None)
+        self.addCleanup(setattr, self.cleanup, "_notify_candidate", original_notify)
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now + timedelta(hours=1),
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        deleted = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.assertEqual(deleted["cleanup_status"], "deleted")
+        self.assertEqual(client.deleted, ["t12345"])
+        self.cleanup._notify_candidate.assert_not_called()
+
     def test_admin_kept_verified_orphan_remains_manual(self):
         self.write_default_files()
         self.write_json(self.cleanup.STATE_FILE, {
@@ -1269,12 +1422,18 @@ class ExpiredCleanupTests(unittest.TestCase):
         }
         client = FakeClient("s1", users)
 
-        self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
+        with mock.patch.object(self.cleanup.CLEANUP_LOGGER, "log") as transition_log:
+            self.cleanup.run_expired_user_cleanup(now=self.now, multi_api=FakeMultiAPI({"s1": client}))
 
         state = self.read_json(self.cleanup.STATE_FILE)
         statuses = [entry["cleanup_status"] for entry in state.values()]
         self.assertEqual(statuses.count("notified"), 25)
-        self.assertEqual(statuses.count("manual_review"), 5)
+        self.assertEqual(statuses.count("notification_pending"), 5)
+        self.assertEqual(statuses.count("manual_review"), 0)
+        self.assertTrue(any(
+            call.args[-1] == "notification_pending"
+            for call in transition_log.call_args_list
+        ))
         self.assertEqual(len(self.cleanup._test_bot.sent_messages), 25)
         self.assertEqual(len(self.read_json(self.cleanup.TEST_CONFIGS_FILE)), 30)
 
@@ -1286,6 +1445,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         second_state = self.read_json(self.cleanup.STATE_FILE)
         second_statuses = [entry["cleanup_status"] for entry in second_state.values()]
         self.assertEqual(second_statuses.count("notified"), 30)
+        self.assertEqual(second_statuses.count("notification_pending"), 0)
         self.assertEqual(second_statuses.count("manual_review"), 0)
         self.assertEqual(len(self.cleanup._test_bot.sent_messages), 30)
         histories = sum(
@@ -1306,7 +1466,8 @@ class ExpiredCleanupTests(unittest.TestCase):
         state = self.read_json(self.cleanup.STATE_FILE)
         statuses = [entry["cleanup_status"] for entry in state.values()]
         self.assertEqual(statuses.count("notified"), 1)
-        self.assertEqual(statuses.count("manual_review"), 1)
+        self.assertEqual(statuses.count("notification_pending"), 1)
+        self.assertEqual(statuses.count("manual_review"), 0)
         self.assertEqual(len(self.cleanup._test_bot.sent_messages), 1)
         recovered = self.read_json(self.cleanup.TEST_CONFIGS_FILE)["12345"]
         self.assertEqual(len(recovered["historical_configs"]), 2)
@@ -1639,6 +1800,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(len(self.cleanup._test_bot.sent_messages), 0)
         self.assertEqual(state["s1:orphan"]["cleanup_status"], "manual_review")
         self.assertEqual(state["s1:orphan"]["source"], "server_user")
+        self.assertEqual(state["s1:orphan"]["manual_review_reason"], "unowned_server_user")
         self.assertNotIn("delete_after", state["s1:orphan"])
         self.assertNotIn("notification_error", state["s1:orphan"])
         self.assertEqual(state["s1:orphan"]["last_state"]["status"], "expired")
@@ -1653,6 +1815,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         state = self.read_json(self.cleanup.STATE_FILE)
         self.assertEqual(client.deleted, [])
         self.assertEqual(state["s1:orphan"]["cleanup_status"], "manual_review")
+        self.assertEqual(state["s1:orphan"]["manual_review_reason"], "unowned_server_user")
         self.assertEqual(state["s1:orphan"]["last_state"]["status"], "expired")
 
     def test_server_only_manual_review_user_is_marked_renewed_when_renewed(self):
@@ -1694,6 +1857,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         state = self.read_json(self.cleanup.STATE_FILE)
         self.assertEqual(client.deleted, [])
         self.assertEqual(state["s1:orphan"]["cleanup_status"], "manual_review")
+        self.assertEqual(state["s1:orphan"]["manual_review_reason"], "unowned_server_user")
         self.assertNotIn("delete_after", state["s1:orphan"])
         self.assertNotIn("notification_error", state["s1:orphan"])
         self.assertNotIn("notified_at", state["s1:orphan"])
@@ -1716,6 +1880,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         state = self.read_json(self.cleanup.STATE_FILE)
         self.assertEqual(client.deleted, [])
         self.assertEqual(state["s1:orphan"]["cleanup_status"], "manual_review")
+        self.assertEqual(state["s1:orphan"]["manual_review_reason"], "unowned_server_user")
         self.assertEqual(state["s1:orphan"]["last_state"]["status"], "expired")
 
     def test_paid_customer_notification_includes_account_type(self):
@@ -2266,6 +2431,18 @@ class ExpiredCleanupTests(unittest.TestCase):
                 "delete_after": "2026-06-09 14:00:00",
                 "last_state": {"days_remaining": 0},
             },
+            "s1:notice-retry": {
+                "username": "notice-retry",
+                "server_id": "s1",
+                "source": "test",
+                "cleanup_status": "notification_pending",
+                "cleanup_error": "notification_failed",
+                "cleanup_reason": "stale_on_hold_test",
+                "recovery_source": "verified_orphan_test",
+                "recovery_attempts": 2,
+                "first_seen_at": "2026-06-08 10:00:00",
+                "last_state": {"days_remaining": 0},
+            },
             "s1:due": {
                 "username": "due",
                 "server_id": "s1",
@@ -2310,6 +2487,7 @@ class ExpiredCleanupTests(unittest.TestCase):
                 "server_id": "s1",
                 "source": "server_user",
                 "cleanup_status": "manual_review",
+                "manual_review_reason": "unowned_server_user",
                 "last_state": {"days_remaining": 0},
             },
             "s1:duplicate": {
@@ -2326,7 +2504,7 @@ class ExpiredCleanupTests(unittest.TestCase):
 
         self.assertEqual(counts["manual_review"], 1)
         self.assertEqual(counts["duplicate_payment"], 1)
-        self.assertEqual(counts["pending"], 1)
+        self.assertEqual(counts["pending"], 2)
         self.assertEqual(counts["due"], 1)
         self.assertEqual(counts["deleted"], 1)
         self.assertEqual(counts["delete_failed"], 1)
@@ -2423,6 +2601,57 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertIn("admin_expired_cleanup:export:pending", callbacks)
         self.assertIn("admin_expired_cleanup:export:all", callbacks)
 
+    def test_notification_pending_is_pending_without_manual_review_actions(self):
+        self.write_default_files()
+        self.write_json(self.cleanup.STATE_FILE, {
+            "s1:t12345": {
+                "username": "t12345",
+                "server_id": "s1",
+                "source": "test",
+                "cleanup_status": "notification_pending",
+                "cleanup_error": "notification_failed",
+                "cleanup_reason": "stale_on_hold_test",
+                "recovery_source": "verified_orphan_test",
+                "recovery_attempts": 2,
+                "first_seen_at": "2026-06-08 10:00:00",
+                "last_state": {"status": "On-hold"},
+            },
+        })
+
+        pending = self.cleanup.get_expired_cleanup_records(
+            filter_key="pending",
+            now=self.now,
+        )
+        manual = self.cleanup.get_expired_cleanup_records(
+            filter_key="manual_review",
+            now=self.now,
+        )
+        text = self.cleanup._build_admin_cleanup_text(
+            "en",
+            filter_key="pending",
+            page=0,
+            now=self.now,
+        )
+        callbacks = self.callback_data_from_markup(
+            self.cleanup._build_admin_cleanup_markup(
+                filter_key="pending",
+                page=0,
+                now=self.now,
+            )
+        )
+        exported = self.cleanup.get_expired_cleanup_export_records(
+            filter_key="pending",
+            now=self.now,
+        )
+
+        self.assertEqual([record["effective_status"] for record in pending], ["pending"])
+        self.assertEqual(pending[0]["cleanup_status"], "notification_pending")
+        self.assertEqual(pending[0]["reason_code"], "stale_on_hold_test")
+        self.assertEqual(manual, [])
+        self.assertIn("retrying notification", text)
+        self.assertFalse(any(callback and callback.startswith("aec:") for callback in callbacks))
+        self.assertEqual(exported[0]["cleanup_status"], "notification_pending")
+
     def test_manual_review_ui_shows_records_and_review_actions(self):
         self.write_default_files()
         self.write_json(self.cleanup.STATE_FILE, {
@@ -2431,6 +2660,7 @@ class ExpiredCleanupTests(unittest.TestCase):
                 "server_id": "s1",
                 "source": "server_user",
                 "cleanup_status": "manual_review",
+                "manual_review_reason": "unowned_server_user",
                 "last_state": {"days_remaining": 0},
             },
         })
@@ -2441,6 +2671,7 @@ class ExpiredCleanupTests(unittest.TestCase):
 
         self.assertIn("Manual Review: *1*", text)
         self.assertIn("`orphan`", text)
+        self.assertIn("No matching bot ownership record", text)
         review_callbacks = [callback for callback in callbacks if callback and callback.startswith("aec:")]
         self.assertTrue(any(callback.startswith("aec:rd:mr:") for callback in review_callbacks))
         self.assertTrue(any(callback.startswith("aec:rk:mr:") for callback in review_callbacks))

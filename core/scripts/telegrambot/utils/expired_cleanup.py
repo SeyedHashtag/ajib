@@ -86,6 +86,8 @@ TEST_ACCOUNT_EXPIRATION_DAYS = 30
 STALE_ON_HOLD_TEST_REASON = 'stale_on_hold_test'
 STALE_TEST_TRAFFIC_ZERO = 'zero_counters'
 STALE_TEST_TRAFFIC_NULL_ZERO_ONLINE = 'null_counters_zero_online'
+NOTIFICATION_PENDING_STATUS = 'notification_pending'
+UNOWNED_SERVER_USER_REASON = 'unowned_server_user'
 ISSUE_DEADLINE_EXPIRED_REASON = 'issue_deadline_expired'
 SUPERSEDED_ON_HOLD_TEST_REASON = 'superseded_on_hold_test'
 DELETE_RESULTS = {'deleted', 'already_missing'}
@@ -144,7 +146,7 @@ RECOVERED_TEST_UNREACHABLE_GRACE_HOURS = _int_env("AJIB_EXPIRED_RECOVERED_TEST_U
 ADMIN_CLEANUP_REVIEW_INFLIGHT_LOCK = threading.Lock()
 ADMIN_CLEANUP_REVIEW_INFLIGHT = set()
 ADMIN_CLEANUP_FILTER_DESCRIPTIONS = {
-    'pending': 'Notified or queued users waiting for the grace period before automatic cleanup.',
+    'pending': 'Users queued for notification, retrying notification, or waiting for the grace period before automatic cleanup.',
     'due': 'Notified or queued users whose grace period has passed and are ready for automatic cleanup.',
     'manual_review': 'Server-only or orphaned records that need an admin decision.',
     'duplicate_payment': 'Duplicate configs from repeated payment creation that need an admin decision.',
@@ -165,6 +167,7 @@ ADMIN_CLEANUP_REASON_LABELS = {
     'server_unavailable': 'VPN server was unavailable',
     'delete_failed': 'Deletion failed and will be retried',
     'notification_unreachable': 'Telegram user unreachable after recovery notice attempts',
+    UNOWNED_SERVER_USER_REASON: 'No matching bot ownership record',
     'unknown': 'Reason unavailable',
 }
 ADMIN_CLEANUP_REVIEW_FILTER_CODES = {
@@ -683,6 +686,7 @@ def _cleanup_transition_snapshot(state):
 
 def _log_cleanup_state_transitions(previous, current):
     logged_statuses = {
+        NOTIFICATION_PENDING_STATUS,
         'notified',
         'deleted',
         'already_missing',
@@ -701,7 +705,12 @@ def _log_cleanup_state_transitions(previous, current):
 
         context = after or before
         if current_status is None:
-            if previous_status not in {'notified', 'server_unavailable', 'delete_failed'}:
+            if previous_status not in {
+                NOTIFICATION_PENDING_STATUS,
+                'notified',
+                'server_unavailable',
+                'delete_failed',
+            }:
                 continue
             current_status = 'canceled'
         elif current_status not in logged_statuses:
@@ -885,7 +894,7 @@ def _effective_cleanup_status(entry, now=None):
         return 'unknown'
 
     status = str(entry.get('cleanup_status') or entry.get('delete_result') or 'unknown')
-    if status in {'notified', 'notification_unreachable'}:
+    if status in {'notified', NOTIFICATION_PENDING_STATUS, 'notification_unreachable'}:
         delete_after = _effective_delete_after(entry)
         if delete_after and (now or datetime.now()) >= delete_after:
             return 'due'
@@ -906,6 +915,12 @@ def _cleanup_reason(entry):
         and entry.get('manual_review_reason') == 'duplicate_payment'
     ):
         return 'duplicate_payment', ADMIN_CLEANUP_REASON_LABELS['duplicate_payment']
+
+    if (
+        entry.get('cleanup_status') == 'manual_review'
+        and entry.get('manual_review_reason') == UNOWNED_SERVER_USER_REASON
+    ):
+        return UNOWNED_SERVER_USER_REASON, ADMIN_CLEANUP_REASON_LABELS[UNOWNED_SERVER_USER_REASON]
 
     status = str(entry.get('cleanup_status') or entry.get('delete_result') or '')
     delete_result = str(entry.get('delete_result') or '')
@@ -950,7 +965,7 @@ def _cleanup_record_from_state(state_key, entry, now=None):
     effective_status = _effective_cleanup_status(entry, now=now)
     cleanup_status = entry.get('cleanup_status') or effective_status
     delete_after = entry.get('delete_after')
-    if cleanup_status in {'notified', 'notification_unreachable'}:
+    if cleanup_status in {'notified', NOTIFICATION_PENDING_STATUS, 'notification_unreachable'}:
         delete_after = _format_time(_effective_delete_after(entry)) or delete_after
     last_state = entry.get('last_state') if isinstance(entry.get('last_state'), dict) else {}
     return {
@@ -1984,13 +1999,8 @@ def _select_recovered_test_batch(candidates, state, batch_size=RECOVERED_TEST_BA
     for candidate in candidates or []:
         key = _state_key(candidate.get('server_id'), candidate.get('username'))
         entry = state.get(key) if isinstance(state.get(key), dict) else None
-        if entry:
-            if entry.get('cleanup_status') != 'manual_review':
-                continue
-            if entry.get('review_status') == 'kept' or entry.get('reviewed_by'):
-                continue
-            if entry.get('manual_review_reason'):
-                continue
+        if entry and not _is_automatic_recovery_notice_entry(entry):
+            continue
         eligible.append((
             str((entry or {}).get('recovery_last_attempt_at') or ''),
             str((entry or {}).get('first_seen_at') or ''),
@@ -2010,6 +2020,88 @@ def _select_recovered_test_batch(candidates, state, batch_size=RECOVERED_TEST_BA
         if len(selected) >= batch_size:
             break
     return selected
+
+
+def _is_automatic_recovery_notice_entry(entry):
+    if not isinstance(entry, dict):
+        return False
+    if entry.get('recovery_source') != 'verified_orphan_test':
+        return False
+    if entry.get('review_status') or entry.get('reviewed_by'):
+        return False
+    if entry.get('manual_review_reason'):
+        return False
+
+    status = entry.get('cleanup_status')
+    if status in {NOTIFICATION_PENDING_STATUS, 'manual_review'}:
+        return True
+    return (
+        status == 'server_unavailable'
+        and not entry.get('delete_after')
+        and not entry.get('recovery_unreachable_queued_at')
+    )
+
+
+def _prepare_recovered_test_notification_state(candidates, state, now_value, now):
+    """Queue verified orphan notices and safely adopt compatible legacy state."""
+    for candidate in candidates or []:
+        key = _state_key(candidate.get('server_id'), candidate.get('username'))
+        entry = state.get(key) if isinstance(state.get(key), dict) else None
+        if entry and not (
+            _is_automatic_recovery_notice_entry(entry)
+            or (
+                entry.get('cleanup_status') == 'manual_review'
+                and not entry.get('review_status')
+                and not entry.get('reviewed_by')
+                and entry.get('manual_review_reason') in {None, UNOWNED_SERVER_USER_REASON}
+            )
+        ):
+            continue
+
+        last_state = _capture_candidate_state(candidate, candidate.get('_user_data'), now=now)
+        if not entry:
+            entry = {
+                'username': candidate.get('username'),
+                'server_id': candidate.get('server_id') or 'primary',
+                'source': 'test',
+                'telegram_user_id': candidate.get('telegram_user_id'),
+                'first_seen_at': now_value,
+                'last_checked_at': now_value,
+                'cleanup_status': NOTIFICATION_PENDING_STATUS,
+                'cleanup_reason': candidate.get('cleanup_reason'),
+                'recovery_source': 'verified_orphan_test',
+                'recovery_attempts': 0,
+                'recovery_discovered_at': candidate.get('_recovery_discovered_at') or now_value,
+                'last_state': last_state,
+            }
+            state[key] = entry
+            continue
+
+        entry.update({
+            'username': candidate.get('username') or entry.get('username'),
+            'server_id': candidate.get('server_id') or entry.get('server_id') or 'primary',
+            'source': 'test',
+            'telegram_user_id': candidate.get('telegram_user_id') or entry.get('telegram_user_id'),
+            'cleanup_status': NOTIFICATION_PENDING_STATUS,
+            'recovery_source': 'verified_orphan_test',
+            'last_checked_at': now_value,
+            'last_state': last_state,
+        })
+        if not entry.get('first_seen_at'):
+            entry['first_seen_at'] = entry.get('recovered_at') or now_value
+        if not entry.get('recovery_discovered_at'):
+            entry['recovery_discovered_at'] = (
+                candidate.get('_recovery_discovered_at')
+                or entry.get('first_seen_at')
+                or now_value
+            )
+        entry.setdefault('recovery_attempts', 0)
+        if entry.get('manual_review_reason') == UNOWNED_SERVER_USER_REASON:
+            entry.pop('manual_review_reason', None)
+        if candidate.get('cleanup_reason'):
+            entry['cleanup_reason'] = candidate.get('cleanup_reason')
+        if entry.get('cleanup_error') == 'server_unavailable':
+            entry.pop('cleanup_error', None)
 
 
 def _is_permanent_recovered_test_notification_error(error):
@@ -2488,6 +2580,8 @@ def _manual_review_entry(candidate, now_value, last_state=None):
     for key in ('manual_review_reason', 'review_note', 'payment_id', 'keeper_username'):
         if candidate.get(key):
             entry[key] = candidate.get(key)
+    if candidate.get('source') == 'server_user' and not entry.get('manual_review_reason'):
+        entry['manual_review_reason'] = UNOWNED_SERVER_USER_REASON
     if candidate.get('cleanup_reason'):
         entry['cleanup_reason'] = candidate.get('cleanup_reason')
     return entry
@@ -2503,6 +2597,7 @@ def _is_duplicate_payment_manual_review(entry):
 
 def _convert_server_user_to_manual_review(entry, now_value):
     entry['cleanup_status'] = 'manual_review'
+    entry.setdefault('manual_review_reason', UNOWNED_SERVER_USER_REASON)
     entry.setdefault('first_seen_at', entry.get('notified_at') or now_value)
     entry['last_checked_at'] = now_value
     entry.pop('delete_after', None)
@@ -2581,6 +2676,12 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
             lookup_context,
             record_stores,
             now_value,
+        )
+        _prepare_recovered_test_notification_state(
+            recovered_test_candidates,
+            state,
+            now_value,
+            now,
         )
         recovery_backfill = _backfill_verified_orphan_tests(
             recovered_test_candidates,
@@ -2794,7 +2895,7 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
                     entry.update({
                         'telegram_user_id': candidate.get('telegram_user_id'),
                         'source': 'test',
-                        'cleanup_status': 'manual_review',
+                        'cleanup_status': NOTIFICATION_PENDING_STATUS,
                         'cleanup_error': 'notification_failed',
                         'notification_error': notification_error,
                         'recovery_first_notification_error': first_notification_error,
@@ -2836,6 +2937,9 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
                 })
                 if previous_entry.get('first_seen_at'):
                     recovered_entry['first_seen_at'] = previous_entry.get('first_seen_at')
+                for field in ('recovery_discovered_at', 'recovery_first_notification_error'):
+                    if previous_entry.get(field):
+                        recovered_entry[field] = previous_entry.get(field)
                 state[key] = recovered_entry
                 recovery_stats['notified'] += 1
                 continue
@@ -2868,9 +2972,16 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
                 )
                 continue
 
+            if entry.get('cleanup_status') == NOTIFICATION_PENDING_STATUS:
+                entry['last_state'] = _capture_candidate_state(candidate, user_data, now=now) if lookup_status == 'found' else entry.get('last_state')
+                entry['last_checked_at'] = now_value
+                continue
+
             if entry.get('cleanup_status') == 'manual_review':
                 entry['last_state'] = _capture_candidate_state(candidate, user_data, now=now) if lookup_status == 'found' else entry.get('last_state')
                 entry['last_checked_at'] = now_value
+                if entry.get('source') == 'server_user' and candidate.get('source') == 'server_user':
+                    entry.setdefault('manual_review_reason', UNOWNED_SERVER_USER_REASON)
                 entry.pop('cleanup_error', None)
                 continue
 
