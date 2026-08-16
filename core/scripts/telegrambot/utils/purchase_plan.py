@@ -84,6 +84,15 @@ from utils.username_utils import (
 from utils.telegram_safe import safe_answer_callback_query, safe_send_message
 from utils.download_guidance import send_download_prompt_safely
 
+
+def _configured_primary_api_client():
+    """Use the panel factory, with compatibility for lightweight test stubs."""
+    try:
+        client = MultiServerAPI().get_client()
+    except (AttributeError, TypeError):
+        client = None
+    return client or APIClient()
+
 # New: Global dictionary for user states
 user_data = {}
 
@@ -1548,7 +1557,7 @@ def _fulfill_credit_funded_purchase(call, plan_gb, plan, quote):
         _release_checkout_incentives(user_id, reservation_id)
         raise
 
-    api_client = APIClient()
+    api_client = _configured_primary_api_client()
     username, result, api_client = create_sale_user_with_note(
         api_client,
         user_id,
@@ -2871,7 +2880,7 @@ def _process_admin_approval_job(call, action, payment_id, payment_record, review
                  else:
                      unlimited = False
             
-            api_client = APIClient()
+            api_client = _configured_primary_api_client()
             username, result, api_client = create_sale_user_with_note(
                 api_client,
                 user_to_notify,
@@ -3138,7 +3147,7 @@ def _process_check_payment_job(call):
                 else:
                     unlimited = False
         
-        api_client = APIClient()
+        api_client = _configured_primary_api_client()
         username, result, api_client = create_sale_user_with_note(
             api_client,
             user_id,
@@ -3348,7 +3357,7 @@ def process_payment_webhook(request_data):
                     else:
                         unlimited = False
                 
-                api_client = APIClient()
+                api_client = _configured_primary_api_client()
                 username, result, api_client = create_sale_user_with_note(
                     api_client,
                     user_id,
@@ -3795,7 +3804,7 @@ def check_pending_payments():
                             else:
                                 unlimited = False
                         
-                        api_client = APIClient()
+                        api_client = _configured_primary_api_client()
                         username, add_result, api_client = create_sale_user_with_note(
                             api_client,
                             user_id,

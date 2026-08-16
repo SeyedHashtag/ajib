@@ -31,6 +31,9 @@ class DummyQR:
 class DummyBot:
     def __init__(self):
         self.sent_photos = []
+        self.replies = []
+        self.sent_messages = []
+        self.next_steps = []
 
     def callback_query_handler(self, *args, **kwargs):
         return lambda func: func
@@ -45,7 +48,15 @@ class DummyBot:
         self.sent_photos.append((args, kwargs))
 
     def reply_to(self, *args, **kwargs):
-        return None
+        self.replies.append((args, kwargs))
+        return types.SimpleNamespace(chat=getattr(args[0], "chat", None))
+
+    def send_message(self, *args, **kwargs):
+        self.sent_messages.append((args, kwargs))
+        return types.SimpleNamespace(chat=types.SimpleNamespace(id=args[0]))
+
+    def register_next_step_handler(self, *args, **kwargs):
+        self.next_steps.append((args, kwargs))
 
 
 def load_edituser():
@@ -132,6 +143,58 @@ class AdminServerDisplayTests(unittest.TestCase):
         label = edituser._format_server_label(types.SimpleNamespace(server_id="de-1"))
 
         self.assertEqual(label, "`de-1`")
+
+    def test_duplicate_username_requires_exact_server_selection(self):
+        edituser, bot = load_edituser()
+        first = types.SimpleNamespace(server_id="s1", server_name="One", panel_type="blitz")
+        second = types.SimpleNamespace(server_id="s2", server_name="Two", panel_type="blitz")
+        edituser.MultiServerAPI = lambda: types.SimpleNamespace(
+            find_user_matches=lambda *_args, **_kwargs: [
+                {"client": first, "user": {}, "ref": edituser._make_ref(first, "alice")},
+                {"client": second, "user": {}, "ref": edituser._make_ref(second, "alice")},
+            ]
+        )
+        message = types.SimpleNamespace(
+            text="alice",
+            chat=types.SimpleNamespace(id=555),
+            from_user=types.SimpleNamespace(id=1),
+        )
+
+        edituser.process_show_user(message)
+
+        prompt = bot.replies[-1]
+        self.assertIn("more than one server", prompt[0][1])
+        callbacks = [button.kwargs["callback_data"] for button in prompt[1]["reply_markup"].buttons]
+        self.assertEqual(len(callbacks), 2)
+        self.assertTrue(all(value.startswith("show_user_ref:") for value in callbacks))
+
+    def test_selected_user_action_uses_only_recorded_server(self):
+        edituser, bot = load_edituser()
+        ref = types.SimpleNamespace(server_id="s2", username="alice", panel_type="blitz")
+        token = edituser._store_user_context(ref)
+        lookups = []
+        resets = []
+        selected_client = types.SimpleNamespace(
+            reset_user=lambda username: resets.append(username) or {"ok": True}
+        )
+
+        def exact_lookup(username, server_id):
+            lookups.append((username, server_id))
+            return selected_client, {"username": username}, {"status": "found"}
+
+        edituser.MultiServerAPI = lambda: types.SimpleNamespace(
+            find_user_on_server=exact_lookup
+        )
+        call = types.SimpleNamespace(
+            data=f"reset_user:{token}",
+            message=types.SimpleNamespace(chat=types.SimpleNamespace(id=555)),
+        )
+
+        edituser.handle_edit_callback(call)
+
+        self.assertEqual(lookups, [("alice", "s2")])
+        self.assertEqual(resets, ["alice"])
+        self.assertIn("reset successfully", bot.sent_messages[-1][0][1].lower())
 
 
 if __name__ == "__main__":

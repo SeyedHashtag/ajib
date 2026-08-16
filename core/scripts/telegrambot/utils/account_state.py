@@ -196,6 +196,10 @@ def elapsed_full_days(started_at: datetime | None, now: datetime | None = None) 
 def panel_deadline(user_data: Mapping[str, Any] | None) -> datetime | None:
     if not isinstance(user_data, Mapping):
         return None
+    for field in ("account_expiration_date", "absolute_expiry", "expiration_at"):
+        explicit = parse_timestamp(user_data.get(field))
+        if explicit is not None:
+            return explicit
     duration = safe_int(user_data.get("expiration_days"))
     started_at = parse_timestamp(user_data.get("account_creation_date"))
     if duration is None or duration < 0 or started_at is None:
@@ -393,15 +397,19 @@ def inspect_account(
     started_at = parse_timestamp(data.get("account_creation_date")) if data is not None else None
     duration = safe_int(data.get("expiration_days")) if data is not None else None
     deadline = panel_deadline(data)
+    explicit_timer_started = strict_bool(data.get("timer_started")) if data is not None else None
+    timer_started = explicit_timer_started if explicit_timer_started is not None else started_at is not None
+    if started_at is None and timer_started and deadline is not None and duration is not None and duration >= 0:
+        started_at = deadline - timedelta(days=duration)
 
     valid_duration = duration is not None and duration >= 0
     if not available or data is None or blocked is None:
         panel_state_value = PanelState.UNKNOWN
     elif blocked:
         panel_state_value = PanelState.BLOCKED
-    elif status == HOLD_STATUS and started_at is None and valid_duration:
+    elif status == HOLD_STATUS and not timer_started and valid_duration:
         panel_state_value = PanelState.HOLD
-    elif status in CONNECTED_STATUSES and started_at is not None and valid_duration:
+    elif status in CONNECTED_STATUSES and timer_started and (valid_duration or deadline is not None):
         panel_state_value = PanelState.CONNECTED
     else:
         panel_state_value = PanelState.UNKNOWN
@@ -478,7 +486,7 @@ def inspect_account(
         entitlement_state=entitlement,
         normalized_status=status,
         blocked=blocked,
-        timer_started=started_at is not None,
+        timer_started=timer_started,
         configured_days=duration,
         panel_started_at=started_at,
         panel_deadline=deadline,

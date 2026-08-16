@@ -31,18 +31,25 @@ load_existing_telegram_servers() {
     existing_server_tokens=()
     existing_server_weights=()
     existing_server_enabled=()
+    existing_server_panels=()
+    existing_server_inbound_ids=()
+    existing_server_limit_ips=()
 
     if [ ! -f "$TELEGRAM_ENV" ]; then
         return
     fi
 
-    while IFS=$'\t' read -r server_id server_url server_token server_weight server_enabled; do
+    while IFS=$'\t' read -r server_id server_url server_token server_weight server_enabled server_panel server_inbound_ids server_limit_ip; do
         [ -z "$server_id" ] && continue
         existing_server_ids+=("$server_id")
         existing_server_urls+=("$server_url")
         existing_server_tokens+=("$server_token")
         existing_server_weights+=("$server_weight")
         existing_server_enabled+=("$server_enabled")
+        existing_server_panels+=("$server_panel")
+        [ "$server_inbound_ids" = "-" ] && server_inbound_ids=""
+        existing_server_inbound_ids+=("$server_inbound_ids")
+        existing_server_limit_ips+=("$server_limit_ip")
     done < <(python3 - "$TELEGRAM_ENV" <<'PY'
 import json
 import sys
@@ -90,7 +97,10 @@ for index, server in enumerate(servers):
     weight = server.get("weight", 1)
     enabled = server.get("enabled", True)
     enabled_text = "true" if enabled else "false"
-    print(f"{server_id}\t{server_url}\t{server_token}\t{weight}\t{enabled_text}")
+    panel = str(server.get("panel") or "blitz").strip().lower()
+    inbound_ids = "|".join(str(value) for value in (server.get("default_inbound_ids") or [])) or "-"
+    limit_ip = server.get("default_limit_ip", 0)
+    print(f"{server_id}\t{server_url}\t{server_token}\t{weight}\t{enabled_text}\t{panel}\t{inbound_ids}\t{limit_ip}")
 PY
 )
 }
@@ -182,6 +192,54 @@ read_yes_no_bool() {
     done
 }
 
+read_panel_type() {
+    local default_value=${1:-blitz}
+    local value
+    while true; do
+        read -e -p "Panel type [blitz/3x-ui, default $default_value]: " value
+        value=${value:-$default_value}
+        case "${value,,}" in
+            blitz) echo "blitz"; return ;;
+            3x-ui|3xui|3x|x-ui|xui) echo "3x-ui"; return ;;
+            *) echo "Panel type must be blitz or 3x-ui." >&2 ;;
+        esac
+    done
+}
+
+read_inbound_ids() {
+    local default_value=$1
+    local required=$2
+    local value
+    while true; do
+        read -e -p "Default inbound IDs (pipe-separated)${default_value:+ [$default_value]}: " value
+        value=${value:-$default_value}
+        if [ -z "$value" ] && [ "$required" != "true" ]; then
+            echo ""
+            return
+        fi
+        if [[ "$value" =~ ^[1-9][0-9]*(\|[1-9][0-9]*)*$ ]]; then
+            echo "$value"
+            return
+        fi
+        echo "Use positive inbound IDs separated by |. Enabled 3x-ui servers require at least one." >&2
+    done
+}
+
+read_nonnegative_integer() {
+    local prompt=$1
+    local default_value=${2:-0}
+    local value
+    while true; do
+        read -e -p "$prompt [$default_value]: " value
+        value=${value:-$default_value}
+        if [[ "$value" =~ ^[0-9]+$ ]]; then
+            echo "$value"
+            return
+        fi
+        echo "Value must be a non-negative integer." >&2
+    done
+}
+
 read_admin_ids() {
     local default_value=$1
     local value
@@ -247,6 +305,9 @@ show_configured_telegram_servers() {
             echo "   API key: $(mask_secret "${existing_server_tokens[$index]}")"
             echo "   Weight: ${existing_server_weights[$index]}"
             echo "   Enabled for new configs: ${existing_server_enabled[$index]}"
+            echo "   Panel: ${existing_server_panels[$index]}"
+            echo "   Default inbound IDs: ${existing_server_inbound_ids[$index]:-(none)}"
+            echo "   Default 3x-ui IP limit: ${existing_server_limit_ips[$index]:-0}"
         done
     fi
     echo "======================================"
@@ -279,8 +340,11 @@ configure_telegram_bot() {
     local server_tokens=()
     local server_weights=()
     local server_enabled=()
-    local i default_id default_url default_token default_weight default_enabled
-    local current_id current_url current_token current_weight current_enabled
+    local server_panels=()
+    local server_inbound_ids=()
+    local server_limit_ips=()
+    local i default_id default_url default_token default_weight default_enabled default_panel default_inbound_ids default_limit_ip
+    local current_id current_url current_token current_weight current_enabled current_panel current_inbound_ids current_limit_ip
 
     for ((i=1; i<=server_count; i++)); do
         default_id="${existing_server_ids[$((i - 1))]}"
@@ -288,6 +352,9 @@ configure_telegram_bot() {
         default_token="${existing_server_tokens[$((i - 1))]}"
         default_weight="${existing_server_weights[$((i - 1))]}"
         default_enabled="${existing_server_enabled[$((i - 1))]}"
+        default_panel="${existing_server_panels[$((i - 1))]}"
+        default_inbound_ids="${existing_server_inbound_ids[$((i - 1))]}"
+        default_limit_ip="${existing_server_limit_ips[$((i - 1))]}"
 
         if [ -z "$default_id" ]; then
             default_id="server$i"
@@ -295,6 +362,8 @@ configure_telegram_bot() {
         fi
         [ -z "$default_weight" ] && default_weight="1"
         [ -z "$default_enabled" ] && default_enabled="true"
+        [ -z "$default_panel" ] && default_panel="blitz"
+        [ -z "$default_limit_ip" ] && default_limit_ip="0"
 
         echo "--------------------------------------"
         echo "VPN server $i"
@@ -325,12 +394,22 @@ configure_telegram_bot() {
 
         current_weight=$(read_positive_number "Balancing weight" "$default_weight")
         current_enabled=$(read_yes_no_bool "Enable this server for new configs?" "$default_enabled")
+        current_panel=$(read_panel_type "$default_panel")
+        current_inbound_ids=""
+        current_limit_ip="0"
+        if [ "$current_panel" = "3x-ui" ]; then
+            current_inbound_ids=$(read_inbound_ids "$default_inbound_ids" "$current_enabled")
+            current_limit_ip=$(read_nonnegative_integer "Default client IP limit (0 = unlimited)" "$default_limit_ip")
+        fi
 
         server_ids+=("$current_id")
         server_urls+=("$current_url")
         server_tokens+=("$current_token")
         server_weights+=("$current_weight")
         server_enabled+=("$current_enabled")
+        server_panels+=("$current_panel")
+        server_inbound_ids+=("$current_inbound_ids")
+        server_limit_ips+=("$current_limit_ip")
     done
 
     echo "======================================"
@@ -338,7 +417,7 @@ configure_telegram_bot() {
     echo "Bot token: $(mask_secret "$token")"
     echo "Admin IDs: $admin_ids"
     for ((i=0; i<server_count; i++)); do
-        echo "$((i + 1)). ${server_ids[$i]} | ${server_urls[$i]} | weight ${server_weights[$i]} | enabled ${server_enabled[$i]}"
+        echo "$((i + 1)). ${server_ids[$i]} | ${server_urls[$i]} | panel ${server_panels[$i]} | inbounds ${server_inbound_ids[$i]:-(none)} | weight ${server_weights[$i]} | enabled ${server_enabled[$i]}"
     done
     echo "======================================"
 
@@ -354,7 +433,7 @@ configure_telegram_bot() {
     local api_key="${server_tokens[0]}"
     local server_args=()
     for ((i=0; i<server_count; i++)); do
-        server_args+=(--server "${server_ids[$i]}=${server_urls[$i]},${server_tokens[$i]},${server_weights[$i]},${server_enabled[$i]}")
+        server_args+=(--server "${server_ids[$i]}=${server_urls[$i]},${server_tokens[$i]},${server_weights[$i]},${server_enabled[$i]},${server_panels[$i]},${server_inbound_ids[$i]},${server_limit_ips[$i]}")
     done
 
     run_ajib_cli telegram -a start -t "$token" -aid "$admin_ids" -u "$api_url" -k "$api_key" "${server_args[@]}"
@@ -377,9 +456,12 @@ add_telegram_vpn_server() {
     local server_tokens=("${existing_server_tokens[@]}")
     local server_weights=("${existing_server_weights[@]}")
     local server_enabled=("${existing_server_enabled[@]}")
+    local server_panels=("${existing_server_panels[@]}")
+    local server_inbound_ids=("${existing_server_inbound_ids[@]}")
+    local server_limit_ips=("${existing_server_limit_ips[@]}")
 
     local default_id="server$((${#server_ids[@]} + 1))"
-    local current_id current_url current_token current_weight current_enabled
+    local current_id current_url current_token current_weight current_enabled current_panel current_inbound_ids current_limit_ip
 
     echo "--------------------------------------"
     echo "Add VPN server for balancing"
@@ -410,12 +492,22 @@ add_telegram_vpn_server() {
 
     current_weight=$(read_positive_number "Balancing weight" "1")
     current_enabled=$(read_yes_no_bool "Enable this server for new configs?" "true")
+    current_panel=$(read_panel_type "blitz")
+    current_inbound_ids=""
+    current_limit_ip="0"
+    if [ "$current_panel" = "3x-ui" ]; then
+        current_inbound_ids=$(read_inbound_ids "" "$current_enabled")
+        current_limit_ip=$(read_nonnegative_integer "Default client IP limit (0 = unlimited)" "0")
+    fi
 
     server_ids+=("$current_id")
     server_urls+=("$current_url")
     server_tokens+=("$current_token")
     server_weights+=("$current_weight")
     server_enabled+=("$current_enabled")
+    server_panels+=("$current_panel")
+    server_inbound_ids+=("$current_inbound_ids")
+    server_limit_ips+=("$current_limit_ip")
 
     echo "======================================"
     echo "Updated VPN server setup"
@@ -424,7 +516,7 @@ add_telegram_vpn_server() {
     local i server_count
     server_count=${#server_ids[@]}
     for ((i=0; i<server_count; i++)); do
-        echo "$((i + 1)). ${server_ids[$i]} | ${server_urls[$i]} | weight ${server_weights[$i]} | enabled ${server_enabled[$i]}"
+        echo "$((i + 1)). ${server_ids[$i]} | ${server_urls[$i]} | panel ${server_panels[$i]} | inbounds ${server_inbound_ids[$i]:-(none)} | weight ${server_weights[$i]} | enabled ${server_enabled[$i]}"
     done
     echo "======================================"
 
@@ -440,7 +532,7 @@ add_telegram_vpn_server() {
     local api_key="${server_tokens[0]}"
     local server_args=()
     for ((i=0; i<server_count; i++)); do
-        server_args+=(--server "${server_ids[$i]}=${server_urls[$i]},${server_tokens[$i]},${server_weights[$i]},${server_enabled[$i]}")
+        server_args+=(--server "${server_ids[$i]}=${server_urls[$i]},${server_tokens[$i]},${server_weights[$i]},${server_enabled[$i]},${server_panels[$i]},${server_inbound_ids[$i]},${server_limit_ips[$i]}")
     done
 
     run_ajib_cli telegram -a start -t "$token" -aid "$admin_ids" -u "$api_url" -k "$api_key" "${server_args[@]}"

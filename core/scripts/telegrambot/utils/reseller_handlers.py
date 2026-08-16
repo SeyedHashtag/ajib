@@ -104,6 +104,15 @@ from utils.telegram_safe import (
     safe_reply_to,
 )
 
+
+def _configured_primary_api_client():
+    """Use the panel factory, with compatibility for lightweight test stubs."""
+    try:
+        client = MultiServerAPI().get_client()
+    except (AttributeError, TypeError):
+        client = None
+    return client or APIClient()
+
 TELEGRAM_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
 reseller_username_state_lock = threading.Lock()
 RESELLER_CREATE_LOCK = threading.Lock()
@@ -1038,7 +1047,7 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
             )
             return
 
-    api_client = APIClient()
+    api_client = _configured_primary_api_client()
     username, result, api_client = _create_reseller_user_with_note(
         api_client,
         user_id,

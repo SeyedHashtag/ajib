@@ -1138,6 +1138,9 @@ def start_telegram_bot(token: str, adminid: str, api_url: str, api_key: str, ser
             server_url, server_token = parts[0], parts[1]
             weight = 1
             enabled = True
+            panel = 'blitz'
+            default_inbound_ids = []
+            default_limit_ip = 0
             if len(parts) >= 3 and parts[2].strip():
                 try:
                     weight = float(parts[2].strip())
@@ -1145,6 +1148,30 @@ def start_telegram_bot(token: str, adminid: str, api_url: str, api_key: str, ser
                     raise InvalidInputError('Error: --server weight must be a number.')
             if len(parts) >= 4 and parts[3].strip():
                 enabled = parts[3].strip().lower() not in ('0', 'false', 'no', 'disabled')
+            if len(parts) >= 5 and parts[4].strip():
+                panel_value = parts[4].strip().lower().replace('_', '-')
+                if panel_value in ('3x', '3xui', 'xui', 'x-ui'):
+                    panel_value = '3x-ui'
+                if panel_value not in ('blitz', '3x-ui'):
+                    raise InvalidInputError('Error: --server panel must be blitz or 3x-ui.')
+                panel = panel_value
+            if len(parts) >= 6 and parts[5].strip():
+                try:
+                    default_inbound_ids = [int(value) for value in parts[5].split('|') if value.strip()]
+                except ValueError:
+                    raise InvalidInputError('Error: --server inbound IDs must be positive integers separated by |.')
+                if not default_inbound_ids or any(value <= 0 for value in default_inbound_ids):
+                    raise InvalidInputError('Error: --server inbound IDs must be positive integers separated by |.')
+                default_inbound_ids = list(dict.fromkeys(default_inbound_ids))
+            if len(parts) >= 7 and parts[6].strip():
+                try:
+                    default_limit_ip = int(parts[6].strip())
+                except ValueError:
+                    raise InvalidInputError('Error: --server IP limit must be a non-negative integer.')
+                if default_limit_ip < 0:
+                    raise InvalidInputError('Error: --server IP limit must be a non-negative integer.')
+            if panel == '3x-ui' and enabled and not default_inbound_ids:
+                raise InvalidInputError('Error: enabled 3x-ui servers require default inbound IDs.')
             server_id = server_id.strip()
             server_url = server_url.strip()
             server_token = server_token.strip()
@@ -1157,6 +1184,9 @@ def start_telegram_bot(token: str, adminid: str, api_url: str, api_key: str, ser
                 'token': server_token,
                 'enabled': enabled,
                 'weight': weight,
+                'panel': panel,
+                'default_inbound_ids': default_inbound_ids,
+                'default_limit_ip': default_limit_ip,
             })
         if parsed_servers and (not api_url or not api_key):
             api_url = parsed_servers[0]['url']

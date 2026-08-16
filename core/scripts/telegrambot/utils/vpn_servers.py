@@ -48,9 +48,13 @@ def _format_status_line(status):
     unknown_text = str(status.get("unknown_count")) if status.get("unknown_count") is not None else "N/A"
     ratio_text = f"{load_ratio:.2f}" if load_ratio is not None else "N/A"
     weight = status.get("weight", 1)
+    panel = status.get("panel", "blitz")
+    creation_ready = status.get("creation_ready", False)
+    creation_text = "ready" if creation_ready else f"not ready ({status.get('creation_error') or 'unknown'})"
     return (
         f"*{status.get('name', status.get('id'))}* (`{status.get('id')}`)\n"
-        f"Status: `{enabled}` | Health: `{health}`\n"
+        f"Panel: `{panel}` | Status: `{enabled}` | Health: `{health}`\n"
+        f"Automatic creation: `{creation_text}`\n"
         f"Allocated: `{allocated_text}` | Started: `{started_text}` | Hold: `{hold_text}`\n"
         f"Online: `{online_text}` | Offline: `{offline_text}` | Blocked: `{blocked_text}` | Unknown: `{unknown_text}`\n"
         f"Weight: `{weight}` | Load: `{ratio_text}`"

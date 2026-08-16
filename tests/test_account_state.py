@@ -44,6 +44,20 @@ class AccountStateTests(unittest.TestCase):
         })
         self.assertEqual(snapshot.panel_state.value, "blocked")
 
+    def test_absolute_expiry_and_explicit_timer_support_three_x_records(self):
+        snapshot = self.state.inspect_account({
+            "status": "Offline",
+            "blocked": False,
+            "expiration_days": 30,
+            "timer_started": True,
+            "account_expiration_date": "2026-09-15T00:00:00+00:00",
+        }, now=datetime(2026, 9, 1, tzinfo=timezone.utc))
+
+        self.assertEqual(snapshot.panel_state.value, "connected")
+        self.assertTrue(snapshot.timer_started)
+        self.assertEqual(snapshot.panel_deadline, datetime(2026, 9, 15, tzinfo=timezone.utc))
+        self.assertEqual(snapshot.panel_days_remaining, 14)
+
     def test_inconsistent_or_missing_live_fields_fail_closed(self):
         inconsistent = self.state.inspect_account({
             "status": "On-hold",

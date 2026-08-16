@@ -11,12 +11,20 @@ whether the target was missing or its assigned server was unavailable.
 """
 
 import json
+import math
 import os
+import re
+import secrets
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
+
 import requests
 try:
-    from utils.account_state import PanelState, inspect_account
+    from utils.account_state import PanelState, inspect_account, panel_deadline
 except ModuleNotFoundError:  # Standalone diagnostics/tests.
-    from account_state import PanelState, inspect_account
+    from account_state import PanelState, inspect_account, panel_deadline
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,7 +35,43 @@ from dotenv import load_dotenv
 TELEGRAM_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
 _HTTP_POOL_CONNECTIONS = 8
 _HTTP_POOL_MAXSIZE = 16
+GIB = 1024 ** 3
+MILLISECONDS_PER_DAY = 86_400_000
+THREE_X_UI_PANEL = "3x-ui"
+BLITZ_PANEL = "blitz"
 _thread_local = threading.local()
+
+
+@dataclass(frozen=True)
+class UserRef:
+    server_id: str
+    username: str
+    panel_type: str = BLITZ_PANEL
+
+
+@dataclass
+class UserProvisionSpec:
+    username: str
+    traffic_limit_bytes: int
+    expiration_days: int
+    password: str | None = None
+    creation_date: str | None = None
+    absolute_expiry: datetime | None = None
+    delayed_start: bool = True
+    upload_bytes: int = 0
+    download_bytes: int = 0
+    blocked: bool = False
+    unlimited_ip: bool = False
+    note: str | None = None
+    inbound_ids: list[int] = field(default_factory=list)
+    limit_ip: int | None = None
+
+
+@dataclass(frozen=True)
+class UserCopySpec:
+    source: UserRef
+    destination_server_id: str
+    inbound_ids: tuple[int, ...] = ()
 
 
 def _float_env(name, default, minimum=0.1):
@@ -76,6 +120,57 @@ def _safe_weight(value) -> float:
     return weight if weight > 0 else 1.0
 
 
+def _safe_bool(value, default=True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "enabled", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "disabled", "off"}:
+            return False
+    return bool(default)
+
+
+def _normalise_panel_type(value) -> str:
+    normalized = str(value or BLITZ_PANEL).strip().lower().replace("_", "-")
+    if normalized in {"3x", "3xui", "3x-ui", "x-ui", "xui"}:
+        return THREE_X_UI_PANEL
+    return BLITZ_PANEL
+
+
+def _safe_inbound_ids(value) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = re.split(r"[|,\s]+", value.strip())
+    elif isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = [value]
+    result = []
+    for item in values:
+        if item in (None, ""):
+            continue
+        try:
+            inbound_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if inbound_id > 0 and inbound_id not in result:
+            result.append(inbound_id)
+    return result
+
+
+def _safe_nonnegative_int(value, default=0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
+    return parsed if parsed >= 0 else int(default)
+
+
 def _normalise_server_config(config: dict, index: int = 0) -> dict | None:
     if not isinstance(config, dict):
         return None
@@ -84,13 +179,23 @@ def _normalise_server_config(config: dict, index: int = 0) -> dict | None:
     if not url or not token:
         return None
     server_id = _safe_server_id(config.get("id") or config.get("name") or f"server{index + 1}")
+    panel_type = _normalise_panel_type(
+        config.get("panel") or config.get("panel_type") or config.get("type")
+    )
     return {
         "id": server_id,
         "name": str(config.get("name") or server_id),
         "url": url,
         "token": token,
-        "enabled": bool(config.get("enabled", True)),
+        "panel": panel_type,
+        "enabled": _safe_bool(config.get("enabled", True)),
         "weight": _safe_weight(config.get("weight", 1)),
+        "default_inbound_ids": _safe_inbound_ids(
+            config.get("default_inbound_ids") or config.get("inbound_ids")
+        ),
+        "default_limit_ip": _safe_nonnegative_int(
+            config.get("default_limit_ip", config.get("limit_ip", 0)), 0
+        ),
     }
 
 
@@ -169,7 +274,11 @@ def save_server_configs(servers: list[dict]) -> bool:
 
 
 class APIClient:
-    """HTTP client for the ajib REST API."""
+    """HTTP client for the Blitz REST API.
+
+    The public name is retained for compatibility.  New multi-panel code uses
+    :func:`create_panel_client`, which returns this class for Blitz servers.
+    """
 
     def __init__(self, server_config: dict | None = None):
         load_dotenv(TELEGRAM_ENV_PATH)
@@ -179,6 +288,18 @@ class APIClient:
         self.token: str = server_config["token"] if server_config else os.getenv('TOKEN', '')
         self.server_id: str = server_config["id"] if server_config else "primary"
         self.server_name: str = server_config["name"] if server_config else "Primary"
+        self.panel_type: str = BLITZ_PANEL
+        self.server_config = server_config or {
+            "id": self.server_id,
+            "name": self.server_name,
+            "url": base_url,
+            "token": self.token,
+            "panel": BLITZ_PANEL,
+            "enabled": True,
+            "weight": 1.0,
+            "default_inbound_ids": [],
+            "default_limit_ip": 0,
+        }
 
         if not base_url or not self.token:
             print("Warning: API URL or TOKEN not found in environment variables.")
@@ -284,9 +405,42 @@ class APIClient:
     # User operations                                                       #
     # ------------------------------------------------------------------ #
 
+    def _normalise_user_record(self, user, username: str | None = None):
+        if not isinstance(user, dict):
+            return user
+        normalized = dict(user)
+        if username and not normalized.get("username"):
+            normalized["username"] = username
+        normalized.setdefault("panel_type", BLITZ_PANEL)
+        normalized.setdefault("server_id", self.server_id)
+        status = " ".join(
+            str(normalized.get("status") or "").strip().lower()
+            .replace("-", " ").replace("_", " ").split()
+        )
+        delayed_start = status == "on hold" and not normalized.get("account_creation_date")
+        normalized.setdefault("delayed_start", delayed_start)
+        normalized.setdefault("timer_started", not delayed_start and bool(normalized.get("account_creation_date")))
+        deadline = panel_deadline(normalized)
+        if deadline is not None:
+            normalized.setdefault("account_expiration_date", deadline.isoformat())
+            normalized.setdefault("absolute_expiry", deadline.isoformat())
+        normalized.setdefault("credential_metadata", {
+            "panel": BLITZ_PANEL,
+            "fields_present": ["password"] if normalized.get("password") else [],
+        })
+        return normalized
+
     def get_users(self):
         """Return list or dict of all users, or ``None`` on failure."""
-        return self._get(self.users_endpoint)
+        users = self._get(self.users_endpoint)
+        if isinstance(users, dict):
+            return {
+                username: self._normalise_user_record(user, str(username))
+                for username, user in users.items()
+            }
+        if isinstance(users, list):
+            return [self._normalise_user_record(user) for user in users]
+        return users
 
     def get_user(self, username: str):
         """Return a single user's detail dict, or ``None`` if not found / on failure."""
@@ -343,12 +497,23 @@ class APIClient:
             }
         return {
             "status": "found",
-            "data": data,
+            "data": self._normalise_user_record(data, username),
             "http_status": status_code,
             "error": None,
         }
 
-    def add_user(self, username: str, traffic_limit: int, expiration_days: int, unlimited: bool = False, note: str | None = None):
+    def add_user(
+        self,
+        username: str,
+        traffic_limit: int,
+        expiration_days: int,
+        unlimited: bool = False,
+        note: str | None = None,
+        password: str | None = None,
+        creation_date: str | None = None,
+        blocked: bool = False,
+        inbound_ids: list[int] | None = None,
+    ):
         """Create a new user. Returns response data or ``None`` on failure."""
         payload = {
             "username": username,
@@ -358,10 +523,35 @@ class APIClient:
         }
         if note is not None:
             payload["note"] = note
+        if password:
+            payload["password"] = password
+        if creation_date:
+            payload["creation_date"] = creation_date
         result = self._post(self.users_endpoint, payload)
         if result is not None:
             MultiServerAPI.record_created_user(self.server_id, username)
+            if blocked and self.update_user(username, {"blocked": True}) is None:
+                return None
         return result
+
+    def is_creation_ready(self, verify_remote: bool = False) -> tuple[bool, str | None]:
+        return True, None
+
+    def get_inbound_options(self) -> list[dict] | None:
+        return []
+
+    def provision_user(self, spec: UserProvisionSpec):
+        traffic_limit_gib = int(math.ceil(spec.traffic_limit_bytes / GIB))
+        return self.add_user(
+            spec.username,
+            traffic_limit_gib,
+            spec.expiration_days,
+            unlimited=False,
+            note=spec.note,
+            password=spec.password,
+            creation_date=spec.creation_date,
+            blocked=spec.blocked,
+        )
 
     def update_user(self, username: str, data: dict):
         """Patch one or more fields of an existing user.
@@ -422,6 +612,459 @@ class APIClient:
         """Return subscription URI data dict, or ``None`` on failure."""
         return self._get(f"{self.base_url}api/v1/users/{username}/uri")
 
+
+class ThreeXUIAPIClient(APIClient):
+    """Adapter for the current 3x-ui v3 Bearer-token clients API."""
+
+    _DURATION_RE = re.compile(r"(?:^|\s)\[ajib-duration:(\d+)d\](?:\s|$)")
+
+    def __init__(self, server_config: dict):
+        config = _normalise_server_config(server_config or {}, 0)
+        if not config:
+            raise ValueError("3x-ui server requires a URL and API token")
+        self.server_config = config
+        self.token = config["token"]
+        self.server_id = config["id"]
+        self.server_name = config["name"]
+        self.panel_type = THREE_X_UI_PANEL
+        self.default_inbound_ids = list(config.get("default_inbound_ids") or [])
+        self.default_limit_ip = _safe_nonnegative_int(config.get("default_limit_ip"), 0)
+        root = config["url"].rstrip("/")
+        for suffix in ("/panel/api", "/panel"):
+            if root.lower().endswith(suffix):
+                root = root[:-len(suffix)]
+                break
+        self.base_url = root.rstrip("/") + "/"
+        self.api_base = f"{self.base_url}panel/api/"
+        bearer = self.token if self.token.lower().startswith("bearer ") else f"Bearer {self.token}"
+        self.headers = {
+            "accept": "application/json",
+            "Authorization": bearer,
+        }
+        self._session_key = (self.api_base, bearer)
+        self._readiness_cache = None
+
+    @staticmethod
+    def _envelope(response) -> dict:
+        status_code = APIClient._http_status(response)
+        if status_code == 404:
+            return {"status": "missing", "data": None, "http_status": status_code, "error": "not_found"}
+        try:
+            response.raise_for_status()
+        except requests.exceptions.RequestException:
+            return {
+                "status": "unavailable" if status_code in {408, 429} or (status_code or 0) >= 500 else "failed",
+                "data": None,
+                "http_status": status_code,
+                "error": APIClient._http_error_code(status_code),
+            }
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            return {"status": "unavailable", "data": None, "http_status": status_code, "error": "invalid_response"}
+        if not isinstance(payload, dict) or not isinstance(payload.get("success"), bool):
+            return {"status": "unavailable", "data": None, "http_status": status_code, "error": "invalid_envelope"}
+        if not payload["success"]:
+            message = str(payload.get("msg") or "").lower()
+            missing = any(word in message for word in ("not found", "does not exist", "no client"))
+            return {
+                "status": "missing" if missing else "failed",
+                "data": None,
+                "http_status": status_code,
+                "error": "not_found" if missing else "panel_rejected",
+                "message": payload.get("msg"),
+            }
+        return {
+            "status": "succeeded",
+            "data": payload.get("obj"),
+            "http_status": status_code,
+            "error": None,
+            "message": payload.get("msg"),
+        }
+
+    def _xui_result(self, method: str, path: str, data: dict | list | None = None) -> dict:
+        url = f"{self.api_base}{path.lstrip('/')}"
+        try:
+            response = self._request(
+                method,
+                url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                timeout=get_api_write_timeout_seconds() if method.upper() != "GET" else get_api_read_timeout_seconds(),
+            )
+        except requests.exceptions.RequestException as error:
+            return {
+                "status": "unavailable",
+                "data": None,
+                "http_status": None,
+                "error": self._request_error_code(error),
+            }
+        return self._envelope(response)
+
+    @classmethod
+    def _duration_days(cls, comment) -> int | None:
+        match = cls._DURATION_RE.search(str(comment or ""))
+        if not match:
+            return None
+        days = int(match.group(1))
+        return days if days > 0 else None
+
+    @classmethod
+    def _comment_with_duration(cls, comment, days: int) -> str:
+        clean = cls._DURATION_RE.sub(" ", str(comment or "")).strip()
+        marker = f"[ajib-duration:{int(days)}d]"
+        return f"{clean} {marker}".strip()
+
+    @classmethod
+    def _comment_without_marker(cls, comment) -> str | None:
+        clean = cls._DURATION_RE.sub(" ", str(comment or "")).strip()
+        return clean or None
+
+    @staticmethod
+    def _record_parts(item) -> tuple[dict, list[int], dict]:
+        if not isinstance(item, dict):
+            return {}, [], {}
+        client = item.get("client") if isinstance(item.get("client"), dict) else item
+        inbound_ids = _safe_inbound_ids(item.get("inboundIds", client.get("inboundIds")))
+        traffic = item.get("traffic") if isinstance(item.get("traffic"), dict) else client.get("traffic")
+        if not isinstance(traffic, dict):
+            traffic = {}
+        return dict(client), inbound_ids, dict(traffic)
+
+    def _normalise_user(self, item, online_emails: set[str] | None = None, traffic_override=None) -> dict | None:
+        client, inbound_ids, traffic = self._record_parts(item)
+        if isinstance(traffic_override, dict):
+            traffic.update(traffic_override)
+        username = str(client.get("email") or "").strip()
+        if not username:
+            return None
+        total_bytes = _safe_nonnegative_int(client.get("totalGB"), 0)
+        upload = _safe_nonnegative_int(traffic.get("up", traffic.get("upload")), 0)
+        download = _safe_nonnegative_int(traffic.get("down", traffic.get("download")), 0)
+        expiry_ms = 0
+        try:
+            expiry_ms = int(client.get("expiryTime") or 0)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        duration_days = self._duration_days(client.get("comment"))
+        delayed_start = expiry_ms < 0
+        absolute_expiry = None
+        creation_date = None
+        if expiry_ms > 0:
+            expiry_dt = datetime.fromtimestamp(expiry_ms / 1000, tz=timezone.utc)
+            absolute_expiry = expiry_dt.isoformat()
+            if duration_days:
+                creation_date = (expiry_dt - timedelta(days=duration_days)).isoformat()
+        elif delayed_start and not duration_days:
+            duration_days = max(1, int(math.ceil(abs(expiry_ms) / MILLISECONDS_PER_DAY)))
+        created_at = client.get("createdAt")
+        if creation_date is None and created_at and not delayed_start:
+            try:
+                creation_date = datetime.fromtimestamp(int(created_at) / 1000, tz=timezone.utc).isoformat()
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
+        blocked = not _safe_bool(client.get("enable", True))
+        online = username in (online_emails or set())
+        status = "Disabled" if blocked else ("On-hold" if delayed_start else ("Online" if online else "Offline"))
+        credential_fields = [name for name in ("auth", "password", "uuid", "id") if client.get(name)]
+        return {
+            "username": username,
+            "panel_type": THREE_X_UI_PANEL,
+            "server_id": self.server_id,
+            "status": status,
+            "blocked": blocked,
+            "max_download_bytes": total_bytes,
+            "upload_bytes": upload,
+            "download_bytes": download,
+            "used_traffic": upload + download,
+            "expiration_days": duration_days,
+            "configured_duration_days": duration_days,
+            "account_creation_date": creation_date,
+            "account_expiration_date": absolute_expiry,
+            "absolute_expiry": absolute_expiry,
+            "delayed_start": delayed_start,
+            "timer_started": not delayed_start,
+            "unlimited_user": total_bytes == 0,
+            "unlimited_ip": _safe_nonnegative_int(client.get("limitIp"), 0) == 0,
+            "limit_ip": _safe_nonnegative_int(client.get("limitIp"), 0),
+            "note": self._comment_without_marker(client.get("comment")),
+            "inbound_ids": inbound_ids,
+            "sub_id": client.get("subId"),
+            "password": client.get("auth") or client.get("password"),
+            "credential_metadata": {"panel": THREE_X_UI_PANEL, "fields_present": credential_fields},
+        }
+
+    def get_users(self):
+        listing = self._xui_result("GET", "clients/list")
+        if listing.get("status") != "succeeded" or not isinstance(listing.get("data"), list):
+            return None
+        online_result = self._xui_result("POST", "clients/onlines", {})
+        online_emails = set(online_result.get("data") or []) if online_result.get("status") == "succeeded" else set()
+        users = []
+        for item in listing["data"]:
+            user = self._normalise_user(item, online_emails=online_emails)
+            if user:
+                users.append(user)
+        return users
+
+    def _get_raw_result(self, username: str) -> dict:
+        result = self._xui_result("GET", f"clients/get/{quote(str(username), safe='')}")
+        if result.get("status") == "succeeded" and not isinstance(result.get("data"), dict):
+            return {**result, "status": "unavailable", "data": None, "error": "invalid_response"}
+        return result
+
+    def get_user_result(self, username: str) -> dict:
+        result = self._get_raw_result(username)
+        if result.get("status") != "succeeded":
+            return result
+        traffic_result = self._xui_result("GET", f"clients/traffic/{quote(str(username), safe='')}")
+        traffic = traffic_result.get("data") if traffic_result.get("status") == "succeeded" else None
+        online_result = self._xui_result("POST", "clients/onlines", {})
+        online = set(online_result.get("data") or []) if online_result.get("status") == "succeeded" else set()
+        user = self._normalise_user(result["data"], online_emails=online, traffic_override=traffic)
+        if user is None:
+            return {**result, "status": "unavailable", "data": None, "error": "invalid_response"}
+        return {**result, "status": "found", "data": user}
+
+    def add_user(
+        self,
+        username: str,
+        traffic_limit: int,
+        expiration_days: int,
+        unlimited: bool = False,
+        note: str | None = None,
+        password: str | None = None,
+        creation_date: str | None = None,
+        blocked: bool = False,
+        inbound_ids: list[int] | None = None,
+    ):
+        ids = _safe_inbound_ids(inbound_ids) or list(self.default_inbound_ids)
+        if not ids:
+            return None
+        try:
+            days = int(expiration_days)
+            limit_bytes = 0 if unlimited else int(traffic_limit) * GIB
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if days <= 0 or limit_bytes < 0:
+            return None
+        client = {
+            "email": username,
+            "subId": secrets.token_urlsafe(12),
+            "totalGB": limit_bytes,
+            "expiryTime": -days * MILLISECONDS_PER_DAY,
+            "tgId": 0,
+            "limitIp": self.default_limit_ip,
+            "enable": not blocked,
+            "comment": self._comment_with_duration(note, days),
+        }
+        if password:
+            client["auth"] = password
+        result = self._xui_result("POST", "clients/add", {"client": client, "inboundIds": ids})
+        if result.get("status") != "succeeded":
+            return None
+        MultiServerAPI.record_created_user(self.server_id, username)
+        return {"message": result.get("message") or "Client added", "obj": result.get("data")}
+
+    def create_from_spec(self, spec: UserProvisionSpec):
+        inbound_ids = _safe_inbound_ids(spec.inbound_ids) or list(self.default_inbound_ids)
+        if not inbound_ids or not spec.password:
+            return None
+        days = int(spec.expiration_days)
+        if days <= 0 or int(spec.traffic_limit_bytes) < 0:
+            return None
+        if spec.delayed_start:
+            expiry_time = -days * MILLISECONDS_PER_DAY
+        elif spec.absolute_expiry is not None:
+            expiry = spec.absolute_expiry
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            expiry_time = int(expiry.timestamp() * 1000)
+        else:
+            expiry_time = int((datetime.now(timezone.utc) + timedelta(days=days)).timestamp() * 1000)
+        client = {
+            "email": spec.username,
+            "subId": secrets.token_urlsafe(12),
+            "auth": spec.password,
+            "totalGB": int(spec.traffic_limit_bytes),
+            "expiryTime": expiry_time,
+            "tgId": 0,
+            "limitIp": self.default_limit_ip if spec.limit_ip is None else _safe_nonnegative_int(spec.limit_ip),
+            "enable": not spec.blocked,
+            "comment": self._comment_with_duration(spec.note, days),
+        }
+        result = self._xui_result("POST", "clients/add", {"client": client, "inboundIds": inbound_ids})
+        if result.get("status") != "succeeded":
+            return None
+        MultiServerAPI.record_created_user(self.server_id, spec.username)
+        return {"message": result.get("message") or "Client added", "obj": result.get("data")}
+
+    def provision_user(self, spec: UserProvisionSpec):
+        return self.create_from_spec(spec)
+
+    def update_traffic(self, username: str, upload_bytes: int, download_bytes: int):
+        result = self._xui_result(
+            "POST",
+            f"clients/updateTraffic/{quote(str(username), safe='')}",
+            {"upload": _safe_nonnegative_int(upload_bytes), "download": _safe_nonnegative_int(download_bytes)},
+        )
+        if result.get("status") == "succeeded":
+            MultiServerAPI.invalidate_all_caches()
+            return {"message": result.get("message") or "Traffic updated"}
+        return None
+
+    def update_user(self, username: str, data: dict):
+        raw_result = self._get_raw_result(username)
+        if raw_result.get("status") != "succeeded":
+            return None
+        client, _, _ = self._record_parts(raw_result["data"])
+        if not client:
+            return None
+        duration = self._duration_days(client.get("comment"))
+        if "new_username" in data:
+            client["email"] = str(data["new_username"]).strip()
+        if "new_traffic_limit" in data:
+            client["totalGB"] = int(data["new_traffic_limit"]) * GIB
+        if "traffic_limit" in data:
+            client["totalGB"] = int(data["traffic_limit"]) * GIB
+        if "new_expiration_days" in data or "expiration_days" in data:
+            days = int(data.get("new_expiration_days", data.get("expiration_days")))
+            if days <= 0:
+                return None
+            client["expiryTime"] = -days * MILLISECONDS_PER_DAY
+            client["comment"] = self._comment_with_duration(client.get("comment"), days)
+            duration = days
+        if "blocked" in data:
+            client["enable"] = not _safe_bool(data["blocked"], False)
+        if "note" in data:
+            client["comment"] = self._comment_with_duration(data.get("note"), duration) if duration else str(data.get("note") or "")
+        if data.get("renew_password"):
+            if client.get("auth") is not None:
+                client["auth"] = secrets.token_urlsafe(18)
+            elif client.get("password") is not None:
+                client["password"] = secrets.token_urlsafe(18)
+            elif client.get("uuid") is not None:
+                client["uuid"] = str(uuid.uuid4())
+            elif isinstance(client.get("id"), str):
+                client["id"] = str(uuid.uuid4())
+            else:
+                return None
+        if data.get("renew_creation_date"):
+            if not duration:
+                return None
+            client["expiryTime"] = int((datetime.now(timezone.utc) + timedelta(days=duration)).timestamp() * 1000)
+        result = self._xui_result("POST", f"clients/update/{quote(str(username), safe='')}", client)
+        if result.get("status") == "succeeded":
+            MultiServerAPI.invalidate_all_caches()
+            return {"message": result.get("message") or "Client updated"}
+        return None
+
+    def reset_user_result(self, username: str) -> dict:
+        raw_result = self._get_raw_result(username)
+        if raw_result.get("status") != "succeeded":
+            return raw_result
+        client, _, _ = self._record_parts(raw_result["data"])
+        duration = self._duration_days(client.get("comment"))
+        if not duration:
+            return {"status": "failed", "data": None, "http_status": None, "error": "duration_unknown"}
+        reset = self._xui_result("POST", f"clients/resetTraffic/{quote(str(username), safe='')}", {})
+        if reset.get("status") != "succeeded":
+            return reset
+        client["expiryTime"] = -duration * MILLISECONDS_PER_DAY
+        client["enable"] = True
+        updated = self._xui_result("POST", f"clients/update/{quote(str(username), safe='')}", client)
+        if updated.get("status") != "succeeded":
+            return updated
+        MultiServerAPI.invalidate_all_caches()
+        return {"status": "succeeded", "data": {"message": "Client reset"}, "http_status": 200, "error": None}
+
+    def delete_user(self, username: str):
+        result = self._xui_result("POST", f"clients/del/{quote(str(username), safe='')}?keepTraffic=0", {})
+        if result.get("status") == "succeeded":
+            MultiServerAPI.invalidate_all_caches()
+            return {"message": result.get("message") or "Client deleted"}
+        return None
+
+    @staticmethod
+    def _settings_dict(data) -> dict:
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list):
+            result = {}
+            for item in data:
+                if isinstance(item, dict) and item.get("key") is not None:
+                    result[str(item["key"])] = item.get("value")
+            return result
+        return {}
+
+    def get_settings(self) -> dict | None:
+        result = self._xui_result("POST", "setting/all", {})
+        return self._settings_dict(result.get("data")) if result.get("status") == "succeeded" else None
+
+    def get_inbound_options(self) -> list[dict] | None:
+        result = self._xui_result("GET", "inbounds/options")
+        if result.get("status") != "succeeded" or not isinstance(result.get("data"), list):
+            return None
+        options = []
+        for item in result["data"]:
+            if not isinstance(item, dict):
+                continue
+            inbound_id = item.get("id")
+            try:
+                inbound_id = int(inbound_id)
+            except (TypeError, ValueError):
+                continue
+            options.append({
+                **item,
+                "id": inbound_id,
+                "remark": item.get("remark") or item.get("tag") or f"Inbound {inbound_id}",
+                "protocol": str(item.get("protocol") or "").lower(),
+            })
+        return options
+
+    def is_creation_ready(self, verify_remote: bool = False) -> tuple[bool, str | None]:
+        if not self.default_inbound_ids:
+            return False, "default_inbounds_missing"
+        if not verify_remote:
+            return True, None
+        options = self.get_inbound_options()
+        if options is None:
+            return False, "inbounds_unavailable"
+        available = {item["id"] for item in options}
+        if any(inbound_id not in available for inbound_id in self.default_inbound_ids):
+            return False, "default_inbounds_invalid"
+        settings = self.get_settings()
+        if settings is None:
+            return False, "settings_unavailable"
+        sub_uri = str(settings.get("subURI") or "").strip()
+        if not sub_uri or not _safe_bool(settings.get("subEnable", True), True):
+            return False, "public_subscription_missing"
+        return True, None
+
+    def get_user_uri(self, username: str):
+        raw_result = self._get_raw_result(username)
+        if raw_result.get("status") != "succeeded":
+            return None
+        client, _, _ = self._record_parts(raw_result["data"])
+        sub_id = str(client.get("subId") or "").strip()
+        settings = self.get_settings()
+        sub_uri = str((settings or {}).get("subURI") or "").strip()
+        if sub_uri and sub_id and _safe_bool((settings or {}).get("subEnable", True), True):
+            return {"normal_sub": f"{sub_uri}{sub_id}", "ipv4": "", "direct": False}
+        links = self._xui_result("GET", f"clients/links/{quote(str(username), safe='')}")
+        direct_links = links.get("data") if links.get("status") == "succeeded" else None
+        if isinstance(direct_links, list) and direct_links:
+            return {"normal_sub": str(direct_links[0]), "ipv4": "", "direct": True, "links": direct_links}
+        return None
+
+
+def create_panel_client(server_config: dict | None = None):
+    """Construct the correct adapter while preserving legacy APIClient use."""
+    if server_config and _normalise_panel_type(server_config.get("panel") or server_config.get("panel_type")) == THREE_X_UI_PANEL:
+        return ThreeXUIAPIClient(server_config)
+    return APIClient(server_config)
+
+
 class MultiServerAPI:
     """Coordinates API operations across configured VPN servers."""
 
@@ -435,19 +1078,19 @@ class MultiServerAPI:
     def __init__(self):
         self.servers = get_server_configs()
 
-    def get_client(self, server_id: str | None = None) -> APIClient | None:
+    def get_client(self, server_id: str | None = None) -> APIClient | ThreeXUIAPIClient | None:
         if not self.servers:
             return None
         if server_id:
             for server in self.servers:
                 if server["id"] == server_id:
-                    return APIClient(server)
-        return APIClient(self.servers[0])
+                    return create_panel_client(server)
+        return create_panel_client(self.servers[0])
 
     def iter_clients(self, include_disabled: bool = False):
         for server in self.servers:
             if include_disabled or server.get("enabled", True):
-                yield server, APIClient(server)
+                yield server, create_panel_client(server)
 
     @staticmethod
     def _max_parallel_workers(server_count: int) -> int:
@@ -463,10 +1106,17 @@ class MultiServerAPI:
             if include_disabled or server.get("enabled", True):
                 entries.append({
                     "server": server,
-                    "client": APIClient(server),
+                    "client": create_panel_client(server),
                     "index": len(entries),
                 })
         return entries
+
+    @staticmethod
+    def _client_creation_readiness(client, healthy: bool) -> tuple[bool, str | None]:
+        if not healthy:
+            return False, "server_unavailable"
+        checker = getattr(client, "is_creation_ready", None)
+        return checker(verify_remote=True) if callable(checker) else (True, None)
 
     def _fetch_users_for_servers(self, include_disabled: bool = False) -> list[dict]:
         entries = self._client_entries(include_disabled=include_disabled)
@@ -665,6 +1315,9 @@ class MultiServerAPI:
                 server.get("token"),
                 bool(server.get("enabled", True)),
                 _safe_weight(server.get("weight", 1)),
+                _normalise_panel_type(server.get("panel")),
+                tuple(_safe_inbound_ids(server.get("default_inbound_ids"))),
+                _safe_nonnegative_int(server.get("default_limit_ip"), 0),
             )
             for server in servers
         )
@@ -678,6 +1331,8 @@ class MultiServerAPI:
             client = entry["client"]
             users = entry["users"]
             healthy = users is not None
+            readiness = self._client_creation_readiness(client, healthy)
+            creation_ready, creation_error = readiness
             allocated_count = self.allocated_user_count(users) if healthy else None
             weight = _safe_weight(server.get("weight", 1))
             if healthy:
@@ -687,6 +1342,8 @@ class MultiServerAPI:
                 "client": client,
                 "index": entry["index"],
                 "healthy": healthy,
+                "creation_ready": bool(creation_ready),
+                "creation_error": creation_error,
                 "active_count": allocated_count,
                 "allocated_count": allocated_count,
                 "weight": weight,
@@ -741,7 +1398,7 @@ class MultiServerAPI:
         snapshot = self._get_creation_snapshot(force_refresh=force_refresh)
         candidates = []
         for state in snapshot.get("servers", []):
-            if not state.get("healthy"):
+            if not state.get("healthy") or not state.get("creation_ready", True):
                 continue
             candidates.append((state["load_ratio"], state["index"], state["client"]))
 
@@ -831,6 +1488,8 @@ class MultiServerAPI:
             server = entry["server"]
             users = entry["users"]
             healthy = users is not None
+            client = entry["client"]
+            creation_ready, creation_error = self._client_creation_readiness(client, healthy)
             allocated_count = self.allocated_user_count(users)
             state_counts = self.account_state_counts(users) if healthy else {
                 "allocated": None,
@@ -847,6 +1506,9 @@ class MultiServerAPI:
                 **server,
                 "index": entry["index"],
                 "healthy": healthy,
+                "panel": getattr(client, "panel_type", server.get("panel", BLITZ_PANEL)),
+                "creation_ready": bool(creation_ready),
+                "creation_error": creation_error,
                 "active_count": allocated_count if healthy else None,
                 "allocated_count": allocated_count if healthy else None,
                 "connected_count": state_counts["active"],
@@ -870,6 +1532,225 @@ class MultiServerAPI:
             if users is not None:
                 usernames.update(self.extract_usernames(users))
         return usernames
+
+    def copy_blitz_user(
+        self,
+        source_ref: UserRef,
+        destination_server_id: str,
+        inbound_ids: list[int] | None = None,
+    ) -> dict:
+        """Copy a live Blitz account without changing its source identity.
+
+        Every post-create failure attempts to remove only the newly-created
+        destination.  The returned error code is safe to show or log and never
+        contains credential values.
+        """
+        source_client, source, source_result = self.find_user_on_server(
+            source_ref.username,
+            source_ref.server_id,
+        )
+        if source_result.get("status") != "found" or source is None:
+            return {"ok": False, "error": f"source_{source_result.get('status', 'unavailable')}"}
+        if getattr(source_client, "panel_type", BLITZ_PANEL) != BLITZ_PANEL:
+            return {"ok": False, "error": "source_panel_not_supported"}
+
+        destination = self.get_client(destination_server_id)
+        if destination is None or destination.server_id == source_client.server_id:
+            return {"ok": False, "error": "destination_invalid"}
+        destination_result = destination.get_user_result(source_ref.username)
+        if destination_result.get("status") == "found":
+            return {"ok": False, "error": "destination_exists"}
+        if destination_result.get("status") != "missing":
+            return {"ok": False, "error": "destination_unavailable"}
+
+        password = source.get("password")
+        if not isinstance(password, str) or not password:
+            return {"ok": False, "error": "source_password_missing"}
+
+        def required_int(field, minimum=0):
+            value = source.get(field)
+            if isinstance(value, bool):
+                return None
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return parsed if parsed >= minimum else None
+
+        def parsed_nonnegative(value):
+            if isinstance(value, bool):
+                return None
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return parsed if parsed >= 0 else None
+
+        total_bytes = required_int("max_download_bytes")
+        upload_bytes = required_int("upload_bytes")
+        download_bytes = required_int("download_bytes")
+        duration_days = required_int("expiration_days", minimum=1)
+        blocked = source.get("blocked") if isinstance(source.get("blocked"), bool) else None
+        if None in (total_bytes, upload_bytes, download_bytes, duration_days, blocked):
+            return {"ok": False, "error": "source_state_malformed"}
+
+        status = " ".join(str(source.get("status") or "").lower().replace("-", " ").replace("_", " ").split())
+        delayed_start = source.get("delayed_start")
+        if not isinstance(delayed_start, bool):
+            timer_started = source.get("timer_started")
+            delayed_start = (timer_started is False) if isinstance(timer_started, bool) else status == "on hold"
+        expiry = panel_deadline(source)
+        note = source.get("note")
+        if note is not None:
+            note = str(note)
+
+        selected_inbounds = []
+        if getattr(destination, "panel_type", BLITZ_PANEL) == THREE_X_UI_PANEL:
+            selected_inbounds = _safe_inbound_ids(inbound_ids)
+            if not selected_inbounds:
+                return {"ok": False, "error": "inbounds_required"}
+            options = destination.get_inbound_options()
+            if options is None:
+                return {"ok": False, "error": "inbounds_unavailable"}
+            option_map = {item["id"]: item for item in options}
+            allowed_protocols = {"hysteria", "hysteria2", "hy2"}
+            if any(
+                inbound_id not in option_map
+                or str(option_map[inbound_id].get("protocol") or "").lower() not in allowed_protocols
+                for inbound_id in selected_inbounds
+            ):
+                return {"ok": False, "error": "inbounds_not_hysteria2"}
+            destination_limit = total_bytes
+        else:
+            if source.get("unlimited_user") is True or total_bytes <= 0:
+                return {"ok": False, "error": "blitz_unlimited_not_representable"}
+            remaining_bytes = total_bytes - upload_bytes - download_bytes
+            if remaining_bytes <= 0:
+                return {"ok": False, "error": "blitz_allowance_exhausted"}
+            destination_limit = int(math.ceil(remaining_bytes / GIB)) * GIB
+
+        spec = UserProvisionSpec(
+            username=source_ref.username,
+            traffic_limit_bytes=destination_limit,
+            expiration_days=duration_days,
+            password=password,
+            creation_date=source.get("account_creation_date") if not delayed_start else None,
+            absolute_expiry=expiry,
+            delayed_start=bool(delayed_start),
+            upload_bytes=upload_bytes if destination.panel_type == THREE_X_UI_PANEL else 0,
+            download_bytes=download_bytes if destination.panel_type == THREE_X_UI_PANEL else 0,
+            blocked=False,
+            note=note,
+            inbound_ids=selected_inbounds,
+            limit_ip=(destination.server_config or {}).get("default_limit_ip"),
+        )
+
+        created = False
+
+        def fail(error_code):
+            if not created:
+                return {"ok": False, "error": error_code}
+            rollback = destination.delete_user(source_ref.username)
+            self.invalidate_all_caches()
+            if rollback is None:
+                return {
+                    "ok": False,
+                    "error": error_code,
+                    "rollback_failed": True,
+                    "partial_destination": destination.server_id,
+                }
+            return {"ok": False, "error": error_code, "rolled_back": True}
+
+        if destination.panel_type == THREE_X_UI_PANEL:
+            creation_result = destination.create_from_spec(spec)
+        else:
+            creation_result = destination.add_user(
+                spec.username,
+                int(destination_limit // GIB),
+                spec.expiration_days,
+                unlimited=False,
+                note=spec.note,
+                password=spec.password,
+                creation_date=spec.creation_date,
+                blocked=False,
+            )
+        if creation_result is None:
+            post_create = destination.get_user_result(spec.username)
+            if post_create.get("status") == "found":
+                return {
+                    "ok": False,
+                    "error": "destination_create_outcome_unknown",
+                    "partial_destination": destination.server_id,
+                }
+            return {"ok": False, "error": "destination_create_failed"}
+        created = True
+
+        if destination.panel_type == THREE_X_UI_PANEL:
+            if destination.update_traffic(spec.username, upload_bytes, download_bytes) is None:
+                return fail("traffic_import_failed")
+
+        uri_data = destination.get_user_uri(spec.username)
+        if not isinstance(uri_data, dict) or not uri_data.get("normal_sub"):
+            return fail("destination_uri_failed")
+
+        if blocked and destination.update_user(spec.username, {"blocked": True}) is None:
+            return fail("destination_state_failed")
+
+        verification = destination.get_user_result(spec.username)
+        copied = verification.get("data") if verification.get("status") == "found" else None
+        if not isinstance(copied, dict):
+            return fail("destination_verification_failed")
+        expected_upload = upload_bytes if destination.panel_type == THREE_X_UI_PANEL else 0
+        expected_download = download_bytes if destination.panel_type == THREE_X_UI_PANEL else 0
+        verified = (
+            copied.get("password") == password
+            and parsed_nonnegative(copied.get("max_download_bytes")) == destination_limit
+            and parsed_nonnegative(copied.get("upload_bytes")) == expected_upload
+            and parsed_nonnegative(copied.get("download_bytes")) == expected_download
+            and copied.get("blocked") is blocked
+            and parsed_nonnegative(copied.get("expiration_days")) == duration_days
+        )
+        if note is not None:
+            verified = verified and copied.get("note") == note
+        if delayed_start:
+            copied_status = " ".join(
+                str(copied.get("status") or "").lower().replace("-", " ").replace("_", " ").split()
+            )
+            verified = verified and (
+                copied.get("delayed_start") is True
+                or (copied_status == "on hold" and not copied.get("account_creation_date"))
+            )
+        elif expiry is not None:
+            copied_expiry = panel_deadline(copied)
+            verified = verified and copied_expiry is not None and abs((copied_expiry - expiry).total_seconds()) <= 2
+        if destination.panel_type == THREE_X_UI_PANEL:
+            verified = verified and set(selected_inbounds).issubset(set(_safe_inbound_ids(copied.get("inbound_ids"))))
+        if not verified:
+            return fail("destination_verification_failed")
+
+        self.invalidate_all_caches()
+        return {
+            "ok": True,
+            "username": spec.username,
+            "source_server_id": source_client.server_id,
+            "destination_server_id": destination.server_id,
+            "destination_server_name": destination.server_name,
+            "panel_type": destination.panel_type,
+            "inbound_ids": selected_inbounds,
+            "normal_sub": uri_data["normal_sub"],
+            "direct_link": bool(uri_data.get("direct")),
+            "blitz_quota_gib": int(destination_limit // GIB) if destination.panel_type == BLITZ_PANEL else None,
+        }
+
+    def copy_user(self, spec: UserCopySpec) -> dict:
+        """Panel-neutral copy entry point for a structured copy request."""
+        if not isinstance(spec, UserCopySpec):
+            return {"ok": False, "error": "copy_spec_invalid"}
+        return self.copy_blitz_user(
+            spec.source,
+            spec.destination_server_id,
+            list(spec.inbound_ids),
+        )
 
     def get_user_snapshot_entries(
         self,
@@ -928,6 +1809,45 @@ class MultiServerAPI:
                 return client, user
         return None, None
 
+    def find_user_matches(self, username: str, force_refresh: bool = True) -> list[dict]:
+        """Return every exact ``(server, username)`` identity that matches."""
+        target = str(username or "").strip().casefold()
+        if not target:
+            return []
+        matches = []
+        for entry in self.get_user_snapshot_entries(
+            include_disabled=True,
+            force_refresh=force_refresh,
+        ):
+            client = entry.get("client")
+            users = entry.get("users")
+            if client is None or users is None:
+                continue
+            candidates = []
+            if isinstance(users, dict):
+                candidates = [
+                    (str(name), value) for name, value in users.items()
+                    if str(name).casefold() == target and isinstance(value, dict)
+                ]
+            elif isinstance(users, list):
+                candidates = [
+                    (str(value.get("username") or ""), value) for value in users
+                    if isinstance(value, dict)
+                    and str(value.get("username") or "").casefold() == target
+                ]
+            for actual_username, user in candidates:
+                matches.append({
+                    "ref": UserRef(
+                        server_id=str(client.server_id),
+                        username=actual_username or str(username),
+                        panel_type=getattr(client, "panel_type", BLITZ_PANEL),
+                    ),
+                    "client": client,
+                    "user": user,
+                    "server": entry.get("server") or {},
+                })
+        return matches
+
     def find_user_on_server(self, username: str, server_id: str):
         """Look up a user only on the exact recorded server.
 
@@ -947,7 +1867,7 @@ class MultiServerAPI:
         for server in self.servers:
             if str(server.get("id")) != target_server_id:
                 continue
-            client = APIClient(server)
+            client = create_panel_client(server)
             result = client.get_user_result(username)
             return client, result.get("data"), result
 
