@@ -1,3 +1,9 @@
+## v2.1.1
+🛠️ Normalize persisted bot timestamps to canonical UTC across payments, renewals, credits, referrals, hosted bots, backups, and operational reporting
+🐛 Repair corroborated legacy reserved-renewal timestamps safely while preserving ambiguous or unrelated records
+🐛 Restore Blitz user copying for finite-quota accounts, on-hold users with null traffic counters, and panel-specific not-found responses
+✅ Expand regression coverage for UTC timestamp handling, migration safety, backup metadata, and Blitz copy compatibility
+
 ## v2.1.0
 ✨ Adopt externally created bulk-reseller configurations atomically while preserving financial neutrality and idempotency
 ✨ Let resellers choose an eligible target plan and review the details before confirming customer renewals
