@@ -72,6 +72,48 @@ class ThreeXUIAdapterTests(unittest.TestCase):
         self.assertEqual(user["account_expiration_date"], "2026-08-31T00:00:00.000000Z")
         self.assertEqual(user["credential_metadata"]["fields_present"], ["password"])
 
+    def test_blitz_on_hold_null_traffic_normalises_to_zero(self):
+        client = api_client.APIClient({
+            "id": "b1", "name": "Blitz", "url": "https://b.example", "token": "t"
+        })
+        client._request = lambda *args, **kwargs: Response({
+            "username": "waiting",
+            "status": "On-hold",
+            "blocked": False,
+            "expiration_days": 30,
+            "account_creation_date": None,
+            "upload_bytes": None,
+            "download_bytes": None,
+        })
+
+        user = client.get_user("waiting")
+
+        self.assertEqual(user["upload_bytes"], 0)
+        self.assertEqual(user["download_bytes"], 0)
+        self.assertTrue(user["delayed_start"])
+
+    def test_blitz_500_not_found_is_confirmed_against_live_list(self):
+        client = api_client.APIClient({
+            "id": "b1", "name": "Blitz", "url": "https://b.example", "token": "t"
+        })
+        calls = []
+
+        def request(method, url, **kwargs):
+            calls.append(url)
+            if url.endswith("api/v1/users/waiting"):
+                return Response({
+                    "status": 500,
+                    "detail": "Command failed: User 'waiting' not found in the database.",
+                }, status_code=500)
+            return Response([])
+
+        client._request = request
+        result = client.get_user_result("waiting")
+
+        self.assertEqual(result["status"], "missing")
+        self.assertEqual(result["source"], "confirmed_list_fallback")
+        self.assertEqual(len(calls), 2)
+
     def test_factory_defaults_legacy_to_blitz_and_uses_bearer_for_3x(self):
         legacy = api_client._normalise_server_config({
             "id": "old", "url": "https://old.example", "token": "t"

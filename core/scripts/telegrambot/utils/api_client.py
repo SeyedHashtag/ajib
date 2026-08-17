@@ -462,6 +462,14 @@ class APIClient:
         delayed_start = status == "on hold" and not normalized.get("account_creation_date")
         normalized.setdefault("delayed_start", delayed_start)
         normalized.setdefault("timer_started", not delayed_start and bool(normalized.get("account_creation_date")))
+        # Blitz reports null traffic before first connection. On-hold proves
+        # the account has never started, so those counters are safely zero.
+        # Active accounts with missing counters remain malformed/fail-closed.
+        if delayed_start:
+            if normalized.get("upload_bytes") is None:
+                normalized["upload_bytes"] = 0
+            if normalized.get("download_bytes") is None:
+                normalized["download_bytes"] = 0
         deadline = panel_deadline(normalized)
         if deadline is not None:
             normalized.setdefault("account_expiration_date", format_utc_timestamp(deadline))
@@ -511,6 +519,61 @@ class APIClient:
                 "http_status": status_code,
                 "error": "not_found",
             }
+        if status_code is not None and status_code >= 500:
+            # Blitz 2.5.x can wrap its command-line "user not found" result
+            # in HTTP 500. Trust it only when it names this exact user, then
+            # confirm absence against the live full list. Other 5xx responses
+            # remain unavailable and therefore fail closed.
+            try:
+                error_payload = response.json()
+            except (TypeError, ValueError):
+                error_payload = None
+            detail = (
+                str(error_payload.get("detail") or "")
+                if isinstance(error_payload, dict)
+                else ""
+            )
+            detail_folded = detail.casefold()
+            if (
+                str(username).casefold() in detail_folded
+                and "not found in the database" in detail_folded
+            ):
+                users = self.get_users()
+                target = str(username).casefold()
+                listed_user = None
+                if isinstance(users, dict):
+                    listed_user = next(
+                        (
+                            user for name, user in users.items()
+                            if str(name).casefold() == target and isinstance(user, dict)
+                        ),
+                        None,
+                    )
+                elif isinstance(users, list):
+                    listed_user = next(
+                        (
+                            user for user in users
+                            if isinstance(user, dict)
+                            and str(user.get("username") or "").casefold() == target
+                        ),
+                        None,
+                    )
+                if users is not None and listed_user is None:
+                    return {
+                        "status": "missing",
+                        "data": None,
+                        "http_status": status_code,
+                        "error": "not_found",
+                        "source": "confirmed_list_fallback",
+                    }
+                if listed_user is not None:
+                    return {
+                        "status": "found",
+                        "data": self._normalise_user_record(listed_user, username),
+                        "http_status": status_code,
+                        "error": None,
+                        "source": "confirmed_list_fallback",
+                    }
         try:
             response.raise_for_status()
         except requests.exceptions.RequestException as error:
@@ -1860,7 +1923,10 @@ class MultiServerAPI:
                 return {"ok": False, "error": "inbounds_not_hysteria2"}
             destination_limit = total_bytes
         else:
-            if source.get("unlimited_user") is True or total_bytes <= 0:
+            # Blitz's ``unlimited_user`` flag describes access/IP policy and
+            # can coexist with a finite byte quota. Only a non-positive byte
+            # limit is an unlimited allowance that cannot be re-imported.
+            if total_bytes <= 0:
                 return {"ok": False, "error": "blitz_unlimited_not_representable"}
             remaining_bytes = total_bytes - upload_bytes - download_bytes
             if remaining_bytes <= 0:

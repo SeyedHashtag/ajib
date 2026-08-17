@@ -173,7 +173,7 @@ class UserCopyTests(unittest.TestCase):
 
     def test_blitz_copy_uses_ceil_of_remaining_allowance_and_zero_counters(self):
         destination = BlitzDestination()
-        multi = make_multi(source_user(), destination)
+        multi = make_multi(source_user(unlimited_user=True), destination)
 
         result = multi.copy_blitz_user(api_client.UserRef("src", "alice", "blitz"), "dst")
 
@@ -263,7 +263,7 @@ class UserCopyTests(unittest.TestCase):
 
     def test_blitz_rejects_unlimited_and_exhausted_allowances(self):
         destination = BlitzDestination()
-        multi = make_multi(source_user(unlimited_user=True), destination)
+        multi = make_multi(source_user(unlimited_user=True, max_download_bytes=0), destination)
         unlimited = multi.copy_blitz_user(api_client.UserRef("src", "alice"), "dst")
         self.assertEqual(unlimited["error"], "blitz_unlimited_not_representable")
 
