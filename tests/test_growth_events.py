@@ -45,7 +45,8 @@ class GrowthEventTests(unittest.TestCase):
         )
 
     def test_schema_v1_is_upgraded_with_growth_and_credit_tables(self):
-        with sqlite3.connect(self.db_path) as connection:
+        connection = sqlite3.connect(self.db_path)
+        try:
             connection.execute(
                 "CREATE TABLE schema_migrations "
                 "(version INTEGER PRIMARY KEY, applied_at TEXT)"
@@ -53,10 +54,13 @@ class GrowthEventTests(unittest.TestCase):
             connection.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (1, 'old')"
             )
+            connection.commit()
+        finally:
+            connection.close()
 
         connection = database.get_connection(self.db_path)
 
-        self.assertEqual(database.schema_version(self.db_path), 2)
+        self.assertEqual(database.schema_version(self.db_path), 3)
         tables = {
             row["name"]
             for row in connection.execute(

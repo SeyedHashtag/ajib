@@ -12,7 +12,7 @@ import sqlite3
 import sys
 import tempfile
 import zipfile
-from datetime import datetime
+from contextlib import closing
 from pathlib import Path, PurePosixPath
 
 
@@ -23,6 +23,7 @@ if str(BOT_SOURCE_DIR) not in sys.path:
 
 from migrate_state import migrate_legacy_state
 from utils import database
+from utils.time_utils import format_utc_timestamp
 
 
 FORMAT_VERSION = 2
@@ -87,7 +88,7 @@ def create_backup(
             database.reset_connection(import_database)
 
         database.reset_connection(snapshot)
-        with sqlite3.connect(snapshot) as connection:
+        with closing(sqlite3.connect(snapshot)) as connection:
             check = connection.execute("PRAGMA quick_check").fetchone()[0]
             if str(check).lower() != "ok":
                 raise StateArchiveError(f"Database snapshot quick_check failed: {check}")
@@ -102,7 +103,7 @@ def create_backup(
         manifest = {
             "format_version": FORMAT_VERSION,
             "schema_version": schema_version,
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at": format_utc_timestamp(),
             "files": checksums,
         }
 
@@ -156,7 +157,7 @@ def _write_member(archive, info, staging: Path):
 
 def _validate_database_file(path: Path, expected_schema=None):
     try:
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
             check = connection.execute("PRAGMA quick_check").fetchone()[0]
             if str(check).lower() != "ok":
                 raise StateArchiveError(f"Restored database quick_check failed: {check}")

@@ -12,6 +12,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RESELLER_PATH = ROOT / "core" / "scripts" / "telegrambot" / "utils" / "reseller.py"
 TRANSLATIONS_PATH = ROOT / "core" / "scripts" / "telegrambot" / "utils" / "translations.py"
+if str(RESELLER_PATH.parent) not in sys.path:
+    sys.path.insert(0, str(RESELLER_PATH.parent))
 
 
 def load_reseller_module():
@@ -36,7 +38,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         return json.loads(self.resellers_file.read_text(encoding="utf-8"))
 
     def hours_ago(self, hours):
-        return (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        return (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
 
     def test_external_bulk_username_parser_is_exact_and_case_insensitive(self):
         self.assertEqual(
@@ -906,7 +908,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
                 "started_at": self.hours_ago(5 * 24),
             },
             {
-                "held_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "held_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                 "used_bytes": 0,
                 "quota_bytes": 10 * 1024 ** 3,
             },
@@ -927,7 +929,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
                 "started_at": self.hours_ago(24),
             },
             {
-                "held_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "held_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                 "used_bytes": 100 * 1024 ** 3,
                 "quota_bytes": 1,
             },
@@ -1123,7 +1125,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
                     "gb": 10,
                     "debt_policy_blocked": True,
                     "debt_policy_hold_snapshot": {
-                        "held_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "held_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                         "used_bytes": 0,
                         "quota_bytes": 10 * 1024 ** 3,
                     },

@@ -1,15 +1,15 @@
 import sqlite3
-from datetime import datetime
 
 from utils.atomic_store import locked_json, read_json
 from utils.payment_lifecycle import PAID_STATUSES
+from utils.time_utils import format_utc_timestamp
 
 
 PAYMENTS_FILE = '/etc/ajib/core/scripts/telegrambot/payments.json'
 
 
 def _now():
-    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return format_utc_timestamp()
 
 
 def _payment_store():

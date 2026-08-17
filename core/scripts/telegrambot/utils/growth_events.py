@@ -6,10 +6,11 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime
 from typing import Any
 
 from . import database
+from .time_utils import format_utc_timestamp, parse_utc_timestamp
 
 
 SURFACE_MAIN = "main"
@@ -126,28 +127,15 @@ def _timestamp(value: datetime | date | str | None, *, required: bool) -> str | 
     if value is None:
         if not required:
             return None
-        parsed = datetime.now(timezone.utc)
-    elif isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, date):
-        parsed = datetime.combine(value, time.min, tzinfo=timezone.utc)
-    elif isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            if required:
-                raise ValueError("occurred_at must not be empty.")
-            return None
-        try:
-            parsed = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
-        except ValueError as error:
-            raise ValueError(f"Invalid ISO timestamp: {value!r}") from error
-    else:
+        return format_utc_timestamp()
+    if not isinstance(value, (datetime, date, str)):
         raise TypeError(f"Unsupported timestamp value: {value!r}")
-
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    parsed = parsed.astimezone(timezone.utc)
-    return parsed.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    parsed = parse_utc_timestamp(value)
+    if parsed is None:
+        if not required and isinstance(value, str) and not value.strip():
+            return None
+        raise ValueError(f"Invalid ISO timestamp: {value!r}")
+    return format_utc_timestamp(parsed)
 
 
 def _metadata_json(metadata: Mapping[str, Any] | None) -> str:
@@ -224,6 +212,7 @@ def record_growth_event(
         _timestamp(occurred_at, required=True),
         key,
         _metadata_json(metadata),
+        format_utc_timestamp(),
     )
 
     with database.write_transaction(path, operation="record_growth_event") as connection:
@@ -232,8 +221,8 @@ def record_growth_event(
             INSERT INTO growth_events(
                 event_type, user_id, surface, hosted_tenant_id, language,
                 plan_id, payment_method, referral_campaign, occurred_at,
-                deduplication_key, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                deduplication_key, metadata_json, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(event_type, surface, hosted_tenant_id, deduplication_key)
             DO NOTHING
             """,

@@ -83,6 +83,12 @@ from utils.username_utils import (
 )
 from utils.telegram_safe import safe_answer_callback_query, safe_send_message
 from utils.download_guidance import send_download_prompt_safely
+from utils.time_utils import (
+    format_utc_display,
+    format_utc_timestamp,
+    parse_utc_timestamp,
+    utc_now,
+)
 
 
 def _configured_primary_api_client():
@@ -341,7 +347,7 @@ def _finalize_checkout_incentives(payment_id, payment_record):
         'invite_discount_redeemed': bool(result.get('invite_redeemed')),
         'referral_reward': result.get('reward_amount', 0),
         'reward_calculation_base': result.get('reward_base', 0),
-        'incentives_finalized_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'incentives_finalized_at': format_utc_timestamp(),
     })
     if result.get('reward_created') and float(result.get('reward_amount', 0) or 0) > 0:
         try:
@@ -631,7 +637,7 @@ def _consume_purchase_disclosure(user_id):
                 raise ValueError("Purchase disclosure store must contain an object.")
             if key in stored:
                 return False
-            stored[key] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            stored[key] = format_utc_timestamp()
             return True
     except Exception:
         if key in _PURCHASE_DISCLOSURE_FALLBACK:
@@ -685,9 +691,9 @@ def _register_card_checkout(
     now=None,
     checkout_id=None,
 ):
-    current = now or datetime.datetime.now()
+    current = parse_utc_timestamp(now) if now is not None else utc_now()
     checkout_id = str(checkout_id or uuid.uuid4())
-    timestamp = current.strftime('%Y-%m-%d %H:%M:%S')
+    timestamp = format_utc_timestamp(current)
     superseded = []
 
     def register(records):
@@ -721,7 +727,7 @@ def _register_card_checkout(
 def _close_card_checkout(checkout_id, status, *, now=None):
     if not checkout_id:
         return False
-    timestamp = (now or datetime.datetime.now()).strftime('%Y-%m-%d %H:%M:%S')
+    timestamp = format_utc_timestamp(now if now is not None else utc_now())
 
     def close(records):
         record = records.get(str(checkout_id))
@@ -738,8 +744,8 @@ def send_due_card_checkout_reminders(now=None):
     """Send one durable reminder for card checkouts awaiting a receipt."""
     if not _checkout_reminders_enabled():
         return 0
-    current = now or datetime.datetime.now()
-    timestamp = current.strftime('%Y-%m-%d %H:%M:%S')
+    current = parse_utc_timestamp(now) if now is not None else utc_now()
+    timestamp = format_utc_timestamp(current)
     due = []
     expired = []
 
@@ -748,10 +754,9 @@ def send_due_card_checkout_reminders(now=None):
             if not isinstance(record, dict) or record.get('status') != 'waiting_receipt':
                 continue
             try:
-                created_at = datetime.datetime.strptime(
-                    str(record.get('created_at')),
-                    '%Y-%m-%d %H:%M:%S',
-                )
+                created_at = parse_utc_timestamp(record.get('created_at'))
+                if created_at is None:
+                    raise ValueError("invalid checkout creation timestamp")
             except (TypeError, ValueError):
                 continue
             elapsed = current - created_at
@@ -821,10 +826,12 @@ def maybe_send_checkout_reminder(payment_id, record, now=None):
         return False
     created_at_value = record.get('created_at')
     try:
-        created_at = datetime.datetime.strptime(str(created_at_value), '%Y-%m-%d %H:%M:%S')
+        created_at = parse_utc_timestamp(created_at_value)
+        if created_at is None:
+            raise ValueError("invalid payment creation timestamp")
     except (TypeError, ValueError):
         return False
-    current = now or datetime.datetime.now()
+    current = parse_utc_timestamp(now) if now is not None else utc_now()
     if current - created_at < CHECKOUT_REMINDER_DELAY or current - created_at >= datetime.timedelta(hours=24):
         return False
 
@@ -848,7 +855,7 @@ def maybe_send_checkout_reminder(payment_id, record, now=None):
         get_button_text(language, "support"),
         callback_data="purchase_support",
     ))
-    reminder_timestamp = current.strftime('%Y-%m-%d %H:%M:%S')
+    reminder_timestamp = format_utc_timestamp(current)
     if not update_payment_record_fields(payment_id, {
         'checkout_reminded_at': reminder_timestamp,
     }):
@@ -1321,7 +1328,7 @@ def _record_review_audit(payment_id, call, action, reviewer_role):
         "reviewed_by_user_id": call.from_user.id,
         "reviewed_by_role": reviewer_role,
         "reviewed_action": action,
-        "reviewed_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "reviewed_at": format_utc_timestamp(),
     })
 
 
@@ -1386,7 +1393,7 @@ def _payment_owner_username(payment_record, fallback=None):
 def _record_processing_error(payment_id, error):
     update_payment_record_fields(payment_id, {
         "processing_error": str(error),
-        "processing_failed_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "processing_failed_at": format_utc_timestamp(),
     })
 
 
@@ -1736,7 +1743,7 @@ def send_admin_payment_notification(
             notification_message += (
                 f"💳 <b>{get_message_text(admin_language, 'payment_method_label')}:</b> {payment_method}\n"
                 f"🔑 <b>{get_message_text(admin_language, 'payment_id_label')}:</b> <code>{payment_id}</code>\n"
-                f"📅 <b>{get_message_text(admin_language, 'timestamp')}:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                f"📅 <b>{get_message_text(admin_language, 'timestamp')}:</b> {format_utc_display()}"
             )
             try:
                 bot.send_message(
@@ -3773,8 +3780,8 @@ def check_pending_payments():
                 created_at_str = record.get('created_at')
                 if created_at_str:
                     try:
-                        created_at = datetime.datetime.strptime(created_at_str, '%Y-%m-%d %H:%M:%S')
-                        if datetime.datetime.now() - created_at > datetime.timedelta(hours=24):
+                        created_at = parse_utc_timestamp(created_at_str)
+                        if created_at is not None and utc_now() - created_at > datetime.timedelta(hours=24):
                             update_payment_status(payment_id, 'expired')
                             _release_checkout_incentives(
                                 record.get('user_id'),

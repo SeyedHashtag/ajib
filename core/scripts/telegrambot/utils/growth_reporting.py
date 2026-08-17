@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 from utils.growth_events import (
     hosted_owner_funnel_summary,
     main_admin_funnel_summary,
 )
+from utils.time_utils import parse_utc_timestamp, utc_now
 
 
 FUNNEL_LABELS = {
@@ -22,10 +23,7 @@ FUNNEL_LABELS = {
 
 
 def _utc(value=None):
-    current = value or datetime.now(timezone.utc)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    return current.astimezone(timezone.utc)
+    return parse_utc_timestamp(value) if value is not None else utc_now()
 
 
 def _periods(end_at=None, days=30):

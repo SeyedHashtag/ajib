@@ -69,7 +69,7 @@ class ThreeXUIAdapterTests(unittest.TestCase):
 
         self.assertEqual(user["panel_type"], "blitz")
         self.assertTrue(user["timer_started"])
-        self.assertEqual(user["account_expiration_date"], "2026-08-31T00:00:00+00:00")
+        self.assertEqual(user["account_expiration_date"], "2026-08-31T00:00:00.000000Z")
         self.assertEqual(user["credential_metadata"]["fields_present"], ["password"])
 
     def test_factory_defaults_legacy_to_blitz_and_uses_bearer_for_3x(self):

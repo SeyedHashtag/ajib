@@ -344,7 +344,7 @@ def test_checkout_reminder_is_sent_once_and_persisted():
     assert module.maybe_send_checkout_reminder("payment-1", record, now=now)
     assert not module.maybe_send_checkout_reminder("payment-1", record, now=now)
     assert len(bot.sent_messages) == 1
-    assert record["checkout_reminded_at"] == "2026-08-05 12:00:00"
+    assert record["checkout_reminded_at"] == "2026-08-05T12:00:00.000000Z"
 
 
 def test_card_checkout_reminder_is_durable_once_and_uses_exact_total():
@@ -374,7 +374,7 @@ def test_card_checkout_reminder_is_durable_once_and_uses_exact_total():
     assert "6000000 toman" in bot.sent_messages[0][0][1]
     assert (
         module._CARD_CHECKOUT_FALLBACK[checkout_id]["checkout_reminded_at"]
-        == "2026-08-05 12:00:00"
+        == "2026-08-05T12:00:00.000000Z"
     )
 
 

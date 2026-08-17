@@ -98,9 +98,9 @@ class AccountStateTests(unittest.TestCase):
         self.assertEqual(snapshot.configured_days, 30)
         self.assertEqual(snapshot.panel_days_remaining, 18)
 
-    def test_naive_timestamp_uses_bot_timezone(self):
+    def test_naive_timestamp_defaults_to_utc_even_when_legacy_hint_is_tehran(self):
         parsed = self.state.parse_timestamp("2026-01-01 03:30:00")
-        self.assertEqual(parsed, datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc))
+        self.assertEqual(parsed, datetime(2026, 1, 1, 3, 30, tzinfo=timezone.utc))
 
     def test_cycle_uses_latest_successful_applied_record(self):
         records = {

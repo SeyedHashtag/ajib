@@ -11,7 +11,6 @@ import sqlite3
 import sys
 import zipfile
 from copy import deepcopy
-from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -22,6 +21,7 @@ if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
 from utils import database, state_store
+from utils.time_utils import format_utc_filename, format_utc_timestamp
 
 
 IMPORT_MARKER = "legacy_import_v1"
@@ -175,7 +175,7 @@ def _create_safety_archive(prepared, archive_dir: str | os.PathLike[str] | None)
         return None
     destination_dir = Path(archive_dir)
     destination_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = format_utc_filename()
     archive_path = destination_dir / f"ajib_pre_sqlite_{timestamp}_{os.getpid()}.zip"
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for item in prepared:
@@ -321,14 +321,18 @@ def migrate_legacy_state(
             "source_files": len(prepared),
             "source_records": sum(_record_count(item["value"]) for item in prepared),
             "archive": str(archive_path) if archive_path else None,
-            "imported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "imported_at": format_utc_timestamp(),
         }
         connection.execute(
             """
             INSERT INTO state_metadata(key, value, updated_at)
-            VALUES (?, ?, datetime('now'))
+            VALUES (?, ?, ?)
             """,
-            (IMPORT_MARKER, json.dumps(summary, sort_keys=True)),
+            (
+                IMPORT_MARKER,
+                json.dumps(summary, sort_keys=True),
+                format_utc_timestamp(),
+            ),
         )
 
     database.integrity_check(target)

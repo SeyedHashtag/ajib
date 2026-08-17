@@ -70,6 +70,7 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
 
         self.hosted_bots = importlib.import_module("utils.hosted_bots")
         self.reseller = importlib.import_module("utils.reseller")
+        self.addCleanup(self.hosted_bots.database.close_connections)
         self.hosted_bots.BOT_DIR = str(root)
         self.hosted_bots.HOSTED_ROOT = str(root / "hosted_bots")
         self.hosted_bots.REGISTRY_FILE = str(root / "hosted_bots.json")
@@ -148,7 +149,7 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
         path = self.hosted_bots.tenant_file("7", "payments.json")
         with self.worker.locked_json(path, {}) as payments:
             payments[payment_id]["processing_started_at"] = (
-                datetime.now() - timedelta(hours=1)
+                datetime.now(timezone.utc) - timedelta(hours=1)
             ).strftime("%Y-%m-%d %H:%M:%S")
 
     def test_stale_payment_claim_can_be_retried_after_a_crash(self):
@@ -384,7 +385,7 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(sent, 2)
         comparison.assert_called_once_with(
             self.worker.OWNER_ID,
-            end_at=datetime(2026, 8, 2),
+            end_at=datetime(2026, 8, 2, tzinfo=timezone.utc),
             days=30,
         )
         comparison_text = send_message.call_args_list[1].args[1]
@@ -657,7 +658,7 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
             self.assertEqual(pending["username"], "ht7")
             self.assertEqual(pending["server_id"], "server-1")
             pending["creation_pending_at"] = (
-                datetime.now()
+                datetime.now(timezone.utc)
                 - timedelta(seconds=self.worker.TEST_CREATION_LEASE_SECONDS + 1)
             ).strftime("%Y-%m-%d %H:%M:%S")
 

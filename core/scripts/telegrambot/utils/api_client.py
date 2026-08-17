@@ -23,8 +23,10 @@ from urllib.parse import quote
 import requests
 try:
     from utils.account_state import PanelState, inspect_account, panel_deadline
+    from utils.time_utils import format_utc_timestamp, utc_now
 except ModuleNotFoundError:  # Standalone diagnostics/tests.
     from account_state import PanelState, inspect_account, panel_deadline
+    from time_utils import format_utc_timestamp, utc_now
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -462,8 +464,8 @@ class APIClient:
         normalized.setdefault("timer_started", not delayed_start and bool(normalized.get("account_creation_date")))
         deadline = panel_deadline(normalized)
         if deadline is not None:
-            normalized.setdefault("account_expiration_date", deadline.isoformat())
-            normalized.setdefault("absolute_expiry", deadline.isoformat())
+            normalized.setdefault("account_expiration_date", format_utc_timestamp(deadline))
+            normalized.setdefault("absolute_expiry", format_utc_timestamp(deadline))
         normalized.setdefault("credential_metadata", {
             "panel": BLITZ_PANEL,
             "fields_present": ["password"] if normalized.get("password") else [],
@@ -887,15 +889,17 @@ class ThreeXUIAPIClient(APIClient):
         creation_date = None
         if expiry_ms > 0:
             expiry_dt = datetime.fromtimestamp(expiry_ms / 1000, tz=timezone.utc)
-            absolute_expiry = expiry_dt.isoformat()
+            absolute_expiry = format_utc_timestamp(expiry_dt)
             if duration_days:
-                creation_date = (expiry_dt - timedelta(days=duration_days)).isoformat()
+                creation_date = format_utc_timestamp(expiry_dt - timedelta(days=duration_days))
         elif delayed_start and not duration_days:
             duration_days = max(1, int(math.ceil(abs(expiry_ms) / MILLISECONDS_PER_DAY)))
         created_at = client.get("createdAt")
         if creation_date is None and created_at and not delayed_start:
             try:
-                creation_date = datetime.fromtimestamp(int(created_at) / 1000, tz=timezone.utc).isoformat()
+                creation_date = format_utc_timestamp(
+                    datetime.fromtimestamp(int(created_at) / 1000, tz=timezone.utc)
+                )
             except (TypeError, ValueError, OverflowError, OSError):
                 pass
         blocked = not _safe_bool(client.get("enable", True))
@@ -1016,7 +1020,7 @@ class ThreeXUIAPIClient(APIClient):
                 expiry = expiry.replace(tzinfo=timezone.utc)
             expiry_time = int(expiry.timestamp() * 1000)
         else:
-            expiry_time = int((datetime.now(timezone.utc) + timedelta(days=days)).timestamp() * 1000)
+            expiry_time = int((utc_now() + timedelta(days=days)).timestamp() * 1000)
         client = {
             "email": spec.username,
             "subId": secrets.token_urlsafe(12),
@@ -1095,7 +1099,7 @@ class ThreeXUIAPIClient(APIClient):
         if data.get("renew_creation_date"):
             if not duration:
                 return None
-            client["expiryTime"] = int((datetime.now(timezone.utc) + timedelta(days=duration)).timestamp() * 1000)
+            client["expiryTime"] = int((utc_now() + timedelta(days=duration)).timestamp() * 1000)
         result = self._xui_result("POST", f"clients/update/{quote(str(username), safe='')}", client)
         if result.get("status") == "succeeded":
             MultiServerAPI.invalidate_all_caches()

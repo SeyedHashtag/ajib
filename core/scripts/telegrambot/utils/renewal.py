@@ -4,13 +4,12 @@ import logging
 import math
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 from utils.account_state import (
     EntitlementState,
     PanelState,
-    bot_timezone,
     inspect_account,
     panel_deadline,
     panel_days_remaining,
@@ -19,6 +18,12 @@ from utils.account_state import (
     verified_panel_expired,
 )
 from utils.atomic_store import locked_json, read_json, write_json
+from utils.time_utils import (
+    format_utc_timestamp,
+    legacy_timezone,
+    parse_utc_timestamp,
+    utc_now,
+)
 
 
 PAYMENTS_FILE = '/etc/ajib/core/scripts/telegrambot/payments.json'
@@ -26,7 +31,6 @@ RESELLERS_FILE = '/etc/ajib/core/scripts/telegrambot/resellers.json'
 STATE_FILE = '/etc/ajib/core/scripts/telegrambot/expired_user_cleanup.json'
 
 GB_BYTES = 1024 ** 3
-TIMESTAMP_FORMAT = '%Y-%m-%d %H:%M:%S'
 PAID_STATUSES = {'completed', 'paid', 'succeeded'}
 DELETE_RESULTS = {'deleted', 'already_missing'}
 RESERVATION_ACTIVE_STATUSES = {'reserved', 'processing', 'attention'}
@@ -196,7 +200,7 @@ def capture_user_state(user_data, now=None, cycle=None):
         'account_creation_date': user_data.get('account_creation_date'),
         'expiration_days': _safe_int(user_data.get('expiration_days')),
         'expiration_deadline': (
-            _expiration_deadline(user_data).isoformat()
+            format_utc_timestamp(_expiration_deadline(user_data))
             if _expiration_deadline(user_data) is not None
             else None
         ),
@@ -206,17 +210,17 @@ def capture_user_state(user_data, now=None, cycle=None):
         'entitlement_state': shared_state.entitlement_state.value,
         'normalized_state': shared_state.state,
         'entitlement_issued_at': (
-            shared_state.entitlement_issued_at.isoformat()
+            format_utc_timestamp(shared_state.entitlement_issued_at)
             if shared_state.entitlement_issued_at else None
         ),
         'entitlement_deadline': (
-            shared_state.entitlement_deadline.isoformat()
+            format_utc_timestamp(shared_state.entitlement_deadline)
             if shared_state.entitlement_deadline else None
         ),
         'entitlement_days_remaining': shared_state.entitlement_days_remaining,
         'cycle_fingerprint': shared_state.cycle_fingerprint,
         'service_deadline': (
-            shared_state.service_deadline.isoformat()
+            format_utc_timestamp(shared_state.service_deadline)
             if shared_state.service_deadline else None
         ),
         'service_days_remaining': shared_state.service_days_remaining,
@@ -598,7 +602,7 @@ def _build_offer(
         'business_expired': business_expired,
         'cycle_fingerprint': cycle.fingerprint if cycle else None,
         'entitlement_deadline': (
-            shared_state.service_deadline.isoformat()
+            format_utc_timestamp(shared_state.service_deadline)
             if shared_state.service_deadline else None
         ),
     }
@@ -1059,26 +1063,31 @@ def mark_payment_renewal_reserved(payment_id, payments_file=None, fields=None, n
 
 def _parse_time(value):
     """Return an aware UTC datetime for legacy and ISO timestamp values."""
-    return parse_timestamp(value)
+    return parse_utc_timestamp(value)
+
+
+def _parse_legacy_renewal_time(value):
+    """Interpret only known historical renewal lifecycle fields as local."""
+    return parse_utc_timestamp(value, legacy_naive_timezone=legacy_timezone())
 
 
 def _current_time(value=None):
-    current = _parse_time(value if value is not None else datetime.now(bot_timezone()))
+    current = _parse_time(value if value is not None else utc_now())
     if current is None:
         raise ValueError('Invalid renewal timestamp')
     return current
 
 
 def _format_time(value):
-    """Persist timestamps in the existing bot-local, offset-free format."""
+    """Persist renewal timestamps as explicit UTC."""
     parsed = _parse_time(value)
     if parsed is None:
         raise ValueError('Invalid renewal timestamp')
-    return parsed.astimezone(bot_timezone()).strftime(TIMESTAMP_FORMAT)
+    return format_utc_timestamp(parsed)
 
 
 def _claim_age_seconds(record, current):
-    claimed_at = _parse_time(record.get('renewal_claimed_at'))
+    claimed_at = _parse_legacy_renewal_time(record.get('renewal_claimed_at'))
     if claimed_at is None:
         return None
     return (current - claimed_at).total_seconds()
@@ -1092,7 +1101,7 @@ def _claim_is_live(record, current, lease_seconds):
 
 
 def _retry_is_due(record, current):
-    next_attempt = _parse_time(record.get('renewal_next_attempt_at'))
+    next_attempt = _parse_legacy_renewal_time(record.get('renewal_next_attempt_at'))
     return next_attempt is None or next_attempt <= current
 
 
@@ -1251,7 +1260,7 @@ def reservation_expected_time_expired(record, now=None):
     deadline = _parse_time(baseline.get('expiration_deadline'))
     if deadline is not None:
         return current >= deadline
-    captured_at = _parse_time(baseline.get('captured_at'))
+    captured_at = _parse_legacy_renewal_time(baseline.get('captured_at'))
     days_remaining = _safe_int(baseline.get('days_remaining'))
     if captured_at is None or days_remaining is None or days_remaining < 0:
         return False
@@ -1264,7 +1273,7 @@ def reservation_alert_due(record, now=None, reminder_seconds=86400, audience=Non
     last_value = record.get(field)
     if last_value is None and audience in {'operator', 'buyer'}:
         last_value = record.get('renewal_last_alert_at')
-    last_alert = _parse_time(last_value)
+    last_alert = _parse_legacy_renewal_time(last_value)
     return last_alert is None or (current - last_alert).total_seconds() >= reminder_seconds
 
 

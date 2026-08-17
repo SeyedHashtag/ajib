@@ -33,7 +33,6 @@ from utils.api_client import MultiServerAPI
 from utils.account_state import (
     EntitlementState,
     PanelState,
-    bot_timezone,
     inspect_account,
     resolve_service_cycle,
 )
@@ -113,6 +112,14 @@ from utils.username_utils import (
     load_recorded_usernames,
     RecordedUsernameLoadError,
 )
+from utils.time_utils import (
+    UTC,
+    format_utc_display,
+    format_utc_timestamp,
+    parse_utc_timestamp,
+    utc_date,
+    utc_now,
+)
 
 
 OWNER_ID = int(os.environ["AJIB_HOSTED_RESELLER_ID"])
@@ -157,7 +164,7 @@ bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=4)
 
 
 def _now():
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+    return format_utc_timestamp()
 
 
 def _release_checkout_wholesale(payment_id, record, kind="credit_released"):
@@ -167,10 +174,7 @@ def _release_checkout_wholesale(payment_id, record, kind="credit_released"):
 
 
 def _parse_time(value):
-    try:
-        return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
-    except (TypeError, ValueError):
-        return None
+    return parse_utc_timestamp(value)
 
 
 def _financial_amount(value, field):
@@ -516,7 +520,7 @@ def _claim_payment(payment_id, allowed):
         current_status = record.get("status")
         if current_status == "processing":
             started_at = _parse_time(record.get("processing_started_at"))
-            stale = started_at is None or (datetime.now() - started_at).total_seconds() >= PROCESSING_LEASE_SECONDS
+            stale = started_at is None or (utc_now() - started_at).total_seconds() >= PROCESSING_LEASE_SECONDS
             original_status = record.get("processing_from_status")
             if not stale or original_status not in allowed_statuses:
                 return None
@@ -615,7 +619,7 @@ def _claim_receipt_notification(payment_id):
         started_at = _parse_time(record.get("owner_receipt_notification_started_at"))
         if (
             started_at is not None
-            and (datetime.now() - started_at).total_seconds() < PROCESSING_LEASE_SECONDS
+            and (utc_now() - started_at).total_seconds() < PROCESSING_LEASE_SECONDS
         ):
             return None
         record["owner_receipt_notification_started_at"] = _now()
@@ -754,7 +758,7 @@ def _recover_stale_payment_claims():
                 continue
             if record.get("status") == "creating":
                 created_at = _parse_time(record.get("created_at"))
-                if created_at is None or (datetime.now() - created_at).total_seconds() >= CHECKOUT_CREATION_LEASE_SECONDS:
+                if created_at is None or (utc_now() - created_at).total_seconds() >= CHECKOUT_CREATION_LEASE_SECONDS:
                     record["status"] = "failed"
                     record["last_error"] = "Recovered an interrupted checkout creation"
                     record["recovered_at"] = _now()
@@ -767,7 +771,7 @@ def _recover_stale_payment_claims():
             if record.get("status") != "processing":
                 continue
             started_at = _parse_time(record.get("processing_started_at"))
-            if started_at is not None and (datetime.now() - started_at).total_seconds() < PROCESSING_LEASE_SECONDS:
+            if started_at is not None and (utc_now() - started_at).total_seconds() < PROCESSING_LEASE_SECONDS:
                 continue
             retry_status = record.get("processing_from_status")
             if retry_status not in {"waiting_receipt", "pending_approval", "pending", "paid_provision_failed"}:
@@ -1950,7 +1954,7 @@ def _send_onboarding(chat_id, user_id, reply_to=None):
                 user_id,
                 "paid_hold_deadline",
                 username=config.get("username"),
-                deadline=cycle.deadline.astimezone(bot_timezone()).strftime("%Y-%m-%d %H:%M"),
+                deadline=format_utc_display(cycle.deadline),
             )
     if state == "trial_active" and isinstance(detail, dict) and detail.get("username"):
         _client, live = MultiServerAPI().find_user(
@@ -2807,7 +2811,7 @@ def free_test(message, customer=None):
             pending_is_stale = (
                 isinstance(existing, dict)
                 and existing.get("creation_pending_at")
-                and (pending_at is None or (datetime.now() - pending_at).total_seconds() >= TEST_CREATION_LEASE_SECONDS)
+                and (pending_at is None or (utc_now() - pending_at).total_seconds() >= TEST_CREATION_LEASE_SECONDS)
                 and str(existing.get("reseller_id")) == str(OWNER_ID)
                 and not existing.get("used_at")
             )
@@ -3253,7 +3257,7 @@ def _stats_period_text(label, bucket):
 
 
 def _owner_stats_chunks(end_date=None, scheduled=False):
-    report_end = end_date or datetime.now().date()
+    report_end = end_date or utc_date()
     reseller = get_reseller_data(OWNER_ID) or {}
     snapshot = build_hosted_stats(
         _tenant_payments(),
@@ -3360,10 +3364,11 @@ def _send_owner_stats(chat_id, end_date=None, scheduled=False):
     try:
         from utils.growth_reporting import hosted_growth_comparison
 
-        report_end = end_date or datetime.now().date()
+        report_end = end_date or utc_date()
         comparison_end = datetime.combine(
             report_end + timedelta(days=1),
             datetime.min.time(),
+            tzinfo=UTC,
         )
         comparison = hosted_growth_comparison(
             OWNER_ID,
@@ -3382,7 +3387,7 @@ def _send_owner_stats(chat_id, end_date=None, scheduled=False):
 
 
 def _owner_stats_report_end(now=None):
-    current = now or datetime.now()
+    current = parse_utc_timestamp(now) if now is not None else utc_now()
     due_at = current.replace(
         hour=OWNER_STATS_SEND_HOUR,
         minute=OWNER_STATS_SEND_MINUTE,
@@ -3393,7 +3398,7 @@ def _owner_stats_report_end(now=None):
 
 
 def _claim_owner_stats_report(report_end, now=None):
-    current = now or datetime.now()
+    current = parse_utc_timestamp(now) if now is not None else utc_now()
     report_key = report_end.isoformat()
     with locked_json(tenant_file(OWNER_ID, "notifications.json"), {}) as notifications:
         state = notifications.get("owner_daily_stats", {})
@@ -3415,13 +3420,13 @@ def _claim_owner_stats_report(report_end, now=None):
             **state,
             "claim_for": report_key,
             "claim_id": claim_id,
-            "claimed_at": current.strftime("%Y-%m-%d %H:%M:%S"),
+            "claimed_at": format_utc_timestamp(current),
         }
         return claim_id
 
 
 def _finish_owner_stats_report(report_end, claim_id, success, now=None):
-    current = now or datetime.now()
+    current = parse_utc_timestamp(now) if now is not None else utc_now()
     with locked_json(tenant_file(OWNER_ID, "notifications.json"), {}) as notifications:
         state = notifications.get("owner_daily_stats", {})
         if not isinstance(state, dict) or state.get("claim_id") != claim_id:
@@ -3431,13 +3436,13 @@ def _finish_owner_stats_report(report_end, claim_id, success, now=None):
         state.pop("claimed_at", None)
         if success:
             state["last_sent_for"] = report_end.isoformat()
-            state["last_sent_at"] = current.strftime("%Y-%m-%d %H:%M:%S")
+            state["last_sent_at"] = format_utc_timestamp(current)
         notifications["owner_daily_stats"] = state
         return True
 
 
 def _run_due_owner_stats(now=None):
-    current = now or datetime.now()
+    current = parse_utc_timestamp(now) if now is not None else utc_now()
     report_end = _owner_stats_report_end(current)
     if report_end is None:
         return False
@@ -4430,8 +4435,8 @@ def _crypto_monitor():
                 if not isinstance(current, dict):
                     continue
                 status = current.get("status")
-                created = _parse_time(current.get("created_at")) or datetime.min
-                age = datetime.now() - created
+                created = _parse_time(current.get("created_at")) or datetime.min.replace(tzinfo=UTC)
+                age = utc_now() - created
                 if status in {"waiting_receipt", "pending_approval", "pending"}:
                     if (
                         REMINDERS_ENABLED

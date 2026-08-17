@@ -66,6 +66,7 @@ from utils.atomic_store import locked_json, read_json
 from utils.command import bot, is_admin
 from utils.common import admin_action_text
 from utils.language import get_user_language
+from utils.time_utils import format_utc_timestamp, parse_utc_timestamp, utc_now
 from utils.translations import get_button_text, get_message_text
 
 
@@ -78,7 +79,6 @@ STATE_FILE = '/etc/ajib/core/scripts/telegrambot/expired_user_cleanup.json'
 SCHEDULE_FILE = '/etc/ajib/core/scripts/telegrambot/expired_cleanup_schedule.json'
 
 GB_BYTES = 1024 ** 3
-TIMESTAMP_FORMAT = '%Y-%m-%d %H:%M:%S'
 CLEANUP_SCAN_INTERVAL_SECONDS = 3600
 EXPIRED_CLEANUP_GRACE_HOURS = 48
 STALE_ON_HOLD_TEST_DAYS = 60
@@ -293,16 +293,11 @@ STATE_LABELS = {
 
 
 def _now_str(now=None):
-    return (now or datetime.now()).strftime(TIMESTAMP_FORMAT)
+    return format_utc_timestamp(now)
 
 
 def _parse_time(value):
-    if not value:
-        return None
-    try:
-        return datetime.strptime(str(value), TIMESTAMP_FORMAT)
-    except Exception:
-        return None
+    return parse_utc_timestamp(value)
 
 
 def _effective_delete_after(entry, grace_hours=EXPIRED_CLEANUP_GRACE_HOURS):
@@ -321,7 +316,7 @@ def _effective_delete_after(entry, grace_hours=EXPIRED_CLEANUP_GRACE_HOURS):
 
 
 def _format_time(value):
-    return value.strftime(TIMESTAMP_FORMAT) if isinstance(value, datetime) else None
+    return format_utc_timestamp(value) if isinstance(value, datetime) else None
 
 
 def _load_json_file(path, default):
@@ -529,7 +524,7 @@ def get_expired_cleanup_schedule_metadata():
 
 
 def get_expired_cleanup_startup_delay(interval_seconds=CLEANUP_SCAN_INTERVAL_SECONDS, now=None, metadata=None):
-    now = now or datetime.now()
+    now = parse_utc_timestamp(now) if now is not None else utc_now()
     metadata = metadata if isinstance(metadata, dict) else _load_cleanup_schedule_metadata()
     interval_seconds = max(0, _safe_int(interval_seconds, CLEANUP_SCAN_INTERVAL_SECONDS) or 0)
     attempt_times = [
@@ -643,7 +638,7 @@ def is_stale_on_hold_test(username, user_data, now=None):
     created_at = _parse_test_note_time(user_data)
     if created_at is None:
         return False
-    current = parse_timestamp(now or datetime.now())
+    current = parse_utc_timestamp(now) if now is not None else utc_now()
     return bool(current and current > created_at + timedelta(days=STALE_ON_HOLD_TEST_DAYS))
 
 
@@ -792,12 +787,12 @@ def capture_last_state(user_data, now=None, cycle=None):
         'entitlement_state': shared_state.entitlement_state.value,
         'normalized_state': shared_state.state,
         'entitlement_issued_at': (
-            shared_state.entitlement_issued_at.isoformat()
+            format_utc_timestamp(shared_state.entitlement_issued_at)
             if shared_state.entitlement_issued_at is not None
             else None
         ),
         'entitlement_deadline': (
-            shared_state.entitlement_deadline.isoformat()
+            format_utc_timestamp(shared_state.entitlement_deadline)
             if shared_state.entitlement_deadline is not None
             else None
         ),
@@ -896,7 +891,8 @@ def _effective_cleanup_status(entry, now=None):
     status = str(entry.get('cleanup_status') or entry.get('delete_result') or 'unknown')
     if status in {'notified', NOTIFICATION_PENDING_STATUS, 'notification_unreachable'}:
         delete_after = _effective_delete_after(entry)
-        if delete_after and (now or datetime.now()) >= delete_after:
+        current = parse_utc_timestamp(now) if now is not None else utc_now()
+        if delete_after and current >= delete_after:
             return 'due'
         return 'pending'
     if status in ADMIN_CLEANUP_STATUS_ORDER:
@@ -1016,7 +1012,11 @@ def _record_sort_key(record):
         return (0, record.get('reviewed_at') or '', record.get('username') or '')
     if status in {'pending', 'due'}:
         return (1, record.get('delete_after') or '', record.get('username') or '')
-    timestamp = _parse_time(record.get('deleted_at')) or _parse_time(record.get('notified_at')) or datetime.min
+    timestamp = (
+        _parse_time(record.get('deleted_at'))
+        or _parse_time(record.get('notified_at'))
+        or datetime.min.replace(tzinfo=utc_now().tzinfo)
+    )
     return (
         2,
         -timestamp.year,
@@ -1030,7 +1030,7 @@ def _record_sort_key(record):
 
 
 def get_expired_cleanup_records(filter_key='pending', now=None):
-    now = now or datetime.now()
+    now = parse_utc_timestamp(now) if now is not None else utc_now()
     state = _load_json_file(STATE_FILE, {})
     if not isinstance(state, dict):
         return []
@@ -1552,8 +1552,8 @@ def _cycle_candidate_fields(candidate, cycle, now):
         **candidate,
         'cleanup_reason': ISSUE_DEADLINE_EXPIRED_REASON,
         'cycle_fingerprint': cycle.fingerprint,
-        'issued_at': cycle.issued_at.isoformat(),
-        'entitlement_deadline': cycle.deadline.isoformat(),
+        'issued_at': format_utc_timestamp(cycle.issued_at),
+        'entitlement_deadline': format_utc_timestamp(cycle.deadline),
         'last_successful_observation_at': _now_str(now),
     }
     if candidate.get('source') == 'customer':
@@ -1919,11 +1919,13 @@ def _recovered_test_used_at(user_data):
     note_match = RECOVERED_TEST_NOTE_TIME_RE.search(note)
     if note_match:
         seconds = note_match.group(3) or '00'
-        return f"{note_match.group(1)} {note_match.group(2)}:{seconds}"
+        return format_utc_timestamp(
+            f"{note_match.group(1)} {note_match.group(2)}:{seconds}"
+        )
 
     created_at = _parse_account_creation_time((user_data or {}).get('account_creation_date'))
     if created_at is not None:
-        return created_at.strftime(TIMESTAMP_FORMAT)
+        return format_utc_timestamp(created_at)
     return _now_str()
 
 
@@ -2468,7 +2470,9 @@ def _state_entry(candidate, now_value, grace_hours, notification_error=None, las
         'telegram_user_id': candidate.get('telegram_user_id'),
         'reseller_id': candidate.get('reseller_id'),
         'notified_at': now_value,
-        'delete_after': (datetime.strptime(now_value, TIMESTAMP_FORMAT) + timedelta(hours=grace_hours)).strftime(TIMESTAMP_FORMAT),
+        'delete_after': format_utc_timestamp(
+            _parse_time(now_value) + timedelta(hours=grace_hours)
+        ),
         'cleanup_status': 'notified',
         'notification_error': notification_error,
         'last_state': last_state,
@@ -2498,7 +2502,7 @@ def queue_superseded_test_cleanup(
 ):
     """Queue (but never directly delete) a replaced unused test account."""
     del language  # Recipient language is always resolved at send time.
-    current = now or datetime.now()
+    current = parse_utc_timestamp(now) if now is not None else utc_now()
     now_value = _now_str(current)
     candidate = {
         'source': 'test',
@@ -2654,7 +2658,7 @@ def _mark_deleted(state, key, candidate, status, now_value, last_state=None, del
 
 
 def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, multi_api=None):
-    now = now or datetime.now()
+    now = parse_utc_timestamp(now) if now is not None else utc_now()
     now_value = _now_str(now)
 
     with _cleanup_lock:
@@ -2996,7 +3000,7 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
             notified_at = _parse_time(entry.get('notified_at'))
             delete_after = _effective_delete_after(entry, grace_hours=grace_hours)
             if delete_after is not None and notified_at is not None:
-                entry['delete_after'] = delete_after.strftime(TIMESTAMP_FORMAT)
+                entry['delete_after'] = format_utc_timestamp(delete_after)
 
             if delete_after is None or now < delete_after:
                 entry['cleanup_status'] = 'notified'
@@ -3063,7 +3067,7 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
 
 
 def run_expired_user_cleanup_with_metadata(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, multi_api=None):
-    started_at = now or datetime.now()
+    started_at = parse_utc_timestamp(now) if now is not None else utc_now()
     metadata = _load_cleanup_schedule_metadata()
     metadata.update({
         'last_started_at': _now_str(started_at),
@@ -3073,7 +3077,7 @@ def run_expired_user_cleanup_with_metadata(grace_hours=EXPIRED_CLEANUP_GRACE_HOU
     try:
         state = run_expired_user_cleanup(grace_hours=grace_hours, now=now, multi_api=multi_api)
     except Exception as e:
-        finished_at = now or datetime.now()
+        finished_at = parse_utc_timestamp(now) if now is not None else utc_now()
         metadata = _load_cleanup_schedule_metadata()
         metadata.update({
             'last_finished_at': _now_str(finished_at),
@@ -3082,7 +3086,7 @@ def run_expired_user_cleanup_with_metadata(grace_hours=EXPIRED_CLEANUP_GRACE_HOU
         _save_cleanup_schedule_metadata(metadata)
         raise
 
-    finished_at = now or datetime.now()
+    finished_at = parse_utc_timestamp(now) if now is not None else utc_now()
     metadata = _load_cleanup_schedule_metadata()
     metadata.update({
         'last_finished_at': _now_str(finished_at),
@@ -3094,7 +3098,7 @@ def run_expired_user_cleanup_with_metadata(grace_hours=EXPIRED_CLEANUP_GRACE_HOU
 
 
 def get_deleted_users_for_json(days=60, now=None):
-    now = now or datetime.now()
+    now = parse_utc_timestamp(now) if now is not None else utc_now()
     cutoff = now - timedelta(days=days)
     deleted_users = []
     for record in get_expired_cleanup_records(filter_key='all', now=now):
@@ -3399,7 +3403,7 @@ def _handle_manual_review_delete(record_id):
             _save_json_file(STATE_FILE, state)
             return "User is already missing."
 
-        last_state = capture_last_state(user_data, now=datetime.now())
+        last_state = capture_last_state(user_data, now=utc_now())
         if not is_user_expired(user_data):
             _mark_renewed(state, state_key, candidate, now_value, last_state=last_state)
             _save_json_file(STATE_FILE, state)

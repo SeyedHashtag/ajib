@@ -2,7 +2,7 @@ import json
 import os
 import re
 import threading
-from datetime import datetime
+from utils.time_utils import format_utc_timestamp
 
 try:
     from telebot import types
@@ -429,7 +429,7 @@ def monitor_user_traffic():
     plans, payments = _load_customer_context()
     alerts = _load_alerts()
     changed = False
-    updated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    updated_at = format_utc_timestamp()
 
     for api_client, username, user_data in multi_api.iter_all_users(include_disabled=False):
         if not username or not user_data:

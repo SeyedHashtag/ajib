@@ -9,11 +9,13 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
+
 ROOT = Path(__file__).resolve().parents[1]
 BOT_DIR = ROOT / "core" / "scripts" / "telegrambot"
 UTILS_DIR = BOT_DIR / "utils"
 if str(UTILS_DIR) not in sys.path:
     sys.path.insert(0, str(UTILS_DIR))
+from time_utils import format_utc_timestamp, parse_utc_timestamp, utc_now
 STATS_PATH = BOT_DIR / "utils" / "hosted_stats.py"
 STATS_SPEC = importlib.util.spec_from_file_location("hosted_stats", STATS_PATH)
 HOSTED_STATS = importlib.util.module_from_spec(STATS_SPEC)
@@ -74,6 +76,9 @@ def _scheduler_namespace(send=None):
         "OWNER_STATS_SEND_MINUTE": 5,
         "OWNER_STATS_CLAIM_LEASE_SECONDS": 600,
         "_send_owner_stats": send_owner_stats,
+        "format_utc_timestamp": format_utc_timestamp,
+        "parse_utc_timestamp": parse_utc_timestamp,
+        "utc_now": utc_now,
     }
     functions = [
         "_parse_time",

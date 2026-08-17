@@ -4,10 +4,18 @@ import os
 import threading
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 from telebot import types
 from utils.command import bot, ADMIN_USER_IDS, is_admin
 from utils.common import admin_action_text
+try:
+    from utils.time_utils import format_utc_filename
+except ImportError:  # Rolling-upgrade/test compatibility.
+    from datetime import datetime, timezone
+
+    def format_utc_filename(value=None):
+        return (value or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime(
+            "%Y%m%dT%H%M%SZ"
+        )
 from utils.referral import (
     get_or_create_referral_code, 
     get_referral_stats, 
@@ -515,7 +523,7 @@ def notify_admins_withdrawal(user_id, telegram_username, amount, wallet, withdra
         available_balance_after=withdrawal_data.get("available_balance_after", 0),
         requested_at=withdrawal_data.get("requested_at", "")
     )
-    filename_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename_time = format_utc_filename()
     filename = f"withdrawal_request_{user_id}_{filename_time}.json"
     json_bytes = json.dumps(audit_payload, indent=2, ensure_ascii=False).encode("utf-8")
     

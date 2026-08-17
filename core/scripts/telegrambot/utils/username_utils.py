@@ -1,6 +1,10 @@
-import datetime
 import json
 import os
+
+try:
+    from .time_utils import utc_now
+except ImportError:  # Standalone diagnostics/tests.
+    from time_utils import utc_now
 
 
 BOT_STATE_DIR = os.getenv("AJIB_BOT_DIR", "/etc/ajib/core/scripts/telegrambot")
@@ -107,12 +111,12 @@ def load_recorded_usernames(record_paths=None, extra_paths=None, scopes=None):
 
 def format_username_timestamp():
     """Return username metadata timestamp in YYMMDDHHMMSS format."""
-    return datetime.datetime.now().strftime("%y%m%d%H%M%S")
+    return utc_now().strftime("%y%m%d%H%M%S")
 
 
 def format_readable_timestamp():
-    """Return human-readable timestamp in YYYY-MM-DD HH:MM format."""
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    """Return a human-readable timestamp with an explicit UTC label."""
+    return utc_now().strftime("%Y-%m-%d %H:%M UTC")
 
 
 def extract_existing_usernames(users_payload):

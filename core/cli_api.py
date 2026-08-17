@@ -1,8 +1,9 @@
 import os
 import subprocess
+import logging
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import sys
 
@@ -108,18 +109,23 @@ def _parse_datetime(value):
     if not value:
         return None
     if isinstance(value, datetime):
-        return value
+        parsed = value
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
     raw = str(value).strip()
     if raw.endswith('Z'):
         raw = raw[:-1] + '+00:00'
     try:
         parsed = datetime.fromisoformat(raw)
-        return parsed.replace(tzinfo=None)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
     except ValueError:
         pass
     for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
         try:
-            return datetime.strptime(str(value), fmt)
+            return datetime.strptime(str(value), fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
     return None
@@ -221,7 +227,8 @@ def _collect_payment_stats(payments: dict, now: datetime, timestamp_resolver) ->
     plan_revenue = {}
     plan_count = {}
 
-    for payment in payments.values():
+    future_timestamp_payments = []
+    for payment_id, payment in payments.items():
         if not isinstance(payment, dict):
             continue
         status = str(payment.get('status', '')).lower()
@@ -230,6 +237,23 @@ def _collect_payment_stats(payments: dict, now: datetime, timestamp_resolver) ->
         if payment_dt is None:
             continue
         not_future = payment_dt <= now
+        if payment_dt > now + timedelta(minutes=5):
+            anomaly = {
+                "payment_id": str(payment_id),
+                "timestamp": payment_dt.isoformat().replace("+00:00", "Z"),
+            }
+            future_timestamp_payments.append(anomaly)
+            logging.getLogger("ajib.reporting").warning(
+                "future_payment_timestamp payment_id=%s timestamp=%s now=%s",
+                anomaly["payment_id"],
+                anomaly["timestamp"],
+                now.isoformat().replace("+00:00", "Z"),
+                extra={
+                    "event": "future_payment_timestamp",
+                    "payment_id": anomaly["payment_id"],
+                    "payment_timestamp": anomaly["timestamp"],
+                },
+            )
         in_month = not_future and (payment_dt.year, payment_dt.month) == (now.year, now.month)
         in_today = not_future and payment_dt.date() == now.date()
         in_last30 = not_future and payment_dt >= last_30_days_start
@@ -260,6 +284,7 @@ def _collect_payment_stats(payments: dict, now: datetime, timestamp_resolver) ->
         "daily_sales": daily_sales,
         "top_plans_revenue": sorted(plan_revenue.items(), key=lambda item: item[1], reverse=True)[:3],
         "top_plans_orders": sorted(plan_count.items(), key=lambda item: item[1], reverse=True)[:3],
+        "future_timestamp_payments": future_timestamp_payments,
     }
 
 
@@ -660,7 +685,9 @@ def build_server_info_snapshot(now=None) -> dict:
         translations,
     )
 
-    now = now or datetime.now()
+    now = _parse_datetime(now) if now is not None else datetime.now(timezone.utc)
+    if now is None:
+        raise ValueError("Invalid server-info timestamp")
     ram = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
     payments = payment_records.load_payments()
@@ -771,6 +798,9 @@ def _build_server_info_alerts(snapshot: dict) -> list[str]:
     pending = buckets.get("all", {}).get("pending", 0)
     if pending:
         alerts.append(f"🟡 Pending payments: {pending}")
+    future_payments = sales.get("future_timestamp_payments", [])
+    if future_payments:
+        alerts.append(f"🔴 Future payment timestamps: {len(future_payments)}")
     if traffic.get("missing_configs"):
         alerts.append(f"🟡 Missing sold configs: {traffic.get('missing_configs')}")
     if traffic.get("unavailable_servers"):
@@ -983,7 +1013,7 @@ def format_server_info_section(snapshot: dict, section: str = "overview") -> str
     generated_at = snapshot.get("generated_at")
     if isinstance(generated_at, datetime):
         output.append("")
-        output.append(f"Updated: {generated_at.strftime('%Y-%m-%d %H:%M:%S')}")
+        output.append(f"Updated: {generated_at.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     return "\n".join(output)
 
 
@@ -1106,6 +1136,15 @@ def format_server_info(snapshot: dict) -> str:
             output.append(f"{lang['name']}: {lang['percent']:.1f}% ({lang['count']})")
     else:
         output.append("No language data available.")
+
+    output.append("")
+    output.extend(_format_alerts_section(snapshot))
+    generated_at = snapshot.get("generated_at")
+    if isinstance(generated_at, datetime):
+        output.append("")
+        output.append(
+            f"Updated: {generated_at.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
 
     return "\n".join(output)
 

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from utils import database
 from utils.account_credit import credit_account, credit_account_in_transaction
 from utils.growth_features import RECRUITMENT_REWARDS, is_growth_feature_enabled
 from utils.referral import credit_manual_referral_reward, get_referral_attribution
+from utils.time_utils import format_utc_timestamp
 
 
 DEFAULT_REQUIRED_SALES = 5
@@ -19,7 +19,7 @@ CLAIM_CHOICES = {"cash", "credit"}
 
 
 def _now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return format_utc_timestamp()
 
 
 def required_sales():

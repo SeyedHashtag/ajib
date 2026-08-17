@@ -5,7 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -127,7 +127,7 @@ class TrafficMonitorTests(unittest.TestCase):
                 {
                     "blocked": False,
                     "status": "Offline",
-                    "account_creation_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "account_creation_date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                     "expiration_days": 30,
                     **data,
                 },
@@ -152,7 +152,7 @@ class TrafficMonitorTests(unittest.TestCase):
             "username": username,
             "server_id": "primary",
             "days": days,
-            "timestamp": (datetime.now() - timedelta(days=95)).strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": (datetime.now(timezone.utc) - timedelta(days=95)).strftime("%Y-%m-%d %H:%M:%S"),
         }
         if customer_name is not None:
             config["customer_name"] = customer_name
@@ -236,7 +236,7 @@ class TrafficMonitorTests(unittest.TestCase):
 
         self.run_monitor([
             (True, "r456", {
-                "account_creation_date": (datetime.now() - timedelta(days=95)).strftime("%Y-%m-%d %H:%M:%S"),
+                "account_creation_date": (datetime.now(timezone.utc) - timedelta(days=95)).strftime("%Y-%m-%d %H:%M:%S"),
                 "expiration_days": 100,
                 "max_download_bytes": 0,
             }),
@@ -323,7 +323,7 @@ class TrafficMonitorTests(unittest.TestCase):
                     "status": "completed",
                     "plan_gb": "100",
                     "days": 30,
-                    "created_at": (datetime.now() - timedelta(days=24)).strftime("%Y-%m-%d %H:%M:%S"),
+                    "created_at": (datetime.now(timezone.utc) - timedelta(days=24)).strftime("%Y-%m-%d %H:%M:%S"),
                 },
             },
             offer={
@@ -339,7 +339,7 @@ class TrafficMonitorTests(unittest.TestCase):
                 True,
                 "s123",
                 {
-                    "account_creation_date": (datetime.now() - timedelta(days=24)).strftime("%Y-%m-%d %H:%M:%S"),
+                    "account_creation_date": (datetime.now(timezone.utc) - timedelta(days=24)).strftime("%Y-%m-%d %H:%M:%S"),
                     "expiration_days": 30,
                     "upload_bytes": 10 * GB,
                     "download_bytes": 0,
@@ -367,7 +367,7 @@ class TrafficMonitorTests(unittest.TestCase):
                 "status": "completed",
                 "plan_gb": "100",
                 "days": 30,
-                "created_at": (datetime.now() - timedelta(days=21)).strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at": (datetime.now(timezone.utc) - timedelta(days=21)).strftime("%Y-%m-%d %H:%M:%S"),
             },
         }
         self.install_customer_context(payments)

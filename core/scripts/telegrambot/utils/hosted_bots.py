@@ -2,11 +2,12 @@ import hashlib
 import os
 import uuid
 from contextlib import nullcontext
-from datetime import datetime, timedelta
+from datetime import timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from .atomic_store import locked_json, read_json
 from . import database, reseller as reseller_store
+from .time_utils import format_utc_timestamp, parse_utc_timestamp, utc_now
 
 
 BOT_DIR = os.getenv("AJIB_BOT_DIR", "/etc/ajib/core/scripts/telegrambot")
@@ -41,7 +42,7 @@ def _contains_private_identifier(value):
 
 
 def _now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return format_utc_timestamp()
 
 
 def _money(value):
@@ -603,7 +604,7 @@ def release_credit(reseller_id, reservation_id, kind="credit_released"):
 def release_stale_credit_reservations(reseller_id, active_reservation_ids, max_age_seconds=86400, now=None):
     """Release old reservations that no live checkout still owns."""
     active = {str(item) for item in (active_reservation_ids or ())}
-    current_time = now or datetime.now()
+    current_time = parse_utc_timestamp(now) if now is not None else utc_now()
     released = []
     with locked_json(tenant_file(reseller_id, "ledger.json"), _default_ledger()) as ledger:
         reservations = ledger.setdefault("credit_reservations", {})
@@ -611,7 +612,7 @@ def release_stale_credit_reservations(reseller_id, active_reservation_ids, max_a
             if reservation_id in active:
                 continue
             try:
-                created_at = datetime.strptime(reservation.get("created_at", ""), "%Y-%m-%d %H:%M:%S")
+                created_at = parse_utc_timestamp(reservation.get("created_at"))
             except (AttributeError, TypeError, ValueError):
                 created_at = current_time - timedelta(seconds=max_age_seconds + 1)
             if (current_time - created_at).total_seconds() < max_age_seconds:

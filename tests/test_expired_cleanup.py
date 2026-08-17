@@ -559,7 +559,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(configs["12345"]["historical_configs"][0]["username"], "t12345")
         self.assertEqual(state["cleanup_status"], "notified")
         self.assertEqual(state["cleanup_reason"], "stale_on_hold_test")
-        self.assertEqual(state["delete_after"], "2026-06-11 12:00:00")
+        self.assertEqual(state["delete_after"], "2026-06-11T12:00:00.000000Z")
         self.assertIn("stale_test_cleanup_notice", requested_message_keys)
         self.assertEqual(records[0]["cleanup_reason"], "stale_on_hold_test")
         self.assertEqual(records[0]["reason_code"], "stale_on_hold_test")
@@ -620,7 +620,7 @@ class ExpiredCleanupTests(unittest.TestCase):
 
             state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
             self.assertEqual(state["cleanup_status"], "notified")
-            self.assertEqual(state["delete_after"], "2026-06-11 12:00:00")
+            self.assertEqual(state["delete_after"], "2026-06-11T12:00:00.000000Z")
             self.assertEqual(client.deleted, [])
             self.assertTrue(transition_log.called)
             self.assertTrue(summary_log.called)
@@ -990,13 +990,13 @@ class ExpiredCleanupTests(unittest.TestCase):
         state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
         self.assertNotIn("username", recovered)
         self.assertEqual(recovered["telegram_id"], 12345)
-        self.assertEqual(recovered["used_at"], "2026-05-01 12:34:00")
+        self.assertEqual(recovered["used_at"], "2026-05-01T12:34:00.000000Z")
         self.assertEqual(recovered["historical_configs"][0]["username"], "t12345")
         self.assertEqual(recovered["historical_configs"][0]["server_id"], "s1")
         self.assertEqual(state["source"], "test")
         self.assertEqual(state["cleanup_status"], "notified")
         self.assertEqual(state["telegram_user_id"], "12345")
-        self.assertEqual(state["delete_after"], "2026-06-11 12:00:00")
+        self.assertEqual(state["delete_after"], "2026-06-11T12:00:00.000000Z")
         self.assertEqual(len(self.cleanup._test_bot.sent_messages), 1)
 
     def test_recovered_history_preserves_newer_current_test(self):
@@ -1082,7 +1082,7 @@ class ExpiredCleanupTests(unittest.TestCase):
 
         notified = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
         self.assertEqual(notified["cleanup_status"], "notified")
-        self.assertEqual(notified["delete_after"], "2026-06-11 13:00:00")
+        self.assertEqual(notified["delete_after"], "2026-06-11T13:00:00.000000Z")
         self.assertEqual(notified["recovery_attempts"], 2)
 
     def test_legacy_recovered_manual_state_is_adopted_without_resetting_metadata(self):
@@ -1243,8 +1243,8 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(queued["source"], "test")
         self.assertEqual(queued["cleanup_status"], "notification_unreachable")
         self.assertEqual(queued["cleanup_error"], "notification_unreachable")
-        self.assertEqual(queued["delete_after"], "2026-06-09 12:00:00")
-        self.assertEqual(queued["recovery_unreachable_queued_at"], "2026-06-09 12:00:00")
+        self.assertEqual(queued["delete_after"], "2026-06-09T12:00:00.000000Z")
+        self.assertEqual(queued["recovery_unreachable_queued_at"], "2026-06-09T12:00:00.000000Z")
         self.assertEqual(queued["recovery_attempts"], 3)
         self.assertEqual(client.deleted, [])
         due_records = self.cleanup.get_expired_cleanup_records(filter_key="due", now=self.now)
@@ -1261,7 +1261,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(deleted["cleanup_status"], "deleted")
         self.assertEqual(deleted["delete_result"], "deleted")
         self.assertEqual(deleted["notification_error"], queued["notification_error"])
-        self.assertEqual(deleted["recovery_unreachable_queued_at"], "2026-06-09 12:00:00")
+        self.assertEqual(deleted["recovery_unreachable_queued_at"], "2026-06-09T12:00:00.000000Z")
 
     def test_recovered_temporary_notification_failure_never_enters_deletion_queue(self):
         self.write_default_files()
@@ -1606,7 +1606,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         saved_test = self.read_json(self.cleanup.TEST_CONFIGS_FILE)["101"]
         self.assertEqual(client.deleted, [])
         self.assertEqual(pending_state["cleanup_status"], "notified")
-        self.assertEqual(pending_state["delete_after"], "2026-06-11 12:00:00")
+        self.assertEqual(pending_state["delete_after"], "2026-06-11T12:00:00.000000Z")
         self.assertEqual(saved_test["cleanup_status"], "notified")
         self.assertNotIn("cleanup_deleted_at", saved_test)
         self.assertNotIn("cleanup_delete_result", saved_test)
@@ -1782,7 +1782,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(len(self.cleanup._test_bot.sent_messages), 1)
         self.assertEqual(state["s1:t101"]["cleanup_status"], "notified")
         self.assertEqual(saved_test["cleanup_status"], "notified")
-        self.assertEqual(saved_test["cleanup_notified_at"], "2026-06-09 12:00:00")
+        self.assertEqual(saved_test["cleanup_notified_at"], "2026-06-09T12:00:00.000000Z")
         self.assertEqual(saved_test["cleanup_last_state"]["status"], "expired")
         self.assertIn("your test account", self.cleanup._test_bot.sent_messages[0][1])
         self.assertIn("|48|", self.cleanup._test_bot.sent_messages[0][1])
@@ -2042,7 +2042,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         pending_state = self.read_json(self.cleanup.STATE_FILE)
         self.assertEqual(client.deleted, [])
         self.assertEqual(pending_state["s1:t101"]["cleanup_status"], "notified")
-        self.assertEqual(pending_state["s1:t101"]["delete_after"], "2026-06-11 12:00:00")
+        self.assertEqual(pending_state["s1:t101"]["delete_after"], "2026-06-11T12:00:00.000000Z")
 
         self.cleanup.run_expired_user_cleanup(now=self.now + timedelta(hours=49), multi_api=FakeMultiAPI({"s1": client}))
 
@@ -2083,8 +2083,8 @@ class ExpiredCleanupTests(unittest.TestCase):
         record = self.cleanup.get_expired_cleanup_records(filter_key="pending", now=self.now + timedelta(hours=25))[0]
         self.assertEqual(client.deleted, [])
         self.assertEqual(state["s1:t101"]["cleanup_status"], "notified")
-        self.assertEqual(state["s1:t101"]["delete_after"], "2026-06-11 08:00:00")
-        self.assertEqual(record["delete_after"], "2026-06-11 08:00:00")
+        self.assertEqual(state["s1:t101"]["delete_after"], "2026-06-11T08:00:00.000000Z")
+        self.assertEqual(record["delete_after"], "2026-06-11T08:00:00.000000Z")
 
     def test_cleanup_batches_local_record_writes_for_multiple_deletions(self):
         self.write_json(self.cleanup.TEST_CONFIGS_FILE, {
@@ -2978,8 +2978,8 @@ class ExpiredCleanupTests(unittest.TestCase):
             self.cleanup.run_expired_user_cleanup_with_metadata(now=self.now)
 
         metadata = self.read_json(self.cleanup.SCHEDULE_FILE)
-        self.assertEqual(metadata["last_started_at"], "2026-06-09 12:00:00")
-        self.assertEqual(metadata["last_finished_at"], "2026-06-09 12:00:00")
+        self.assertEqual(metadata["last_started_at"], "2026-06-09T12:00:00.000000Z")
+        self.assertEqual(metadata["last_finished_at"], "2026-06-09T12:00:00.000000Z")
         self.assertEqual(metadata["last_error"], "boom")
         self.assertNotIn("last_success_at", metadata)
 

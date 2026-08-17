@@ -1037,7 +1037,7 @@ class RenewalTests(unittest.TestCase):
 
         self.assertTrue(self.renewal.reservation_generation_changed(record, extended))
 
-    def test_production_offset_baseline_equal_to_date_only_live_deadline_waits(self):
+    def test_utc_date_only_deadline_does_not_hide_earlier_offset_baseline(self):
         now = datetime(2026, 8, 13, 18, 0, tzinfo=timezone.utc)
         active_user = {
             "account_creation_date": "2026-07-14",
@@ -1075,8 +1075,8 @@ class RenewalTests(unittest.TestCase):
             )
 
         saved = self.read_json(self.renewal.PAYMENTS_FILE)["production-reservation"]
-        self.assertEqual(result["status"], "waiting")
-        self.assertEqual(saved["renewal_status"], "reserved")
+        self.assertEqual(result["status"], "attention")
+        self.assertEqual(saved["renewal_status"], "attention")
         self.assertNotIn("renewal_claim_id", saved)
         self.assertEqual(client.reset_calls, [])
         self.assertIn("renewal_stale_claim_reclaimed", "\n".join(captured.output))
@@ -1401,8 +1401,8 @@ class RenewalTests(unittest.TestCase):
         self.assertNotEqual(recovered["claim_id"], "dead-worker")
 
     def test_attention_reminders_are_limited_to_once_per_day(self):
-        now = datetime(2026, 8, 2, 12, 0, 0)
-        record = {"renewal_last_alert_at": now.strftime("%Y-%m-%d %H:%M:%S")}
+        now = datetime(2026, 8, 2, 12, 0, 0, tzinfo=timezone.utc)
+        record = {"renewal_last_alert_at": "2026-08-02T12:00:00.000000Z"}
 
         self.assertFalse(self.renewal.reservation_alert_due(
             record, now=now + timedelta(hours=23, minutes=59)

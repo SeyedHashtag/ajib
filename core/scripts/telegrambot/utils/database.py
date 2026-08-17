@@ -9,10 +9,13 @@ import logging
 from contextlib import contextmanager
 from pathlib import Path
 
+from .time_utils import format_utc_timestamp
+from .timestamp_migration import migrate_v3_utc_timestamps
+
 
 DEFAULT_BOT_DIR = "/etc/ajib/core/scripts/telegrambot"
 DATABASE_NAME = "ajib.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 BUSY_TIMEOUT_MS = 5000
 
 _local = threading.local()
@@ -53,14 +56,14 @@ SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,
-        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS state_metadata (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
     )
     """,
     """
@@ -332,7 +335,7 @@ SCHEMA_STATEMENTS = (
         scope TEXT NOT NULL,
         state_key TEXT NOT NULL,
         value_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')),
         PRIMARY KEY (namespace, scope, state_key)
     )
     """,
@@ -350,7 +353,7 @@ SCHEMA_STATEMENTS = (
         occurred_at TEXT NOT NULL,
         deduplication_key TEXT NOT NULL,
         metadata_json TEXT NOT NULL DEFAULT '{}',
-        recorded_at TEXT NOT NULL DEFAULT (datetime('now')),
+        recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')),
         UNIQUE(event_type, surface, hosted_tenant_id, deduplication_key)
     )
     """,
@@ -493,9 +496,11 @@ def _ensure_schema(connection: sqlite3.Connection, path: str) -> None:
                     f"Database schema {current} is newer than supported schema {SCHEMA_VERSION}."
                 )
             if current < SCHEMA_VERSION:
+                if current < 3:
+                    migrate_v3_utc_timestamps(connection)
                 connection.execute(
-                    "INSERT INTO schema_migrations(version) VALUES (?)",
-                    (SCHEMA_VERSION,),
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (SCHEMA_VERSION, format_utc_timestamp()),
                 )
             connection.execute("COMMIT")
         except Exception:
@@ -652,7 +657,6 @@ def schema_version(path: str | os.PathLike[str] | None = None) -> int:
 def user_table_row_count(path: str | os.PathLike[str] | None = None) -> int:
     connection = get_connection(path)
     tables = (
-        "state_metadata",
         "payments",
         "payment_events",
         "resellers",
@@ -678,7 +682,18 @@ def user_table_row_count(path: str | os.PathLike[str] | None = None) -> int:
         "account_credit_reservations",
         "recruitment_milestones",
     )
-    return sum(int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables)
+    application_metadata = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) FROM state_metadata
+            WHERE key != 'utc_timestamp_migration_v3'
+            """
+        ).fetchone()[0]
+    )
+    return application_metadata + sum(
+        int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        for table in tables
+    )
 
 
 def replace_database_file(

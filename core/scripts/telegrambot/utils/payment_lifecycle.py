@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime, timezone
+
+try:
+    from .time_utils import parse_utc_timestamp
+except ImportError:  # Standalone diagnostics/tests.
+    from time_utils import parse_utc_timestamp
 
 
 PAID_STATUSES = frozenset({"completed", "paid", "success", "succeeded"})
@@ -20,20 +25,8 @@ OPEN_STATUSES = frozenset({
 
 
 def parse_payment_timestamp(value) -> datetime | None:
-    """Return a naive datetime for a persisted payment timestamp."""
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=None)
-    if isinstance(value, date):
-        return datetime.combine(value, datetime.min.time())
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    if raw.endswith("Z"):
-        raw = f"{raw[:-1]}+00:00"
-    try:
-        return datetime.fromisoformat(raw).replace(tzinfo=None)
-    except ValueError:
-        return None
+    """Return an aware UTC datetime for a persisted payment timestamp."""
+    return parse_utc_timestamp(value, legacy_naive_timezone=timezone.utc)
 
 
 def _event_timestamps(record: dict, statuses) -> list[datetime]:

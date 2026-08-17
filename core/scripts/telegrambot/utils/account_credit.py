@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from utils import database
+from utils.time_utils import format_utc_timestamp
 
 
 def _now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return format_utc_timestamp()
 
 
 def _user_key(user_id):

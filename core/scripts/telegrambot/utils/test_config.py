@@ -34,6 +34,7 @@ from utils.username_utils import (
 from utils.telegram_safe import safe_answer_callback_query, safe_edit_message_text, safe_send_message, safe_send_photo
 from utils.download_guidance import send_download_prompt_safely
 from utils import test_config_store
+from utils.time_utils import format_utc_timestamp, parse_utc_timestamp, utc_now
 
 TEST_CONFIGS_FILE = '/etc/ajib/core/scripts/telegrambot/test_configs.json'
 TEST_SETTINGS_FILE = '/etc/ajib/core/scripts/telegrambot/test_settings.json'
@@ -135,12 +136,7 @@ def save_waiting_users(users):
             json.dump(users, f, indent=4)
 
 def _parse_config_time(value):
-    if not value:
-        return None
-    try:
-        return datetime.datetime.strptime(str(value), '%Y-%m-%d %H:%M:%S')
-    except (TypeError, ValueError):
-        return None
+    return parse_utc_timestamp(value)
 
 
 def _strict_nonnegative_int(value):
@@ -228,7 +224,8 @@ def _creation_claim_is_active(entry, now=None):
     claimed_at = _parse_config_time(entry.get('creation_pending_at'))
     if claimed_at is None:
         return False
-    return (now or datetime.datetime.now()) - claimed_at < datetime.timedelta(
+    current = parse_utc_timestamp(now) if now is not None else utc_now()
+    return current - claimed_at < datetime.timedelta(
         minutes=TEST_CREATION_CLAIM_TIMEOUT_MINUTES
     )
 
@@ -253,13 +250,12 @@ def _has_used_test_config_from(configs, user_id, now=None):
         # User was reset — check if they have received a new test config since the reset
         used_at_str = entry.get('used_at')
         if used_at_str:
-            try:
-                used_at = datetime.datetime.strptime(used_at_str, '%Y-%m-%d %H:%M:%S')
-                reset_at = datetime.datetime.strptime(reset_at_str, '%Y-%m-%d %H:%M:%S')
-                # If used_at is older than reset_at, the user has not yet collected their new test config
-                if used_at <= reset_at:
-                    return False
-            except Exception:
+            used_at = _parse_config_time(used_at_str)
+            reset_at = _parse_config_time(reset_at_str)
+            if used_at is None or reset_at is None:
+                return False
+            # If used_at is older than reset_at, the user has not yet collected their new test config
+            if used_at <= reset_at:
                 return False
     return True
 
@@ -273,7 +269,7 @@ def get_test_config_journey(user_id, now=None):
     if not isinstance(entry, dict) or not _has_used_test_config_from({str(user_id): entry}, user_id, now=now):
         return None
     connected_at = parse_timestamp(entry.get("connected_at"))
-    current = parse_timestamp(now or datetime.datetime.now())
+    current = parse_utc_timestamp(now) if now is not None else utc_now()
     used_at_aware = parse_timestamp(entry.get("used_at"))
     hold_elapsed_days = elapsed_full_days(used_at_aware, now=current)
     remaining_days = (
@@ -309,7 +305,7 @@ def get_test_config_journey(user_id, now=None):
 def mark_test_config_connected(user_id, connected_at=None):
     """Idempotently record that the customer confirmed a successful connection."""
     key = str(user_id)
-    timestamp = connected_at or datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    timestamp = format_utc_timestamp(connected_at)
 
     def mutate(configs):
         entry = configs.get(key)
@@ -336,7 +332,7 @@ def add_to_waiting_list(user_id, username=None, language=None):
                 "telegram_id": user_id,
                 "telegram_username": username,
                 "language": language,
-                "added_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "added_at": format_utc_timestamp(),
             }
             return True
     waiting_users = load_waiting_users()
@@ -346,7 +342,7 @@ def add_to_waiting_list(user_id, username=None, language=None):
         "telegram_id": user_id,
         "telegram_username": username,
         "language": language,
-        "added_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "added_at": format_utc_timestamp(),
     }
     save_waiting_users(waiting_users)
     return True
@@ -364,7 +360,7 @@ def _mark_test_config_used_in_memory(
     # Preserve existing history fields (reset_at, reset_count, original used_at, etc.)
     existing = configs.get(key, {})
     entry = dict(existing)
-    now_value = used_at or datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    now_value = format_utc_timestamp(used_at)
     archived = None
     replacement_username = str(entry.get('replacement_from_username') or '').strip()
     replacement_server = str(entry.get('replacement_from_server_id') or '').strip()
@@ -464,8 +460,8 @@ def _queue_superseded_cleanup(user_id, archived, language=None):
 
 
 def _claim_test_config_creation(user_id, now=None):
-    now = now or datetime.datetime.now()
-    now_value = now.strftime('%Y-%m-%d %H:%M:%S')
+    now = parse_utc_timestamp(now) if now is not None else utc_now()
+    now_value = format_utc_timestamp(now)
     key = str(user_id)
 
     def mutate(configs):
@@ -514,7 +510,7 @@ def _revoke_replacement_eligibility(user_id, reason):
         ):
             entry.pop(field, None)
         entry['replacement_validation_status'] = str(reason or 'invalid')
-        entry['replacement_validation_at'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        entry['replacement_validation_at'] = format_utc_timestamp()
 
     test_config_store.update_test_configs(TEST_CONFIGS_FILE, mutate)
 
@@ -547,8 +543,8 @@ def reset_test_users(mode='expired', now=None, multi_api=None):
 
     Returns the number of users that were reset.
     """
-    now = now or datetime.datetime.now()
-    reset_ts = now.strftime('%Y-%m-%d %H:%M:%S')
+    now = parse_utc_timestamp(now) if now is not None else utc_now()
+    reset_ts = format_utc_timestamp(now)
 
     try:
         multi_api = multi_api or MultiServerAPI()

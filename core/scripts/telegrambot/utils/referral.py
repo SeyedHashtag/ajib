@@ -7,7 +7,7 @@ import uuid
 import math
 from copy import deepcopy
 from contextlib import contextmanager
-from datetime import datetime
+from utils.time_utils import format_utc_timestamp
 
 REFERRALS_FILE = '/etc/ajib/core/scripts/telegrambot/referrals.json'
 referral_lock = threading.RLock()
@@ -214,7 +214,7 @@ def process_referral(
             "last_name": last_name,
             "referral_code": code,
             "referrer_id": referrer_id,
-            "invited_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "invited_at": format_utc_timestamp(),
             "campaign_type": (
                 "reseller" if str(campaign_type).strip().lower() == "reseller" else "customer"
             ),
@@ -263,7 +263,7 @@ def add_referral_reward(user_id, purchase_amount, order_id=None):
                 "referrer_id": referrer_id,
                 "invitee_user_id": user_id_str,
                 "amount": reward_amount,
-                "rewarded_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "rewarded_at": format_utc_timestamp(),
             }
         return True, referrer_id, reward_amount
 
@@ -362,7 +362,7 @@ def reserve_invitee_discount(user_id, order_id, payments=None):
             "referrer_id": str(data["referrals"][invitee_id]),
             "percent": referral_buyer_discount_percent(),
             "status": "reserved",
-            "reserved_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "reserved_at": format_utc_timestamp(),
         }
         reservations[order_key] = reservation
         return dict(reservation)
@@ -399,7 +399,7 @@ def redeem_invitee_discount(user_id, order_id):
         redemption = {
             **reservation,
             "status": "redeemed",
-            "redeemed_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "redeemed_at": format_utc_timestamp(),
         }
         redemptions[invitee_id] = redemption
         data["discount_reservations"].pop(order_key, None)
@@ -436,7 +436,7 @@ def credit_manual_referral_reward(user_id, amount, reward_id, metadata=None):
         rewards[reward_key] = {
             "user_id": user_key,
             "amount": round(amount_value, 2),
-            "credited_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "credited_at": format_utc_timestamp(),
             "metadata": dict(metadata or {}),
         }
         return True
@@ -526,7 +526,7 @@ def mark_referral_payout_paid(user_id, admin_user_id):
             "admin_user_id": str(admin_user_id),
             "amount": available_balance,
             "wallet": wallet,
-            "paid_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "paid_at": format_utc_timestamp(),
             "available_balance_before": available_balance,
             "available_balance_after": 0,
             "total_earnings_snapshot": _safe_float(stats.get("total_earnings", 0)),
@@ -561,7 +561,7 @@ def mark_withdrawal_request_paid(request_id, admin_user_id):
             if withdrawal_request.get("status") != "pending":
                 return False, f"Withdrawal request already {withdrawal_request.get('status', 'processed')}"
 
-            paid_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            paid_at = format_utc_timestamp()
             withdrawal_request["status"] = "paid"
             withdrawal_request["paid_at"] = paid_at
             withdrawal_request["admin_user_id"] = str(admin_user_id)
@@ -670,7 +670,7 @@ def process_withdrawal_request(user_id, telegram_username=None):
         if not wallet:
             return False, "Wallet address not set"
 
-        requested_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        requested_at = format_utc_timestamp()
         withdrawal_request = {
             "id": str(uuid.uuid4()),
             "status": "pending",

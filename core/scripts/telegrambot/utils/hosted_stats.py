@@ -7,8 +7,10 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 try:
     from utils.payment_lifecycle import parse_payment_timestamp, payment_lifecycle_timestamp
+    from utils.time_utils import utc_now
 except ImportError:  # Support direct module loading in maintenance tools and tests.
     from payment_lifecycle import parse_payment_timestamp, payment_lifecycle_timestamp
+    from time_utils import utc_now
 
 
 OPEN_STATUSES = {
@@ -158,7 +160,7 @@ def _rollup(buckets):
 
 def build_hosted_stats(payments, reseller_configs, end_date=None, origin_bot_id=None):
     """Build seven daily buckets and a trailing 30-calendar-day storefront summary."""
-    report_end = _coerce_date(end_date or datetime.now())
+    report_end = _coerce_date(end_date or utc_now())
     last30_start = report_end - timedelta(days=29)
     seven_day_start = report_end - timedelta(days=6)
     buckets = {

@@ -17,6 +17,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
 from . import database
+from .time_utils import format_utc_timestamp
 
 
 STATIC_JSON_FILES = {"plans.json", "support_info.json"}
@@ -1075,10 +1076,15 @@ def _save_kv(connection, descriptor, data):
             raise ValueError(f"{descriptor.namespace} must contain a JSON list.")
         connection.execute(
             """
-            INSERT INTO kv_state(namespace, scope, state_key, value_json)
-            VALUES (?, ?, '__document__', ?)
+            INSERT INTO kv_state(namespace, scope, state_key, value_json, updated_at)
+            VALUES (?, ?, '__document__', ?, ?)
             """,
-            (descriptor.namespace, descriptor.scope, _dump(data)),
+            (
+                descriptor.namespace,
+                descriptor.scope,
+                _dump(data),
+                format_utc_timestamp(),
+            ),
         )
         return
     if not isinstance(data, dict):
@@ -1086,10 +1092,16 @@ def _save_kv(connection, descriptor, data):
     for key, value in data.items():
         connection.execute(
             """
-            INSERT INTO kv_state(namespace, scope, state_key, value_json)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO kv_state(namespace, scope, state_key, value_json, updated_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (descriptor.namespace, descriptor.scope, str(key), _dump(value)),
+            (
+                descriptor.namespace,
+                descriptor.scope,
+                str(key),
+                _dump(value),
+                format_utc_timestamp(),
+            ),
         )
 
 

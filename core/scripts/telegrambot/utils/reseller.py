@@ -10,6 +10,21 @@ from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 try:
+    from utils.time_utils import (
+        format_utc_timestamp,
+        legacy_timezone,
+        parse_utc_timestamp,
+        utc_now,
+    )
+except ModuleNotFoundError:  # Direct module loading in compatibility tests/tools.
+    from time_utils import (
+        format_utc_timestamp,
+        legacy_timezone,
+        parse_utc_timestamp,
+        utc_now,
+    )
+
+try:
     from . import database, state_store
 except ImportError:  # Direct module loading in compatibility tests/tools.
     database = None
@@ -244,7 +259,7 @@ def _allocate_debt_fifo(record, amount, kind='settlement', reference_id=None):
         charged_at = _parse_time(charge.get('charged_at'))
         return (
             0 if charged_at is not None else 1,
-            charged_at or datetime.min,
+            charged_at or datetime.min.replace(tzinfo=timezone.utc),
             sequence,
             str(charge.get('id') or ''),
         )
@@ -533,61 +548,27 @@ def can_reseller_add_debt(record, amount):
 
 
 def _now_str():
-    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return format_utc_timestamp()
 
 
 def _parse_time(value):
-    if not value:
-        return None
-    try:
-        return datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
-    except (TypeError, ValueError):
-        return None
+    return parse_utc_timestamp(value, legacy_naive_timezone=timezone.utc)
 
 
 def _parse_renewal_time(value):
     """Parse renewal timestamps as aware UTC without changing legacy parsers."""
-    try:
-        from utils.account_state import parse_timestamp
-    except ImportError:  # Direct module loading in compatibility tests/tools.
-        from zoneinfo import ZoneInfo
-
-        if isinstance(value, datetime):
-            parsed = value
-        elif value is None:
-            return None
-        else:
-            text = str(value).strip()
-            if text.endswith('Z'):
-                text = f'{text[:-1]}+00:00'
-            try:
-                parsed = datetime.fromisoformat(text)
-            except (TypeError, ValueError):
-                return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=ZoneInfo(os.getenv('AJIB_TIMEZONE') or 'Asia/Tehran'))
-        return parsed.astimezone(timezone.utc)
-    return parse_timestamp(value)
+    return parse_utc_timestamp(value, legacy_naive_timezone=legacy_timezone())
 
 
 def _renewal_current_time(value=None):
-    current = _parse_renewal_time(value if value is not None else datetime.now(timezone.utc))
+    current = _parse_renewal_time(value if value is not None else utc_now())
     if current is None:
         raise ValueError('Invalid renewal timestamp')
     return current
 
 
 def _format_renewal_time(value):
-    current = _renewal_current_time(value)
-    try:
-        from utils.account_state import bot_timezone
-
-        local_timezone = bot_timezone()
-    except ImportError:  # Direct module loading in compatibility tests/tools.
-        from zoneinfo import ZoneInfo
-
-        local_timezone = ZoneInfo(os.getenv('AJIB_TIMEZONE') or 'Asia/Tehran')
-    return current.astimezone(local_timezone).strftime('%Y-%m-%d %H:%M:%S')
+    return format_utc_timestamp(_renewal_current_time(value))
 
 
 def _resellers_lock_path():
@@ -670,8 +651,9 @@ def _compute_debt_state(debt, debt_since=None, now=None):
     if _is_debt_fully_settled(debt_amount):
         return 'active'
     started_at = _parse_time(debt_since)
+    current = parse_utc_timestamp(now) if now is not None else utc_now()
     age_hours = (
-        max(0.0, ((now or datetime.now()) - started_at).total_seconds() / 3600)
+        max(0.0, (current - started_at).total_seconds() / 3600)
         if started_at else 0.0
     )
     if age_hours >= DEBT_SUSPEND_DEADLINE_HOURS:
@@ -1029,7 +1011,7 @@ def claim_reseller_level_presentation(user_id, lease_seconds=None):
                     claimed_at = _parse_time(existing_claim.get('claimed_at'))
                     claim_age = lease
                     if claimed_at is not None:
-                        elapsed = (datetime.now() - claimed_at).total_seconds()
+                        elapsed = (utc_now() - claimed_at).total_seconds()
                         claim_age = elapsed if elapsed >= 0 else lease
                     try:
                         existing_level = int(existing_claim.get('level', 0) or 0)
@@ -2410,7 +2392,7 @@ def apply_reseller_payment(user_id, amount, payment_id=None, allocation_kind='se
                             current_debt > 0
                             and not cycle_was_late
                             and cycle_started is not None
-                            and (datetime.now() - cycle_started).total_seconds()
+                            and (utc_now() - cycle_started).total_seconds()
                                 < DEBT_SUSPEND_DEADLINE_HOURS * 3600
                         ):
                             _record_credit_outcome(
@@ -2545,7 +2527,7 @@ def _notification_claim_due(record, kind, audience, now, lease_minutes=10):
     claimed_at = _parse_time(item.get('claimed_at'))
     if claimed_at is not None and now - claimed_at < timedelta(minutes=lease_minutes):
         return False
-    state[key] = {'claimed_at': now.strftime('%Y-%m-%d %H:%M:%S')}
+    state[key] = {'claimed_at': format_utc_timestamp(now)}
     return True
 
 
@@ -2560,7 +2542,7 @@ def _service_action_claim_due(record, action, now, lease_minutes=10):
         return False
     claims[action] = {
         'cycle_id': current_cycle,
-        'claimed_at': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'claimed_at': format_utc_timestamp(now),
     }
     return True
 
@@ -2622,7 +2604,7 @@ def claim_reseller_debt_notification(user_id, kind, audience):
                 if user_id not in resellers:
                     return False
                 current = _ensure_reseller_defaults(resellers[user_id])
-                claimed = _notification_claim_due(current, str(kind), str(audience), datetime.now())
+                claimed = _notification_claim_due(current, str(kind), str(audience), utc_now())
                 if claimed:
                     resellers[user_id] = current
                     _write_resellers_file(resellers)
@@ -2681,7 +2663,7 @@ def evaluate_reseller_debt_policies():
                     return []
                 resellers = _read_resellers_file()
 
-                now = datetime.now()
+                now = utc_now()
                 events = []
                 changed = False
 

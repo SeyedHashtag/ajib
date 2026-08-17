@@ -2,7 +2,7 @@ import importlib.util
 import sys
 import types
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -110,6 +110,62 @@ def load_cli_api(payments=None, servers=None, clients=None, online_response=None
 
 
 class ServerInfoDashboardTests(unittest.TestCase):
+    def test_aug17_utc_completion_is_present_in_every_business_window(self):
+        payments = {
+            "a6971cd0-590a-43bb-a205-fece95902da8": {
+                "status": "completed",
+                "type": "renewal",
+                "renewal_mode": "reserved",
+                "price": 2.25,
+                "plan_gb": 100,
+                "user_id": 5349197611,
+                "completed_at": "2026-08-17T10:48:54.000000Z",
+                "updated_at": "2026-08-17T16:29:47.000000Z",
+            }
+        }
+        cli_api = load_cli_api(payments=payments)
+
+        snapshot = cli_api.build_server_info_snapshot(
+            now=datetime(2026, 8, 17, 12, 46, 37, tzinfo=timezone.utc)
+        )
+        sales = snapshot["sales"]
+
+        for window in ("today", "month", "last30", "all"):
+            self.assertEqual(sales["buckets"][window]["paid"], 1)
+            self.assertEqual(sales["buckets"][window]["revenue"], 2.25)
+        self.assertEqual(sales["daily_sales"][0]["date"], "2026-08-17")
+        self.assertEqual(sales["daily_sales"][0]["paid"], 1)
+        self.assertEqual(sales["future_timestamp_payments"], [])
+        text = cli_api.format_server_info(snapshot)
+        self.assertIn("Aug 17: $2.25 • 1 paid", text)
+        self.assertIn("Updated: 2026-08-17 12:46:37 UTC", text)
+
+    def test_lifecycle_more_than_five_minutes_ahead_is_alerted(self):
+        payments = {
+            "future-payment": {
+                "status": "completed",
+                "price": 2.25,
+                "completed_at": "2026-08-17T13:01:38.000000Z",
+            }
+        }
+        cli_api = load_cli_api(payments=payments)
+
+        with self.assertLogs("ajib.reporting", level="WARNING"):
+            snapshot = cli_api.build_server_info_snapshot(
+                now=datetime(2026, 8, 17, 12, 46, 37, tzinfo=timezone.utc)
+            )
+
+        self.assertEqual(
+            snapshot["sales"]["future_timestamp_payments"],
+            [
+                {
+                    "payment_id": "future-payment",
+                    "timestamp": "2026-08-17T13:01:38Z",
+                }
+            ],
+        )
+        self.assertIn("Future payment timestamps: 1", cli_api.format_server_info(snapshot))
+
     def test_snapshot_includes_daily_sales_online_and_unhealthy_servers(self):
         payments = {
             "today-paid": {"status": "completed", "price": 10, "updated_at": "2026-06-04 10:00:00", "plan_gb": 10},

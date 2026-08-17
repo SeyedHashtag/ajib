@@ -15,7 +15,8 @@ import re
 import json
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
+from utils.time_utils import format_utc_display, format_utc_filename, utc_now
 
 BROADCAST_FAILED_USERS_PATH = "/etc/ajib/core/scripts/telegrambot/broadcast_failed_users.json"
 BROADCAST_LOGS_DIR = "/etc/ajib/core/scripts/telegrambot/broadcast_logs"
@@ -117,9 +118,9 @@ def generate_broadcast_log(target_label, total_users, success_users, failed_by_e
     Returns:
         Path to the generated log file
     """
-    timestamp = datetime.now()
-    timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
-    timestamp_file = timestamp.strftime("%Y%m%d_%H%M%S")
+    timestamp = utc_now()
+    timestamp_str = format_utc_display(timestamp)
+    timestamp_file = format_utc_filename(timestamp)
     
     # Create logs directory if it doesn't exist
     os.makedirs(BROADCAST_LOGS_DIR, exist_ok=True)
@@ -326,7 +327,7 @@ def get_user_ids(filter_type):
         excluded_by_reason = {}
         try:
             test_users = test_config_store.load_test_configs(TEST_CONFIGS_FILE)
-            now = parse_timestamp(datetime.now())
+            now = utc_now()
             live_by_identity = {
                 (
                     str((details or {}).get('_ajib_server_id') or 'primary').lower(),

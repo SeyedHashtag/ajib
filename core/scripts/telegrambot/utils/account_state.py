@@ -10,15 +10,18 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Iterable, Mapping
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+try:
+    from .time_utils import format_utc_timestamp, parse_utc_timestamp, utc_now
+except ImportError:  # Standalone diagnostics/tests.
+    from time_utils import format_utc_timestamp, parse_utc_timestamp, utc_now
 
 
-DEFAULT_TIMEZONE = "Asia/Tehran"
+DEFAULT_TIMEZONE = "UTC"
 SUCCESS_STATUSES = frozenset({"completed", "paid", "succeeded", "approved"})
 CONNECTED_STATUSES = frozenset({"online", "offline"})
 HOLD_STATUS = "on hold"
@@ -55,7 +58,7 @@ class ServiceCycle:
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         for key in ("issued_at", "deadline"):
-            result[key] = result[key].isoformat()
+            result[key] = format_utc_timestamp(result[key])
         return result
 
 
@@ -98,42 +101,18 @@ class AccountState:
             "observed_at",
         ):
             value = result.get(key)
-            result[key] = value.isoformat() if value is not None else None
+            result[key] = format_utc_timestamp(value) if value is not None else None
         return result
 
 
 def bot_timezone(name: str | None = None):
-    timezone_name = name or os.getenv("AJIB_TIMEZONE") or DEFAULT_TIMEZONE
-    try:
-        return ZoneInfo(timezone_name)
-    except (ZoneInfoNotFoundError, ValueError, TypeError):
-        return ZoneInfo(DEFAULT_TIMEZONE)
-
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    """Return UTC; retained as a compatibility name for older callers."""
+    return timezone.utc
 
 
 def parse_timestamp(value: Any, *, default_timezone=None) -> datetime | None:
     """Parse an API/bot timestamp and return an aware UTC datetime."""
-    if isinstance(value, datetime):
-        parsed = value
-    elif value is None:
-        return None
-    else:
-        text = str(value).strip()
-        if not text:
-            return None
-        if text.endswith("Z"):
-            text = f"{text[:-1]}+00:00"
-        try:
-            parsed = datetime.fromisoformat(text)
-        except (TypeError, ValueError):
-            return None
-
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=default_timezone or bot_timezone())
-    return parsed.astimezone(timezone.utc)
+    return parse_utc_timestamp(value, legacy_naive_timezone=default_timezone or timezone.utc)
 
 
 def normalize_panel_status(value: Any) -> str | None:
@@ -361,7 +340,7 @@ def resolve_service_cycle(
             "record_id": record_id,
             "username": expected_username,
             "server_id": expected_server,
-            "issued_at": issued_at.isoformat(),
+            "issued_at": format_utc_timestamp(issued_at),
             "duration_days": duration,
             "source": source,
         },
@@ -464,8 +443,8 @@ def inspect_account(
         marker_source = json.dumps(
             {
                 "source": deadline_source.value,
-                "started_at": started_at.isoformat() if started_at else None,
-                "deadline": deadline.isoformat() if deadline else None,
+                "started_at": format_utc_timestamp(started_at) if started_at else None,
+                "deadline": format_utc_timestamp(deadline) if deadline else None,
                 "duration_days": duration,
             },
             sort_keys=True,

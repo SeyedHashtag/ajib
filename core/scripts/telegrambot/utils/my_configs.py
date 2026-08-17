@@ -15,6 +15,7 @@ from utils.translations import BUTTON_TRANSLATIONS, get_message_text, get_button
 from utils.language import get_user_language
 from utils.telegram_safe import safe_answer_callback_query, safe_delete_message, safe_edit_message_text, safe_send_message, safe_send_photo
 from utils.download_guidance import send_download_prompt_safely
+from utils.time_utils import format_utc_display
 
 MY_CONFIGS_CACHE_TTL_SECONDS = 300
 MY_CONFIGS_INFLIGHT_LOCK = threading.Lock()
@@ -427,7 +428,7 @@ def display_config(
         entitlement_line = ''
         if shared_state.deadline_source.value == 'issuance' and shared_state.service_deadline is not None:
             entitlement_line = (
-                f"\n🧾 Unused-service deadline: {shared_state.service_deadline.isoformat()}"
+                f"\n🧾 Unused-service deadline: {format_utc_display(shared_state.service_deadline)}"
                 f"\n📆 Days remaining before use: {shared_state.service_days_remaining}"
             )
         elif is_test and shared_state.panel_state == PanelState.HOLD:

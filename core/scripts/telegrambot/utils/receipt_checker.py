@@ -2,9 +2,11 @@ import json
 import os
 import threading
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from dotenv import load_dotenv
+
+from utils.time_utils import format_utc_timestamp, parse_utc_timestamp, utc_now
 
 
 TELEGRAM_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
@@ -119,12 +121,7 @@ def _safe_float(value, default=0.0):
 
 
 def _parse_payment_datetime(value):
-    if not value:
-        return None
-    try:
-        return datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
-    except (TypeError, ValueError):
-        return None
+    return parse_utc_timestamp(value, legacy_naive_timezone=timezone.utc)
 
 
 def is_receipt_checker(user_id):
@@ -193,7 +190,7 @@ def add_checker_settlement(amount, admin_user_id, stats_snapshot, checker_id=Non
         'id': str(uuid.uuid4()),
         'amount_toman': amount_value,
         'currency': 'Tomans',
-        'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'created_at': format_utc_timestamp(),
         'admin_user_id': admin_user_id,
         'checker_user_id': checker_id,
         'checker_share_percent_snapshot': stats_snapshot.get('share_percent', get_receipt_checker_share_percent()),
@@ -334,7 +331,7 @@ def build_receipt_checker_stats(payments, checker_id=None):
         'owed_total': 0.0,
         'owed_total_usd': 0.0,
         'paid_total': get_checker_paid_total(checker_id),
-        'paid_last_30_days': get_checker_paid_total_since(datetime.now() - timedelta(days=30), checker_id),
+        'paid_last_30_days': get_checker_paid_total_since(utc_now() - timedelta(days=30), checker_id),
         'paid_total_usd': get_checker_paid_total_usd_legacy(checker_id),
         'paid_open_account_total': paid_open_account_total,
         'unpaid_total': 0.0,
@@ -429,7 +426,7 @@ def build_receipt_checker_stats(payments, checker_id=None):
     if latest_review:
         reviewed_at, payment_id, record = latest_review
         stats['latest_review'] = {
-            'reviewed_at': reviewed_at.strftime('%Y-%m-%d %H:%M:%S'),
+            'reviewed_at': format_utc_timestamp(reviewed_at),
             'payment_id': payment_id,
             'receipt_type': _receipt_type_from_record(record),
             'reviewed_action': record.get('reviewed_action', 'N/A'),

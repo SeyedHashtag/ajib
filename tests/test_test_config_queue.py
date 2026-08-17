@@ -500,7 +500,7 @@ class TestConfigQueueTests(unittest.TestCase):
             connected_at="2026-06-10 12:00:00",
         ))
         after = test_config_module.get_test_config_journey(123, now=now)
-        self.assertEqual(after["connected_at"], "2026-06-10 12:00:00")
+        self.assertEqual(after["connected_at"], "2026-06-10T12:00:00.000000Z")
         self.assertEqual(after["panel_state"], "connected")
         self.assertEqual(after["remaining_days"], 30)
 
