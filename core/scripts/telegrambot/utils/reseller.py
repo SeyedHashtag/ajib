@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -79,6 +80,33 @@ MONEY_QUANTUM = Decimal('0.01')
 DEBT_CHARGE_EPSILON = 0.005
 CREDIT_OUTCOME_LIMIT = 3
 CREDIT_OUTCOME_WEIGHTS = {'good': 0, 'late': 1, 'default': 2}
+EXTERNAL_BULK_PROVISIONING_SOURCE = 'external_bulk'
+EXTERNAL_BULK_USERNAME_RE = re.compile(r'^r([1-9]\d*)c(\d+)$', re.IGNORECASE)
+GIB = 1024 ** 3
+
+
+def parse_external_bulk_reseller_username(username):
+    """Return ``(reseller_id, sequence)`` for r{telegram_id}c{digits}."""
+    match = EXTERNAL_BULK_USERNAME_RE.fullmatch(str(username or '').strip())
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def is_external_bulk_reseller_config(config):
+    return (
+        isinstance(config, dict)
+        and config.get('provisioning_source') == EXTERNAL_BULK_PROVISIONING_SOURCE
+        and bool(config.get('financially_excluded'))
+    )
+
+
+def is_reseller_sales_config(config):
+    return (
+        isinstance(config, dict)
+        and not _is_removed_config(config)
+        and not is_external_bulk_reseller_config(config)
+    )
 
 
 def _update_recruitment_milestone(reseller_id, reseller_data):
@@ -316,7 +344,12 @@ def get_reseller_config_value(config):
             for renewal in renewals
             if isinstance(renewal, dict)
         )
-    return _safe_float(config.get('price', 0.0)) + renewal_total
+    base_value = (
+        0.0
+        if is_external_bulk_reseller_config(config)
+        else _safe_float(config.get('price', 0.0))
+    )
+    return base_value + renewal_total
 
 
 def get_reseller_config_total_value(configs):
@@ -832,6 +865,142 @@ def get_all_resellers():
     for rid, data in resellers.items():
         normalized[str(rid)] = _ensure_reseller_defaults(data)
     return normalized
+
+
+def _bulk_candidate_config(candidate, sequence, discovered_at):
+    user_data = candidate.get('user_data') if isinstance(candidate.get('user_data'), dict) else {}
+    username = str(candidate.get('username') or user_data.get('username') or '').strip()
+    server_id = str(candidate.get('server_id') or user_data.get('server_id') or 'primary').strip() or 'primary'
+    config = {
+        'username': username,
+        'server_id': server_id,
+        'bulk_sequence': str(sequence),
+        'provisioning_source': EXTERNAL_BULK_PROVISIONING_SOURCE,
+        'financially_excluded': True,
+        'discovered_at': discovered_at,
+    }
+
+    created_at = str(user_data.get('account_creation_date') or '').strip()
+    if created_at:
+        config['timestamp'] = created_at
+
+    try:
+        duration_value = int(user_data.get('configured_duration_days'))
+    except (TypeError, ValueError, OverflowError):
+        duration_value = 0
+    if duration_value <= 0:
+        try:
+            duration_value = int(user_data.get('expiration_days'))
+        except (TypeError, ValueError, OverflowError):
+            duration_value = 0
+    if duration_value > 0:
+        config['days'] = duration_value
+
+    has_quota = 'max_download_bytes' in user_data
+    try:
+        quota_bytes = max(0, int(user_data.get('max_download_bytes') or 0))
+    except (TypeError, ValueError, OverflowError):
+        quota_bytes = 0
+    unlimited_value = user_data.get('unlimited_user')
+    if unlimited_value is not None:
+        config['unlimited'] = bool(unlimited_value)
+    elif has_quota:
+        config['unlimited'] = quota_bytes == 0
+    if quota_bytes > 0:
+        quota_gib = round(quota_bytes / GIB, 3)
+        config['gb'] = int(quota_gib) if quota_gib.is_integer() else quota_gib
+
+    return config
+
+
+def adopt_external_bulk_reseller_configs(user_id, candidates):
+    """Atomically append unowned live bulk accounts to one known reseller.
+
+    Candidates are live user dictionaries containing ``username``, ``server_id``,
+    and optional normalized ``user_data``. Existing identities are never moved
+    between resellers.
+    """
+    reseller_id = str(user_id)
+    result = {'added': 0, 'existing': 0, 'conflicts': 0, 'ignored': 0}
+    if not isinstance(candidates, (list, tuple)):
+        return result
+
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                if reseller_id not in resellers or not isinstance(resellers[reseller_id], dict):
+                    return result
+
+                owners = {}
+                for owner_id, raw_owner in resellers.items():
+                    configs = raw_owner.get('configs', []) if isinstance(raw_owner, dict) else []
+                    for config in configs if isinstance(configs, list) else []:
+                        if not isinstance(config, dict) or not config.get('username'):
+                            continue
+                        identity = (
+                            str(config.get('server_id') or 'primary').casefold(),
+                            str(config.get('username')).strip().casefold(),
+                        )
+                        owners.setdefault(identity, set()).add(str(owner_id))
+
+                current = _ensure_reseller_defaults(resellers[reseller_id])
+                configs = current.get('configs', [])
+                if not isinstance(configs, list):
+                    configs = []
+                    current['configs'] = configs
+                discovered_at = _now_str()
+                seen_candidates = set()
+
+                for candidate in candidates:
+                    if not isinstance(candidate, dict):
+                        result['ignored'] += 1
+                        continue
+                    user_data = candidate.get('user_data') if isinstance(candidate.get('user_data'), dict) else {}
+                    username = str(candidate.get('username') or user_data.get('username') or '').strip()
+                    parsed = parse_external_bulk_reseller_username(username)
+                    if not parsed or parsed[0] != reseller_id:
+                        result['ignored'] += 1
+                        continue
+                    server_id = str(candidate.get('server_id') or user_data.get('server_id') or 'primary').strip() or 'primary'
+                    identity = (server_id.casefold(), username.casefold())
+                    if identity in seen_candidates:
+                        continue
+                    seen_candidates.add(identity)
+
+                    owner_ids = owners.get(identity, set())
+                    if owner_ids == {reseller_id}:
+                        result['existing'] += 1
+                        continue
+                    if owner_ids:
+                        result['conflicts'] += 1
+                        logging.getLogger('ajib.resellers').warning(
+                            'Skipped external bulk ownership conflict. username=%s server_id=%s expected_reseller=%s existing_reseller=%s',
+                            username,
+                            server_id,
+                            reseller_id,
+                            ','.join(sorted(owner_ids)),
+                        )
+                        continue
+
+                    config = _bulk_candidate_config(
+                        {**candidate, 'username': username, 'server_id': server_id},
+                        parsed[1],
+                        discovered_at,
+                    )
+                    configs.append(config)
+                    owners[identity] = {reseller_id}
+                    result['added'] += 1
+
+                if result['added']:
+                    resellers[reseller_id] = _ensure_reseller_defaults(current)
+                    _write_resellers_file(resellers)
+        except Exception:
+            logging.getLogger('ajib.resellers').exception(
+                'Unable to adopt external bulk reseller configs. reseller_id=%s',
+                reseller_id,
+            )
+    return result
 
 
 def claim_reseller_level_presentation(user_id, lease_seconds=None):

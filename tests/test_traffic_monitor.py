@@ -213,6 +213,24 @@ class TrafficMonitorTests(unittest.TestCase):
         self.assertIn("reseller-gb ali123 r456 95", self.bot.sent_messages[0][1])
         self.assertEqual(self.read_alerts()["r456"]["gb_notified"], [80, 90])
 
+    def test_external_bulk_reseller_username_routes_alert_with_empty_note(self):
+        username = "r7784615720c184"
+        self.write_reseller_config(7784615720, username, customer_name=None)
+
+        self.run_monitor([
+            (True, username, {
+                "upload_bytes": 95 * GB,
+                "download_bytes": 0,
+                "max_download_bytes": 100 * GB,
+                "note": "",
+            }),
+        ])
+
+        self.assertEqual(self.monitor._extract_reseller_id(username), 7784615720)
+        self.assertEqual(len(self.bot.sent_messages), 1)
+        self.assertEqual(self.bot.sent_messages[0][0], 7784615720)
+        self.assertIn(f"reseller-gb — {username} 95", self.bot.sent_messages[0][1])
+
     def test_reseller_client_at_95_percent_days_gets_one_alert_and_marks_all_crossed_thresholds(self):
         self.write_reseller_config(456, "r456", days=100, customer_name="sara88")
 

@@ -34,6 +34,12 @@ from utils.account_state import EntitlementState, PanelState, inspect_account, r
 from utils.command import bot
 from utils.language import get_user_language
 from utils.translations import get_button_text, get_message_text
+try:
+    from utils.reseller import parse_external_bulk_reseller_username
+except ImportError:  # Rolling-upgrade/test compatibility.
+    def parse_external_bulk_reseller_username(username):
+        match = re.fullmatch(r'r([1-9]\d*)c(\d+)', str(username or '').strip(), re.IGNORECASE)
+        return (match.group(1), match.group(2)) if match else None
 
 ALERTS_FILE = '/etc/ajib/core/scripts/telegrambot/traffic_alerts.json'
 RESELLERS_FILE = '/etc/ajib/core/scripts/telegrambot/resellers.json'
@@ -326,6 +332,9 @@ def _extract_reseller_id(username):
     """
     if not username:
         return None
+    bulk_match = parse_external_bulk_reseller_username(username)
+    if bulk_match:
+        return int(bulk_match[0])
     match = re.match(r'^r(\d+)[a-z]*$', username, flags=re.IGNORECASE)
     if match:
         return int(match.group(1))
@@ -568,11 +577,13 @@ def monitor_user_traffic():
         if reseller_id is None:
             continue
 
+        reseller_data = _get_reseller_data(reseller_id)
+        if not reseller_data:
+            continue
         language = get_user_language(reseller_id)
         previous_state = alerts.get(username, {})
         previous_state = previous_state if isinstance(previous_state, dict) else {}
         state = dict(previous_state)
-        reseller_data = _get_reseller_data(reseller_id)
         reseller_config = _get_reseller_config(
             reseller_id,
             username,

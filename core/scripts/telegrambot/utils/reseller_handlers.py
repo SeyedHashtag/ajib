@@ -31,6 +31,25 @@ except ImportError:  # Rolling-upgrade/test compatibility.
     def get_reseller_credit_policy(data):
         limit = get_reseller_trust_limit(get_reseller_total_paid(data or {}))
         return {'base_limit': limit, 'effective_limit': limit, 'mode': 'credit', 'outcomes': []}
+try:
+    from utils.reseller import (
+        adopt_external_bulk_reseller_configs,
+        is_external_bulk_reseller_config,
+        is_reseller_sales_config,
+    )
+except ImportError:  # Rolling-upgrade/test compatibility.
+    def adopt_external_bulk_reseller_configs(_user_id, _candidates):
+        return {'added': 0, 'existing': 0, 'conflicts': 0, 'ignored': 0}
+
+    def is_external_bulk_reseller_config(config):
+        return bool(isinstance(config, dict) and config.get('financially_excluded'))
+
+    def is_reseller_sales_config(config):
+        return bool(
+            isinstance(config, dict)
+            and not config.get('removed_from_vpn')
+            and not is_external_bulk_reseller_config(config)
+        )
 from utils.edit_plans import load_plans
 from utils.api_client import APIClient, MultiServerAPI
 from utils.account_state import (
@@ -1674,7 +1693,10 @@ def handle_reseller_stats(call):
     present_pending_reseller_level(bot, user_id, language)
 
     configs = reseller_data.get('configs', [])
-    total_configs = len(configs)
+    total_configs = sum(
+        1 for config in configs
+        if is_reseller_sales_config(config)
+    )
     
     total_value = sum(_reseller_config_value(c) for c in configs if isinstance(c, dict))
     current_debt = float(reseller_data.get('debt', 0.0))
@@ -1828,22 +1850,28 @@ def _format_reseller_customer_entry(index, cfg, category, language):
     if customer_name:
         identifier_lines.append(f"   🆔 `{username}`")
     removal_reason = _removed_config_reason_line(cfg, language)
+    price_display = (
+        unavailable
+        if is_external_bulk_reseller_config(cfg)
+        else f"${format_usd_amount(price)}"
+    )
 
     return get_message_text(language, "reseller_customer_entry").format(
         identifiers="\n".join(identifier_lines),
         status=status_label,
         gb=gb,
         days=days,
-        price=format_usd_amount(price),
+        price=price_display,
         timestamp=timestamp,
         removal_reason=removal_reason,
     )
 
 
-def _load_reseller_live_users(force_refresh=False):
+def _load_reseller_live_snapshot(force_refresh=False):
     multi_api = MultiServerAPI()
     live_users = {}
     unavailable_server_ids = set()
+    candidates = []
 
     for entry in multi_api.get_user_snapshot_entries(
         include_disabled=True,
@@ -1862,11 +1890,28 @@ def _load_reseller_live_users(force_refresh=False):
             for username, data in users.items():
                 if username and isinstance(data, dict):
                     live_users[(str(server_id).casefold(), str(username).casefold())] = data
+                    candidates.append({
+                        "username": str(data.get("username") or username),
+                        "server_id": str(server_id),
+                        "user_data": data,
+                    })
         elif isinstance(users, list):
             for data in users:
                 if isinstance(data, dict) and data.get("username"):
                     live_users[(str(server_id).casefold(), str(data["username"]).casefold())] = data
+                    candidates.append({
+                        "username": str(data["username"]),
+                        "server_id": str(server_id),
+                        "user_data": data,
+                    })
 
+    return live_users, unavailable_server_ids, candidates
+
+
+def _load_reseller_live_users(force_refresh=False):
+    live_users, unavailable_server_ids, _candidates = _load_reseller_live_snapshot(
+        force_refresh=force_refresh,
+    )
     return live_users, unavailable_server_ids
 
 
@@ -1905,8 +1950,11 @@ def _is_customer_expired(user_config, cfg=None):
     ).entitlement_state == EntitlementState.EXPIRED
 
 
-def _categorize_reseller_customers(configs, force_refresh=False):
-    live_users, unavailable_server_ids = _load_reseller_live_users(force_refresh=force_refresh)
+def _categorize_reseller_customers(configs, force_refresh=False, live_snapshot=None):
+    if live_snapshot is None:
+        live_users, unavailable_server_ids = _load_reseller_live_users(force_refresh=force_refresh)
+    else:
+        live_users, unavailable_server_ids = live_snapshot
     categorized = {category: [] for category in RESELLER_CUSTOMER_CATEGORY_ORDER}
 
     for cfg in configs:
@@ -2097,8 +2145,46 @@ def _render_reseller_customer_category(call, language, categorized, category, pa
     _render_reseller_customer_message(call, msg, markup)
 
 
-def _render_reseller_customers_job(call, language, configs, total, category, page, force_refresh):
-    categorized = _categorize_reseller_customers(configs, force_refresh=force_refresh)
+def _render_reseller_customers_job(call, user_id, language, category, page, force_refresh):
+    live_users, unavailable_server_ids, candidates = _load_reseller_live_snapshot(
+        force_refresh=force_refresh,
+    )
+    adopt_external_bulk_reseller_configs(user_id, candidates)
+    reseller_data = _get_active_reseller_data(user_id)
+    stored_configs = (reseller_data or {}).get('configs', [])
+    if not isinstance(stored_configs, list):
+        stored_configs = []
+    # Show newest configs first while preserving each record's stable list index.
+    configs = [
+        {**config, "_config_index": config_index}
+        for config_index, config in reversed(list(enumerate(stored_configs)))
+        if isinstance(config, dict)
+    ]
+    total = len(configs)
+
+    if total == 0:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(
+            get_message_text(language, "refresh_action"),
+            callback_data="reseller:my_customers_refresh:overview:0",
+        ))
+        markup.add(types.InlineKeyboardButton(
+            get_button_text(language, "cancel"),
+            callback_data="reseller:cancel",
+        ))
+        safe_edit_message_text(
+            bot,
+            get_message_text(language, "reseller_no_configs_created"),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=markup,
+        )
+        return
+
+    categorized = _categorize_reseller_customers(
+        configs,
+        live_snapshot=(live_users, unavailable_server_ids),
+    )
 
     if category == "overview" or category.isdigit():
         _render_reseller_customer_overview(call, language, categorized, total)
@@ -2107,7 +2193,7 @@ def _render_reseller_customers_job(call, language, configs, total, category, pag
     _render_reseller_customer_category(call, language, categorized, category, page)
 
 
-def _queue_reseller_customers_render(call, language, configs, total, category, page, force_refresh):
+def _queue_reseller_customers_render(call, user_id, language, category, page, force_refresh):
     message = call.message
     key = (
         call.from_user.id,
@@ -2124,7 +2210,14 @@ def _queue_reseller_customers_render(call, language, configs, total, category, p
 
     def run():
         try:
-            _render_reseller_customers_job(call, language, configs, total, category, page, force_refresh)
+            _render_reseller_customers_job(
+                call,
+                user_id,
+                language,
+                category,
+                page,
+                force_refresh,
+            )
         finally:
             with RESELLER_CUSTOMERS_LOCK:
                 RESELLER_CUSTOMERS_INFLIGHT.discard(key)
@@ -2152,35 +2245,18 @@ def handle_reseller_my_customers(call):
         return
     safe_answer_callback_query(bot, call.id)
 
+    parts = call.data.split(":")
     stored_configs = reseller_data.get('configs', [])
     if not isinstance(stored_configs, list):
         stored_configs = []
-    # Show newest configs first while preserving each record's stable list index.
-    configs = [
-        {**config, "_config_index": config_index}
-        for config_index, config in reversed(list(enumerate(stored_configs)))
-        if isinstance(config, dict)
-    ]
-    total = len(configs)
-
-    if total == 0:
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
-        safe_edit_message_text(
-            bot,
-            get_message_text(language, "reseller_no_configs_created"),
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=markup
-        )
-        return
-
-    parts = call.data.split(":")
-    force_refresh = len(parts) > 1 and parts[1] == "my_customers_refresh"
+    force_refresh = (
+        (len(parts) > 1 and parts[1] == "my_customers_refresh")
+        or not stored_configs
+    )
     category = parts[2] if len(parts) > 2 else "overview"
 
     if category == "overview" or category.isdigit():
-        _queue_reseller_customers_render(call, language, configs, total, category, 0, force_refresh)
+        _queue_reseller_customers_render(call, user_id, language, category, 0, force_refresh)
         return
 
     if category not in RESELLER_CUSTOMER_CATEGORY_ORDER:
@@ -2196,7 +2272,7 @@ def handle_reseller_my_customers(call):
     except (IndexError, ValueError):
         page = 0
 
-    _queue_reseller_customers_render(call, language, configs, total, category, page, force_refresh)
+    _queue_reseller_customers_render(call, user_id, language, category, page, force_refresh)
 
 @bot.callback_query_handler(func=lambda call: call.data == "reseller:my_customers_noop")
 def handle_reseller_customers_noop(call):
@@ -3072,7 +3148,12 @@ def _reseller_config_value(config):
                 for renewal in renewals
                 if isinstance(renewal, dict)
             )
-        return _safe_float(config.get("price", 0.0)) + renewal_total
+        base_value = (
+            0.0
+            if is_external_bulk_reseller_config(config)
+            else _safe_float(config.get("price", 0.0))
+        )
+        return base_value + renewal_total
 
 
 def _username_display(language, reseller_data):
@@ -3123,20 +3204,32 @@ def _reseller_financial_stats(reseller_data):
     if not isinstance(configs, list):
         configs = []
 
-    total_configs = len(configs)
-    billable_configs = [
+    sales_configs = [
+        config
+        for config in configs
+        if is_reseller_sales_config(config)
+    ]
+    total_configs = len(sales_configs)
+    value_configs = [
         config
         for config in configs
         if isinstance(config, dict) and not _is_removed_config(config)
     ]
-    total_turnover = sum(_reseller_config_value(config) for config in billable_configs)
+    total_turnover = sum(_reseller_config_value(config) for config in value_configs)
     current_debt = _safe_float((reseller_data or {}).get("debt", 0.0))
     total_paid = get_reseller_total_paid(reseller_data)
     trust_limit = get_reseller_trust_limit(total_paid)
-    average_config_value = total_turnover / len(billable_configs) if billable_configs else 0.0
+    financially_active_configs = [
+        config for config in value_configs
+        if _reseller_config_value(config) > 0
+    ]
+    average_config_value = (
+        total_turnover / len(financially_active_configs)
+        if financially_active_configs else 0.0
+    )
     last_config_at = "N/A"
 
-    for config in reversed(configs):
+    for config in reversed(sales_configs):
         if not isinstance(config, dict):
             continue
         timestamp = config.get("timestamp")

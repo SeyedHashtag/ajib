@@ -187,7 +187,7 @@ def install_stubs():
         "reseller_invalid_request": "This request is invalid or has expired.",
         "reseller_removed_during_cleanup": "Removed during account cleanup",
         "reseller_customer_entry": (
-            "{identifiers}\n   {status}\n   📊 {gb} GB | 📅 {days}d | 💰 ${price}"
+            "{identifiers}\n   {status}\n   📊 {gb} GB | 📅 {days}d | 💰 {price}"
             "\n   🕒 {timestamp}{removal_reason}"
         ),
         "reseller_config_data_unavailable": (
@@ -572,6 +572,28 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
         self.assertIn("3. ✅ `r1988033051`", entry)
         self.assertNotIn("🆔", entry)
 
+    def test_external_bulk_customer_uses_username_and_unavailable_price(self):
+        entry = reseller_handlers._format_reseller_customer_entry(
+            1,
+            {
+                "username": "r7784615720c184",
+                "server_id": "s1",
+                "gb": 100,
+                "days": 60,
+                "timestamp": "2026-08-01 12:00:00",
+                "provisioning_source": "external_bulk",
+                "financially_excluded": True,
+                "_status_category": "active",
+                "_user_config": {"note": ""},
+            },
+            "active",
+            "en",
+        )
+
+        self.assertIn("`r7784615720c184`", entry)
+        self.assertIn("💰 Not available", entry)
+        self.assertNotIn("$0.00", entry)
+
     def test_removed_cleanup_customer_entry_shows_reason(self):
         entry = reseller_handlers._format_reseller_customer_entry(
             4,
@@ -877,6 +899,88 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
         finally:
             reseller_handlers.MultiServerAPI = original_multi_api
             reseller_handlers.get_reseller_data = original_get_reseller_data
+            reseller_handlers.RESELLER_CUSTOMERS_EXECUTOR = original_executor
+
+    def test_empty_reseller_panel_adopts_bulk_user_before_rendering(self):
+        original_multi_api = reseller_handlers.MultiServerAPI
+        original_get_reseller_data = reseller_handlers.get_reseller_data
+        original_adopt = reseller_handlers.adopt_external_bulk_reseller_configs
+        original_executor = reseller_handlers.RESELLER_CUSTOMERS_EXECUTOR
+        record = {"status": "approved", "debt": 0.0, "total_paid": 0.0, "configs": []}
+        adoption_calls = []
+
+        class FakeMultiServerAPI:
+            calls = []
+
+            def get_user_snapshot_entries(self, **kwargs):
+                self.__class__.calls.append(kwargs)
+                return [{
+                    "server": {"id": "s1"},
+                    "client": types.SimpleNamespace(server_id="s1"),
+                    "users": {"r7784615720c184": {
+                        "username": "r7784615720c184",
+                        "blocked": False,
+                        "status": "Offline",
+                        "account_creation_date": "2026-08-01 12:00:00",
+                        "configured_duration_days": 60,
+                        "expiration_days": 60,
+                        "max_download_bytes": 100 * 1024 ** 3,
+                        "note": "",
+                    }},
+                }]
+
+        def adopt(user_id, candidates):
+            adoption_calls.append((user_id, candidates))
+            if not record["configs"]:
+                candidate = candidates[0]
+                record["configs"].append({
+                    "username": candidate["username"],
+                    "server_id": candidate["server_id"],
+                    "gb": 100,
+                    "days": 60,
+                    "timestamp": "2026-08-01 12:00:00",
+                    "provisioning_source": "external_bulk",
+                    "financially_excluded": True,
+                    "discovered_at": "2026-08-17 12:00:00",
+                })
+            return {"added": 1, "existing": 0, "conflicts": 0, "ignored": 0}
+
+        try:
+            executor = HoldingExecutor()
+            reseller_handlers.RESELLER_CUSTOMERS_EXECUTOR = executor
+            reseller_handlers.MultiServerAPI = FakeMultiServerAPI
+            reseller_handlers.get_reseller_data = lambda _user_id: record
+            reseller_handlers.adopt_external_bulk_reseller_configs = adopt
+            call = types.SimpleNamespace(
+                id="call-bulk",
+                data="reseller:my_customers:active:0",
+                from_user=types.SimpleNamespace(id=7784615720),
+                message=types.SimpleNamespace(
+                    photo=None,
+                    document=None,
+                    sticker=None,
+                    chat=types.SimpleNamespace(id=100),
+                    message_id=200,
+                ),
+            )
+
+            reseller_handlers.handle_reseller_my_customers(call)
+            self.assertEqual(len(executor.jobs), 1)
+            executor.run_next()
+
+            self.assertTrue(FakeMultiServerAPI.calls[0]["force_refresh"])
+            self.assertEqual(adoption_calls[0][0], 7784615720)
+            self.assertEqual(len(record["configs"]), 1)
+            self.assertIn("r7784615720c184", reseller_handlers.bot.edits[-1][0][0])
+            callbacks = [
+                button.callback_data
+                for button in reseller_handlers.bot.edits[-1][1]["reply_markup"].buttons
+            ]
+            self.assertIn("reseller:cfg_index:0:active:0", callbacks)
+        finally:
+            reseller_handlers.MultiServerAPI = original_multi_api
+            reseller_handlers.get_reseller_data = original_get_reseller_data
+            reseller_handlers.adopt_external_bulk_reseller_configs = original_adopt
             reseller_handlers.RESELLER_CUSTOMERS_EXECUTOR = original_executor
 
     def test_reseller_customer_buttons_keep_original_indices_when_reversed(self):
@@ -1605,6 +1709,30 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
             "✅ 1988 (@buyer) - Debt: $35.50 | Paid: $64.50 | Limit: $30.00",
             row_texts,
         )
+
+    def test_external_bulk_baseline_is_excluded_from_reseller_financial_stats(self):
+        stats = reseller_handlers._reseller_financial_stats({
+            "debt": 2.0,
+            "total_paid": 10.0,
+            "configs": [
+                {
+                    "username": "r1988a",
+                    "price": 5.0,
+                    "timestamp": "2026-08-01 10:00:00",
+                },
+                {
+                    "username": "r1988c184",
+                    "price": 99.0,
+                    "timestamp": "2026-08-17 10:00:00",
+                    "provisioning_source": "external_bulk",
+                    "financially_excluded": True,
+                },
+            ],
+        })
+
+        self.assertEqual(stats["total_configs"], 1)
+        self.assertEqual(stats["total_turnover"], 5.0)
+        self.assertEqual(stats["last_config_at"], "2026-08-01 10:00:00")
 
     def test_approved_reseller_detail_has_suspend_and_ban_actions(self):
         markup = reseller_handlers._build_admin_reseller_detail_markup(

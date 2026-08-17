@@ -1653,14 +1653,19 @@ class ExpiredCleanupTests(unittest.TestCase):
             "settlement": {"status": "completed", "type": "settlement", "username": "ignored"},
         })
         self.write_json(self.cleanup.RESELLERS_FILE, {
-            "303": {"configs": [{"username": "r303", "server_id": "s2"}]}
+            "303": {"configs": [{
+                "username": "r303c184",
+                "server_id": "s2",
+                "provisioning_source": "external_bulk",
+                "financially_excluded": True,
+            }]}
         })
 
         candidates = self.cleanup.discover_cleanup_candidates()
 
         self.assertEqual(
             {(candidate["source"], candidate["username"]) for candidate in candidates},
-            {("test", "t101"), ("customer", "s202"), ("reseller_customer", "r303")},
+            {("test", "t101"), ("customer", "s202"), ("reseller_customer", "r303c184")},
         )
 
     def test_reseller_cleanup_metadata_save_preserves_new_configs_added_during_scan(self):

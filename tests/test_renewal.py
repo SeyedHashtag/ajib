@@ -715,6 +715,34 @@ class RenewalTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(client.reset_calls, ["bob"])
 
+    def test_external_bulk_config_can_use_normal_reseller_renewal_pricing(self):
+        reseller_data = {
+            "total_paid": 0,
+            "configs": [{
+                "username": "r1988c184",
+                "server_id": "s1",
+                "gb": "5",
+                "days": 30,
+                "unlimited": False,
+                "provisioning_source": "external_bulk",
+                "financially_excluded": True,
+            }],
+        }
+        client = FakeClient("s1", {"r1988c184": self.expired_user()})
+
+        offer = self.renewal.find_reseller_renewal_offer(
+            "1988",
+            0,
+            client,
+            client.get_user("r1988c184"),
+            self.plans,
+            reseller_data=reseller_data,
+        )
+
+        self.assertTrue(offer["eligible"])
+        self.assertEqual(offer["server_id"], "s1")
+        self.assertAlmostEqual(offer["price"], 9.6)
+
     def test_reseller_offer_accepts_reseller_only_plan(self):
         reseller_data = {
             "configs": [{

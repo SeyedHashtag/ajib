@@ -55,7 +55,12 @@ def _dump(value):
 def productive_sales_count(reseller_data):
     count = 0
     for config in (reseller_data or {}).get("configs", []) or []:
-        if not isinstance(config, dict) or config.get("removed"):
+        if (
+            not isinstance(config, dict)
+            or config.get("removed")
+            or config.get("removed_from_vpn")
+            or config.get("financially_excluded")
+        ):
             continue
         username = str(config.get("username") or "").strip().lower()
         plan = str(config.get("plan_gb") or config.get("gb") or "").strip().lower()

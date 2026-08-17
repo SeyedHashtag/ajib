@@ -55,6 +55,12 @@ class RecruitmentRewardTests(unittest.TestCase):
         data["configs"].extend([
             {"username": "ht20", "plan_gb": "1"},
             {"username": "r20z", "plan_gb": "10", "removed": True},
+            {
+                "username": "r20c184",
+                "plan_gb": "10",
+                "provisioning_source": "external_bulk",
+                "financially_excluded": True,
+            },
         ])
 
         self.assertEqual(self.recruitment.productive_sales_count(data), 3)

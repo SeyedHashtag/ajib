@@ -38,6 +38,120 @@ class ResellerDebtPolicyTests(unittest.TestCase):
     def hours_ago(self, hours):
         return (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
 
+    def test_external_bulk_username_parser_is_exact_and_case_insensitive(self):
+        self.assertEqual(
+            self.reseller.parse_external_bulk_reseller_username("r7784615720c184"),
+            ("7784615720", "184"),
+        )
+        self.assertEqual(
+            self.reseller.parse_external_bulk_reseller_username("R7784615720C001"),
+            ("7784615720", "001"),
+        )
+        for invalid in ("r7784615720c", "r7784615720x184", "r0c184", "7784615720c184"):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(
+                    self.reseller.parse_external_bulk_reseller_username(invalid)
+                )
+
+    def test_external_bulk_adoption_is_atomic_idempotent_and_financially_neutral(self):
+        self.write_resellers({
+            "7784615720": {
+                "status": "approved",
+                "debt": 4.0,
+                "total_paid": 20.0,
+                "configs": [],
+            },
+            "999": {
+                "status": "approved",
+                "configs": [
+                    {"username": "r7784615720c2", "server_id": "s1", "price": 7.0},
+                ],
+            },
+        })
+        candidates = [
+            {
+                "username": "r7784615720c184",
+                "server_id": "s1",
+                "user_data": {
+                    "username": "r7784615720c184",
+                    "server_id": "s1",
+                    "max_download_bytes": 100 * 1024 ** 3,
+                    "configured_duration_days": 60,
+                    "expiration_days": 12,
+                    "account_creation_date": "2026-08-01 12:00:00",
+                    "note": "",
+                },
+            },
+            {
+                "username": "r7784615720c184",
+                "server_id": "s2",
+                "user_data": {
+                    "max_download_bytes": 50 * 1024 ** 3,
+                    "expiration_days": 30,
+                },
+            },
+            {"username": "r7784615720c2", "server_id": "s1", "user_data": {}},
+            {"username": "r111c1", "server_id": "s1", "user_data": {}},
+        ]
+
+        first = self.reseller.adopt_external_bulk_reseller_configs("7784615720", candidates)
+        second = self.reseller.adopt_external_bulk_reseller_configs("7784615720", candidates)
+        saved = self.read_resellers()["7784615720"]
+
+        self.assertEqual(first["added"], 2)
+        self.assertEqual(first["conflicts"], 1)
+        self.assertEqual(second["added"], 0)
+        self.assertEqual(len(saved["configs"]), 2)
+        imported = saved["configs"][0]
+        self.assertEqual(imported["username"], "r7784615720c184")
+        self.assertEqual(imported["server_id"], "s1")
+        self.assertEqual(imported["bulk_sequence"], "184")
+        self.assertEqual(imported["provisioning_source"], "external_bulk")
+        self.assertTrue(imported["financially_excluded"])
+        self.assertEqual(imported["gb"], 100)
+        self.assertEqual(imported["days"], 60)
+        self.assertEqual(imported["timestamp"], "2026-08-01 12:00:00")
+        self.assertNotIn("customer_name", imported)
+        self.assertNotIn("price", imported)
+        self.assertNotIn("note", imported)
+        missing_metadata = saved["configs"][1]
+        self.assertNotIn("timestamp", missing_metadata)
+        self.assertIn("discovered_at", missing_metadata)
+        self.assertEqual(saved["debt"], 4.0)
+        self.assertEqual(saved["total_paid"], 20.0)
+        self.assertEqual(self.reseller.get_reseller_config_value(imported), 0.0)
+        self.assertFalse(self.reseller.is_reseller_sales_config(imported))
+
+        imported_with_renewal = {
+            **imported,
+            "price": 99,
+            "renewals": [{"price": 3.5}],
+        }
+        self.assertEqual(
+            self.reseller.get_reseller_config_value(imported_with_renewal),
+            3.5,
+        )
+
+    def test_external_bulk_imports_remain_normal_cleanup_candidates(self):
+        self.write_resellers({
+            "1988": {
+                "status": "approved",
+                "debt": 0,
+                "configs": [],
+            },
+        })
+        self.reseller.adopt_external_bulk_reseller_configs("1988", [{
+            "username": "r1988c7",
+            "server_id": "primary",
+            "user_data": {"expiration_days": 30, "max_download_bytes": 1024 ** 3},
+        }])
+        saved = self.read_resellers()["1988"]
+
+        candidates = self.reseller.get_banned_reseller_cleanup_candidates(saved)
+
+        self.assertEqual([item["username"] for item in candidates], ["r1988c7"])
+        self.assertEqual(candidates[0]["price"], 0.0)
+
     def test_trust_limit_tiers_cap_at_thirty(self):
         cases = [
             (0.0, 5.0),
