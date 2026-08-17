@@ -178,6 +178,7 @@ def install_stubs():
         "no_active_configs": "No active configs",
         "my_configs_cache_notice": "This list may take a few minutes to update.",
         "not_authorized": "Not authorized",
+        "renewal_choose_plan": "Choose a renewal plan for `{username}`.",
     }.get(key, key)
     translations_stub.get_button_text = lambda language, key: key
     sys.modules["utils.translations"] = translations_stub
@@ -416,7 +417,7 @@ class MyConfigsTests(unittest.TestCase):
             self.restore_renewal_stub(original)
 
         sent_args, sent_kwargs = my_configs_module.bot.sent_messages[-1]
-        self.assertIn("Renew offer details", sent_args[1])
+        self.assertIn("Choose a renewal plan for `s123a`.", sent_args[1])
         self.assertEqual(sent_kwargs["reply_markup"].buttons[0].callback_data, "renew_plan:renew-token")
 
     def test_expired_customer_config_shows_renewal_unavailable_reason(self):

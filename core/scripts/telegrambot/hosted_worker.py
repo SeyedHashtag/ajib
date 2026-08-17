@@ -889,7 +889,6 @@ def _resolve_hosted_renewal_checkout(user_id, plan_id, renewal):
         or config.get("removed_from_vpn")
         or str(config.get("customer_telegram_id")) != str(user_id)
         or str(config.get("username") or "").lower() != str((renewal or {}).get("username") or "").lower()
-        or str(config.get("plan_gb") or config.get("gb") or "") != str(plan_id)
     ):
         return None, "renewal_ineligible_missing"
     client, live, lookup_result = lookup_renewal_user(
@@ -906,6 +905,7 @@ def _resolve_hosted_renewal_checkout(user_id, plan_id, renewal):
         reseller_data=reseller,
         allow_reservation=True,
         lookup_result=lookup_result,
+        target_plan_gb=plan_id,
     )
     if not offer.get("eligible"):
         return None, offer.get("reason") or "renewal_ineligible_missing"
@@ -914,8 +914,51 @@ def _resolve_hosted_renewal_checkout(user_id, plan_id, renewal):
         "server_id": offer.get("server_id"),
         "config_index": config_index,
         "renewal_mode": offer.get("renewal_mode", "immediate"),
+        "renewal_business_expired": bool(offer.get("business_expired")),
         "renewal_baseline": offer.get("before_state"),
+        "renewal_source_plan_snapshot": offer.get("source_plan_snapshot"),
     }, None
+
+
+def _show_hosted_renewal_plan_picker(chat_id, user_id, config, offer):
+    plans = _sellable_plans()
+    settings = get_settings(OWNER_ID)
+    language = _language(user_id)
+    exchange_rate = get_exchange_rate() if _customer_card_pricing_enabled(language) else None
+    renewal_token = _store_renewal_token(
+        user_id,
+        {
+            "username": config["username"],
+            "server_id": config.get("server_id"),
+            "config_index": config.get("_config_index"),
+            "renewal_mode": offer.get("renewal_mode", "immediate"),
+            "renewal_business_expired": bool(offer.get("business_expired")),
+            "renewal_baseline": offer.get("before_state"),
+            "renewal_source_plan_snapshot": offer.get("source_plan_snapshot"),
+        },
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    choices = sorted(
+        plans,
+        key=lambda plan_id: (int(plans[plan_id].get("gb", plan_id)), int(plan_id)),
+    )
+    for plan_id in choices:
+        plan = plans[plan_id]
+        quote = _hosted_plan_quote(plan, settings)
+        markup.add(types.InlineKeyboardButton(
+            _plan_button_text(
+                user_id, plan_id, plan, quote, exchange_rate=exchange_rate
+            ),
+            callback_data=f"hb:renew:{plan_id}:{renewal_token}",
+        ))
+    bot.send_message(
+        chat_id,
+        _message(user_id, "renewal_choose_plan").format(
+            username=config.get("username") or "—"
+        ),
+        reply_markup=markup,
+        parse_mode="Markdown",
+    )
 
 
 def _referral_data():
@@ -1369,6 +1412,7 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
         "renewal_status": "reserved",
         "renewal_reserved_at": _now(),
         "renewal_baseline": record.get("renewal_baseline") or {},
+        "renewal_source_plan_snapshot": record.get("renewal_source_plan_snapshot") or {},
         "before_state": record.get("renewal_baseline") or {},
         "after_state": None,
         "renewal_plan_snapshot": record.get("renewal_plan_snapshot") or {
@@ -1512,19 +1556,17 @@ def _provision_payment(payment_id, record, funded):
             )
         return True, username
     if renewed:
-        from utils.renewal import lookup_renewal_user
+        from utils.renewal import execute_hosted_renewal
 
-        client, live, _lookup_result = lookup_renewal_user(
-            MultiServerAPI(),
-            username,
-            server_id=record.get("server_id"),
-        )
-        reset_method = getattr(client, "reset_user_result", None) if client and live else None
-        if callable(reset_method):
-            reset_succeeded = reset_method(username).get("status") == "succeeded"
-        else:
-            reset_succeeded = bool(client and live and client.reset_user(username) is not None)
-        if not client or not live or not reset_succeeded:
+        renewal_result = execute_hosted_renewal(record, multi_api=MultiServerAPI())
+        client = renewal_result.get("api_client")
+        if not renewal_result.get("success") or not client:
+            lookup_result = renewal_result.get("lookup_result") or {}
+            _save_payment(payment_id, {
+                "renewal_api_error": lookup_result.get("error"),
+                "renewal_api_http_status": lookup_result.get("http_status"),
+                "renewal_api_stage": lookup_result.get("stage"),
+            })
             return False, "VPN renewal failed"
         _save_payment(payment_id, {"provisioned_username": username,
                                    "provisioned_server_id": getattr(client, "server_id", None)})
@@ -1570,7 +1612,21 @@ def _provision_payment(payment_id, record, funded):
         "reseller_level": record.get("reseller_level"),
         "discount_percent": record.get("discount_percent"),
         "plan_gb": record["plan_gb"], "days": record["days"],
+        "unlimited": record.get("unlimited", False),
     }
+    if renewed:
+        common["renewal_source_plan_snapshot"] = (
+            record.get("renewal_source_plan_snapshot") or {}
+        )
+        common["renewal_plan_snapshot"] = record.get("renewal_plan_snapshot") or {
+            "plan_gb": record["plan_gb"],
+            "days": record["days"],
+            "unlimited": record.get("unlimited", False),
+            "price": record.get("wholesale_price"),
+            "full_price": record.get("list_price"),
+            "reseller_level": record.get("reseller_level"),
+            "discount_percent": record.get("discount_percent"),
+        }
     if prepaid:
         try:
             accounted = (
@@ -2140,7 +2196,9 @@ def payment_method(call):
         "renew_username": renewal and renewal["username"], "server_id": renewal and renewal.get("server_id"),
         "renewal_source": renewal and "hosted_customer",
         "renewal_mode": renewal and renewal.get("renewal_mode", "immediate"),
+        "renewal_business_expired": renewal and bool(renewal.get("renewal_business_expired")),
         "renewal_baseline": renewal and renewal.get("renewal_baseline"),
+        "renewal_source_plan_snapshot": renewal and renewal.get("renewal_source_plan_snapshot"),
         "renewal_plan_snapshot": renewal and {
             "plan_gb": plan_id,
             "days": plan.get("days", 30),
@@ -2560,7 +2618,6 @@ def config_detail(call):
         status_text = _hosted_message(call.from_user.id, "renewal_reserved_status")
         bot.send_message(call.message.chat.id, status_text)
         return
-    plan_id = str(config.get("plan_gb") or config.get("gb") or "")
     plans = _sellable_plans()
     reseller_data = get_reseller_data(OWNER_ID) or {}
     if reseller_data.get("status") != "approved":
@@ -2576,30 +2633,11 @@ def config_detail(call):
         allow_reservation=True,
         lookup_result=lookup_result,
     )
-    if plan_id in plans and offer.get("eligible"):
-        renewal_mode = offer.get("renewal_mode", "immediate")
-        markup = types.InlineKeyboardMarkup()
-        renewal_token = _store_renewal_token(
-            call.from_user.id,
-            {
-                "username": config["username"],
-                "server_id": config.get("server_id"),
-                "config_index": config.get("_config_index"),
-                "renewal_mode": renewal_mode,
-                "renewal_baseline": offer.get("before_state"),
-            },
+    if plans and offer.get("eligible"):
+        _show_hosted_renewal_plan_picker(
+            call.message.chat.id, call.from_user.id, config, offer
         )
-        button_key = "renew_plan" if renewal_mode == "immediate" else "reserve_renewal"
-        markup.add(types.InlineKeyboardButton(
-            get_button_text(_language(call.from_user.id), button_key) or (
-                "🔄 Renew" if renewal_mode == "immediate" else "🗓 Reserve renewal"
-            ),
-            callback_data=f"hb:renew:{plan_id}:{renewal_token}",
-        ))
-        message_key = "renewal_available" if renewal_mode == "immediate" else "renewal_reservation_available"
-        message = _hosted_message(call.from_user.id, message_key)
-        bot.send_message(call.message.chat.id, message, reply_markup=markup)
-    elif plan_id in plans:
+    elif plans:
         reason_key = offer.get("reason") or "renewal_ineligible_plan_mismatch"
         reason = _message(call.from_user.id, reason_key)
         bot.send_message(
@@ -2619,11 +2657,24 @@ def renew(call):
         )
         return
     plan_id, token = parts[2], parts[3]
-    renewal = _consume_renewal_token(token, call.from_user.id)
-    if not renewal:
+    renewal_context = _consume_renewal_token(token, call.from_user.id)
+    if not renewal_context:
         bot.answer_callback_query(
             call.id,
             _hosted_message(call.from_user.id, "renewal_action_expired"),
+            show_alert=True,
+        )
+        return
+    renewal, reason = _resolve_hosted_renewal_checkout(
+        call.from_user.id, plan_id, renewal_context
+    )
+    if not renewal:
+        localized_reason = _message(call.from_user.id, reason)
+        bot.answer_callback_query(
+            call.id,
+            _message(call.from_user.id, "renewal_unavailable").format(
+                reason=localized_reason
+            ),
             show_alert=True,
         )
         return
@@ -2643,13 +2694,16 @@ def renew_config_direct(call):
             show_alert=True,
         )
         return
-    plan_id = str(config.get("plan_gb") or config.get("gb") or "")
-    if plan_id not in _sellable_plans():
-        bot.answer_callback_query(call.id, _message(call.from_user.id, "plan_not_found"), show_alert=True)
+    plans = _sellable_plans()
+    if not plans:
+        bot.answer_callback_query(
+            call.id, _message(call.from_user.id, "plan_not_found"), show_alert=True
+        )
         return
+    first_plan_id = next(iter(sorted(plans, key=lambda value: int(value))))
     renewal, reason = _resolve_hosted_renewal_checkout(
         call.from_user.id,
-        plan_id,
+        first_plan_id,
         {
             "config_index": config.get("_config_index"),
             "username": config.get("username"),
@@ -2664,7 +2718,15 @@ def renew_config_direct(call):
         )
         return
     bot.answer_callback_query(call.id)
-    _purchase_options(call.message.chat.id, call.from_user.id, plan_id, renewal)
+    offer = {
+        "renewal_mode": renewal.get("renewal_mode"),
+        "business_expired": renewal.get("renewal_business_expired"),
+        "before_state": renewal.get("renewal_baseline"),
+        "source_plan_snapshot": renewal.get("renewal_source_plan_snapshot"),
+    }
+    _show_hosted_renewal_plan_picker(
+        call.message.chat.id, call.from_user.id, config, offer
+    )
 
 
 @bot.message_handler(func=lambda m: m.text in _all_button_values("support"))

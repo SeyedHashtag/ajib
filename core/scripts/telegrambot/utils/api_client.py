@@ -171,6 +171,46 @@ def _safe_nonnegative_int(value, default=0) -> int:
     return parsed if parsed >= 0 else int(default)
 
 
+def _renewal_postconditions(user, traffic_limit_gb, expiration_days, unlimited_ip) -> bool:
+    """Return whether a live user reflects a completed renewal snapshot."""
+    if not isinstance(user, dict):
+        return False
+    try:
+        expected_bytes = int(traffic_limit_gb) * GIB
+        expected_days = int(expiration_days)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    live_unlimited_ip = user.get("unlimited_ip")
+    if live_unlimited_ip is None:
+        live_unlimited_ip = user.get("unlimited_user")
+    if live_unlimited_ip is None or any(
+        user.get(field) is None for field in ("upload_bytes", "download_bytes")
+    ):
+        return False
+    used_bytes = _safe_nonnegative_int(user.get("upload_bytes"), 0) + _safe_nonnegative_int(
+        user.get("download_bytes"), 0
+    )
+    return bool(
+        expected_bytes > 0
+        and expected_days > 0
+        and _safe_nonnegative_int(user.get("max_download_bytes"), -1) == expected_bytes
+        and _safe_nonnegative_int(user.get("expiration_days"), -1) == expected_days
+        and _safe_bool(live_unlimited_ip, False) == bool(unlimited_ip)
+        and not _safe_bool(user.get("blocked"), True)
+        and used_bytes == 0
+    )
+
+
+def _renewal_failure(outcome, stage: str) -> dict:
+    result = dict(outcome) if isinstance(outcome, dict) else {}
+    result["status"] = "unavailable" if result.get("status") == "unavailable" else "failed"
+    result.setdefault("data", None)
+    result.setdefault("http_status", None)
+    result.setdefault("error", f"{stage}_failed")
+    result["stage"] = stage
+    return result
+
+
 def _normalise_server_config(config: dict, index: int = 0) -> dict | None:
     if not isinstance(config, dict):
         return None
@@ -546,7 +586,7 @@ class APIClient:
             spec.username,
             traffic_limit_gib,
             spec.expiration_days,
-            unlimited=False,
+            unlimited=spec.unlimited_ip,
             note=spec.note,
             password=spec.password,
             creation_date=spec.creation_date,
@@ -602,6 +642,96 @@ class APIClient:
             "data": data,
             "http_status": status_code,
             "error": None,
+        }
+
+    def renew_user_result(
+        self,
+        username: str,
+        traffic_limit_gb: int,
+        expiration_days: int,
+        unlimited_ip: bool = False,
+    ) -> dict:
+        """Apply a plan snapshot to an existing Blitz user and reset its cycle."""
+        try:
+            traffic_limit_gb = int(traffic_limit_gb)
+            expiration_days = int(expiration_days)
+        except (TypeError, ValueError, OverflowError):
+            return {
+                "status": "failed", "data": None, "http_status": None,
+                "error": "invalid_plan", "stage": "reconfigure",
+            }
+        if traffic_limit_gb <= 0 or expiration_days <= 0:
+            return {
+                "status": "failed", "data": None, "http_status": None,
+                "error": "invalid_plan", "stage": "reconfigure",
+            }
+
+        url = f"{self.users_endpoint}{username}"
+        payload = {
+            "new_traffic_limit": traffic_limit_gb,
+            "new_expiration_days": expiration_days,
+            "unlimited_ip": bool(unlimited_ip),
+        }
+        try:
+            response = self._request(
+                "PATCH",
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=get_api_write_timeout_seconds(),
+            )
+        except requests.exceptions.RequestException as error:
+            return {
+                "status": "unavailable", "data": None, "http_status": None,
+                "error": self._request_error_code(error), "stage": "reconfigure",
+            }
+        status_code = self._http_status(response)
+        try:
+            response.raise_for_status()
+        except requests.exceptions.RequestException:
+            unavailable = status_code in {408, 429} or (status_code is not None and status_code >= 500)
+            return {
+                "status": "unavailable" if unavailable else "failed",
+                "data": None,
+                "http_status": status_code,
+                "error": self._http_error_code(status_code),
+                "stage": "reconfigure",
+            }
+        MultiServerAPI.invalidate_all_caches()
+
+        reset = self.reset_user_result(username)
+        if reset.get("status") != "succeeded":
+            lookup = self.get_user_result(username)
+            if lookup.get("status") == "found" and _renewal_postconditions(
+                lookup.get("data"), traffic_limit_gb, expiration_days, unlimited_ip
+            ):
+                return {
+                    "status": "succeeded",
+                    "data": reset.get("data"),
+                    "user": lookup.get("data"),
+                    "http_status": lookup.get("http_status"),
+                    "error": None,
+                    "stage": "verify",
+                }
+            return _renewal_failure(reset, "reset")
+        lookup = self.get_user_result(username)
+        if lookup.get("status") != "found":
+            return _renewal_failure(lookup, "verify")
+        if not _renewal_postconditions(
+            lookup.get("data"), traffic_limit_gb, expiration_days, unlimited_ip
+        ):
+            return {
+                "status": "failed", "data": lookup.get("data"),
+                "http_status": lookup.get("http_status"),
+                "error": "verification_failed", "stage": "verify",
+            }
+        return {
+            "status": "succeeded",
+            "data": reset.get("data"),
+            "user": lookup.get("data"),
+            "http_status": reset.get("http_status"),
+            "error": None,
+            "stage": "verify",
         }
 
     def delete_user(self, username: str):
@@ -719,6 +849,11 @@ class ThreeXUIAPIClient(APIClient):
     def _comment_without_marker(cls, comment) -> str | None:
         clean = cls._DURATION_RE.sub(" ", str(comment or "")).strip()
         return clean or None
+
+    def _limit_ip_for_plan(self, unlimited_ip: bool) -> int:
+        if unlimited_ip:
+            return 0
+        return self.default_limit_ip if self.default_limit_ip > 0 else 1
 
     @staticmethod
     def _record_parts(item) -> tuple[dict, list[int], dict]:
@@ -843,7 +978,7 @@ class ThreeXUIAPIClient(APIClient):
             return None
         try:
             days = int(expiration_days)
-            limit_bytes = 0 if unlimited else int(traffic_limit) * GIB
+            limit_bytes = int(traffic_limit) * GIB
         except (TypeError, ValueError, OverflowError):
             return None
         if days <= 0 or limit_bytes < 0:
@@ -854,7 +989,7 @@ class ThreeXUIAPIClient(APIClient):
             "totalGB": limit_bytes,
             "expiryTime": -days * MILLISECONDS_PER_DAY,
             "tgId": 0,
-            "limitIp": self.default_limit_ip,
+            "limitIp": self._limit_ip_for_plan(bool(unlimited)),
             "enable": not blocked,
             "comment": self._comment_with_duration(note, days),
         }
@@ -889,7 +1024,11 @@ class ThreeXUIAPIClient(APIClient):
             "totalGB": int(spec.traffic_limit_bytes),
             "expiryTime": expiry_time,
             "tgId": 0,
-            "limitIp": self.default_limit_ip if spec.limit_ip is None else _safe_nonnegative_int(spec.limit_ip),
+            "limitIp": (
+                self._limit_ip_for_plan(spec.unlimited_ip)
+                if spec.limit_ip is None
+                else _safe_nonnegative_int(spec.limit_ip)
+            ),
             "enable": not spec.blocked,
             "comment": self._comment_with_duration(spec.note, days),
         }
@@ -936,6 +1075,10 @@ class ThreeXUIAPIClient(APIClient):
             duration = days
         if "blocked" in data:
             client["enable"] = not _safe_bool(data["blocked"], False)
+        if "unlimited_ip" in data:
+            client["limitIp"] = self._limit_ip_for_plan(
+                _safe_bool(data["unlimited_ip"], False)
+            )
         if "note" in data:
             client["comment"] = self._comment_with_duration(data.get("note"), duration) if duration else str(data.get("note") or "")
         if data.get("renew_password"):
@@ -977,6 +1120,97 @@ class ThreeXUIAPIClient(APIClient):
             return updated
         MultiServerAPI.invalidate_all_caches()
         return {"status": "succeeded", "data": {"message": "Client reset"}, "http_status": 200, "error": None}
+
+    def _verify_renewed_user_result(
+        self,
+        username: str,
+        traffic_limit_gb: int,
+        expiration_days: int,
+        unlimited_ip: bool,
+    ) -> dict:
+        lookup = self._get_raw_result(username)
+        if lookup.get("status") != "succeeded":
+            return _renewal_failure(lookup, "verify")
+        traffic_lookup = self._xui_result(
+            "GET", f"clients/traffic/{quote(str(username), safe='')}"
+        )
+        if traffic_lookup.get("status") != "succeeded":
+            return _renewal_failure(traffic_lookup, "verify")
+        verified_user = self._normalise_user(
+            lookup.get("data"), traffic_override=traffic_lookup.get("data")
+        )
+        if not _renewal_postconditions(
+            verified_user, traffic_limit_gb, expiration_days, unlimited_ip
+        ):
+            return {
+                "status": "failed", "data": verified_user,
+                "http_status": lookup.get("http_status"),
+                "error": "verification_failed", "stage": "verify",
+            }
+        return {
+            "status": "succeeded", "data": {"message": "Client renewed"},
+            "user": verified_user, "http_status": 200, "error": None,
+            "stage": "verify",
+        }
+
+    def renew_user_result(
+        self,
+        username: str,
+        traffic_limit_gb: int,
+        expiration_days: int,
+        unlimited_ip: bool = False,
+    ) -> dict:
+        """Replace 3x-ui plan fields, reset traffic, and verify the result."""
+        try:
+            traffic_limit_gb = int(traffic_limit_gb)
+            expiration_days = int(expiration_days)
+        except (TypeError, ValueError, OverflowError):
+            return {
+                "status": "failed", "data": None, "http_status": None,
+                "error": "invalid_plan", "stage": "reconfigure",
+            }
+        if traffic_limit_gb <= 0 or expiration_days <= 0:
+            return {
+                "status": "failed", "data": None, "http_status": None,
+                "error": "invalid_plan", "stage": "reconfigure",
+            }
+
+        raw_result = self._get_raw_result(username)
+        if raw_result.get("status") != "succeeded":
+            return _renewal_failure(raw_result, "reconfigure")
+        client, _, _ = self._record_parts(raw_result.get("data"))
+        if not client:
+            return {
+                "status": "failed", "data": None,
+                "http_status": raw_result.get("http_status"),
+                "error": "invalid_response", "stage": "reconfigure",
+            }
+        client["totalGB"] = traffic_limit_gb * GIB
+        client["expiryTime"] = -expiration_days * MILLISECONDS_PER_DAY
+        client["limitIp"] = self._limit_ip_for_plan(bool(unlimited_ip))
+        client["comment"] = self._comment_with_duration(client.get("comment"), expiration_days)
+        client["enable"] = True
+
+        updated = self._xui_result(
+            "POST", f"clients/update/{quote(str(username), safe='')}", client
+        )
+        if updated.get("status") != "succeeded":
+            return _renewal_failure(updated, "reconfigure")
+        reset = self._xui_result(
+            "POST", f"clients/resetTraffic/{quote(str(username), safe='')}", {}
+        )
+        if reset.get("status") != "succeeded":
+            verified = self._verify_renewed_user_result(
+                username, traffic_limit_gb, expiration_days, bool(unlimited_ip)
+            )
+            if verified.get("status") == "succeeded":
+                MultiServerAPI.invalidate_all_caches()
+                return verified
+            return _renewal_failure(reset, "reset")
+        MultiServerAPI.invalidate_all_caches()
+        return self._verify_renewed_user_result(
+            username, traffic_limit_gb, expiration_days, bool(unlimited_ip)
+        )
 
     def delete_user(self, username: str):
         result = self._xui_result("POST", f"clients/del/{quote(str(username), safe='')}?keepTraffic=0", {})

@@ -2712,7 +2712,7 @@ def _render_reseller_customer_config_job(
         )
 
 
-def _resolve_reseller_renewal_offer_for_call(call, token):
+def _resolve_reseller_renewal_offer_for_call(call, token, target_plan_gb=None):
     from utils.renewal import resolve_reseller_renewal_token
 
     reseller_data = get_reseller_data(call.from_user.id)
@@ -2721,6 +2721,7 @@ def _resolve_reseller_renewal_offer_for_call(call, token):
         token,
         load_plans(),
         reseller_data=reseller_data,
+        target_plan_gb=target_plan_gb,
     ), reseller_data
 
 
@@ -2755,6 +2756,38 @@ def _renewal_reason_text(language, reason):
     return text
 
 
+def _show_reseller_renewal_confirmation(call, token, offer, reseller_data, language):
+    user_id = call.from_user.id
+    price = float(offer.get('price', 0.0))
+    current_debt = float(reseller_data.get('debt', 0.0))
+    funding_mode, trust_limit, available_credit, _balance = _reseller_order_funding(
+        user_id, reseller_data, price
+    )
+    if not funding_mode:
+        _show_reseller_trust_limit_block(
+            call, language, current_debt, price, trust_limit, available_credit
+        )
+        return
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton(
+        get_button_text(language, "confirm"),
+        callback_data=f"reseller:renew_confirm:{token}:{offer['plan_gb']}",
+    ))
+    markup.add(types.InlineKeyboardButton(
+        get_button_text(language, "back"), callback_data=f"reseller:renew:{token}"
+    ))
+    markup.add(types.InlineKeyboardButton(
+        get_button_text(language, "cancel"), callback_data="reseller:cancel"
+    ))
+    bot.edit_message_text(
+        _reseller_renewal_details_message(language, offer, current_debt, trust_limit),
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=markup,
+        parse_mode="Markdown",
+    )
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reseller:renew:"))
 def handle_reseller_renewal_start(call):
     user_id = call.from_user.id
@@ -2782,21 +2815,25 @@ def handle_reseller_renewal_start(call):
             show_alert=True,
         )
         return
-
-    price = float(offer.get('price', 0.0))
-    current_debt = float(reseller_data.get('debt', 0.0))
-    funding_mode, trust_limit, available_credit, _balance = _reseller_order_funding(
-        user_id, reseller_data, price
-    )
-    if not funding_mode:
-        _show_reseller_trust_limit_block(call, language, current_debt, price, trust_limit, available_credit)
-        return
-
     markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton(get_button_text(language, "confirm"), callback_data=f"reseller:renew_confirm:{token}"))
+    from utils.renewal import eligible_renewal_plans
+    for plan_id, plan in eligible_renewal_plans(load_plans(), 'reseller_customer'):
+        wholesale_price = calculate_reseller_wholesale_price(
+            float(plan.get('price', 0) or 0), reseller_data
+        )
+        markup.add(types.InlineKeyboardButton(
+            get_message_text(language, 'renewal_plan_choice').format(
+                plan_gb=plan_id,
+                days=plan.get('days', 0),
+                price=format_usd_amount(wholesale_price),
+            ),
+            callback_data=f"reseller:renew_plan:{token}:{plan_id}",
+        ))
     markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
     bot.edit_message_text(
-        _reseller_renewal_details_message(language, offer, current_debt, trust_limit),
+        get_message_text(language, 'renewal_choose_plan').format(
+            username=offer.get('username') or '—'
+        ),
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         reply_markup=markup,
@@ -2804,8 +2841,41 @@ def handle_reseller_renewal_start(call):
     )
 
 
-def _queue_reseller_renewal_confirm(call, user_id, language, token):
-    key = (user_id, token)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("reseller:renew_plan:"))
+def handle_reseller_renewal_plan_choice(call):
+    language = get_user_language(call.from_user.id)
+    try:
+        _, _, token, plan_gb = call.data.split(":", 3)
+        offer, reseller_data = _resolve_reseller_renewal_offer_for_call(
+            call, token, plan_gb
+        )
+        if not offer.get('eligible'):
+            bot.answer_callback_query(
+                call.id,
+                get_message_text(language, 'renewal_unavailable').format(
+                    reason=_renewal_reason_text(language, offer.get('reason'))
+                ),
+                show_alert=True,
+            )
+            return
+        bot.answer_callback_query(call.id)
+        _show_reseller_renewal_confirmation(
+            call, token, offer, reseller_data, language
+        )
+    except Exception as error:
+        bot.answer_callback_query(
+            call.id,
+            get_message_text(language, 'error_occurred').format(error=str(error)),
+            show_alert=True,
+        )
+
+
+def _queue_reseller_renewal_confirm(call, user_id, language, token, target_plan_gb=None):
+    key = (
+        (user_id, token, str(target_plan_gb))
+        if target_plan_gb is not None
+        else (user_id, token)
+    )
     with RESELLER_RENEWAL_LOCK:
         if key in RESELLER_RENEWAL_INFLIGHT:
             return False
@@ -2813,7 +2883,12 @@ def _queue_reseller_renewal_confirm(call, user_id, language, token):
 
     def run():
         try:
-            _process_reseller_renewal_confirm_job(call, user_id, language, token)
+            if target_plan_gb is None:
+                _process_reseller_renewal_confirm_job(call, user_id, language, token)
+            else:
+                _process_reseller_renewal_confirm_job(
+                    call, user_id, language, token, target_plan_gb
+                )
         finally:
             with RESELLER_RENEWAL_LOCK:
                 RESELLER_RENEWAL_INFLIGHT.discard(key)
@@ -2827,7 +2902,9 @@ def _queue_reseller_renewal_confirm(call, user_id, language, token):
     return True
 
 
-def _process_reseller_renewal_confirm_job(call, user_id, language, token):
+def _process_reseller_renewal_confirm_job(
+    call, user_id, language, token, target_plan_gb=None
+):
     reseller_data = _get_active_reseller_data(user_id)
     if not reseller_data:
         safe_edit_message_text(
@@ -2848,7 +2925,9 @@ def _process_reseller_renewal_confirm_job(call, user_id, language, token):
         )
         return
 
-    offer, reseller_data = _resolve_reseller_renewal_offer_for_call(call, token)
+    offer, reseller_data = _resolve_reseller_renewal_offer_for_call(
+        call, token, target_plan_gb
+    )
     if not offer.get("eligible"):
         safe_edit_message_text(
             bot,
@@ -2856,6 +2935,24 @@ def _process_reseller_renewal_confirm_job(call, user_id, language, token):
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             parse_mode="Markdown",
+        )
+        return
+
+    confirmation_id = (
+        f"reseller-renewal:{user_id}:{token}:{offer.get('plan_gb')}"
+    )
+    existing_confirmation = next((
+        renewal
+        for renewal in (offer.get('config') or {}).get('renewals', [])
+        if isinstance(renewal, dict)
+        and renewal.get('renewal_confirmation_id') == confirmation_id
+    ), None)
+    if existing_confirmation:
+        safe_edit_message_text(
+            bot,
+            get_message_text(language, 'renewal_confirmation_duplicate'),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
         )
         return
 
@@ -2868,7 +2965,7 @@ def _process_reseller_renewal_confirm_job(call, user_id, language, token):
         _show_reseller_trust_limit_block(call, language, current_debt, price, trust_limit, available_credit)
         return
 
-    wholesale_reservation_id = f"reseller-renewal:{user_id}:{token}"
+    wholesale_reservation_id = confirmation_id
     if funding_mode == 'prepaid':
         reserved_amount = reserve_wholesale_balance(
             user_id,
@@ -2896,6 +2993,7 @@ def _process_reseller_renewal_confirm_job(call, user_id, language, token):
             'renewal_source': 'reseller_customer',
             'reseller_id': str(user_id),
             'config_index': offer.get('config_index'),
+            'renewal_confirmation_id': confirmation_id,
         })
         if funding_mode == 'prepaid':
             try:
@@ -2980,6 +3078,7 @@ def _process_reseller_renewal_confirm_job(call, user_id, language, token):
         return
 
     renewal_record = reseller_renewal_record(offer, result.get('before_state'), result.get('after_state'))
+    renewal_record['renewal_confirmation_id'] = confirmation_id
     if funding_mode == 'prepaid':
         try:
             debt_added = finalize_prepaid_renewal(
@@ -3077,8 +3176,12 @@ def handle_reseller_renewal_confirm(call):
         )
         return
 
-    token = call.data.split(":", 2)[2]
-    if _queue_reseller_renewal_confirm(call, user_id, language, token):
+    parts = call.data.split(":", 3)
+    token = parts[2]
+    target_plan_gb = parts[3] if len(parts) == 4 else None
+    if _queue_reseller_renewal_confirm(
+        call, user_id, language, token, target_plan_gb
+    ):
         safe_answer_callback_query(
             bot,
             call.id,

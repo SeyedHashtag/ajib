@@ -73,6 +73,28 @@ class FakeClient:
             "error": None if result is not None else "reset_failed",
         }
 
+    def renew_user_result(self, username, traffic_limit_gb, expiration_days, unlimited_ip=False):
+        user = self.users.get(username)
+        if user is None:
+            return {
+                "status": "failed", "data": None, "http_status": 404,
+                "error": "not_found", "stage": "reconfigure",
+            }
+        user.update({
+            "max_download_bytes": int(traffic_limit_gb) * GB_BYTES,
+            "expiration_days": int(expiration_days),
+            "unlimited_ip": bool(unlimited_ip),
+        })
+        result = self.reset_user_result(username)
+        if result.get("status") != "succeeded":
+            return {**result, "stage": "reset"}
+        user["expiration_days"] = int(expiration_days)
+        return {
+            **result,
+            "user": user,
+            "stage": "verify",
+        }
+
     def get_user_uri(self, username):
         return {"normal_sub": f"https://sub.example/{username}", "ipv4": ""}
 
@@ -248,6 +270,109 @@ class RenewalTests(unittest.TestCase):
         self.assertIn("Catalog $12.00; renewal 10% (-$1.20)", message)
         self.assertIn("$10.80", message)
 
+    def test_customer_can_upgrade_and_checkout_snapshot_survives_catalog_deletion(self):
+        payments = {"base-1": self.base_payment()}
+        client = FakeClient("s1", {"alice": self.expired_user()})
+
+        offer = self.renewal.find_customer_renewal_offer(
+            123,
+            "alice",
+            client,
+            client.get_user("alice"),
+            self.plans,
+            payments=payments,
+            target_plan_gb="10",
+        )
+        metadata = self.renewal.customer_payment_metadata(offer)
+        payment_record = {
+            **self.base_payment(type="renewal", plan_gb="10", days=60, unlimited=True),
+            **metadata,
+        }
+
+        result = self.renewal.execute_customer_renewal(
+            payment_record,
+            plans={},
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        self.assertTrue(offer["eligible"])
+        self.assertEqual(offer["source_plan_snapshot"]["plan_gb"], "5")
+        self.assertEqual(metadata["renewal_plan_snapshot"]["plan_gb"], "10")
+        self.assertTrue(result["success"])
+        self.assertEqual(client.get_user("alice")["max_download_bytes"], 10 * GB_BYTES)
+        self.assertEqual(client.get_user("alice")["expiration_days"], 60)
+        self.assertTrue(client.get_user("alice")["unlimited_ip"])
+
+    def test_deleted_original_plan_does_not_block_selecting_a_current_plan(self):
+        current_plans = {
+            "10": {"price": 20.0, "days": 60, "unlimited": True, "target": "both"},
+        }
+        client = FakeClient("s1", {"alice": self.expired_user()})
+
+        offer = self.renewal.find_customer_renewal_offer(
+            123,
+            "alice",
+            client,
+            client.get_user("alice"),
+            current_plans,
+            payments={"base-1": self.base_payment()},
+            target_plan_gb="10",
+        )
+
+        self.assertTrue(offer["eligible"])
+        self.assertEqual(offer["plan_gb"], "10")
+
+    def test_hosted_immediate_renewal_uses_locked_target_snapshot(self):
+        client = FakeClient("s1", {"alice": self.expired_user()})
+        record = {
+            "renew_username": "alice",
+            "server_id": "s1",
+            "renewal_source": "hosted_customer",
+            "renewal_source_plan_snapshot": {
+                "plan_gb": "5", "days": 30, "unlimited": False,
+            },
+            "renewal_plan_snapshot": {
+                "plan_gb": "10", "days": 60, "unlimited": True, "price": 16.0,
+            },
+        }
+
+        result = self.renewal.execute_hosted_renewal(
+            record, multi_api=FakeMultiAPI({"s1": client})
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(client.get_user("alice")["max_download_bytes"], 10 * GB_BYTES)
+        self.assertEqual(client.get_user("alice")["expiration_days"], 60)
+        self.assertTrue(client.get_user("alice")["unlimited_ip"])
+
+    def test_retry_accepts_target_state_only_after_a_recorded_partial_stage(self):
+        partially_reconfigured = {
+            **self.expired_user(max_gb=10),
+            "expiration_days": 60,
+            "upload_bytes": 10 * GB_BYTES,
+            "download_bytes": 0,
+            "unlimited_ip": True,
+        }
+        client = FakeClient("s1", {"alice": partially_reconfigured})
+        record = {
+            "renewal_username": "alice",
+            "renewal_server_id": "s1",
+            "renewal_api_stage": "reset",
+            "renewal_source_plan_snapshot": {
+                "plan_gb": "5", "days": 30, "unlimited": False,
+            },
+            "renewal_plan_snapshot": {
+                "plan_gb": "10", "days": 60, "unlimited": True,
+            },
+        }
+
+        result = self.renewal.execute_reserved_renewal(
+            record, multi_api=FakeMultiAPI({"s1": client})
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(client.reset_calls, ["alice"])
+
     def test_customer_offer_accepts_time_expired_api_duration_shape(self):
         payments = {"base-1": self.base_payment()}
         time_expired_user = {
@@ -336,7 +461,7 @@ class RenewalTests(unittest.TestCase):
             "blocked": False,
             "status": "Online",
             "account_creation_date": "2026-08-01T00:00:00+00:00",
-            "expiration_days": 60,
+            "expiration_days": 30,
             "upload_bytes": 0,
             "download_bytes": 0,
             "max_download_bytes": 5 * GB_BYTES,
@@ -450,7 +575,7 @@ class RenewalTests(unittest.TestCase):
         )
         self.assertEqual(deleted_offer["reason"], "renewal_ineligible_no_record")
 
-        day_mismatch_offer = self.renewal.find_customer_renewal_offer(
+        edited_catalog_offer = self.renewal.find_customer_renewal_offer(
             123,
             "alice",
             client,
@@ -458,7 +583,8 @@ class RenewalTests(unittest.TestCase):
             self.plans,
             payments={"base-1": self.base_payment(days=15)},
         )
-        self.assertEqual(day_mismatch_offer["reason"], "renewal_ineligible_plan_mismatch")
+        self.assertTrue(edited_catalog_offer["eligible"])
+        self.assertEqual(edited_catalog_offer["days"], 30)
 
         quota_mismatch_offer = self.renewal.find_customer_renewal_offer(
             123,
@@ -473,7 +599,7 @@ class RenewalTests(unittest.TestCase):
     def test_active_customer_offer_is_reservable_and_duplicate_is_rejected(self):
         active_user = {
             "blocked": False,
-            "expiration_days": 60,
+            "expiration_days": 30,
             "upload_bytes": GB_BYTES,
             "download_bytes": 2 * GB_BYTES,
             "max_download_bytes": 5 * GB_BYTES,
@@ -614,8 +740,10 @@ class RenewalTests(unittest.TestCase):
             reseller_data=reseller_data,
         )
 
-        self.assertEqual(customer_offer["reason"], "renewal_ineligible_plan_mismatch")
-        self.assertEqual(reseller_offer["reason"], "renewal_ineligible_plan_mismatch")
+        self.assertTrue(customer_offer["eligible"])
+        self.assertTrue(customer_offer["unlimited"])
+        self.assertTrue(reseller_offer["eligible"])
+        self.assertTrue(reseller_offer["unlimited"])
 
     def test_customer_renewal_resets_existing_user_and_clears_cleanup_state(self):
         events = []

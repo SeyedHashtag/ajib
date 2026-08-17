@@ -112,3 +112,35 @@ supported.
 ajib-created 3x-ui accounts keep their configured duration in a non-secret
 comment marker. This allows reset to restore delayed-start expiry. Reset fails
 closed for pre-existing clients whose original duration cannot be determined.
+
+## Renewal contract
+
+Renewal checkout may select any plan currently eligible for the sales audience,
+but it never moves an account between servers, panels, or inbound sets. The
+selected quota, duration, unlimited-IP policy, and price are copied into the
+renewal record at checkout. That snapshot remains authoritative if an admin
+later edits or removes the catalog plan.
+
+Expired accounts are reconfigured immediately. Active accounts retain their
+current live settings and reserve the selected snapshot until their current
+service cycle expires. In both cases the username, credentials, server,
+inbounds, and subscription URL are preserved.
+
+Panel adapters expose the structured operation
+`renew_user_result(username, traffic_limit_gb, expiration_days, unlimited_ip)`.
+It returns `succeeded`, `failed`, or `unavailable`, plus the failing `stage`:
+`reconfigure`, `reset`, or `verify`.
+
+- Blitz first patches `new_traffic_limit`, `new_expiration_days`, and
+  `unlimited_ip`, then calls the reset endpoint.
+- 3x-ui reads the full client record, preserves credentials and unrelated
+  fields, replaces `totalGB`, delayed-start `expiryTime`, the ajib duration
+  marker, `limitIp`, and enabled state, then resets traffic. Unlimited-IP plans
+  use `limitIp=0`; limited plans use the server's configured positive limit or
+  fall back to `1`.
+
+Success is recorded only after a fresh read verifies the target quota and
+duration, IP policy, enabled state, and zero upload/download counters. Operators
+should therefore treat renewal as a quota reset: any unused traffic from the old
+cycle is discarded when an immediate renewal is applied, or when a reserved
+renewal reaches expiry.

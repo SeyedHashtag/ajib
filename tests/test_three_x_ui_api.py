@@ -147,6 +147,20 @@ class ThreeXUIAdapterTests(unittest.TestCase):
         self.assertIn("[ajib-duration:30d]", payload["client"]["comment"])
         self.assertEqual(payload["client"]["limitIp"], 2)
 
+    def test_create_unlimited_ip_keeps_quota_and_maps_limit_ip_to_zero(self):
+        client = make_client()
+        calls = []
+        client._request = lambda method, url, **kwargs: (
+            calls.append((method, url, kwargs)) or Response({"success": True, "msg": "added"})
+        )
+
+        result = client.add_user("alice", 8, 30, unlimited=True)
+
+        self.assertIsNotNone(result)
+        payload = calls[0][2]["data"]["client"]
+        self.assertEqual(payload["totalGB"], 8 * api_client.GIB)
+        self.assertEqual(payload["limitIp"], 0)
+
     def test_update_sends_full_record_and_preserves_auth(self):
         client = make_client()
         calls = []
@@ -190,6 +204,215 @@ class ThreeXUIAdapterTests(unittest.TestCase):
 
         self.assertEqual(result["error"], "duration_unknown")
         self.assertEqual(len(calls), 1)
+
+    def test_blitz_renewal_patches_then_resets_and_verifies(self):
+        client = api_client.APIClient({
+            "id": "b1", "name": "Blitz", "url": "https://b.example", "token": "t"
+        })
+        calls = []
+
+        def request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if method == "PATCH":
+                return Response({"detail": "updated"})
+            if url.endswith("/reset"):
+                return Response({"detail": "reset"})
+            return Response({
+                "username": "alice",
+                "max_download_bytes": 10 * api_client.GIB,
+                "expiration_days": 60,
+                "unlimited_user": True,
+                "blocked": False,
+                "upload_bytes": 0,
+                "download_bytes": 0,
+            })
+
+        client._request = request
+        result = client.renew_user_result("alice", 10, 60, True)
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual([call[0] for call in calls], ["PATCH", "GET", "GET"])
+        self.assertEqual(calls[0][2]["data"], {
+            "new_traffic_limit": 10,
+            "new_expiration_days": 60,
+            "unlimited_ip": True,
+        })
+
+    def test_blitz_renewal_reports_verification_failure(self):
+        client = api_client.APIClient({
+            "id": "b1", "name": "Blitz", "url": "https://b.example", "token": "t"
+        })
+
+        def request(method, url, **kwargs):
+            if method == "PATCH" or url.endswith("/reset"):
+                return Response({"detail": "ok"})
+            return Response({
+                "username": "alice",
+                "max_download_bytes": 5 * api_client.GIB,
+                "expiration_days": 30,
+                "unlimited_user": False,
+                "blocked": False,
+                "upload_bytes": 1,
+                "download_bytes": 0,
+            })
+
+        client._request = request
+        result = client.renew_user_result("alice", 10, 60, True)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["stage"], "verify")
+        self.assertEqual(result["error"], "verification_failed")
+
+    def test_blitz_renewal_recovers_a_lost_reset_response_by_verifying(self):
+        client = api_client.APIClient({
+            "id": "b1", "name": "Blitz", "url": "https://b.example", "token": "t"
+        })
+
+        def request(method, url, **kwargs):
+            if method == "PATCH":
+                return Response({"detail": "updated"})
+            if url.endswith("/reset"):
+                return Response({"detail": "gateway timeout"}, status_code=503)
+            return Response({
+                "username": "alice",
+                "max_download_bytes": 10 * api_client.GIB,
+                "expiration_days": 60,
+                "unlimited_user": True,
+                "blocked": False,
+                "upload_bytes": 0,
+                "download_bytes": 0,
+            })
+
+        client._request = request
+        result = client.renew_user_result("alice", 10, 60, True)
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["stage"], "verify")
+
+    def test_three_x_ui_renewal_preserves_full_client_and_verifies(self):
+        client = make_client()
+        calls = []
+        stored_client = {
+            "email": "alice",
+            "auth": "keep-this",
+            "subId": "keep-sub",
+            "totalGB": api_client.GIB,
+            "expiryTime": 1893456000000,
+            "limitIp": 2,
+            "enable": False,
+            "comment": "customer note [ajib-duration:15d]",
+            "protocolSettings": {"keep": True},
+        }
+        traffic = {"up": 9, "down": 11}
+
+        def request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if url.endswith("clients/get/alice"):
+                return Response({
+                    "success": True,
+                    "obj": {"client": dict(stored_client), "inboundIds": [4, 7]},
+                })
+            if url.endswith("clients/update/alice"):
+                stored_client.update(kwargs["data"])
+                return Response({"success": True, "msg": "updated"})
+            if url.endswith("clients/resetTraffic/alice"):
+                traffic.update({"up": 0, "down": 0})
+                return Response({"success": True, "msg": "reset"})
+            if url.endswith("clients/traffic/alice"):
+                return Response({"success": True, "obj": dict(traffic)})
+            if url.endswith("clients/onlines"):
+                return Response({"success": True, "obj": []})
+            raise AssertionError(url)
+
+        client._request = request
+        result = client.renew_user_result("alice", 10, 60, True)
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(
+            [(method, url.rsplit("/", 2)[-2:]) for method, url, _ in calls],
+            [
+                ("GET", ["get", "alice"]),
+                ("POST", ["update", "alice"]),
+                ("POST", ["resetTraffic", "alice"]),
+                ("GET", ["get", "alice"]),
+                ("GET", ["traffic", "alice"]),
+            ],
+        )
+        update_payload = calls[1][2]["data"]
+        self.assertEqual(update_payload["auth"], "keep-this")
+        self.assertEqual(update_payload["subId"], "keep-sub")
+        self.assertEqual(update_payload["protocolSettings"], {"keep": True})
+        self.assertEqual(update_payload["totalGB"], 10 * api_client.GIB)
+        self.assertEqual(update_payload["expiryTime"], -60 * api_client.MILLISECONDS_PER_DAY)
+        self.assertEqual(update_payload["limitIp"], 0)
+        self.assertTrue(update_payload["enable"])
+        self.assertIn("customer note", update_payload["comment"])
+        self.assertIn("[ajib-duration:60d]", update_payload["comment"])
+
+    def test_three_x_ui_renewal_classifies_failures_by_stage(self):
+        client = make_client()
+        client._request = lambda *_args, **_kwargs: Response({
+            "success": False, "msg": "Client not found",
+        })
+        missing = client.renew_user_result("missing", 10, 60, False)
+        self.assertEqual((missing["status"], missing["stage"]), ("failed", "reconfigure"))
+
+        full = {"client": {
+            "email": "alice", "auth": "keep", "totalGB": api_client.GIB,
+            "expiryTime": -api_client.MILLISECONDS_PER_DAY,
+            "limitIp": 1, "enable": True, "comment": "[ajib-duration:1d]",
+        }}
+
+        def reset_failure(method, url, **kwargs):
+            if method == "GET":
+                return Response({"success": True, "obj": full})
+            if url.endswith("clients/update/alice"):
+                return Response({"success": True, "msg": "updated"})
+            return Response({"success": False, "msg": "reset rejected"})
+
+        client._request = reset_failure
+        reset = client.renew_user_result("alice", 10, 60, False)
+        self.assertEqual((reset["status"], reset["stage"]), ("failed", "reset"))
+
+        calls = []
+
+        def verify_failure(method, url, **kwargs):
+            calls.append(url)
+            if url.endswith("clients/get/alice"):
+                return Response({"success": True, "obj": full})
+            if url.endswith("clients/traffic/alice"):
+                return Response({"detail": "down"}, status_code=503)
+            return Response({"success": True, "msg": "ok"})
+
+        client._request = verify_failure
+        verify = client.renew_user_result("alice", 10, 60, False)
+        self.assertEqual((verify["status"], verify["stage"]), ("unavailable", "verify"))
+
+    def test_three_x_ui_renewal_recovers_a_lost_reset_response_by_verifying(self):
+        client = make_client()
+        stored = {
+            "email": "alice", "auth": "keep", "totalGB": api_client.GIB,
+            "expiryTime": -api_client.MILLISECONDS_PER_DAY,
+            "limitIp": 2, "enable": False, "comment": "[ajib-duration:1d]",
+        }
+
+        def request(method, url, **kwargs):
+            if url.endswith("clients/get/alice"):
+                return Response({"success": True, "obj": {"client": dict(stored)}})
+            if url.endswith("clients/update/alice"):
+                stored.update(kwargs["data"])
+                return Response({"success": True, "msg": "updated"})
+            if url.endswith("clients/resetTraffic/alice"):
+                return Response({"success": False, "msg": "response lost"})
+            if url.endswith("clients/traffic/alice"):
+                return Response({"success": True, "obj": {"up": 0, "down": 0}})
+            raise AssertionError(url)
+
+        client._request = request
+        result = client.renew_user_result("alice", 10, 60, True)
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["stage"], "verify")
 
     def test_subscription_and_readiness_require_public_settings(self):
         client = make_client([4])

@@ -496,7 +496,6 @@ def display_config(
             try:
                 from utils.renewal import (
                     find_customer_renewal_offer,
-                    format_renewal_offer,
                     format_renewal_unavailable,
                 )
 
@@ -510,7 +509,7 @@ def display_config(
                 if offer.get('eligible'):
                     message = (
                         f"❌ **Your configuration has expired!**\n{formatted_details}\n\n"
-                        f"{format_renewal_offer(language, offer, include_payment_prompt=False)}"
+                        f"{get_message_text(language, 'renewal_choose_plan').format(username=username)}"
                     )
                     renewal_markup = types.InlineKeyboardMarkup()
                     renewal_markup.add(

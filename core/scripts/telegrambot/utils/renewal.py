@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import uuid
 from datetime import datetime, timedelta
@@ -325,6 +326,7 @@ def _lookup_failure_fields(lookup_result):
     return {
         'renewal_api_error': lookup_result.get('error'),
         'renewal_api_http_status': lookup_result.get('http_status'),
+        'renewal_api_stage': lookup_result.get('stage'),
     }
 
 
@@ -336,31 +338,106 @@ def reseller_renewal_token(reseller_id, config_index, username, server_id):
     return _token('reseller', reseller_id, config_index, server_id or 'primary', username)
 
 
-def _plan_for_record(record, plans, source):
-    if not isinstance(record, dict) or not isinstance(plans, dict):
-        return None, 'renewal_ineligible_plan_missing'
+def _record_plan_snapshot(record):
+    if not isinstance(record, dict):
+        return None
+    snapshot = record.get('renewal_plan_snapshot')
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    plan_gb = snapshot.get('plan_gb')
+    if plan_gb is None:
+        plan_gb = record.get('plan_gb') if record.get('plan_gb') is not None else record.get('gb')
+    plan_gb = str(plan_gb or '').strip()
+    days = _safe_int(snapshot.get('days'))
+    if days is None:
+        days = _safe_int(record.get('days'))
+    unlimited = snapshot.get('unlimited')
+    if unlimited is None and record.get('unlimited') is not None:
+        unlimited = record.get('unlimited')
+    if not plan_gb or days is None or days <= 0:
+        return None
+    result = {
+        'plan_gb': plan_gb,
+        'days': days,
+        'unlimited': _safe_bool(unlimited) if unlimited is not None else None,
+    }
+    price = snapshot.get('price')
+    if price is None:
+        price = record.get('price')
+    full_price = snapshot.get('full_price')
+    if full_price is None:
+        full_price = record.get('full_price', record.get('list_price'))
+    if price is not None:
+        result['price'] = _safe_float(price)
+    if full_price is not None:
+        result['full_price'] = _safe_float(full_price)
+    return result
 
-    plan_gb = str(record.get('plan_gb') if record.get('plan_gb') is not None else record.get('gb', '')).strip()
-    if plan_gb not in plans:
-        return None, 'renewal_ineligible_plan_missing'
 
-    plan = plans.get(plan_gb) or {}
-    target = plan.get('target', 'both')
-    if source == 'customer' and target == 'reseller':
-        return None, 'renewal_ineligible_plan_mismatch'
-    if source == 'reseller_customer' and target == 'customer':
-        return None, 'renewal_ineligible_plan_mismatch'
+def _source_plan_snapshot(record):
+    if not isinstance(record, dict):
+        return None
+    renewals = record.get('renewals')
+    if isinstance(renewals, list):
+        for renewal in reversed(renewals):
+            if not isinstance(renewal, dict):
+                continue
+            mode = str(renewal.get('renewal_mode') or '').lower()
+            status = str(renewal.get('renewal_status') or '').lower()
+            if mode == 'reserved' and status != 'applied':
+                continue
+            if status and status not in {'applied', 'completed', 'succeeded'}:
+                continue
+            snapshot = _record_plan_snapshot(renewal)
+            if snapshot:
+                return snapshot
+    return _record_plan_snapshot(record)
 
-    if _safe_int(record.get('days')) != _safe_int(plan.get('days')):
-        return None, 'renewal_ineligible_plan_mismatch'
 
-    if (
-        record.get('unlimited') is not None
-        and _safe_bool(record.get('unlimited')) != _safe_bool(plan.get('unlimited', False))
-    ):
-        return None, 'renewal_ineligible_plan_mismatch'
+def eligible_renewal_plans(plans, source):
+    if not isinstance(plans, dict):
+        return []
+    eligible = []
+    for plan_id, plan in plans.items():
+        plan_key = str(plan_id).strip()
+        if not isinstance(plan, dict):
+            continue
+        try:
+            if int(plan_key) <= 0:
+                continue
+        except (TypeError, ValueError, OverflowError):
+            continue
+        target = plan.get('target', 'both')
+        if source == 'customer' and target == 'reseller':
+            continue
+        if source == 'reseller_customer' and target == 'customer':
+            continue
+        price = _safe_float(plan.get('price'), -1)
+        if _safe_int(plan.get('days'), 0) <= 0 or not math.isfinite(price) or price < 0:
+            continue
+        eligible.append((plan_key, plan))
+    return sorted(
+        eligible,
+        key=lambda item: (_safe_int(item[0], 10 ** 12), item[0]),
+    )
 
-    return plan, None
+
+def _target_plan_for_record(record, plans, source, target_plan_gb=None):
+    eligible = dict(eligible_renewal_plans(plans, source))
+    source_snapshot = _source_plan_snapshot(record)
+    requested = str(target_plan_gb or '').strip()
+    if not requested and source_snapshot:
+        requested = source_snapshot['plan_gb']
+    if requested and requested not in eligible:
+        if requested in (plans or {}):
+            return None, None, 'renewal_ineligible_plan_mismatch'
+        if target_plan_gb is not None:
+            return None, None, 'renewal_ineligible_plan_missing'
+    if not requested or requested not in eligible:
+        if not eligible:
+            reason = 'renewal_ineligible_plan_mismatch' if plans else 'renewal_ineligible_plan_missing'
+            return None, None, reason
+        requested = next(iter(eligible))
+    return requested, eligible[requested], None
 
 
 def _live_quota_matches_plan(user_data, plan_gb):
@@ -369,6 +446,32 @@ def _live_quota_matches_plan(user_data, plan_gb):
         return False
     live_gb = max_download_bytes / GB_BYTES
     return abs(live_gb - _safe_float(plan_gb)) <= 0.01
+
+
+def _live_account_matches_source_plan(user_data, source_snapshot):
+    if not source_snapshot or not _live_quota_matches_plan(
+        user_data, source_snapshot.get('plan_gb')
+    ):
+        return False
+    # Blitz exposes a countdown-like value while 3x-ui exposes the immutable
+    # ajib duration marker through the same normalized field. Quota and IP
+    # policy are stable cross-panel identity checks. A positive duration is
+    # also verifiable; zero is retained as a legacy expired/countdown shape.
+    source_days = _safe_int(source_snapshot.get('days'))
+    live_days = _safe_int((user_data or {}).get('expiration_days'))
+    if source_days and live_days and source_days != live_days:
+        return False
+    source_unlimited = source_snapshot.get('unlimited')
+    live_unlimited = (user_data or {}).get('unlimited_ip')
+    if live_unlimited is None:
+        live_unlimited = (user_data or {}).get('unlimited_user')
+    if (
+        source_unlimited is not None
+        and live_unlimited is not None
+        and _safe_bool(source_unlimited) != _safe_bool(live_unlimited)
+    ):
+        return False
+    return True
 
 
 def _build_offer(
@@ -384,6 +487,7 @@ def _build_offer(
     allow_reservation=False,
     lookup_result=None,
     cycle_records=None,
+    target_plan_gb=None,
 ):
     if not api_client or not user_data:
         return {
@@ -422,7 +526,10 @@ def _build_offer(
             'before_state': capture_user_state(user_data, cycle=cycle),
         }
 
-    plan, reason = _plan_for_record(record, plans, source)
+    source_snapshot = _source_plan_snapshot(record)
+    plan_gb, plan, reason = _target_plan_for_record(
+        record, plans, source, target_plan_gb=target_plan_gb
+    )
     if reason:
         return {
             'eligible': False,
@@ -433,8 +540,7 @@ def _build_offer(
             'before_state': capture_user_state(user_data, cycle=cycle),
         }
 
-    plan_gb = str(record.get('plan_gb') if record.get('plan_gb') is not None else record.get('gb'))
-    if not _live_quota_matches_plan(user_data, plan_gb):
+    if not _live_account_matches_source_plan(user_data, source_snapshot):
         return {
             'eligible': False,
             'reason': 'renewal_ineligible_plan_mismatch',
@@ -485,6 +591,7 @@ def _build_offer(
         'renewal_discount_percent': renewal_discount_percent,
         'renewal_discount_amount': renewal_discount_amount,
         'plan': plan,
+        'source_plan_snapshot': source_snapshot,
         'before_state': capture_user_state(user_data, cycle=cycle),
         'expected_after_state': expected_after_state(plan_gb, plan.get('days')),
         'renewal_mode': 'immediate' if expired else 'reserved',
@@ -568,6 +675,7 @@ def find_customer_renewal_offer(
     payments=None,
     server_id=None,
     allow_reservation=False,
+    target_plan_gb=None,
 ):
     existing_reservation = find_customer_reservation(
         user_id,
@@ -624,6 +732,7 @@ def find_customer_renewal_offer(
             },
             allow_reservation=allow_reservation,
             cycle_records=cycle_records,
+            target_plan_gb=target_plan_gb,
         )
         if offer.get('eligible'):
             return offer
@@ -648,6 +757,7 @@ def resolve_customer_renewal_token(
     multi_api=None,
     payments=None,
     allow_reservation=True,
+    target_plan_gb=None,
 ):
     from utils.api_client import MultiServerAPI
 
@@ -701,6 +811,7 @@ def resolve_customer_renewal_token(
             allow_reservation=allow_reservation,
             lookup_result=lookup_result,
             cycle_records=exact_records,
+            target_plan_gb=target_plan_gb,
         )
     return {'eligible': False, 'reason': 'renewal_ineligible_missing', 'source': 'customer'}
 
@@ -724,6 +835,7 @@ def find_reseller_renewal_offer(
     reseller_data=None,
     allow_reservation=False,
     lookup_result=None,
+    target_plan_gb=None,
 ):
     configs = dict(_iter_reseller_configs(reseller_id, reseller_data=reseller_data))
     config = configs.get(config_index)
@@ -761,6 +873,7 @@ def find_reseller_renewal_offer(
         reseller_data=reseller_data,
         allow_reservation=allow_reservation,
         lookup_result=lookup_result,
+        target_plan_gb=target_plan_gb,
     )
 
 
@@ -771,6 +884,7 @@ def resolve_reseller_renewal_token(
     multi_api=None,
     reseller_data=None,
     allow_reservation=True,
+    target_plan_gb=None,
 ):
     from utils.api_client import MultiServerAPI
 
@@ -800,6 +914,7 @@ def resolve_reseller_renewal_token(
             reseller_data=reseller_data,
             allow_reservation=allow_reservation,
             lookup_result=lookup_result,
+            target_plan_gb=target_plan_gb,
         )
 
     return {'eligible': False, 'reason': 'renewal_ineligible_missing', 'source': 'reseller_customer'}
@@ -819,6 +934,7 @@ def customer_payment_metadata(offer):
         'renewal_entitlement_deadline': offer.get('entitlement_deadline'),
         'renewal_discount_percent': offer.get('renewal_discount_percent'),
         'renewal_discount_amount': offer.get('renewal_discount_amount'),
+        'renewal_source_plan_snapshot': dict(offer.get('source_plan_snapshot') or {}),
         'renewal_plan_snapshot': {
             'plan_gb': offer.get('plan_gb'),
             'days': offer.get('days'),
@@ -850,6 +966,16 @@ def reseller_renewal_record(offer, before_state, after_state):
         'renewal_business_expired': bool(offer.get('business_expired')),
         'renewal_cycle_fingerprint': offer.get('cycle_fingerprint'),
         'renewal_entitlement_deadline': offer.get('entitlement_deadline'),
+        'renewal_source_plan_snapshot': dict(offer.get('source_plan_snapshot') or {}),
+        'renewal_plan_snapshot': {
+            'plan_gb': offer.get('plan_gb'),
+            'days': offer.get('days'),
+            'unlimited': offer.get('unlimited', False),
+            'price': offer.get('price'),
+            'full_price': offer.get('full_price'),
+            'reseller_level': offer.get('reseller_level'),
+            'discount_percent': offer.get('discount_percent'),
+        },
     }
 
 
@@ -862,6 +988,7 @@ def reserved_renewal_record(offer, reservation_id=None, funded=False):
         'renewal_status': 'reserved',
         'renewal_reserved_at': _now_str(),
         'renewal_baseline': dict(offer.get('before_state') or {}),
+        'renewal_source_plan_snapshot': dict(offer.get('source_plan_snapshot') or {}),
         'renewal_plan_snapshot': {
             'plan_gb': offer.get('plan_gb'),
             'days': offer.get('days'),
@@ -1749,15 +1876,29 @@ def _execute_reset(
     if require_expired and not (is_user_expired(user_data) or business_expired):
         return {'success': False, 'reason': 'renewal_ineligible_not_expired', 'before_state': before_state}
 
-    if validate_plan and not _live_quota_matches_plan(
-        user_data,
-        plan_record.get('plan_gb') or plan_record.get('gb'),
-    ):
-        return {'success': False, 'reason': 'renewal_ineligible_plan_mismatch', 'before_state': before_state}
+    target_snapshot = _record_plan_snapshot(plan_record)
+    if not target_snapshot:
+        return {'success': False, 'reason': 'renewal_ineligible_plan_missing', 'before_state': before_state}
+    source_snapshot = plan_record.get('renewal_source_plan_snapshot')
+    if not isinstance(source_snapshot, dict):
+        source_snapshot = target_snapshot
+    if validate_plan and not _live_account_matches_source_plan(user_data, source_snapshot):
+        partial_stage = str(plan_record.get('renewal_api_stage') or '').lower()
+        partial_target = (
+            partial_stage in {'reset', 'verify'}
+            and _live_account_matches_source_plan(user_data, target_snapshot)
+        )
+        if not partial_target:
+            return {'success': False, 'reason': 'renewal_ineligible_plan_mismatch', 'before_state': before_state}
 
-    reset_result_method = getattr(api_client, 'reset_user_result', None)
-    if callable(reset_result_method):
-        reset_outcome = reset_result_method(username)
+    renew_result_method = getattr(api_client, 'renew_user_result', None)
+    if callable(renew_result_method):
+        reset_outcome = renew_result_method(
+            username,
+            target_snapshot['plan_gb'],
+            target_snapshot['days'],
+            bool(target_snapshot.get('unlimited')),
+        )
         result = reset_outcome.get('data') if isinstance(reset_outcome, dict) else None
         reset_status = reset_outcome.get('status') if isinstance(reset_outcome, dict) else None
         if reset_status != 'succeeded':
@@ -1770,14 +1911,42 @@ def _execute_reset(
                     'status': 'unavailable' if reset_status == 'unavailable' else 'failed',
                     'http_status': reset_outcome.get('http_status') if isinstance(reset_outcome, dict) else None,
                     'error': reset_outcome.get('error') if isinstance(reset_outcome, dict) else 'reset_failed',
+                    'stage': reset_outcome.get('stage') if isinstance(reset_outcome, dict) else None,
                 },
             }
+        after_user = reset_outcome.get('user') or api_client.get_user(username) or user_data
     else:
-        result = api_client.reset_user(username)
-        if result is None:
-            return {'success': False, 'reason': 'renewal_reset_failed', 'before_state': before_state}
+        if not _live_account_matches_source_plan(user_data, target_snapshot):
+            return {
+                'success': False,
+                'reason': 'renewal_reset_failed',
+                'before_state': before_state,
+                'lookup_result': {'status': 'failed', 'error': 'reconfigure_unsupported'},
+            }
+        reset_result_method = getattr(api_client, 'reset_user_result', None)
+        if callable(reset_result_method):
+            reset_outcome = reset_result_method(username)
+            result = reset_outcome.get('data') if isinstance(reset_outcome, dict) else None
+            reset_status = reset_outcome.get('status') if isinstance(reset_outcome, dict) else None
+            if reset_status != 'succeeded':
+                reason = 'server_unavailable' if reset_status == 'unavailable' else 'renewal_reset_failed'
+                return {
+                    'success': False,
+                    'reason': reason,
+                    'before_state': before_state,
+                    'lookup_result': {
+                        'status': 'unavailable' if reset_status == 'unavailable' else 'failed',
+                        'http_status': reset_outcome.get('http_status') if isinstance(reset_outcome, dict) else None,
+                        'error': reset_outcome.get('error') if isinstance(reset_outcome, dict) else 'reset_failed',
+                        'stage': 'reset',
+                    },
+                }
+        else:
+            result = api_client.reset_user(username)
+            if result is None:
+                return {'success': False, 'reason': 'renewal_reset_failed', 'before_state': before_state}
+        after_user = api_client.get_user(username) or user_data
 
-    after_user = api_client.get_user(username) or user_data
     after_state = capture_user_state(after_user)
     if clear_cleanup:
         mark_cleanup_state_renewed(username, server_id or getattr(api_client, 'server_id', None))
@@ -1794,17 +1963,10 @@ def _execute_reset(
 
 
 def execute_customer_renewal(payment_record, plans=None, multi_api=None):
-    from utils.edit_plans import load_plans
-
-    plans = plans if plans is not None else load_plans()
     username = payment_record.get('renewal_username')
     server_id = payment_record.get('renewal_server_id')
     if not username:
         return {'success': False, 'reason': 'renewal_ineligible_missing'}
-
-    plan, reason = _plan_for_record(payment_record, plans, 'customer')
-    if reason:
-        return {'success': False, 'reason': reason}
 
     result = _execute_reset(
         username,
@@ -1828,7 +1990,12 @@ def execute_reseller_renewal(offer, multi_api=None):
     result = _execute_reset(
         username,
         server_id,
-        {'gb': offer.get('plan_gb')},
+        {
+            'plan_gb': offer.get('plan_gb'),
+            'days': offer.get('days'),
+            'unlimited': offer.get('unlimited', False),
+            'renewal_source_plan_snapshot': offer.get('source_plan_snapshot'),
+        },
         'reseller_customer',
         multi_api=multi_api,
         business_expired=bool(offer.get('business_expired')),
@@ -1836,6 +2003,26 @@ def execute_reseller_renewal(offer, multi_api=None):
     )
     if result.get('success'):
         _record_renewal_completed(offer, result, 'reseller_customer')
+    return result
+
+
+def execute_hosted_renewal(payment_record, multi_api=None):
+    """Apply one paid hosted-customer snapshot through the shared renewal path."""
+    username = payment_record.get('renew_username') or payment_record.get('renewal_username')
+    server_id = payment_record.get('renewal_server_id') or payment_record.get('server_id')
+    if not username:
+        return {'success': False, 'reason': 'renewal_ineligible_missing'}
+    result = _execute_reset(
+        username,
+        server_id,
+        payment_record,
+        'hosted_customer',
+        multi_api=multi_api,
+        business_expired=bool(payment_record.get('renewal_business_expired')),
+        clear_cleanup=False,
+    )
+    if result.get('success'):
+        _record_renewal_completed(payment_record, result, 'hosted_customer')
     return result
 
 
@@ -1854,7 +2041,11 @@ def execute_reserved_renewal(record, multi_api=None, force=False):
     result = _execute_reset(
         username,
         server_id,
-        snapshot,
+        {
+            **snapshot,
+            'renewal_source_plan_snapshot': record.get('renewal_source_plan_snapshot'),
+            'renewal_api_stage': record.get('renewal_api_stage'),
+        },
         record.get('renewal_source') or 'reserved',
         multi_api=multi_api,
         require_expired=not force,

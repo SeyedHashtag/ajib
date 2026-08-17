@@ -231,6 +231,41 @@ def test_direct_renewal_shows_ten_percent_card_and_fifteen_percent_crypto_totals
     assert totals == "base=$12.00;card=10%:648000;crypto=15%:$10.20"
 
 
+def test_direct_renewal_opens_customer_plan_picker_and_carries_target_plan():
+    bot = DummyBot()
+    module = load_purchase_plan(bot, [])
+    plans = {
+        "5": {"price": 12, "days": 30, "target": "customer"},
+        "10": {"price": 20, "days": 60, "target": "both"},
+        "20": {"price": 30, "days": 90, "target": "reseller"},
+    }
+    module.load_plans = lambda: plans
+    module._resolve_customer_renewal_offer_for_call = lambda *_args, **_kwargs: {
+        "eligible": True, "username": "alice", "token": "renew-token",
+    }
+    original_message = module.get_message_text
+    module.get_message_text = lambda language, key: {
+        "renewal_choose_plan": "Choose for {username}",
+        "renewal_plan_choice": "{plan_gb}GB/{days}d/${price}",
+    }.get(key, original_message(language, key))
+    renewal_stub = types.ModuleType("utils.renewal")
+    renewal_stub.eligible_renewal_plans = lambda catalog, source: [
+        (plan_id, plan)
+        for plan_id, plan in catalog.items()
+        if plan.get("target", "both") != "reseller"
+    ]
+    with patch.dict("sys.modules", {"utils.renewal": renewal_stub}):
+        module.handle_customer_renewal_start(make_call("renew_plan:renew-token"))
+
+    buttons = bot.edited_messages[0][1]["reply_markup"].buttons
+    callbacks = [button.kwargs.get("callback_data") for button in buttons]
+    assert callbacks[:2] == [
+        "renew_plan_choice:renew-token:5",
+        "renew_plan_choice:renew-token:10",
+    ]
+    assert all(":20" not in callback for callback in callbacks if callback)
+
+
 def test_direct_renewal_crypto_quote_and_copy_show_both_discount_components():
     module = load_purchase_plan(DummyBot(), [])
     messages = {

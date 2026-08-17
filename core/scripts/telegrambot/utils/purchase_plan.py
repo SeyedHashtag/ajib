@@ -1092,9 +1092,13 @@ def _process_customer_renewal_payment(payment_id, payment_record, notify_chat_id
 
     result = execute_customer_renewal(payment_record)
     if not result.get('success'):
+        lookup_result = result.get('lookup_result') or {}
         update_payment_record_fields(payment_id, {
             "renewal_failure_reason": result.get('reason'),
             "renewal_before_state": result.get('before_state', payment_record.get('renewal_before_state')),
+            "renewal_api_error": lookup_result.get('error'),
+            "renewal_api_http_status": lookup_result.get('http_status'),
+            "renewal_api_stage": lookup_result.get('stage'),
         })
         update_payment_status(payment_id, 'renewal_failed')
         _release_checkout_incentives(
@@ -1956,10 +1960,111 @@ def handle_cancel_purchase(call):
     )
 
 
-def _resolve_customer_renewal_offer_for_call(call, token):
+def _resolve_customer_renewal_offer_for_call(call, token, target_plan_gb=None):
     from utils.renewal import resolve_customer_renewal_token
 
-    return resolve_customer_renewal_token(call.from_user.id, token, load_plans())
+    return resolve_customer_renewal_token(
+        call.from_user.id,
+        token,
+        load_plans(),
+        target_plan_gb=target_plan_gb,
+    )
+
+
+def _show_customer_renewal_plan_picker(call, token, offer, language):
+    from utils.renewal import eligible_renewal_plans
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for plan_id, plan in eligible_renewal_plans(load_plans(), 'customer'):
+        markup.add(types.InlineKeyboardButton(
+            get_message_text(language, 'renewal_plan_choice').format(
+                plan_gb=plan_id,
+                days=plan.get('days', 0),
+                price=format_usd_amount(plan.get('price', 0)),
+            ),
+            callback_data=f"renew_plan_choice:{token}:{plan_id}",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        get_button_text(language, "cancel"), callback_data="cancel_purchase"
+    ))
+    bot.edit_message_text(
+        get_message_text(language, 'renewal_choose_plan').format(
+            username=offer.get('username') or '—'
+        ),
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=markup,
+        parse_mode="Markdown",
+    )
+
+
+def _show_customer_renewal_payment_options(call, token, offer, language):
+    load_dotenv(TELEGRAM_ENV_PATH, override=True)
+    crypto_configured = all(os.getenv(key) for key in ['CRYPTO_MERCHANT_ID', 'CRYPTO_API_KEY'])
+    card_to_card_configured = (
+        get_card_number_for_receipt_type(RECEIPT_TYPE_REGULAR)
+        if _customer_card_pricing_enabled(language)
+        else None
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    methods_count = 0
+    callback_suffix = f"{token}:{offer['plan_gb']}"
+    if crypto_configured:
+        renewal_crypto_percent = (
+            float(offer.get('renewal_discount_percent', 0) or 0)
+            + CRYPTO_PAYMENT_DISCOUNT_PERCENT
+        )
+        markup.add(types.InlineKeyboardButton(
+            get_renewal_crypto_discount_button_text(language, renewal_crypto_percent),
+            callback_data=f"renew_payment_method:crypto:{callback_suffix}",
+        ))
+        methods_count += 1
+    if card_to_card_configured:
+        markup.add(types.InlineKeyboardButton(
+            get_button_text(language, "card_to_card"),
+            callback_data=f"renew_payment_method:card_to_card:{callback_suffix}",
+        ))
+        methods_count += 1
+    if methods_count == 0:
+        bot.edit_message_text(
+            get_message_text(language, "no_payment_methods"),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+        return
+    markup.add(types.InlineKeyboardButton(
+        get_button_text(language, "support"), callback_data="purchase_support",
+    ))
+    markup.add(types.InlineKeyboardButton(
+        get_button_text(language, "back"), callback_data=f"renew_plan:{token}"
+    ))
+    markup.add(types.InlineKeyboardButton(
+        get_button_text(language, "cancel"), callback_data="cancel_purchase"
+    ))
+
+    from utils.renewal import format_renewal_offer
+    exchange_rate = get_exchange_rate() if _customer_card_pricing_enabled(language) else None
+    offer_message = get_message_text(language, "purchase_progress_payment") + "\n\n"
+    offer_message += format_renewal_offer(language, offer, include_payment_prompt=True)
+    offer_message += "\n\n" + build_plan_payment_totals(
+        language,
+        offer['plan_gb'],
+        offer.get('full_price', offer['price']),
+        exchange_rate,
+        renewal_discount_percent=offer.get('renewal_discount_percent', 0),
+        discount_cap_percent=(
+            float(offer.get('renewal_discount_percent', 0) or 0)
+            + CRYPTO_PAYMENT_DISCOUNT_PERCENT
+        ),
+    )
+    offer_message += "\n\n" + get_message_text(language, "purchase_delivery_note")
+    bot.edit_message_text(
+        offer_message,
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=markup,
+        parse_mode="Markdown",
+    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('renew_plan:'))
@@ -1980,72 +2085,35 @@ def handle_customer_renewal_start(call):
                 parse_mode="Markdown"
             )
             return
-
-        load_dotenv(TELEGRAM_ENV_PATH, override=True)
-        crypto_configured = all(os.getenv(key) for key in ['CRYPTO_MERCHANT_ID', 'CRYPTO_API_KEY'])
-        card_to_card_configured = (
-            get_card_number_for_receipt_type(RECEIPT_TYPE_REGULAR)
-            if _customer_card_pricing_enabled(language)
-            else None
-        )
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        methods_count = 0
-        if crypto_configured:
-            renewal_crypto_percent = (
-                float(offer.get('renewal_discount_percent', 0) or 0)
-                + CRYPTO_PAYMENT_DISCOUNT_PERCENT
-            )
-            markup.add(types.InlineKeyboardButton(
-                get_renewal_crypto_discount_button_text(language, renewal_crypto_percent),
-                callback_data=f"renew_payment_method:crypto:{token}",
-            ))
-            methods_count += 1
-        if card_to_card_configured:
-            markup.add(types.InlineKeyboardButton(get_button_text(language, "card_to_card"), callback_data=f"renew_payment_method:card_to_card:{token}"))
-            methods_count += 1
-        if methods_count == 0:
-            bot.edit_message_text(
-                get_message_text(language, "no_payment_methods"),
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-            )
-            return
-        markup.add(types.InlineKeyboardButton(
-            get_button_text(language, "support"),
-            callback_data="purchase_support",
-        ))
-        markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="cancel_purchase"))
-
-        from utils.renewal import format_renewal_offer
-        exchange_rate = (
-            get_exchange_rate()
-            if _customer_card_pricing_enabled(language)
-            else None
-        )
-        offer_message = get_message_text(language, "purchase_progress_payment") + "\n\n"
-        offer_message += format_renewal_offer(language, offer, include_payment_prompt=True)
-        offer_message += "\n\n" + build_plan_payment_totals(
-            language,
-            offer['plan_gb'],
-            offer.get('full_price', offer['price']),
-            exchange_rate,
-            renewal_discount_percent=offer.get('renewal_discount_percent', 0),
-            discount_cap_percent=(
-                float(offer.get('renewal_discount_percent', 0) or 0)
-                + CRYPTO_PAYMENT_DISCOUNT_PERCENT
-            ),
-        )
-        offer_message += "\n\n" + get_message_text(language, "purchase_delivery_note")
-        bot.edit_message_text(
-            offer_message,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=markup,
-            parse_mode="Markdown"
-        )
+        _show_customer_renewal_plan_picker(call, token, offer, language)
     except Exception as e:
         language = get_user_language(call.from_user.id)
         bot.answer_callback_query(call.id, text=get_message_text(language, "error_occurred").format(error=str(e)))
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('renew_plan_choice:'))
+def handle_customer_renewal_plan_choice(call):
+    try:
+        _, token, plan_gb = call.data.split(':', 2)
+        language = get_user_language(call.from_user.id)
+        offer = _resolve_customer_renewal_offer_for_call(call, token, plan_gb)
+        if not offer.get('eligible'):
+            bot.answer_callback_query(
+                call.id,
+                text=get_message_text(language, "renewal_unavailable").format(
+                    reason=_renewal_reason_text(language, offer.get('reason'))
+                ),
+                show_alert=True,
+            )
+            return
+        bot.answer_callback_query(call.id)
+        _show_customer_renewal_payment_options(call, token, offer, language)
+    except Exception as e:
+        language = get_user_language(call.from_user.id)
+        bot.answer_callback_query(
+            call.id,
+            text=get_message_text(language, "error_occurred").format(error=str(e)),
+        )
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('renew_payment_method:'))
@@ -2053,7 +2121,9 @@ def handle_customer_renewal_payment_method(call):
     try:
         user_id = call.from_user.id
         language = get_user_language(user_id)
-        _, method, token = call.data.split(':', 2)
+        parts = call.data.split(':', 3)
+        _, method, token = parts[:3]
+        target_plan_gb = parts[3] if len(parts) == 4 else None
         if method == 'card_to_card' and not _customer_card_pricing_enabled(language):
             bot.answer_callback_query(
                 call.id,
@@ -2061,7 +2131,7 @@ def handle_customer_renewal_payment_method(call):
                 show_alert=True,
             )
             return
-        offer = _resolve_customer_renewal_offer_for_call(call, token)
+        offer = _resolve_customer_renewal_offer_for_call(call, token, target_plan_gb)
         if not offer.get('eligible'):
             bot.answer_callback_query(
                 call.id,
