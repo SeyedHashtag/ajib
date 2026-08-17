@@ -1,3 +1,11 @@
+## v2.1.0
+✨ Adopt externally created bulk-reseller configurations atomically while preserving financial neutrality and idempotency
+✨ Let resellers choose an eligible target plan and review the details before confirming customer renewals
+🛠️ Recognize external bulk-reseller usernames consistently across customer displays, traffic monitoring, cleanup, rewards, and sales statistics
+🛠️ Preserve target-plan details throughout queued renewal processing and document the updated renewal API contract
+🌐 Update reseller customer and renewal messaging for the new adoption and plan-selection flows
+✅ Expand regression coverage for external configuration adoption, reseller accounting, traffic monitoring, plan-changing renewals, and 3x-ui renewal behavior
+
 ## v2.0.0
 ✨ Add first-class 3x-ui v3 support for account creation, lookup, updates, deletion, and Hysteria2 inbound selection
 ✨ Support copying users between Blitz and 3x-ui servers while preserving credentials, remaining allowance, counters, state, and panel-specific settings
