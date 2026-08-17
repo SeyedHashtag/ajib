@@ -1,3 +1,11 @@
+## v2.0.0
+✨ Add first-class 3x-ui v3 support for account creation, lookup, updates, deletion, and Hysteria2 inbound selection
+✨ Support copying users between Blitz and 3x-ui servers while preserving credentials, remaining allowance, counters, state, and panel-specific settings
+🛠️ Extend CLI and interactive server configuration with panel type, default inbound IDs, and 3x-ui IP limits
+🐛 Queue recoverable orphan-test notifications separately from manual review and resume them safely after notification or server failures
+🐛 Label unowned server users explicitly for administrator review and preserve cleanup metadata across legacy-state recovery
+✅ Add regression coverage for 3x-ui APIs, cross-panel user copies, server configuration, and expired-cleanup recovery workflows
+
 ## v1.19.4
 🛠️ Use stable lifecycle timestamps in payment reports and timezone-safe timestamps for reserved renewals
 🐛 Recover stale or failed renewal claims safely, schedule automatic retries, and improve operator logging
