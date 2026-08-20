@@ -982,5 +982,9 @@ def doctor(*, live: bool = True) -> dict[str, Any]:
         checks.append(preflight["telegram"])
         checks.extend(preflight["servers"])
     ok = all(item.get("ok") for item in checks)
-    broken = any(item["name"] in {"installation", "configuration"} and not item.get("ok") for item in checks)
+    broken = any(
+        item.get("name") in {"installation", "configuration"}
+        and not item.get("ok")
+        for item in checks
+    )
     return {"ok": ok, "status": "healthy" if ok else "broken" if broken else "degraded", "checks": checks}

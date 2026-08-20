@@ -141,6 +141,21 @@ def test_configuration_diff_reports_added_changed_and_removed():
     assert diff == {"added": ["new"], "changed": ["primary"], "removed": ["old"]}
 
 
+def test_doctor_handles_live_server_checks_without_name(operator_paths, monkeypatch):
+    operator.save_config(config(server()), keep_previous=False)
+    monkeypatch.setenv("AJIB_SKIP_SERVICE_ACTIONS", "1")
+    monkeypatch.setattr(operator, "preflight_config", lambda _config: {
+        "ok": False,
+        "telegram": {"name": "telegram", "ok": True, "message": "verified"},
+        "servers": [{"id": "primary", "ok": False, "message": "unreachable"}],
+    })
+
+    report = operator.doctor(live=True)
+
+    assert report["status"] == "degraded"
+    assert report["checks"][-1]["id"] == "primary"
+
+
 def _create_reference_database(path, *, active=False):
     connection = sqlite3.connect(path)
     connection.execute("CREATE TABLE payments(server_id TEXT, payload_json TEXT)")
