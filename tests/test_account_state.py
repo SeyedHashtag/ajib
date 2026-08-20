@@ -98,6 +98,47 @@ class AccountStateTests(unittest.TestCase):
         self.assertEqual(snapshot.configured_days, 30)
         self.assertEqual(snapshot.panel_days_remaining, 18)
 
+    def test_zero_duration_is_unlimited_and_overrides_stale_expiry(self):
+        user = {
+            "status": "Offline",
+            "blocked": False,
+            "account_creation_date": "2025-01-01T00:00:00+00:00",
+            "account_expiration_date": "2025-01-01T00:00:00+00:00",
+            "expiration_days": 0,
+            "timer_started": False,
+            "max_download_bytes": 1024,
+            "upload_bytes": 1,
+            "download_bytes": 0,
+        }
+
+        snapshot = self.state.inspect_account(
+            user, now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        )
+
+        self.assertEqual(snapshot.configured_days, 0)
+        self.assertIsNone(snapshot.panel_deadline)
+        self.assertIsNone(snapshot.panel_days_remaining)
+        self.assertTrue(snapshot.timer_started)
+        self.assertEqual(snapshot.panel_state.value, "connected")
+        self.assertEqual(snapshot.entitlement_state.value, "current")
+
+    def test_blocked_unlimited_duration_requires_an_independent_expiry_signal(self):
+        user = {
+            "status": "Offline",
+            "blocked": True,
+            "expiration_days": 0,
+            "max_download_bytes": 1024,
+            "upload_bytes": 1,
+            "download_bytes": 0,
+        }
+
+        self.assertFalse(self.state.verified_panel_expired(user))
+        self.assertEqual(self.state.inspect_account(user).state, "blocked")
+
+        user["upload_bytes"] = 1024
+        self.assertTrue(self.state.verified_panel_expired(user))
+        self.assertEqual(self.state.inspect_account(user).state, "expired")
+
     def test_naive_timestamp_defaults_to_utc_even_when_legacy_hint_is_tehran(self):
         parsed = self.state.parse_timestamp("2026-01-01 03:30:00")
         self.assertEqual(parsed, datetime(2026, 1, 1, 3, 30, tzinfo=timezone.utc))

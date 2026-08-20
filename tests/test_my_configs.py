@@ -404,7 +404,8 @@ class MyConfigsTests(unittest.TestCase):
                 "s123a",
                 {
                     "blocked": True,
-                    "expiration_days": 0,
+                    "expiration_days": 30,
+                    "account_creation_date": "2020-01-01T00:00:00+00:00",
                     "upload_bytes": 0,
                     "download_bytes": 0,
                     "max_download_bytes": 5 * 1024 ** 3,
@@ -432,7 +433,8 @@ class MyConfigsTests(unittest.TestCase):
                 "s123a",
                 {
                     "blocked": True,
-                    "expiration_days": 0,
+                    "expiration_days": 30,
+                    "account_creation_date": "2020-01-01T00:00:00+00:00",
                     "upload_bytes": 0,
                     "download_bytes": 0,
                     "max_download_bytes": 5 * 1024 ** 3,
@@ -585,6 +587,47 @@ class MyConfigsTests(unittest.TestCase):
         caption = my_configs_module.bot.sent_photos[-1][1]["caption"]
         self.assertIn("Status: ✅ Active", caption)
         self.assertRegex(caption, r"Server Days Remaining: \d+")
+        self.assertNotIn("Unused-service deadline", caption)
+
+    def test_unlimited_duration_is_displayed_without_a_deadline(self):
+        class DummyQR:
+            def save(self, target, image_format):
+                target.write(b"qr")
+
+        client = types.SimpleNamespace(
+            server_id="enabled",
+            get_user_uri=lambda username: {"normal_sub": "https://example.com/sub"},
+        )
+        sys.modules["utils.payment_records"].load_payments = lambda: {}
+        original = self.install_renewal_stub({
+            "eligible": False,
+            "reason": "renewal_ineligible_not_expired",
+        })
+        original_make = my_configs_module.qrcode.make
+        my_configs_module.display_config = REAL_DISPLAY_CONFIG
+        try:
+            my_configs_module.qrcode.make = lambda value: DummyQR()
+            my_configs_module.display_config(
+                456,
+                "unlimited",
+                {
+                    "blocked": False,
+                    "status": "Offline",
+                    "expiration_days": 0,
+                    "upload_bytes": 0,
+                    "download_bytes": 0,
+                    "max_download_bytes": 5 * 1024 ** 3,
+                },
+                client,
+                user_id=123,
+            )
+        finally:
+            my_configs_module.qrcode.make = original_make
+            self.restore_renewal_stub(original)
+
+        caption = my_configs_module.bot.sent_photos[-1][1]["caption"]
+        self.assertIn("Status: ✅ Active", caption)
+        self.assertIn("Server Days Remaining: Unlimited", caption)
         self.assertNotIn("Unused-service deadline", caption)
 
     def test_unused_test_hold_shows_replacement_and_stale_timing(self):

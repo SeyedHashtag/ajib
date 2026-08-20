@@ -2532,7 +2532,9 @@ def _render_reseller_customer_config_job(
     download_bytes = user_config.get('download_bytes', 0) or 0
     max_download_bytes = user_config.get('max_download_bytes', 0) or 0
     expiration_days = shared_state.service_days_remaining
-    if expiration_days is None:
+    if shared_state.configured_days == 0:
+        expiration_days = get_message_text(language, "value_unlimited")
+    elif expiration_days is None:
         expiration_days = get_message_text(language, "value_unknown")
     account_creation_date = (
         user_config.get('account_creation_date')

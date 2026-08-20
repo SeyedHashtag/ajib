@@ -187,14 +187,17 @@ def _source_rejection(user, source_panel, destination_panel, source_options):
         _nonnegative_int(user.get("expiration_days")),
     )
     access_key = "unlimited_ip" if source_panel == THREE_X_UI_PANEL else "unlimited_user"
-    if any(value is None for value in required) or required[3] <= 0:
+    if any(value is None for value in required):
         return "source_state_malformed"
     if not isinstance(user.get("blocked"), bool) or not isinstance(user.get(access_key), bool):
         return "source_state_malformed"
     delayed = user.get("delayed_start")
     if not isinstance(delayed, bool):
         delayed = user.get("timer_started") is False or str(user.get("status") or "").lower() == "on hold"
-    if not delayed and not (user.get("expiry") or user.get("expiry_time") or user.get("expiration_date")):
+    unlimited_duration = required[3] == 0
+    if not unlimited_duration and not delayed and not (
+        user.get("expiry") or user.get("expiry_time") or user.get("expiration_date")
+    ):
         # panel_deadline performs the definitive live check; this catches only
         # obviously malformed records without making preflight panel-specific.
         if not user.get("account_creation_date"):
@@ -720,7 +723,14 @@ def _interrupted_destination_match(job, source_user, destination_user, destinati
     source_delayed = source_user.get("delayed_start") is True
     destination_delayed = destination_user.get("delayed_start") is True
     expiry_extension = 0.0
-    if source_delayed:
+    if days == 0:
+        matched = (
+            matched
+            and destination_delayed is False
+            and panel_deadline(source_user) is None
+            and panel_deadline(destination_user) is None
+        )
+    elif source_delayed:
         matched = matched and destination_delayed
     else:
         source_expiry = panel_deadline(source_user)

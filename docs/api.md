@@ -93,6 +93,11 @@ The bot relies on user records containing the fields returned by the deployed
 panel, including `username`, `blocked`, traffic usage/limit values, creation
 date, and expiration data where available.
 
+`expiration_days` is a configured duration, not a countdown. A value of `0`
+means unlimited duration and therefore has no deadline. Positive values are
+finite durations; negative or malformed values are rejected. Paid plan and
+renewal snapshots remain finite and must use a positive duration.
+
 ## 3x-ui v3 endpoints
 
 3x-ui uses `Authorization: Bearer <token>` and the current first-class clients
@@ -132,6 +137,11 @@ with unlimited traffic or no remaining allowance are rejected. 3x-ui
 destinations retain exact byte quotas and counters, use `limitIp=0` for
 unlimited access, and otherwise apply the destination server's configured IP
 limit.
+
+Unlimited-duration accounts are preserved on every supported route. Blitz
+`expiration_days=0` maps to 3x-ui `expiryTime=0`, carries no finite-duration
+comment marker, and is treated as active rather than delayed-start. Unlimited
+duration is independent of traffic allowance and IP/access policy.
 
 Blitz stores started-account dates at day precision. If a 3x-ui absolute expiry
 has a time component, the copy rounds it outward to the next UTC day so service

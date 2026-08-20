@@ -601,6 +601,58 @@ def test_restart_recovery_adopts_only_a_strictly_matching_interrupted_copy(tmp_p
     assert item["error_code"] == "interrupted_copy_ambiguous"
 
 
+def test_unlimited_duration_is_eligible_and_restart_recovery_matches_without_expiry(tmp_path):
+    path = str(tmp_path / "state.db")
+    unlimited = user("alice")
+    unlimited.update({
+        "expiration_days": 0,
+        "delayed_start": False,
+        "status": "Offline",
+        "account_creation_date": None,
+    })
+    source = FakeClient("source", {"alice": unlimited})
+    destination = FakeClient("destination")
+    multi = FakeMulti(source, destination)
+
+    preview = preflight_transfer(spec(), multi)
+    assert preview["eligible"] == 1
+    assert preview["rejections"] == {}
+    job_id = create_from_preflight(path, multi, spec())
+    destination.users["alice"] = dict(unlimited)
+    database.get_connection(path).execute(
+        "UPDATE bulk_transfer_items SET stage='copying' WHERE job_id=?", (job_id,)
+    )
+
+    assert run_transfer_job(job_id, multi_api=multi, path=path)
+    assert job_counts(job_id, path=path)["completed"] == 1
+    metadata = json.loads(
+        get_job(job_id, path=path, include_items=True)["items"][0]["result_json"]
+    )
+    assert metadata["expiry_extension_seconds"] == 0
+    assert metadata["recovered_after_restart"] is True
+
+
+def test_unlimited_duration_migration_deletes_source_after_verified_copy(tmp_path):
+    path = str(tmp_path / "state.db")
+    unlimited = user("alice")
+    unlimited.update({
+        "expiration_days": 0,
+        "delayed_start": False,
+        "status": "Offline",
+        "account_creation_date": None,
+    })
+    source = FakeClient("source", {"alice": unlimited})
+    destination = FakeClient("destination")
+    multi = FakeMulti(source, destination)
+    job_id = create_from_preflight(path, multi, spec("migrate"))
+
+    assert run_transfer_job(job_id, multi_api=multi, path=path)
+
+    assert source.deleted == ["alice"]
+    assert destination.users["alice"]["expiration_days"] == 0
+    assert job_counts(job_id, path=path)["completed"] == 1
+
+
 def test_cancel_after_current_state_is_resumable(tmp_path, monkeypatch):
     path = str(tmp_path / "state.db")
     source = FakeClient("source", {"alice": user("alice")})

@@ -463,8 +463,9 @@ def _live_account_matches_source_plan(user_data, source_snapshot):
         return False
     # Blitz exposes a countdown-like value while 3x-ui exposes the immutable
     # ajib duration marker through the same normalized field. Quota and IP
-    # policy are stable cross-panel identity checks. A positive duration is
-    # also verifiable; zero is retained as a legacy expired/countdown shape.
+    # policy are stable cross-panel identity checks. Positive durations can
+    # also be compared; zero is canonical unlimited duration and therefore
+    # has no finite duration to compare with a paid-plan snapshot.
     source_days = _safe_int(source_snapshot.get('days'))
     live_days = _safe_int((user_data or {}).get('expiration_days'))
     if source_days and live_days and source_days != live_days:
@@ -2266,9 +2267,13 @@ def format_state_summary(state, language='en'):
     days_remaining = state.get('days_remaining')
     return get_message_text(language, 'renewal_state_summary').format(
         days_remaining=(
-            days_remaining
-            if days_remaining is not None
-            else get_message_text(language, 'value_unknown')
+            get_message_text(language, 'value_unlimited')
+            if _safe_int(state.get('configured_days')) == 0
+            else (
+                days_remaining
+                if days_remaining is not None
+                else get_message_text(language, 'value_unknown')
+            )
         ),
         gb_used=f"{_safe_float(state.get('gb_used')):.2f} GB",
         gb_limit=gb_limit_text,

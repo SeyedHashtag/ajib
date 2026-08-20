@@ -23,10 +23,10 @@ from urllib.parse import quote
 
 import requests
 try:
-    from utils.account_state import PanelState, inspect_account, panel_deadline
+    from utils.account_state import PanelState, inspect_account, panel_deadline, parse_timestamp
     from utils.time_utils import format_utc_timestamp, utc_now
 except ModuleNotFoundError:  # Standalone diagnostics/tests.
-    from account_state import PanelState, inspect_account, panel_deadline
+    from account_state import PanelState, inspect_account, panel_deadline, parse_timestamp
     from time_utils import format_utc_timestamp, utc_now
 import threading
 import time
@@ -69,6 +69,14 @@ class UserProvisionSpec:
     inbound_ids: list[int] = field(default_factory=list)
     limit_ip: int | None = None
 
+    def __post_init__(self):
+        if (
+            isinstance(self.expiration_days, bool)
+            or not isinstance(self.expiration_days, int)
+            or self.expiration_days < 0
+        ):
+            raise ValueError("expiration_days must be a non-negative integer")
+
 
 @dataclass(frozen=True)
 class UserCopySpec:
@@ -105,6 +113,7 @@ class _UserTransferSnapshot:
     blocked: bool
     delayed_start: bool
     absolute_expiry: datetime | None
+    account_creation_date: str | None
     note: str | None
     unlimited_access: bool
 
@@ -549,9 +558,20 @@ class APIClient:
             str(normalized.get("status") or "").strip().lower()
             .replace("-", " ").replace("_", " ").split()
         )
-        delayed_start = status == "on hold" and not normalized.get("account_creation_date")
-        normalized.setdefault("delayed_start", delayed_start)
-        normalized.setdefault("timer_started", not delayed_start and bool(normalized.get("account_creation_date")))
+        try:
+            duration_days = int(normalized.get("expiration_days"))
+        except (TypeError, ValueError, OverflowError):
+            duration_days = None
+        unlimited_duration = duration_days == 0
+        delayed_start = False if unlimited_duration else (
+            status == "on hold" and not normalized.get("account_creation_date")
+        )
+        if unlimited_duration:
+            normalized["delayed_start"] = False
+            normalized["timer_started"] = True
+        else:
+            normalized.setdefault("delayed_start", delayed_start)
+            normalized.setdefault("timer_started", not delayed_start and bool(normalized.get("account_creation_date")))
         # Blitz reports null traffic before first connection. On-hold proves
         # the account has never started, so those counters are safely zero.
         # Active accounts with missing counters remain malformed/fail-closed.
@@ -1053,16 +1073,20 @@ class ThreeXUIAPIClient(APIClient):
         total_bytes = _safe_nonnegative_int(client.get("totalGB"), 0)
         upload = _safe_nonnegative_int(traffic.get("up", traffic.get("upload")), 0)
         download = _safe_nonnegative_int(traffic.get("down", traffic.get("download")), 0)
-        expiry_ms = 0
-        try:
-            expiry_ms = int(client.get("expiryTime") or 0)
-        except (TypeError, ValueError, OverflowError):
-            pass
+        raw_expiry_ms = client.get("expiryTime")
+        expiry_ms = None
+        if raw_expiry_ms is not None:
+            try:
+                expiry_ms = int(raw_expiry_ms)
+            except (TypeError, ValueError, OverflowError):
+                pass
         duration_days = self._duration_days(client.get("comment"))
-        delayed_start = expiry_ms < 0
+        delayed_start = expiry_ms is not None and expiry_ms < 0
         absolute_expiry = None
         creation_date = None
-        if expiry_ms > 0:
+        if expiry_ms == 0:
+            duration_days = 0
+        elif expiry_ms is not None and expiry_ms > 0:
             expiry_dt = datetime.fromtimestamp(expiry_ms / 1000, tz=timezone.utc)
             absolute_expiry = format_utc_timestamp(expiry_dt)
             if duration_days:
@@ -1168,17 +1192,23 @@ class ThreeXUIAPIClient(APIClient):
             limit_bytes = int(traffic_limit) * GIB
         except (TypeError, ValueError, OverflowError):
             return None
-        if days <= 0 or limit_bytes < 0:
+        if days < 0 or limit_bytes < 0:
             return None
+        expiry_time = 0 if days == 0 else -days * MILLISECONDS_PER_DAY
+        comment = (
+            self._comment_without_marker(note)
+            if days == 0
+            else self._comment_with_duration(note, days)
+        )
         client = {
             "email": username,
             "subId": secrets.token_urlsafe(12),
             "totalGB": limit_bytes,
-            "expiryTime": -days * MILLISECONDS_PER_DAY,
+            "expiryTime": expiry_time,
             "tgId": 0,
             "limitIp": self._limit_ip_for_plan(bool(unlimited)),
             "enable": not blocked,
-            "comment": self._comment_with_duration(note, days),
+            "comment": comment,
         }
         if password:
             client["auth"] = password
@@ -1193,9 +1223,11 @@ class ThreeXUIAPIClient(APIClient):
         if not inbound_ids or not spec.password:
             return None
         days = int(spec.expiration_days)
-        if days <= 0 or int(spec.traffic_limit_bytes) < 0:
+        if days < 0 or int(spec.traffic_limit_bytes) < 0:
             return None
-        if spec.delayed_start:
+        if days == 0:
+            expiry_time = 0
+        elif spec.delayed_start:
             expiry_time = -days * MILLISECONDS_PER_DAY
         elif spec.absolute_expiry is not None:
             expiry = spec.absolute_expiry
@@ -1217,7 +1249,11 @@ class ThreeXUIAPIClient(APIClient):
                 else _safe_nonnegative_int(spec.limit_ip)
             ),
             "enable": not spec.blocked,
-            "comment": self._comment_with_duration(spec.note, days),
+            "comment": (
+                self._comment_without_marker(spec.note)
+                if days == 0
+                else self._comment_with_duration(spec.note, days)
+            ),
         }
         result = self._xui_result("POST", "clients/add", {"client": client, "inboundIds": inbound_ids})
         if result.get("status") != "succeeded":
@@ -1255,10 +1291,14 @@ class ThreeXUIAPIClient(APIClient):
             client["totalGB"] = int(data["traffic_limit"]) * GIB
         if "new_expiration_days" in data or "expiration_days" in data:
             days = int(data.get("new_expiration_days", data.get("expiration_days")))
-            if days <= 0:
+            if days < 0:
                 return None
-            client["expiryTime"] = -days * MILLISECONDS_PER_DAY
-            client["comment"] = self._comment_with_duration(client.get("comment"), days)
+            client["expiryTime"] = 0 if days == 0 else -days * MILLISECONDS_PER_DAY
+            client["comment"] = (
+                self._comment_without_marker(client.get("comment"))
+                if days == 0
+                else self._comment_with_duration(client.get("comment"), days)
+            )
             duration = days
         if "blocked" in data:
             client["enable"] = not _safe_bool(data["blocked"], False)
@@ -1267,7 +1307,11 @@ class ThreeXUIAPIClient(APIClient):
                 _safe_bool(data["unlimited_ip"], False)
             )
         if "note" in data:
-            client["comment"] = self._comment_with_duration(data.get("note"), duration) if duration else str(data.get("note") or "")
+            client["comment"] = (
+                self._comment_with_duration(data.get("note"), duration)
+                if duration and duration > 0
+                else self._comment_without_marker(data.get("note")) or ""
+            )
         if data.get("renew_password"):
             if client.get("auth") is not None:
                 client["auth"] = secrets.token_urlsafe(18)
@@ -1299,12 +1343,20 @@ class ThreeXUIAPIClient(APIClient):
             return raw_result
         client, _, _ = self._record_parts(raw_result["data"])
         duration = self._duration_days(client.get("comment"))
-        if not duration:
+        raw_expiry_time = client.get("expiryTime")
+        try:
+            expiry_time = int(raw_expiry_time) if raw_expiry_time is not None else None
+        except (TypeError, ValueError, OverflowError):
+            expiry_time = None
+        unlimited_duration = expiry_time == 0
+        if not duration and not unlimited_duration:
             return {"status": "failed", "data": None, "http_status": None, "error": "duration_unknown"}
         reset = self._xui_result("POST", f"clients/resetTraffic/{quote(str(username), safe='')}", {})
         if reset.get("status") != "succeeded":
             return reset
-        client["expiryTime"] = -duration * MILLISECONDS_PER_DAY
+        client["expiryTime"] = 0 if unlimited_duration else -duration * MILLISECONDS_PER_DAY
+        if unlimited_duration:
+            client["comment"] = self._comment_without_marker(client.get("comment")) or ""
         client["enable"] = True
         updated = self._xui_result(
             "POST",
@@ -2081,7 +2133,7 @@ class MultiServerAPI:
         total_bytes = required_int("max_download_bytes")
         upload_bytes = required_int("upload_bytes")
         download_bytes = required_int("download_bytes")
-        duration_days = required_int("expiration_days", minimum=1)
+        duration_days = required_int("expiration_days", minimum=0)
         blocked = source.get("blocked") if isinstance(source.get("blocked"), bool) else None
         access_field = "unlimited_ip" if source_panel == THREE_X_UI_PANEL else "unlimited_user"
         unlimited_access = source.get(access_field) if isinstance(source.get(access_field), bool) else None
@@ -2093,8 +2145,11 @@ class MultiServerAPI:
         if not isinstance(delayed_start, bool):
             timer_started = source.get("timer_started")
             delayed_start = (timer_started is False) if isinstance(timer_started, bool) else status == "on hold"
+        unlimited_duration = duration_days == 0
+        if unlimited_duration:
+            delayed_start = False
         expiry = panel_deadline(source)
-        if not delayed_start and expiry is None:
+        if not unlimited_duration and not delayed_start and expiry is None:
             return {"ok": False, "error": "source_state_malformed"}
         note = _canonical_note(source.get("note"))
 
@@ -2123,6 +2178,7 @@ class MultiServerAPI:
             blocked=blocked,
             delayed_start=bool(delayed_start),
             absolute_expiry=expiry,
+            account_creation_date=(str(source.get("account_creation_date") or "").strip() or None),
             note=note,
             unlimited_access=unlimited_access,
         )
@@ -2157,7 +2213,14 @@ class MultiServerAPI:
             if remaining_bytes <= 0:
                 return {"ok": False, "error": "blitz_allowance_exhausted"}
             destination_limit = int(math.ceil(remaining_bytes / GIB)) * GIB
-            if not snapshot.delayed_start:
+            if snapshot.duration_days == 0:
+                source_creation = parse_timestamp(snapshot.account_creation_date)
+                blitz_creation_date = (
+                    source_creation.date().isoformat()
+                    if source_creation is not None
+                    else utc_now().date().isoformat()
+                )
+            elif not snapshot.delayed_start:
                 expected_expiry = _ceil_utc_day(snapshot.absolute_expiry)
                 expiry_extension_seconds = max(
                     0.0,
@@ -2263,7 +2326,13 @@ class MultiServerAPI:
             and copied_access is snapshot.unlimited_access
             and _canonical_note(copied.get("note")) == snapshot.note
         )
-        if snapshot.delayed_start:
+        if snapshot.duration_days == 0:
+            verified = (
+                verified
+                and copied.get("delayed_start") is False
+                and panel_deadline(copied) is None
+            )
+        elif snapshot.delayed_start:
             copied_status = " ".join(
                 str(copied.get("status") or "").lower().replace("-", " ").replace("_", " ").split()
             )

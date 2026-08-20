@@ -144,6 +144,23 @@ class AdminServerDisplayTests(unittest.TestCase):
 
         self.assertEqual(label, "`de-1`")
 
+    def test_zero_expiration_edit_is_accepted_as_unlimited(self):
+        edituser, bot = load_edituser()
+        updates = []
+        client = types.SimpleNamespace(
+            update_user=lambda username, data: updates.append((username, data)) or {"ok": True}
+        )
+        edituser._exact_client_for_step = lambda _token: (
+            client,
+            types.SimpleNamespace(username="alice"),
+        )
+        message = types.SimpleNamespace(text="0")
+
+        edituser.process_edit_expiration(message, "token")
+
+        self.assertEqual(updates, [("alice", {"new_expiration_days": 0})])
+        self.assertIn("unlimited", bot.replies[-1][0][1].lower())
+
     def test_duplicate_username_requires_exact_server_selection(self):
         edituser, bot = load_edituser()
         first = types.SimpleNamespace(server_id="s1", server_name="One", panel_type="blitz")

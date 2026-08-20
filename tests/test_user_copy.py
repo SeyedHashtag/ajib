@@ -295,6 +295,77 @@ class UserCopyTests(unittest.TestCase):
         self.assertTrue(destination.spec.unlimited_ip)
         self.assertIsNone(destination.spec.limit_ip)
 
+    def test_blitz_to_three_x_preserves_unlimited_duration_as_active(self):
+        destination = ThreeXDestination()
+        source = source_user(
+            expiration_days=0,
+            status="On-hold",
+            account_creation_date=None,
+            delayed_start=True,
+        )
+        multi = make_multi(source, destination)
+
+        result = multi.copy_user(api_client.UserCopySpec(
+            source=api_client.UserRef("src", "alice", "blitz"),
+            destination_server_id="x3",
+            inbound_ids=(4,),
+        ))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(destination.spec.expiration_days, 0)
+        self.assertFalse(destination.spec.delayed_start)
+        self.assertIsNone(destination.spec.absolute_expiry)
+        self.assertFalse(result["expiry_rounded"])
+
+    def test_blocked_unlimited_duration_is_blocked_after_copy(self):
+        destination = ThreeXDestination()
+        source = source_user(
+            expiration_days=0,
+            blocked=True,
+            status="Disabled",
+            delayed_start=True,
+        )
+        multi = make_multi(source, destination)
+
+        result = multi.copy_user(api_client.UserCopySpec(
+            source=api_client.UserRef("src", "alice", "blitz"),
+            destination_server_id="x3",
+            inbound_ids=(4,),
+        ))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(destination.spec.expiration_days, 0)
+        self.assertFalse(destination.spec.delayed_start)
+        self.assertTrue(destination.blocked)
+
+    def test_blitz_to_blitz_preserves_unlimited_duration(self):
+        destination = BlitzDestination()
+        source = source_user(expiration_days=0)
+        multi = make_multi(source, destination)
+
+        result = multi.copy_user(api_client.UserCopySpec(
+            source=api_client.UserRef("src", "alice", "blitz"),
+            destination_server_id="dst",
+        ))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(destination.add_args[2], 0)
+        self.assertEqual(destination.add_args[5]["creation_date"], "2026-08-01")
+
+    def test_three_x_to_blitz_preserves_unlimited_duration(self):
+        destination = BlitzDestination()
+        source = xui_source_user(expiration_days=0)
+        multi = make_multi(source, destination, source_panel="3x-ui")
+
+        result = multi.copy_user(api_client.UserCopySpec(
+            source=api_client.UserRef("src", "alice", "3x-ui"),
+            destination_server_id="dst",
+        ))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(destination.add_args[2], 0)
+        self.assertFalse(result["expiry_rounded"])
+
     def test_destination_collision_stops_before_creation(self):
         destination = BlitzDestination()
         destination.created = True

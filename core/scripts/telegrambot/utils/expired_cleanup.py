@@ -248,6 +248,7 @@ STATE_LABELS = {
         'yes': 'yes',
         'no': 'no',
         'unknown': 'unknown',
+        'unlimited': 'Unlimited',
         'not_found': 'not found on server',
     },
     'fa': {
@@ -261,6 +262,7 @@ STATE_LABELS = {
         'yes': 'بله',
         'no': 'خیر',
         'unknown': 'نامشخص',
+        'unlimited': 'نامحدود',
         'not_found': 'روی سرور پیدا نشد',
     },
     'tk': {
@@ -274,6 +276,7 @@ STATE_LABELS = {
         'yes': 'hawa',
         'no': 'ýok',
         'unknown': 'näbelli',
+        'unlimited': 'Çäksiz',
         'not_found': 'serwerde tapylmady',
     },
     'ru': {
@@ -287,6 +290,7 @@ STATE_LABELS = {
         'yes': 'да',
         'no': 'нет',
         'unknown': 'неизвестно',
+        'unlimited': 'Без ограничений',
         'not_found': 'не найден на сервере',
     },
 }
@@ -846,7 +850,11 @@ def _format_state_summary(last_state, language, missing=False):
         return f"{labels['state']}: {labels['unknown']}"
 
     status = _format_state_value(last_state.get('status'), labels['unknown'])
-    days_remaining = _format_state_value(last_state.get('days_remaining'), labels['unknown'])
+    days_remaining = (
+        labels['unlimited']
+        if _safe_int(last_state.get('configured_days')) == 0
+        else _format_state_value(last_state.get('days_remaining'), labels['unknown'])
+    )
     gb_used = _format_state_value(last_state.get('gb_used'), labels['unknown'])
     gb_limit = _format_state_value(last_state.get('gb_limit'), labels['unknown'])
     gb_usage = f"{gb_used}/{gb_limit}"
@@ -941,10 +949,8 @@ def _cleanup_reason(entry):
     if not isinstance(last_state, dict):
         return 'missing_on_server', ADMIN_CLEANUP_REASON_LABELS['missing_on_server']
 
-    expiration_days = _safe_int(last_state.get('days_remaining'))
-    if expiration_days is None:
-        expiration_days = _safe_int(last_state.get('expiration_days'))
-    if expiration_days is not None and expiration_days <= 0:
+    days_remaining = _safe_int(last_state.get('days_remaining'))
+    if days_remaining is not None and days_remaining <= 0:
         return 'time_expired', ADMIN_CLEANUP_REASON_LABELS['time_expired']
 
     max_download_bytes = _safe_bytes(last_state.get('max_download_bytes'))

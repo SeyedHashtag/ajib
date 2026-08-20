@@ -7,10 +7,15 @@ from utils.account_state import inspect_account
 def _account_description(username, details):
     state = inspect_account(details, source="admin_search")
     traffic = (details.get("max_download_bytes", 0) or 0) / (1024 ** 3)
+    duration = (
+        "Unlimited"
+        if state.configured_days == 0
+        else f"{state.configured_days} days" if state.configured_days is not None else "Unknown"
+    )
     description = (
         f"Traffic Limit: {traffic:.2f} GB, "
         f"State: {state.state}, "
-        f"Configured Duration: {state.configured_days if state.configured_days is not None else 'Unknown'} days"
+        f"Configured Duration: {duration}"
     )
     remaining = (
         f"\nPanel time remaining: {state.panel_days_remaining} days"
@@ -21,7 +26,7 @@ def _account_description(username, details):
         f"Name: {username}\n"
         f"Traffic limit: {traffic:.2f} GB\n"
         f"State: {state.state}\n"
-        f"Configured duration: {state.configured_days if state.configured_days is not None else 'Unknown'} days"
+        f"Configured duration: {duration}"
         f"{remaining}\n"
         f"Account Creation: {details.get('account_creation_date') or 'Not started'}\n"
         f"Blocked: {details.get('blocked')}"

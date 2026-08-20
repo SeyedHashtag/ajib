@@ -233,7 +233,8 @@ class ExpiredCleanupTests(unittest.TestCase):
     def expired_user(self):
         return {
             "blocked": True,
-            "expiration_days": 0,
+            "expiration_days": 30,
+            "account_creation_date": "2026-05-01T00:00:00+00:00",
             "upload_bytes": self.cleanup.GB_BYTES,
             "download_bytes": 2 * self.cleanup.GB_BYTES,
             "max_download_bytes": 5 * self.cleanup.GB_BYTES,
@@ -383,10 +384,32 @@ class ExpiredCleanupTests(unittest.TestCase):
             "download_bytes": self.cleanup.GB_BYTES,
             "max_download_bytes": 5 * self.cleanup.GB_BYTES,
         }
+        blocked_unlimited_duration = {
+            "blocked": True,
+            "expiration_days": 0,
+            "upload_bytes": self.cleanup.GB_BYTES,
+            "download_bytes": self.cleanup.GB_BYTES,
+            "max_download_bytes": 5 * self.cleanup.GB_BYTES,
+        }
 
         self.assertFalse(self.cleanup.is_user_expired(unblocked_expired_days))
         self.assertFalse(self.cleanup.is_user_expired(unblocked_exhausted_traffic))
         self.assertFalse(self.cleanup.is_user_expired(blocked_active_user))
+        self.assertFalse(self.cleanup.is_user_expired(blocked_unlimited_duration))
+
+        blocked_unlimited_duration["download_bytes"] = 4 * self.cleanup.GB_BYTES
+        self.assertTrue(self.cleanup.is_user_expired(blocked_unlimited_duration))
+        summary = self.cleanup._format_state_summary(
+            {
+                "status": "expired",
+                "configured_days": 0,
+                "days_remaining": None,
+                "gb_used": 5,
+                "gb_limit": 5,
+            },
+            "en",
+        )
+        self.assertIn("Days remaining: Unlimited", summary)
 
     def test_stale_on_hold_test_requires_more_than_sixty_full_days(self):
         exactly_sixty_days = self.stale_on_hold_test_user(note_time="2026-04-10 12:00:00")
@@ -1788,7 +1811,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertIn("|48|", self.cleanup._test_bot.sent_messages[0][1])
         self.assertIn("Status: expired", self.cleanup._test_bot.sent_messages[0][1])
         self.assertNotIn("Blocked:", self.cleanup._test_bot.sent_messages[0][1])
-        self.assertIn("Days remaining: unknown", self.cleanup._test_bot.sent_messages[0][1])
+        self.assertIn("Days remaining: 0", self.cleanup._test_bot.sent_messages[0][1])
         self.assertIn("GB used: 3.0/5.0", self.cleanup._test_bot.sent_messages[0][1])
         self.assertNotIn("GB remaining:", self.cleanup._test_bot.sent_messages[0][1])
 
@@ -2052,7 +2075,7 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(client.deleted, ["t101"])
         self.assertEqual(saved_test["cleanup_status"], "deleted")
         self.assertEqual(state["s1:t101"]["delete_result"], "deleted")
-        self.assertIsNone(last_state["days_remaining"])
+        self.assertEqual(last_state["days_remaining"], 0)
         self.assertEqual(last_state["gb_limit"], 5.0)
         self.assertEqual(last_state["gb_used"], 3.0)
         self.assertEqual(last_state["gb_remaining"], 2.0)

@@ -221,7 +221,8 @@ class RenewalTests(unittest.TestCase):
     def expired_user(self, max_gb=5):
         return {
             "blocked": True,
-            "expiration_days": 0,
+            "expiration_days": 30,
+            "account_creation_date": "2020-01-01T00:00:00+00:00",
             "upload_bytes": GB_BYTES,
             "download_bytes": 2 * GB_BYTES,
             "max_download_bytes": max_gb * GB_BYTES,
@@ -269,6 +270,31 @@ class RenewalTests(unittest.TestCase):
         message = self.renewal.format_renewal_offer("en", offer)
         self.assertIn("Catalog $12.00; renewal 10% (-$1.20)", message)
         self.assertIn("$10.80", message)
+
+    def test_unlimited_duration_renews_only_after_independent_expiry(self):
+        payments = {"base-1": self.base_payment()}
+        user = dict(self.expired_user(), expiration_days=0, account_creation_date=None)
+        client = FakeClient("s1", {"alice": user})
+
+        current_offer = self.renewal.find_customer_renewal_offer(
+            123, "alice", client, user, self.plans, payments=payments
+        )
+
+        self.assertFalse(current_offer["eligible"])
+        self.assertEqual(current_offer["reason"], "renewal_ineligible_state_unknown")
+
+        user["upload_bytes"] = 5 * GB_BYTES
+        user["download_bytes"] = 0
+        expired_offer = self.renewal.find_customer_renewal_offer(
+            123, "alice", client, user, self.plans, payments=payments
+        )
+
+        self.assertTrue(expired_offer["eligible"])
+        self.assertGreater(expired_offer["days"], 0)
+        self.assertIn(
+            "Days remaining: Unlimited",
+            self.renewal.format_state_summary(expired_offer["before_state"], "en"),
+        )
 
     def test_customer_can_upgrade_and_checkout_snapshot_survives_catalog_deletion(self):
         payments = {"base-1": self.base_payment()}
@@ -559,7 +585,13 @@ class RenewalTests(unittest.TestCase):
         )
         self.assertEqual(active_offer["reason"], "renewal_ineligible_not_expired")
 
-        manually_blocked_user = dict(self.expired_user(), expiration_days=12, upload_bytes=0, download_bytes=0)
+        manually_blocked_user = dict(
+            self.expired_user(),
+            expiration_days=12,
+            account_creation_date=None,
+            upload_bytes=0,
+            download_bytes=0,
+        )
         blocked_offer = self.renewal.find_customer_renewal_offer(
             123, "alice", client, manually_blocked_user, self.plans, payments=payments
         )
@@ -579,7 +611,7 @@ class RenewalTests(unittest.TestCase):
             123,
             "alice",
             client,
-            client.get_user("alice"),
+            dict(client.get_user("alice"), expiration_days=15),
             self.plans,
             payments={"base-1": self.base_payment(days=15)},
         )
@@ -885,7 +917,9 @@ class RenewalTests(unittest.TestCase):
         plans = {
             "1": {"price": 2.0, "days": 7, "unlimited": False, "target": "reseller"},
         }
-        client = FakeClient("s1", {"bob": self.expired_user(max_gb=1)})
+        client = FakeClient("s1", {
+            "bob": dict(self.expired_user(max_gb=1), expiration_days=7)
+        })
 
         offer = self.renewal.find_reseller_renewal_offer(
             "1988",
@@ -902,7 +936,7 @@ class RenewalTests(unittest.TestCase):
     def test_reserved_payment_waits_then_applies_once_from_locked_snapshot(self):
         active_user = {
             "blocked": False,
-            "expiration_days": 12,
+            "expiration_days": 30,
             "upload_bytes": GB_BYTES,
             "download_bytes": 2 * GB_BYTES,
             "max_download_bytes": 5 * GB_BYTES,
@@ -938,7 +972,12 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(waiting["status"], "waiting")
         self.assertEqual(client.reset_calls, [])
 
-        active_user.update({"blocked": True, "expiration_days": 0, "status": "expired"})
+        active_user.update({
+            "blocked": True,
+            "expiration_days": 30,
+            "account_creation_date": "2020-01-01T00:00:00+00:00",
+            "status": "expired",
+        })
         applied = self.renewal.process_payment_renewal_reservation(
             "reservation-1", payments_file=self.renewal.PAYMENTS_FILE, multi_api=multi_api
         )

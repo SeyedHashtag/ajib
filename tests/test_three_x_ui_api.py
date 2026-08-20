@@ -92,6 +92,25 @@ class ThreeXUIAdapterTests(unittest.TestCase):
         self.assertEqual(user["download_bytes"], 0)
         self.assertTrue(user["delayed_start"])
 
+    def test_blitz_zero_duration_normalises_as_active_without_a_deadline(self):
+        client = api_client.APIClient({
+            "id": "b1", "name": "Blitz", "url": "https://b.example", "token": "t"
+        })
+        client._request = lambda *args, **kwargs: Response({
+            "username": "unlimited",
+            "status": "On-hold",
+            "blocked": False,
+            "expiration_days": 0,
+            "account_creation_date": None,
+        })
+
+        user = client.get_user("unlimited")
+
+        self.assertEqual(user["expiration_days"], 0)
+        self.assertFalse(user["delayed_start"])
+        self.assertTrue(user["timer_started"])
+        self.assertNotIn("account_expiration_date", user)
+
     def test_blitz_500_not_found_is_confirmed_against_live_list(self):
         client = api_client.APIClient({
             "id": "b1", "name": "Blitz", "url": "https://b.example", "token": "t"
@@ -172,6 +191,60 @@ class ThreeXUIAdapterTests(unittest.TestCase):
         self.assertEqual(users[0]["credential_metadata"]["selected_field"], "auth")
         self.assertEqual(calls[0][0:2], ("GET", "https://x.example/panel/api/clients/list"))
 
+    def test_zero_expiry_normalises_as_unlimited_duration(self):
+        client = make_client()
+
+        user = client._normalise_user({
+            "client": {
+                "email": "unlimited",
+                "auth": "secret",
+                "totalGB": api_client.GIB,
+                "expiryTime": 0,
+                "enable": True,
+                "comment": "customer [ajib-duration:30d]",
+            },
+            "inboundIds": [4],
+        })
+
+        self.assertEqual(user["expiration_days"], 0)
+        self.assertEqual(user["configured_duration_days"], 0)
+        self.assertFalse(user["delayed_start"])
+        self.assertIsNone(user["absolute_expiry"])
+        self.assertEqual(user["note"], "customer")
+
+    def test_missing_expiry_is_not_normalised_as_unlimited_duration(self):
+        client = make_client()
+
+        user = client._normalise_user({
+            "client": {
+                "email": "malformed",
+                "auth": "secret",
+                "totalGB": api_client.GIB,
+                "enable": True,
+            },
+            "inboundIds": [4],
+        })
+
+        self.assertIsNone(user["expiration_days"])
+        self.assertIsNone(user["absolute_expiry"])
+
+    def test_provision_spec_accepts_zero_and_rejects_invalid_duration(self):
+        valid = api_client.UserProvisionSpec(
+            username="unlimited",
+            traffic_limit_bytes=api_client.GIB,
+            expiration_days=0,
+        )
+
+        self.assertEqual(valid.expiration_days, 0)
+        for invalid in (-1, "0", None, True):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    api_client.UserProvisionSpec(
+                        username="invalid",
+                        traffic_limit_bytes=api_client.GIB,
+                        expiration_days=invalid,
+                    )
+
     def test_create_uses_defaults_password_marker_and_negative_expiry(self):
         client = make_client([4, 7])
         calls = []
@@ -204,6 +277,21 @@ class ThreeXUIAdapterTests(unittest.TestCase):
         self.assertEqual(payload["totalGB"], 8 * api_client.GIB)
         self.assertEqual(payload["limitIp"], 0)
 
+    def test_create_zero_duration_uses_zero_expiry_without_duration_marker(self):
+        client = make_client()
+        calls = []
+        client._request = lambda method, url, **kwargs: (
+            calls.append((method, url, kwargs)) or Response({"success": True, "msg": "added"})
+        )
+
+        result = client.add_user("alice", 8, 0, password="secret", note="customer")
+
+        self.assertIsNotNone(result)
+        payload = calls[0][2]["data"]["client"]
+        self.assertEqual(payload["expiryTime"], 0)
+        self.assertEqual(payload["comment"], "customer")
+        self.assertNotIn("[ajib-duration:", payload["comment"])
+
     def test_update_sends_full_record_and_preserves_auth(self):
         client = make_client()
         calls = []
@@ -234,6 +322,32 @@ class ThreeXUIAdapterTests(unittest.TestCase):
         self.assertNotIn("id", update_call[2]["data"])
         self.assertEqual(update_call[2]["data"]["allowedIPs"], [])
         self.assertNotIn("inboundIds", update_call[2]["data"])
+
+    def test_update_zero_duration_preserves_note_and_removes_marker(self):
+        client = make_client()
+        calls = []
+        full = {
+            "client": {
+                "email": "alice", "auth": "keep", "totalGB": api_client.GIB,
+                "expiryTime": -30 * api_client.MILLISECONDS_PER_DAY,
+                "comment": "customer [ajib-duration:30d]", "enable": True,
+            },
+            "inboundIds": [4],
+        }
+
+        def request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if method == "GET":
+                return Response({"success": True, "obj": full})
+            return Response({"success": True, "msg": "updated"})
+
+        client._request = request
+        result = client.update_user("alice", {"new_expiration_days": 0})
+
+        self.assertIsNotNone(result)
+        payload = calls[-1][2]["data"]
+        self.assertEqual(payload["expiryTime"], 0)
+        self.assertEqual(payload["comment"], "customer")
 
     def test_update_retains_string_protocol_id(self):
         client = make_client()
@@ -274,6 +388,28 @@ class ThreeXUIAdapterTests(unittest.TestCase):
 
         self.assertEqual(result["error"], "duration_unknown")
         self.assertEqual(len(calls), 1)
+
+    def test_reset_unlimited_duration_keeps_zero_expiry(self):
+        client = make_client()
+        calls = []
+
+        def request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if method == "GET":
+                return Response({"success": True, "obj": {"client": {
+                    "email": "alice", "auth": "keep", "expiryTime": 0,
+                    "comment": "customer [ajib-duration:30d]", "enable": False,
+                }, "inboundIds": [4]}})
+            return Response({"success": True, "msg": "ok"})
+
+        client._request = request
+        result = client.reset_user_result("alice")
+
+        self.assertEqual(result["status"], "succeeded")
+        payload = calls[-1][2]["data"]
+        self.assertEqual(payload["expiryTime"], 0)
+        self.assertEqual(payload["comment"], "customer")
+        self.assertTrue(payload["enable"])
 
     def test_reset_removes_numeric_database_id_from_update_payload(self):
         client = make_client()

@@ -130,7 +130,12 @@ class BroadcastTargetingTests(unittest.TestCase):
                     "account_creation_date": "2026-08-01T00:00:00+00:00",
                     "expiration_days": 30,
                 }
-                yield client, "222t", {"blocked": True, "status": "expired", "expiration_days": 0}
+                yield client, "222t", {
+                    "blocked": True,
+                    "status": "expired",
+                    "expiration_days": 30,
+                    "account_creation_date": "2020-01-01T00:00:00+00:00",
+                }
                 yield client, "sell333t", {
                     "blocked": False,
                     "status": "Online",

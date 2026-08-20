@@ -399,25 +399,26 @@ def display_config(
             traffic_message += f"\n🌐 Status: {status}"
 
         traffic_limit_display = f"{max_traffic_gb:.2f} GB" if max_traffic_gb > 0 else "Unlimited"
+        unlimited_duration = shared_state.configured_days == 0
         
         if shared_state.panel_state == PanelState.HOLD and is_expired:
             status_display = '❌ Unused service expired'
-            days_display = '0'
+            days_display = 'Unlimited' if unlimited_duration else '0'
         elif shared_state.panel_state == PanelState.HOLD:
             status_display = '⏸ On Hold — server timer starts on first connection'
-            days_display = (
+            days_display = 'Unlimited' if unlimited_duration else (
                 str(shared_state.service_days_remaining)
                 if shared_state.service_days_remaining is not None else 'Unknown'
             )
         elif shared_state.panel_state == PanelState.CONNECTED:
             status_display = '✅ Active'
-            days_display = (
+            days_display = 'Unlimited' if unlimited_duration else (
                 str(shared_state.service_days_remaining)
                 if shared_state.service_days_remaining is not None else 'Unknown'
             )
         elif shared_state.panel_state == PanelState.BLOCKED:
             status_display = '❌ Expired' if is_expired else '⛔ Blocked by administrator'
-            days_display = (
+            days_display = 'Unlimited' if unlimited_duration else (
                 str(shared_state.service_days_remaining)
                 if shared_state.service_days_remaining is not None else 'Unknown'
             )

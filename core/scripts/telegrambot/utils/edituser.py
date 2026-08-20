@@ -214,9 +214,24 @@ def _send_user_details(message, api_client, user_details, ref):
     shared_state = inspect_account(user_details, source="admin_user_detail")
     server_label = _format_server_label(api_client)
     panel_type = getattr(api_client, "panel_type", user_details.get("panel_type", BLITZ_PANEL))
+    unlimited_duration = shared_state.configured_days == 0
+    configured_duration = (
+        "Unlimited"
+        if unlimited_duration
+        else (
+            f"{shared_state.configured_days} days"
+            if shared_state.configured_days is not None
+            else "Unknown"
+        )
+    )
     panel_remaining_line = (
-        f"⏱ Panel Time Remaining: {shared_state.panel_days_remaining} days\n"
-        if shared_state.panel_days_remaining is not None else ""
+        "⏱ Panel Time Remaining: Unlimited\n"
+        if unlimited_duration
+        else (
+            f"⏱ Panel Time Remaining: {shared_state.panel_days_remaining} days\n"
+            if shared_state.panel_days_remaining is not None
+            else ""
+        )
     )
     formatted_details = (
         f"\n🆔 Name: {_escape_markdown(actual_username)}\n"
@@ -224,7 +239,7 @@ def _send_user_details(message, api_client, user_details, ref):
         f"🧩 Panel: `{panel_type}`\n"
         f"📊 Traffic Limit: {traffic_limit:.2f} GB\n"
         f"🔖 State: {shared_state.state}\n"
-        f"📅 Configured Duration: {shared_state.configured_days if shared_state.configured_days is not None else 'Unknown'} days\n"
+        f"📅 Configured Duration: {configured_duration}\n"
         f"{panel_remaining_line}"
         f"⏳ Timer Start: {user_details.get('account_creation_date') or 'First connection'}\n"
         f"💡 Blocked: {user_details.get('blocked')}\n\n"
@@ -291,7 +306,10 @@ def handle_edit_callback(call):
         msg = bot.send_message(call.message.chat.id, f"Enter new traffic limit (GB) for {ref.username}:")
         bot.register_next_step_handler(msg, process_edit_traffic, token)
     elif action == "edit_expiration":
-        msg = bot.send_message(call.message.chat.id, f"Enter new expiration days for {ref.username}:")
+        msg = bot.send_message(
+            call.message.chat.id,
+            f"Enter new expiration days for {ref.username} (0 = unlimited):",
+        )
         bot.register_next_step_handler(msg, process_edit_expiration, token)
     elif action == "renew_password":
         _report_update(call.message.chat.id, api_client.update_user(ref.username, {"renew_password": True}), "Password renewed.", "Password renewal failed.")
@@ -364,14 +382,19 @@ def process_edit_traffic(message, token):
 def process_edit_expiration(message, token):
     try:
         value = int(message.text.strip())
-        if value <= 0:
+        if value < 0:
             raise ValueError
     except (TypeError, ValueError):
-        bot.reply_to(message, "Invalid expiration. Please enter a positive number.")
+        bot.reply_to(message, "Invalid expiration. Enter zero for unlimited or a positive number of days.")
         return
     client, ref = _exact_client_for_step(token)
     result = client.update_user(ref.username, {"new_expiration_days": value}) if client and ref else None
-    bot.reply_to(message, f"Expiration updated to {value} days successfully." if result is not None else "Failed to update expiration.")
+    success = (
+        "Expiration updated to unlimited successfully."
+        if value == 0
+        else f"Expiration updated to {value} days successfully."
+    )
+    bot.reply_to(message, success if result is not None else "Failed to update expiration.")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("copy_user:"))

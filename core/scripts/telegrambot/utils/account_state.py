@@ -175,13 +175,17 @@ def elapsed_full_days(started_at: datetime | None, now: datetime | None = None) 
 def panel_deadline(user_data: Mapping[str, Any] | None) -> datetime | None:
     if not isinstance(user_data, Mapping):
         return None
+    duration = safe_int(user_data.get("expiration_days"))
+    # Both supported panels use zero as the canonical no-expiry value.  It
+    # must take precedence over stale or adapter-derived date fields.
+    if duration == 0:
+        return None
     for field in ("account_expiration_date", "absolute_expiry", "expiration_at"):
         explicit = parse_timestamp(user_data.get(field))
         if explicit is not None:
             return explicit
-    duration = safe_int(user_data.get("expiration_days"))
     started_at = parse_timestamp(user_data.get("account_creation_date"))
-    if duration is None or duration < 0 or started_at is None:
+    if duration is None or duration <= 0 or started_at is None:
         return None
     return started_at + timedelta(days=duration)
 
@@ -197,10 +201,6 @@ def verified_panel_expired(
     """Match only the legacy panel-expiration rules with valid live values."""
     if not isinstance(user_data, Mapping) or strict_bool(user_data.get("blocked")) is not True:
         return False
-
-    duration = safe_int(user_data.get("expiration_days"))
-    if duration is not None and duration <= 0:
-        return True
 
     current = parse_timestamp(now or utc_now())
     deadline = panel_deadline(user_data)
@@ -375,9 +375,12 @@ def inspect_account(
     blocked = strict_bool(data.get("blocked")) if data is not None else None
     started_at = parse_timestamp(data.get("account_creation_date")) if data is not None else None
     duration = safe_int(data.get("expiration_days")) if data is not None else None
+    unlimited_duration = duration == 0
     deadline = panel_deadline(data)
     explicit_timer_started = strict_bool(data.get("timer_started")) if data is not None else None
     timer_started = explicit_timer_started if explicit_timer_started is not None else started_at is not None
+    if unlimited_duration:
+        timer_started = True
     if started_at is None and timer_started and deadline is not None and duration is not None and duration >= 0:
         started_at = deadline - timedelta(days=duration)
 
@@ -386,6 +389,8 @@ def inspect_account(
         panel_state_value = PanelState.UNKNOWN
     elif blocked:
         panel_state_value = PanelState.BLOCKED
+    elif unlimited_duration and status in CONNECTED_STATUSES | {HOLD_STATUS}:
+        panel_state_value = PanelState.CONNECTED
     elif status == HOLD_STATUS and not timer_started and valid_duration:
         panel_state_value = PanelState.HOLD
     elif status in CONNECTED_STATUSES and timer_started and (valid_duration or deadline is not None):
