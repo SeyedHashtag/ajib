@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -124,6 +125,59 @@ class MultiServerCreationCacheTests(unittest.TestCase):
         self.assertEqual(creation["existing_usernames"], {"a", "b", "c"})
         self.assertEqual(clients["s1"].get_users_calls, 1)
         self.assertEqual(clients["s2"].get_users_calls, 1)
+
+    def test_zero_weight_server_is_scanned_but_not_selected(self):
+        clients = {
+            "s1": FakeClient("s1", {"reserved": {"blocked": False}}),
+            "s2": FakeClient("s2", {"existing": {"blocked": False}}),
+        }
+        multi_api = self.make_multi_api(clients)
+        multi_api.servers[0]["weight"] = 0
+
+        creation = multi_api.prepare_new_user_creation()
+        zero_state = next(
+            state for state in creation["server_states"]
+            if state["client"].server_id == "s1"
+        )
+
+        self.assertEqual(creation["client"].server_id, "s2")
+        self.assertEqual(creation["existing_usernames"], {"reserved", "existing"})
+        self.assertFalse(zero_state["accepting_new_users"])
+        self.assertEqual(zero_state["placement_reason"], "weight_zero")
+        self.assertIsNone(zero_state["load_ratio"])
+
+    def test_all_zero_weights_return_no_target_without_primary_fallback(self):
+        clients = {
+            "s1": FakeClient("s1", {}),
+            "s2": FakeClient("s2", {}),
+        }
+        multi_api = self.make_multi_api(clients)
+        for server in multi_api.servers:
+            server["weight"] = 0
+
+        username, result, selected = multi_api.create_user_with_retry(
+            lambda _existing: "new-user",
+            lambda client, name: client.add_user(name, 1, 1),
+            fallback_client=clients["s1"],
+        )
+
+        self.assertIsNone(username)
+        self.assertIsNone(result)
+        self.assertIsNone(selected)
+        self.assertEqual(clients["s1"].add_user_calls, [])
+        self.assertEqual(clients["s2"].add_user_calls, [])
+
+    def test_zero_weight_server_status_is_paused_without_load_ratio(self):
+        clients = {"s1": FakeClient("s1", {"a": {"blocked": False}})}
+        multi_api = self.make_multi_api(clients)
+        multi_api.servers[0]["weight"] = 0
+
+        status = multi_api.get_server_statuses()[0]
+
+        self.assertEqual(status["weight"], 0)
+        self.assertFalse(status["accepting_new_users"])
+        self.assertEqual(status["placement_reason"], "weight_zero")
+        self.assertIsNone(status["load_ratio"])
 
     def test_hold_is_separate_from_active_but_counts_as_allocated_load(self):
         users = {
@@ -883,7 +937,7 @@ class ServerConfigPersistenceTests(unittest.TestCase):
         ]
         new_servers = [
             {"id": "primary", "name": "Primary", "url": "https://one.example", "token": "token-one", "enabled": True, "weight": 1},
-            {"id": "backup", "name": "backup", "url": "https://two.example", "token": "token-two", "enabled": False, "weight": 2},
+            {"id": "backup", "name": "backup", "url": "https://two.example", "token": "token-two", "enabled": False, "weight": 0},
         ]
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -901,8 +955,21 @@ class ServerConfigPersistenceTests(unittest.TestCase):
         self.assertEqual(values["URL"], "https://one.example")
         self.assertEqual(values["TOKEN"], "token-one")
         self.assertIn('"id":"backup"', values["SERVERS_JSON"])
+        self.assertEqual(json.loads(values["SERVERS_JSON"])[1]["weight"], 0)
         for key, value in preserved_values.items():
             self.assertEqual(values[key], value)
+
+    def test_weight_normalization_preserves_zero_and_defaults_invalid_values(self):
+        base = {
+            "id": "s1",
+            "url": "https://one.example",
+            "token": "token-one",
+        }
+
+        self.assertEqual(api_client._normalise_server_config({**base, "weight": 0})["weight"], 0)
+        self.assertEqual(api_client._normalise_server_config(base)["weight"], 1)
+        self.assertEqual(api_client._normalise_server_config({**base, "weight": -1})["weight"], 1)
+        self.assertEqual(api_client._normalise_server_config({**base, "weight": float("inf")})["weight"], 1)
 
 
 if __name__ == "__main__":

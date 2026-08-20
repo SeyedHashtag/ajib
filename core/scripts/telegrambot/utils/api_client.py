@@ -165,7 +165,27 @@ def _safe_weight(value) -> float:
         weight = float(value)
     except (TypeError, ValueError):
         return 1.0
-    return weight if weight > 0 else 1.0
+    if not math.isfinite(weight) or weight < 0:
+        return 1.0
+    return 0.0 if weight == 0 else weight
+
+
+def server_placement_status(
+    server: dict,
+    *,
+    healthy: bool,
+    creation_ready: bool,
+) -> tuple[bool, str]:
+    """Return whether a server accepts automatic placement and why."""
+    if not server.get("enabled", True):
+        return False, "disabled"
+    if _safe_weight(server.get("weight", 1)) == 0:
+        return False, "weight_zero"
+    if not healthy:
+        return False, "unhealthy"
+    if not creation_ready:
+        return False, "creation_not_ready"
+    return True, "ready"
 
 
 def _safe_bool(value, default=True) -> bool:
@@ -358,6 +378,9 @@ def save_server_configs(servers: list[dict]) -> bool:
     os.environ["SERVERS_JSON"] = updates["SERVERS_JSON"]
     os.environ["URL"] = updates["URL"]
     os.environ["TOKEN"] = updates["TOKEN"]
+    multi_server_api = globals().get("MultiServerAPI")
+    if multi_server_api is not None:
+        multi_server_api.invalidate_all_caches()
     return True
 
 
@@ -1465,6 +1488,19 @@ class MultiServerAPI:
     def __init__(self):
         self.servers = get_server_configs()
 
+    @staticmethod
+    def server_placement_status(
+        server: dict,
+        *,
+        healthy: bool,
+        creation_ready: bool,
+    ) -> tuple[bool, str]:
+        return server_placement_status(
+            server,
+            healthy=healthy,
+            creation_ready=creation_ready,
+        )
+
     def get_client(self, server_id: str | None = None) -> APIClient | ThreeXUIAPIClient | None:
         if not self.servers:
             return None
@@ -1722,6 +1758,11 @@ class MultiServerAPI:
             creation_ready, creation_error = readiness
             allocated_count = self.allocated_user_count(users) if healthy else None
             weight = _safe_weight(server.get("weight", 1))
+            accepting_new_users, placement_reason = self.server_placement_status(
+                server,
+                healthy=healthy,
+                creation_ready=bool(creation_ready),
+            )
             if healthy:
                 usernames.update(self.extract_usernames(users))
             server_states.append({
@@ -1731,10 +1772,12 @@ class MultiServerAPI:
                 "healthy": healthy,
                 "creation_ready": bool(creation_ready),
                 "creation_error": creation_error,
+                "accepting_new_users": accepting_new_users,
+                "placement_reason": placement_reason,
                 "active_count": allocated_count,
                 "allocated_count": allocated_count,
                 "weight": weight,
-                "load_ratio": (allocated_count / weight) if healthy else None,
+                "load_ratio": (allocated_count / weight) if healthy and weight > 0 else None,
             })
 
         return {
@@ -1785,7 +1828,7 @@ class MultiServerAPI:
         snapshot = self._get_creation_snapshot(force_refresh=force_refresh)
         candidates = []
         for state in snapshot.get("servers", []):
-            if not state.get("healthy") or not state.get("creation_ready", True):
+            if not state.get("accepting_new_users", False):
                 continue
             candidates.append((state["load_ratio"], state["index"], state["client"]))
 
@@ -1825,7 +1868,7 @@ class MultiServerAPI:
                     state["active_count"] = allocated_count
                     state["allocated_count"] = allocated_count
                     weight = _safe_weight(state.get("weight", 1))
-                    state["load_ratio"] = allocated_count / weight
+                    state["load_ratio"] = allocated_count / weight if weight > 0 else None
                 break
 
     def create_user_with_retry(
@@ -1846,7 +1889,9 @@ class MultiServerAPI:
                     username = last_username
                 else:
                     creation = self.prepare_new_user_creation(force_refresh=attempt > 0)
-                    target_client = creation.get("client") or fallback_client
+                    target_client = creation.get("client")
+                    if target_client is None and not self.servers:
+                        target_client = fallback_client
                     if target_client is None:
                         return None, None, None
 
@@ -1889,6 +1934,11 @@ class MultiServerAPI:
                 "unknown": None,
             }
             weight = _safe_weight(server.get("weight", 1))
+            accepting_new_users, placement_reason = self.server_placement_status(
+                server,
+                healthy=healthy,
+                creation_ready=bool(creation_ready),
+            )
             statuses.append({
                 **server,
                 "index": entry["index"],
@@ -1896,6 +1946,8 @@ class MultiServerAPI:
                 "panel": getattr(client, "panel_type", server.get("panel", BLITZ_PANEL)),
                 "creation_ready": bool(creation_ready),
                 "creation_error": creation_error,
+                "accepting_new_users": accepting_new_users,
+                "placement_reason": placement_reason,
                 "active_count": allocated_count if healthy else None,
                 "allocated_count": allocated_count if healthy else None,
                 "connected_count": state_counts["active"],
@@ -1905,7 +1957,7 @@ class MultiServerAPI:
                 "hold_count": state_counts["hold"],
                 "blocked_count": state_counts["blocked"],
                 "unknown_count": state_counts["unknown"],
-                "load_ratio": (allocated_count / weight) if healthy else None,
+                "load_ratio": (allocated_count / weight) if healthy and weight > 0 else None,
             })
         return statuses
 

@@ -165,6 +165,83 @@ class VpnServersTests(unittest.TestCase):
         self.assertIn("Unknown: `1`", bot.edits[0][0][0])
         self.assertEqual(FakeMultiServerAPI.calls, ["statuses"])
 
+    def test_zero_weight_status_is_rendered_as_paused(self):
+        module, _bot = load_vpn_servers_module()
+
+        text = module._format_status_line({
+            "id": "s1",
+            "name": "Server 1",
+            "enabled": True,
+            "healthy": True,
+            "creation_ready": True,
+            "accepting_new_users": False,
+            "placement_reason": "weight_zero",
+            "allocated_count": 5,
+            "weight": 0,
+            "load_ratio": None,
+        })
+
+        self.assertIn("Placement: `paused (weight 0)`", text)
+        self.assertIn("Weight: `0` | Load: `N/A`", text)
+
+    def test_weight_editor_accepts_zero_and_persists_it(self):
+        module, bot = load_vpn_servers_module()
+        module.VPN_SERVER_MENU_EXECUTOR = HoldingExecutor()
+        servers = [{"id": "s1", "name": "Server 1", "enabled": True, "weight": 1}]
+        saved = []
+        module.get_server_configs = lambda: servers
+        module.save_server_configs = lambda value: saved.append([dict(item) for item in value]) or True
+        module.server_admin_state[1] = {"state": "waiting_server_weight", "server_id": "s1"}
+        message = types.SimpleNamespace(
+            from_user=types.SimpleNamespace(id=1),
+            chat=types.SimpleNamespace(id=10),
+            message_id=20,
+            text="0",
+        )
+
+        module.handle_server_weight_input(message)
+
+        self.assertEqual(saved[0][0]["weight"], 0)
+        self.assertNotIn(1, module.server_admin_state)
+        self.assertEqual(len(module.VPN_SERVER_MENU_EXECUTOR.jobs), 1)
+
+    def test_weight_editor_rejects_negative_and_non_finite_values(self):
+        module, bot = load_vpn_servers_module()
+
+        for value in ("-1", "nan", "inf"):
+            with self.subTest(value=value):
+                module.server_admin_state[1] = {
+                    "state": "waiting_server_weight",
+                    "server_id": "s1",
+                }
+                message = types.SimpleNamespace(
+                    from_user=types.SimpleNamespace(id=1),
+                    chat=types.SimpleNamespace(id=10),
+                    message_id=20,
+                    text=value,
+                )
+
+                module.handle_server_weight_input(message)
+
+        self.assertEqual(len(bot.replies), 3)
+        self.assertTrue(all("finite non-negative" in args[1] for args, _kwargs in bot.replies))
+
+    def test_toggle_reports_persistence_failure(self):
+        module, bot = load_vpn_servers_module()
+        module.get_server_configs = lambda: [{"id": "s1", "name": "Server 1", "enabled": True}]
+        module.save_server_configs = lambda _servers: False
+        call = types.SimpleNamespace(
+            id="callback",
+            data="vpn_server:toggle:s1",
+            from_user=types.SimpleNamespace(id=1),
+            message=types.SimpleNamespace(chat=types.SimpleNamespace(id=10), message_id=20),
+        )
+
+        module.handle_vpn_server_callback(call)
+
+        self.assertIn("Failed to update server.", bot.answers[0][0])
+        self.assertTrue(bot.answers[0][1]["show_alert"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,8 +25,8 @@ def shell_function_body(script_text, function_name):
 
 class MenuPythonEnvironmentTests(unittest.TestCase):
     def test_cli_actions_use_virtual_environment_helper(self):
-        menu_text = (REPO_ROOT / "menu.sh").read_text()
-        path_text = (REPO_ROOT / "core" / "scripts" / "path.sh").read_text()
+        menu_text = (REPO_ROOT / "menu.sh").read_text(encoding="utf-8")
+        path_text = (REPO_ROOT / "core" / "scripts" / "path.sh").read_text(encoding="utf-8")
         helper_body = shell_function_body(menu_text, "run_ajib_cli")
 
         self.assertIn('AJIB_PYTHON="/etc/ajib/ajib_venv/bin/python"', path_text)
@@ -35,12 +35,21 @@ class MenuPythonEnvironmentTests(unittest.TestCase):
         self.assertNotIn('python3 "$CLI_PATH"', menu_text)
 
     def test_inline_json_parser_keeps_using_system_python(self):
-        menu_text = (REPO_ROOT / "menu.sh").read_text()
+        menu_text = (REPO_ROOT / "menu.sh").read_text(encoding="utf-8")
 
         self.assertIn('python3 - "$TELEGRAM_ENV"', menu_text)
 
+    def test_server_weight_reader_accepts_zero(self):
+        menu_text = (REPO_ROOT / "menu.sh").read_text(encoding="utf-8")
+        helper_body = shell_function_body(menu_text, "read_nonnegative_number")
+
+        self.assertIn('$value >= 0', helper_body)
+        self.assertNotIn('$value > 0', helper_body)
+        self.assertEqual(menu_text.count('read_nonnegative_number "Balancing weight'), 2)
+        self.assertIn("0 pauses automatic placement", menu_text)
+
     def test_missing_virtual_environment_has_actionable_error(self):
-        menu_text = (REPO_ROOT / "menu.sh").read_text()
+        menu_text = (REPO_ROOT / "menu.sh").read_text(encoding="utf-8")
         helper_body = shell_function_body(menu_text, "run_ajib_cli")
         script = "\n".join(
             (

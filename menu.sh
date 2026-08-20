@@ -157,7 +157,7 @@ read_secret_value() {
     done
 }
 
-read_positive_number() {
+read_nonnegative_number() {
     local prompt=$1
     local default_value=$2
     local value
@@ -165,11 +165,11 @@ read_positive_number() {
     while true; do
         read -e -p "$prompt [$default_value]: " value
         value=${value:-$default_value}
-        if [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk "BEGIN {exit !($value > 0)}"; then
+        if [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk "BEGIN {exit !($value >= 0)}"; then
             echo "$value"
             return
         fi
-        echo "Value must be a positive number. Please try again." >&2
+        echo "Value must be a non-negative number. Use 0 to pause automatic placement." >&2
     done
 }
 
@@ -344,7 +344,7 @@ configure_telegram_bot() {
     local server_inbound_ids=()
     local server_limit_ips=()
     local i default_id default_url default_token default_weight default_enabled default_panel default_inbound_ids default_limit_ip
-    local current_id current_url current_token current_weight current_enabled current_panel current_inbound_ids current_limit_ip
+    local current_id current_url current_token current_weight current_enabled current_panel current_inbound_ids current_limit_ip current_inbound_required
 
     for ((i=1; i<=server_count; i++)); do
         default_id="${existing_server_ids[$((i - 1))]}"
@@ -392,13 +392,17 @@ configure_telegram_bot() {
             current_token=$(read_secret_value "API key" "")
         done
 
-        current_weight=$(read_positive_number "Balancing weight" "$default_weight")
+        current_weight=$(read_nonnegative_number "Balancing weight (0 pauses automatic placement)" "$default_weight")
         current_enabled=$(read_yes_no_bool "Enable this server for new configs?" "$default_enabled")
         current_panel=$(read_panel_type "$default_panel")
         current_inbound_ids=""
         current_limit_ip="0"
         if [ "$current_panel" = "3x-ui" ]; then
-            current_inbound_ids=$(read_inbound_ids "$default_inbound_ids" "$current_enabled")
+            current_inbound_required="false"
+            if [ "$current_enabled" = "true" ] && awk "BEGIN {exit !($current_weight > 0)}"; then
+                current_inbound_required="true"
+            fi
+            current_inbound_ids=$(read_inbound_ids "$default_inbound_ids" "$current_inbound_required")
             current_limit_ip=$(read_nonnegative_integer "Default client IP limit (0 = unlimited)" "$default_limit_ip")
         fi
 
@@ -461,7 +465,7 @@ add_telegram_vpn_server() {
     local server_limit_ips=("${existing_server_limit_ips[@]}")
 
     local default_id="server$((${#server_ids[@]} + 1))"
-    local current_id current_url current_token current_weight current_enabled current_panel current_inbound_ids current_limit_ip
+    local current_id current_url current_token current_weight current_enabled current_panel current_inbound_ids current_limit_ip current_inbound_required
 
     echo "--------------------------------------"
     echo "Add VPN server for balancing"
@@ -490,13 +494,17 @@ add_telegram_vpn_server() {
         current_token=$(read_secret_value "API key" "")
     done
 
-    current_weight=$(read_positive_number "Balancing weight" "1")
+    current_weight=$(read_nonnegative_number "Balancing weight (0 pauses automatic placement)" "1")
     current_enabled=$(read_yes_no_bool "Enable this server for new configs?" "true")
     current_panel=$(read_panel_type "blitz")
     current_inbound_ids=""
     current_limit_ip="0"
     if [ "$current_panel" = "3x-ui" ]; then
-        current_inbound_ids=$(read_inbound_ids "" "$current_enabled")
+        current_inbound_required="false"
+        if [ "$current_enabled" = "true" ] && awk "BEGIN {exit !($current_weight > 0)}"; then
+            current_inbound_required="true"
+        fi
+        current_inbound_ids=$(read_inbound_ids "" "$current_inbound_required")
         current_limit_ip=$(read_nonnegative_integer "Default client IP limit (0 = unlimited)" "0")
     fi
 

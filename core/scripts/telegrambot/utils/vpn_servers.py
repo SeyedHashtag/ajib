@@ -1,4 +1,5 @@
 from telebot import types
+import math
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -49,12 +50,31 @@ def _format_status_line(status):
     ratio_text = f"{load_ratio:.2f}" if load_ratio is not None else "N/A"
     weight = status.get("weight", 1)
     panel = status.get("panel", "blitz")
-    creation_ready = status.get("creation_ready", False)
-    creation_text = "ready" if creation_ready else f"not ready ({status.get('creation_error') or 'unknown'})"
+    placement_reason = status.get("placement_reason")
+    if not placement_reason:
+        if not status.get("enabled", True):
+            placement_reason = "disabled"
+        elif weight == 0:
+            placement_reason = "weight_zero"
+        elif not status.get("healthy"):
+            placement_reason = "unhealthy"
+        elif not status.get("creation_ready", False):
+            placement_reason = "creation_not_ready"
+        else:
+            placement_reason = "ready"
+    placement_text = {
+        "ready": "accepting new users",
+        "disabled": "paused (disabled)",
+        "weight_zero": "paused (weight 0)",
+        "unhealthy": "paused (unhealthy)",
+        "creation_not_ready": (
+            f"paused ({status.get('creation_error') or 'creation not ready'})"
+        ),
+    }.get(placement_reason, f"paused ({placement_reason})")
     return (
         f"*{status.get('name', status.get('id'))}* (`{status.get('id')}`)\n"
         f"Panel: `{panel}` | Status: `{enabled}` | Health: `{health}`\n"
-        f"Automatic creation: `{creation_text}`\n"
+        f"Placement: `{placement_text}`\n"
         f"Allocated: `{allocated_text}` | Started: `{started_text}` | Hold: `{hold_text}`\n"
         f"Online: `{online_text}` | Offline: `{offline_text}` | Blocked: `{blocked_text}` | Unknown: `{unknown_text}`\n"
         f"Weight: `{weight}` | Load: `{ratio_text}`"
@@ -188,7 +208,9 @@ def handle_vpn_server_callback(call):
 
     if action == "toggle":
         target["enabled"] = not bool(target.get("enabled", True))
-        save_server_configs(servers)
+        if not save_server_configs(servers):
+            safe_answer_callback_query(bot, call.id, "Failed to update server.", show_alert=True)
+            return
         safe_answer_callback_query(bot, call.id, "Server updated.")
         _queue_vpn_servers_edit(call.message.chat.id, call.message.message_id)
         return
@@ -196,7 +218,11 @@ def handle_vpn_server_callback(call):
     if action == "weight":
         server_admin_state[call.from_user.id] = {"state": "waiting_server_weight", "server_id": server_id}
         safe_answer_callback_query(bot, call.id)
-        safe_send_message(bot, call.message.chat.id, f"Enter a new positive weight for {target.get('name', server_id)}:")
+        safe_send_message(
+            bot,
+            call.message.chat.id,
+            f"Enter a non-negative weight for {target.get('name', server_id)} (0 pauses automatic placement):",
+        )
         return
 
     bot.answer_callback_query(call.id, "Invalid action.")
@@ -208,10 +234,11 @@ def handle_server_weight_input(message):
     server_id = state.get("server_id")
     try:
         weight = float(message.text.strip())
-        if weight <= 0:
+        if not math.isfinite(weight) or weight < 0:
             raise ValueError
+        weight = 0.0 if weight == 0 else weight
     except (TypeError, ValueError):
-        bot.reply_to(message, "Weight must be a positive number.")
+        bot.reply_to(message, "Weight must be a finite non-negative number. Use 0 to pause automatic placement.")
         return
 
     servers = get_server_configs()

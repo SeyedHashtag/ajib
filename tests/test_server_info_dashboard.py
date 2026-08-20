@@ -193,6 +193,30 @@ class ServerInfoDashboardTests(unittest.TestCase):
         self.assertIn("⚠️ Pending Payments: 1", text)
         self.assertIn("Backup: unhealthy", text)
 
+    def test_zero_weight_server_has_no_dashboard_load_ratio(self):
+        servers = [
+            {"id": "primary", "name": "Primary", "url": "https://primary.test", "token": "token", "enabled": True, "weight": 0},
+        ]
+        clients = {
+            "primary": FakeClient({
+                "a": {
+                    "blocked": False,
+                    "status": "Online",
+                    "account_creation_date": "2026-06-01",
+                    "expiration_days": 30,
+                },
+            }),
+        }
+        cli_api = load_cli_api(servers=servers, clients=clients)
+
+        snapshot = cli_api.build_server_info_snapshot(
+            now=datetime(2026, 6, 4, 12, 0, 0)
+        )
+
+        self.assertEqual(snapshot["vpn"]["servers"][0]["weight"], 0)
+        self.assertIsNone(snapshot["vpn"]["servers"][0]["load_ratio"])
+        self.assertIn("load N/A", cli_api.format_server_info(snapshot))
+
     def test_completed_renewal_keeps_its_original_sales_day_after_worker_updates(self):
         payments = {
             "affected-renewal": {

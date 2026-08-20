@@ -222,6 +222,41 @@ class RecordedUsernameProvisioningTests(unittest.TestCase):
         self.assertEqual(usernames, {"t123"})
         self.assertEqual(len(server_states), 1)
 
+    def test_bulk_test_snapshot_reserves_zero_weight_usernames_without_selecting_server(self):
+        class BulkMultiServerAPI:
+            def iter_clients(self, include_disabled=True):
+                yield (
+                    {"id": "paused", "enabled": True, "weight": 0},
+                    SimpleNamespace(get_users=lambda: {"paused-user": {}}),
+                )
+                yield (
+                    {"id": "ready", "enabled": True, "weight": 2},
+                    SimpleNamespace(get_users=lambda: {"ready-user": {}}),
+                )
+
+            def extract_usernames(self, users):
+                return set(users)
+
+            def active_user_count(self, users):
+                return len(users)
+
+        namespace = {
+            "MultiServerAPI": BulkMultiServerAPI,
+            "load_recorded_usernames": lambda: set(),
+            "_safe_server_weight": float,
+        }
+        build_state = compile_function(
+            Path("utils/test_config.py"),
+            "_build_bulk_test_config_state",
+            namespace,
+        )
+
+        usernames, server_states = build_state()
+
+        self.assertEqual(usernames, {"paused-user", "ready-user"})
+        self.assertEqual(len(server_states), 1)
+        self.assertEqual(server_states[0]["client"].get_users(), {"ready-user": {}})
+
 
 if __name__ == "__main__":
     unittest.main()

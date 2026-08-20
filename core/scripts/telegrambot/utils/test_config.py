@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import datetime
 import time
@@ -1081,7 +1082,9 @@ def _safe_server_weight(value):
         weight = float(value)
     except (TypeError, ValueError):
         return 1.0
-    return weight if weight > 0 else 1.0
+    if not math.isfinite(weight) or weight < 0:
+        return 1.0
+    return 0.0 if weight == 0 else weight
 
 def _build_bulk_test_config_state():
     multi_api = MultiServerAPI()
@@ -1094,10 +1097,25 @@ def _build_bulk_test_config_state():
             continue
 
         existing_usernames.update(multi_api.extract_usernames(users))
-        if not server.get("enabled", True):
+        weight = _safe_server_weight(server.get("weight", 1))
+        readiness_checker = getattr(client, "is_creation_ready", None)
+        creation_ready = True
+        if callable(readiness_checker):
+            creation_ready, _creation_error = readiness_checker(verify_remote=True)
+        placement_checker = getattr(multi_api, "server_placement_status", None)
+        if callable(placement_checker):
+            accepting_new_users, _placement_reason = placement_checker(
+                server,
+                healthy=True,
+                creation_ready=bool(creation_ready),
+            )
+        else:
+            accepting_new_users = bool(
+                server.get("enabled", True) and weight > 0 and creation_ready
+            )
+        if not accepting_new_users:
             continue
 
-        weight = _safe_server_weight(server.get("weight", 1))
         server_states.append({
             "index": index,
             "client": client,
@@ -1112,10 +1130,14 @@ def _build_bulk_test_config_state():
     return existing_usernames, server_states
 
 def _select_bulk_server_state(server_states):
-    if not server_states:
+    eligible_states = [
+        state for state in (server_states or [])
+        if _safe_server_weight(state.get("weight", 1)) > 0
+    ]
+    if not eligible_states:
         return None
     return min(
-        server_states,
+        eligible_states,
         key=lambda state: (state["allocated_count"] / state["weight"], state["index"])
     )
 
@@ -1394,7 +1416,7 @@ def handle_waiting_chunk(call):
         if not server_states:
             text, markup = build_waiting_management_menu()
             bot.edit_message_text(
-                f"❌ No healthy enabled VPN servers were available.\n\n{text}",
+                f"❌ No VPN server is accepting new users.\n\n{text}",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 reply_markup=markup,

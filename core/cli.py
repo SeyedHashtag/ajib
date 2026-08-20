@@ -63,7 +63,7 @@ def server_info(section):
 @click.option('--adminid', '-aid', required=False, help='Telegram admins ID for running the telegram bot', type=str)
 @click.option('--api-url', '-u', required=False, help='API URL for the API client', type=str)
 @click.option('--api-key', '-k', required=False, help='API key for the API client', type=str)
-@click.option('--server', multiple=True, help='VPN server in id=url,token[,weight,enabled[,panel[,inbound_ids[,limit_ip]]]] format. Inbound IDs use |. Can be repeated.', type=str)
+@click.option('--server', multiple=True, help='VPN server in id=url,token[,weight,enabled[,panel[,inbound_ids[,limit_ip]]]] format. Weight 0 pauses automatic placement. Inbound IDs use |. Can be repeated.', type=str)
 def telegram(action: str, token: str, adminid: str, api_url: str, api_key: str, server):
     try:
         if action == 'start':

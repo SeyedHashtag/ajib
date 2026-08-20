@@ -44,13 +44,18 @@ For multiple servers, `SERVERS_JSON` is the source of truth:
 ```
 
 `panel` defaults to `blitz`, so existing configurations require no migration.
-Enabled 3x-ui servers require one or more `default_inbound_ids` for automatic
-sales. A disabled 3x-ui server may omit them and remain available as a manual
-copy destination, where the admin selects live Hysteria2 inbounds.
+`weight` must be a finite non-negative number and defaults to `1`. A weight of
+`0` pauses automatic placement while the server remains available for health
+checks, existing-user management, renewals, cleanup, and explicit copy or bulk
+transfer operations. Enabled 3x-ui servers with a positive weight require one
+or more `default_inbound_ids` for automatic sales. A disabled or zero-weight
+3x-ui server may omit them and remain available as a manual copy destination,
+where the admin selects live Hysteria2 inbounds.
 
 The CLI format is
 `id=url,token[,weight,enabled[,panel[,inbound_ids[,limit_ip]]]]`; multiple
-inbound IDs are separated with `|`.
+inbound IDs are separated with `|`. Use weight `0` to pause automatic
+placement on a server.
 
 The Blitz client sends the configured token in the `Authorization` request header.
 The base URL may include a deployment-specific API root and is normalized with

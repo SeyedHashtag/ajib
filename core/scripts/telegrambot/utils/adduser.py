@@ -125,7 +125,7 @@ def process_add_user_step4(call):
         if api_client is None:
             _finish_add_user_callback(
                 call,
-                "Failed to add user. No healthy VPN server is available.",
+                "Failed to add user. No VPN server is accepting new users.",
             )
             return
         

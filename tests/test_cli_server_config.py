@@ -1,5 +1,6 @@
 import ast
 import json
+import math
 import types
 import unittest
 from pathlib import Path
@@ -23,6 +24,7 @@ def load_start_telegram_bot():
     commands = []
     namespace = {
         "json": json,
+        "math": math,
         "InvalidInputError": InvalidInputError,
         "Command": types.SimpleNamespace(
             INSTALL_TELEGRAMBOT=types.SimpleNamespace(value="runbot.sh")
@@ -74,6 +76,28 @@ class CLIServerConfigTests(unittest.TestCase):
         server = json.loads(commands[0][-1])[0]
         self.assertFalse(server["enabled"])
         self.assertEqual(server["default_inbound_ids"], [])
+
+    def test_zero_weight_is_preserved_and_three_x_inbounds_are_optional(self):
+        start, commands = load_start_telegram_bot()
+
+        start("bot", "1", "", "", servers=[
+            "hy2=https://x.example,bearer-token,0,true,3x-ui,,1"
+        ])
+
+        server = json.loads(commands[0][-1])[0]
+        self.assertEqual(server["weight"], 0)
+        self.assertTrue(server["enabled"])
+        self.assertEqual(server["default_inbound_ids"], [])
+
+    def test_negative_and_non_finite_weights_are_rejected(self):
+        start, _commands = load_start_telegram_bot()
+
+        for weight in ("-1", "nan", "inf"):
+            with self.subTest(weight=weight):
+                with self.assertRaisesRegex(InvalidInputError, "finite non-negative"):
+                    start("bot", "1", "", "", servers=[
+                        f"primary=https://b.example,t,{weight},true"
+                    ])
 
 
 if __name__ == "__main__":

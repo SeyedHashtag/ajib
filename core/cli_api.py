@@ -1,6 +1,7 @@
 import os
 import subprocess
 import logging
+import math
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 from datetime import datetime, timedelta, timezone
@@ -101,8 +102,13 @@ def _safe_int(value, default: int = 0) -> int:
 
 
 def _safe_weight(value) -> float:
-    weight = _safe_float(value, 1.0)
-    return weight if weight > 0 else 1.0
+    try:
+        weight = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(weight) or weight < 0:
+        return 1.0
+    return 0.0 if weight == 0 else weight
 
 
 def _parse_datetime(value):
@@ -401,7 +407,7 @@ def _collect_vpn_and_live_users(api_client_module=None) -> tuple[dict, dict]:
                 "unknown_count": unknown_count,
                 "allocated_count": allocated_count,
                 "weight": weight,
-                "load_ratio": (allocated_count / weight) if healthy else None,
+                "load_ratio": (allocated_count / weight) if healthy and weight > 0 else None,
             }
             vpn["servers"].append(server_status)
 
@@ -1185,6 +1191,9 @@ def start_telegram_bot(token: str, adminid: str, api_url: str, api_key: str, ser
                     weight = float(parts[2].strip())
                 except ValueError:
                     raise InvalidInputError('Error: --server weight must be a number.')
+                if not math.isfinite(weight) or weight < 0:
+                    raise InvalidInputError('Error: --server weight must be a finite non-negative number.')
+                weight = 0.0 if weight == 0 else weight
             if len(parts) >= 4 and parts[3].strip():
                 enabled = parts[3].strip().lower() not in ('0', 'false', 'no', 'disabled')
             if len(parts) >= 5 and parts[4].strip():
@@ -1209,7 +1218,7 @@ def start_telegram_bot(token: str, adminid: str, api_url: str, api_key: str, ser
                     raise InvalidInputError('Error: --server IP limit must be a non-negative integer.')
                 if default_limit_ip < 0:
                     raise InvalidInputError('Error: --server IP limit must be a non-negative integer.')
-            if panel == '3x-ui' and enabled and not default_inbound_ids:
+            if panel == '3x-ui' and enabled and weight > 0 and not default_inbound_ids:
                 raise InvalidInputError('Error: enabled 3x-ui servers require default inbound IDs.')
             server_id = server_id.strip()
             server_url = server_url.strip()
