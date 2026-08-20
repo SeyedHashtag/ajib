@@ -1,3 +1,11 @@
+## v2.2.0
+✨ Add resumable bulk account transfers with eligibility previews, conflict handling, progress tracking, and durable customer notifications
+✨ Support copying Hysteria2 users from 3x-ui to Blitz while preserving credentials, access limits, state, notes, traffic, and expiry semantics
+✨ Add reseller application review queues and centralized pending confirmations for receipts, reserved renewals, and referral payouts
+🛠️ Reinspect legacy reserved renewals safely after timezone normalization and provide clearer operator recovery actions for renewals needing attention
+🐛 Strengthen hosted payment, renewal, debt, and notification recovery so failed or stale work can be retried without duplicate effects
+✅ Expand regression coverage for bulk transfers, cross-panel copying, reseller review, renewal migrations, hosted runtime recovery, and database schema upgrades
+
 ## v2.1.1
 🛠️ Normalize persisted bot timestamps to canonical UTC across payments, renewals, credits, referrals, hosted bots, backups, and operational reporting
 🐛 Repair corroborated legacy reserved-renewal timestamps safely while preserving ambiguous or unrelated records
