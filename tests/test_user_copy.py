@@ -377,7 +377,7 @@ class UserCopyTests(unittest.TestCase):
         self.assertEqual(result["error"], "destination_exists")
         self.assertEqual(destination.add_args[5]["password"], "existing")
 
-    def test_three_x_copy_preserves_password_counters_state_and_inbounds(self):
+    def test_blitz_to_three_x_prefixes_password_and_preserves_state(self):
         destination = ThreeXDestination()
         source = source_user(
             status="On-hold",
@@ -391,7 +391,7 @@ class UserCopyTests(unittest.TestCase):
         result = multi.copy_blitz_user(api_client.UserRef("src", "alice"), "x3", [4])
 
         self.assertTrue(result["ok"])
-        self.assertEqual(destination.spec.password, "same-secret")
+        self.assertEqual(destination.spec.password, "alice:same-secret")
         self.assertEqual(destination.spec.traffic_limit_bytes, 10 * api_client.GIB)
         self.assertTrue(destination.spec.delayed_start)
         self.assertEqual(destination.traffic, (123, 456))
@@ -472,6 +472,7 @@ class UserCopyTests(unittest.TestCase):
         ))
 
         self.assertTrue(result["ok"])
+        self.assertEqual(destination.create_args[5]["password"], "same-secret")
         self.assertTrue(destination.create_args[3])
         self.assertEqual(destination.create_args[4], "imported")
         self.assertEqual(result["source_panel_type"], "3x-ui")

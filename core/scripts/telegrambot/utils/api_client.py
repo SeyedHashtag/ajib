@@ -45,6 +45,21 @@ BLITZ_PANEL = "blitz"
 _thread_local = threading.local()
 
 
+def _destination_transfer_password(
+    username: str,
+    source_password: str | None,
+    source_panel: str,
+    destination_panel: str,
+) -> str | None:
+    if (
+        source_panel == BLITZ_PANEL
+        and destination_panel == THREE_X_UI_PANEL
+        and isinstance(source_password, str)
+    ):
+        return f"{username}:{source_password}"
+    return source_password
+
+
 @dataclass(frozen=True)
 class UserRef:
     server_id: str
@@ -2234,7 +2249,12 @@ class MultiServerAPI:
             username=snapshot.username,
             traffic_limit_bytes=destination_limit,
             expiration_days=snapshot.duration_days,
-            password=snapshot.password,
+            password=_destination_transfer_password(
+                snapshot.username,
+                snapshot.password,
+                snapshot.source_panel_type,
+                destination.panel_type,
+            ),
             creation_date=blitz_creation_date,
             absolute_expiry=snapshot.absolute_expiry,
             delayed_start=snapshot.delayed_start,
@@ -2317,7 +2337,7 @@ class MultiServerAPI:
             else copied.get("unlimited_user")
         )
         verified = (
-            copied.get("password") == snapshot.password
+            copied.get("password") == spec.password
             and parsed_nonnegative(copied.get("max_download_bytes")) == destination_limit
             and parsed_destination_counter(copied.get("upload_bytes")) == expected_upload
             and parsed_destination_counter(copied.get("download_bytes")) == expected_download

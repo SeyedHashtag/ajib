@@ -23,6 +23,7 @@ from .api_client import (
     MultiServerAPI,
     UserCopySpec,
     UserRef,
+    _destination_transfer_password,
 )
 from .account_state import panel_deadline
 from .time_utils import format_utc_timestamp, utc_now
@@ -679,7 +680,13 @@ def _ceil_utc_day(value):
     return midnight if current == midnight else midnight + timedelta(days=1)
 
 
-def _interrupted_destination_match(job, source_user, destination_user, destination_panel):
+def _interrupted_destination_match(
+    job,
+    source_user,
+    destination_user,
+    destination_panel,
+    username,
+):
     """Strictly compare live states before adopting an interrupted creation."""
     source_panel = str(source_user.get("panel_type") or BLITZ_PANEL)
     source_access = source_user.get(
@@ -710,8 +717,14 @@ def _interrupted_destination_match(job, source_user, destination_user, destinati
     if destination_panel == BLITZ_PANEL:
         destination_upload = 0 if destination_upload is None else destination_upload
         destination_download = 0 if destination_download is None else destination_download
+    expected_password = _destination_transfer_password(
+        username,
+        source_user.get("password"),
+        source_panel,
+        destination_panel,
+    )
     matched = (
-        destination_user.get("password") == source_user.get("password")
+        destination_user.get("password") == expected_password
         and _nonnegative_int(destination_user.get("max_download_bytes")) == expected_total
         and _nonnegative_int(destination_upload) == expected_upload
         and _nonnegative_int(destination_download) == expected_download
@@ -809,7 +822,7 @@ def _recover_item(job, item, multi_api, *, path=None):
         if destination_result.get("status") == "found" and source_result.get("status") == "found":
             matched, metadata = _interrupted_destination_match(
                 job, source_result.get("data") or {}, destination_result.get("data") or {},
-                _panel_type(destination),
+                _panel_type(destination), item["username"],
             )
             if matched:
                 _set_item(

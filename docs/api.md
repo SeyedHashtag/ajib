@@ -131,12 +131,13 @@ supported. Reverse copies require a nonempty `auth` credential and at least one
 live Hysteria-family inbound attached to the source account.
 
 Copies preserve credentials, finite quota semantics, access/IP policy, timer
-state, blocked state, and canonical nonblank notes. Blitz destinations receive
-the remaining allowance rounded up to GiB and start with zero counters; sources
-with unlimited traffic or no remaining allowance are rejected. 3x-ui
-destinations retain exact byte quotas and counters, use `limitIp=0` for
-unlimited access, and otherwise apply the destination server's configured IP
-limit.
+state, blocked state, and canonical nonblank notes. When copying from Blitz to
+3x-ui, the destination `auth` credential is `{username}:{blitz_password}`.
+Blitz destinations receive the remaining allowance rounded up to GiB and start
+with zero counters; sources with unlimited traffic or no remaining allowance
+are rejected. 3x-ui destinations retain exact byte quotas and counters, use
+`limitIp=0` for unlimited access, and otherwise apply the destination server's
+configured IP limit.
 
 Unlimited-duration accounts are preserved on every supported route. Blitz
 `expiration_days=0` maps to 3x-ui `expiryTime=0`, carries no finite-duration

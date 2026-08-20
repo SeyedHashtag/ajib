@@ -601,6 +601,55 @@ def test_restart_recovery_adopts_only_a_strictly_matching_interrupted_copy(tmp_p
     assert item["error_code"] == "interrupted_copy_ambiguous"
 
 
+@pytest.mark.parametrize(
+    ("destination_password", "expected_stage"),
+    [
+        ("alice:secret", "completed"),
+        ("secret", "manual_review"),
+    ],
+)
+def test_blitz_to_three_x_restart_recovery_requires_prefixed_password(
+    tmp_path,
+    destination_password,
+    expected_stage,
+):
+    path = str(tmp_path / f"{expected_stage}.db")
+    source_user = user("alice")
+    source = FakeClient("source", {"alice": source_user})
+    destination = FakeClient(
+        "destination",
+        panel="3x-ui",
+        inbounds=[{"id": 7, "protocol": "hysteria2", "remark": "hy2"}],
+    )
+    multi = FakeMulti(source, destination)
+    transfer_spec = BulkUserTransferSpec(
+        mode="copy",
+        source_server_id="source",
+        destination_server_id="destination",
+        inbound_ids=(7,),
+        requesting_admin="42",
+        notification_policy="disabled",
+    )
+    job_id = create_from_preflight(path, multi, transfer_spec)
+    destination_user = dict(source_user, password=destination_password)
+    destination_user["unlimited_ip"] = destination_user.pop("unlimited_user")
+    destination_user["inbound_ids"] = [7]
+    destination.users["alice"] = destination_user
+    database.get_connection(path).execute(
+        "UPDATE bulk_transfer_items SET stage='copying' WHERE job_id=?", (job_id,)
+    )
+
+    assert run_transfer_job(job_id, multi_api=multi, path=path)
+    item = get_job(job_id, path=path, include_items=True)["items"][0]
+
+    assert item["stage"] == expected_stage
+    if expected_stage == "completed":
+        metadata = json.loads(item["result_json"])
+        assert metadata["recovered_after_restart"] is True
+    else:
+        assert item["error_code"] == "interrupted_copy_ambiguous"
+
+
 def test_unlimited_duration_is_eligible_and_restart_recovery_matches_without_expiry(tmp_path):
     path = str(tmp_path / "state.db")
     unlimited = user("alice")
