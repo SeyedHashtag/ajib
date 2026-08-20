@@ -1,3 +1,8 @@
+## v2.7.3
+🛠️ Prefix Blitz passwords with the username when copying or migrating accounts to 3x-ui for valid Hysteria2 credentials
+🐛 Verify the transformed destination password during transfers and safely recover matching interrupted bulk jobs
+✅ Add regression coverage for Blitz-to-3x-ui password conversion, reverse transfers, and restart recovery
+
 ## v2.7.2
 🚀 Add manual release dispatch support and grant the release job explicit permission to publish repository contents
 🛠️ Limit GitHub release descriptions to the changelog section matching the version being published
