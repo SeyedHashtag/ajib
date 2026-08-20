@@ -4,7 +4,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from utils.api_client import MultiServerAPI, get_server_configs, save_server_configs
+from utils.api_client import MultiServerAPI, get_server_configs, update_server_config
 from utils.command import bot, is_admin
 from utils.common import admin_action_text
 from utils.telegram_safe import (
@@ -207,8 +207,8 @@ def handle_vpn_server_callback(call):
         return
 
     if action == "toggle":
-        target["enabled"] = not bool(target.get("enabled", True))
-        if not save_server_configs(servers):
+        enabled = not bool(target.get("enabled", True))
+        if not update_server_config(server_id, enabled=enabled):
             safe_answer_callback_query(bot, call.id, "Failed to update server.", show_alert=True)
             return
         safe_answer_callback_query(bot, call.id, "Server updated.")
@@ -241,15 +241,7 @@ def handle_server_weight_input(message):
         bot.reply_to(message, "Weight must be a finite non-negative number. Use 0 to pause automatic placement.")
         return
 
-    servers = get_server_configs()
-    updated = False
-    for server in servers:
-        if server["id"] == server_id:
-            server["weight"] = weight
-            updated = True
-            break
-
-    if not updated or not save_server_configs(servers):
+    if not update_server_config(server_id, weight=weight):
         bot.reply_to(message, "Failed to update server weight.")
         server_admin_state.pop(message.from_user.id, None)
         return

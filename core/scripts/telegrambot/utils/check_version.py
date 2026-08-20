@@ -3,7 +3,7 @@ import re
 from utils.command import AJIB_PYTHON, ADMIN_USER_IDS, CLI_PATH, bot, run_cli_command
 
 def check_version():
-    result = run_cli_command([AJIB_PYTHON, CLI_PATH, "check-version"])
+    result = run_cli_command([AJIB_PYTHON, CLI_PATH, "version", "--check"])
     if result.startswith("Error:"):
         error_message = f"Error checking version: {result}"
         print(error_message)

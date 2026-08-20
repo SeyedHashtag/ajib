@@ -15,6 +15,7 @@ import math
 import os
 import re
 import secrets
+import sys
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -349,35 +350,55 @@ def save_server_configs(servers: list[dict]) -> bool:
     if not normalized:
         return False
 
-    os.makedirs(os.path.dirname(TELEGRAM_ENV_PATH), exist_ok=True)
-    existing_lines = []
-    if os.path.exists(TELEGRAM_ENV_PATH):
-        with open(TELEGRAM_ENV_PATH, "r") as f:
-            existing_lines = f.readlines()
+    core_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    if core_dir not in sys.path:
+        sys.path.insert(0, core_dir)
+    try:
+        import ajib_operator
+        from pathlib import Path
+        fingerprint = ajib_operator.replace_servers(normalized, path=Path(TELEGRAM_ENV_PATH))
+    except Exception as error:
+        print(f"Failed to save server configuration atomically: {type(error).__name__}")
+        return False
 
     updates = {
         "SERVERS_JSON": json.dumps(normalized, separators=(",", ":")),
         "URL": normalized[0]["url"],
         "TOKEN": normalized[0]["token"],
     }
-    seen = set()
-    new_lines = []
-    for line in existing_lines:
-        key = line.split("=", 1)[0].strip() if "=" in line else None
-        if key in updates:
-            new_lines.append(f"{key}={updates[key]}\n")
-            seen.add(key)
-        else:
-            new_lines.append(line)
-    for key, value in updates.items():
-        if key not in seen:
-            new_lines.append(f"{key}={value}\n")
+    os.environ.update(updates)
+    os.environ["AJIB_CONFIG_FINGERPRINT"] = fingerprint
+    if os.getenv("AJIB_BOT_ROLE") == "main":
+        ajib_operator.refresh_ready_fingerprint(fingerprint)
+    multi_server_api = globals().get("MultiServerAPI")
+    if multi_server_api is not None:
+        multi_server_api.invalidate_all_caches()
+    return True
 
-    with open(TELEGRAM_ENV_PATH, "w") as f:
-        f.writelines(new_lines)
-    os.environ["SERVERS_JSON"] = updates["SERVERS_JSON"]
-    os.environ["URL"] = updates["URL"]
-    os.environ["TOKEN"] = updates["TOKEN"]
+
+def update_server_config(server_id: str, **changes) -> bool:
+    """Atomically edit one server without overwriting concurrent changes."""
+    core_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    if core_dir not in sys.path:
+        sys.path.insert(0, core_dir)
+    try:
+        import ajib_operator
+        from pathlib import Path
+        normalized, fingerprint = ajib_operator.update_server(
+            server_id, changes, path=Path(TELEGRAM_ENV_PATH)
+        )
+    except Exception as error:
+        print(f"Failed to update server configuration atomically: {type(error).__name__}")
+        return False
+
+    os.environ.update({
+        "SERVERS_JSON": json.dumps(normalized, separators=(",", ":")),
+        "URL": normalized[0]["url"],
+        "TOKEN": normalized[0]["token"],
+        "AJIB_CONFIG_FINGERPRINT": fingerprint,
+    })
+    if os.getenv("AJIB_BOT_ROLE") == "main":
+        ajib_operator.refresh_ready_fingerprint(fingerprint)
     multi_server_api = globals().get("MultiServerAPI")
     if multi_server_api is not None:
         multi_server_api.invalidate_all_caches()

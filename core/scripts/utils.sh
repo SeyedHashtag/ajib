@@ -1,4 +1,9 @@
-source /etc/ajib/core/scripts/path.sh
+#!/bin/bash
+# shellcheck disable=SC2034  # Functions populate variables for their callers.
+
+AJIB_INSTALL_DIR=${AJIB_INSTALL_DIR:-/etc/ajib}
+# shellcheck source=core/scripts/path.sh
+source "$AJIB_INSTALL_DIR/core/scripts/path.sh"
 
 # Function to define colors
 define_colors() {

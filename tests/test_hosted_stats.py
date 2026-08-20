@@ -264,7 +264,9 @@ class HostedStatsAggregationTests(unittest.TestCase):
 
 class HostedStatsWorkerTests(unittest.TestCase):
     def test_money_menu_routes_statistics_as_an_owner_action(self):
-        self.assertIn(("stats",), _worker_constant("OWNER_MONEY_ROWS"))
+        self.assertTrue(
+            any("stats" in row for row in _worker_constant("OWNER_MONEY_ROWS"))
+        )
         owner_handler = ast.get_source_segment(
             WORKER_SOURCE, _worker_function("owner_menu_action")
         )

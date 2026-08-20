@@ -15,6 +15,8 @@ import threading
 import time
 import traceback
 import logging
+import json
+import tempfile
 from types import SimpleNamespace
 from utils.telegram_safe import safe_reply_to, safe_send_message
 
@@ -287,7 +289,38 @@ def run_polling_forever():
             time.sleep(retry_delay_seconds)
             retry_delay_seconds = min(max_retry_delay_seconds, retry_delay_seconds * 2)
 
+
+def write_readiness_marker():
+    """Authenticate once and publish readiness for the active configuration."""
+    bot_info = bot.get_me()
+    fingerprint = os.getenv("AJIB_CONFIG_FINGERPRINT", "").strip()
+    if not fingerprint:
+        raise RuntimeError("AJIB_CONFIG_FINGERPRINT is missing")
+    target = os.getenv("AJIB_READY_FILE", "/run/ajib/main.ready")
+    directory = os.path.dirname(target)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".main.ready.", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as ready_file:
+            ready_file.write(json.dumps({
+                "config_fingerprint": fingerprint,
+                "pid": os.getpid(),
+                "bot_id": getattr(bot_info, "id", None),
+                "username": getattr(bot_info, "username", None),
+                "ready_at": time.time(),
+            }, separators=(",", ":")))
+            ready_file.flush()
+            os.fsync(ready_file.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
 if __name__ == '__main__':
+    write_readiness_marker()
     monitor_thread = threading.Thread(target=monitoring_thread, daemon=True)
     monitor_thread.start()
     version_thread = threading.Thread(target=version_monitoring, daemon=True)

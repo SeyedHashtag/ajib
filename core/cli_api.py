@@ -1218,8 +1218,8 @@ def start_telegram_bot(token: str, adminid: str, api_url: str, api_key: str, ser
                     raise InvalidInputError('Error: --server IP limit must be a non-negative integer.')
                 if default_limit_ip < 0:
                     raise InvalidInputError('Error: --server IP limit must be a non-negative integer.')
-            if panel == '3x-ui' and enabled and weight > 0 and not default_inbound_ids:
-                raise InvalidInputError('Error: enabled 3x-ui servers require default inbound IDs.')
+            if panel == '3x-ui' and not default_inbound_ids:
+                raise InvalidInputError('Error: 3x-ui servers require default inbound IDs.')
             server_id = server_id.strip()
             server_url = server_url.strip()
             server_token = server_token.strip()

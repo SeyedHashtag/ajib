@@ -26,6 +26,16 @@ PYTHON = sys.executable
 STOPPING = False
 POLL_INTERVAL_SECONDS = 3
 STABLE_UPTIME_SECONDS = 300
+READY_FILE = os.getenv("AJIB_READY_FILE", "/run/ajib/main.ready")
+
+
+def _clear_main_readiness():
+    try:
+        os.unlink(READY_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        print(f"Could not clear main readiness marker: {type(error).__name__}", flush=True)
 
 
 def _set_hosted_status(reseller_id, status, error=None):
@@ -51,6 +61,8 @@ class Worker:
         self.started_at = None
 
     def _record_failure(self, detail):
+        if not self.hosted:
+            _clear_main_readiness()
         self.failures += 1
         delay = min(60, 2 ** min(self.failures, 6))
         self.next_start = time.monotonic() + delay
@@ -64,6 +76,8 @@ class Worker:
             return False
         if self.hosted:
             _set_hosted_status(self.key, "starting")
+        else:
+            _clear_main_readiness()
         try:
             self.process = subprocess.Popen(self.command, cwd=BOT_DIR, env=self.env)
         except (OSError, subprocess.SubprocessError) as error:
@@ -93,6 +107,8 @@ class Worker:
         process = self.process
         self.process = None
         self.started_at = None
+        if not self.hosted:
+            _clear_main_readiness()
         if not process or process.poll() is not None:
             return
         try:

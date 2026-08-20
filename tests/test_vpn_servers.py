@@ -120,7 +120,7 @@ def load_vpn_servers_module():
     api_client_stub = types.ModuleType("utils.api_client")
     api_client_stub.MultiServerAPI = FakeMultiServerAPI
     api_client_stub.get_server_configs = lambda: [{"id": "s1", "name": "Server 1", "enabled": True}]
-    api_client_stub.save_server_configs = lambda _servers: True
+    api_client_stub.update_server_config = lambda _server_id, **_changes: True
     sys.modules["utils.api_client"] = api_client_stub
 
     telegram_safe_stub = types.ModuleType("utils.telegram_safe")
@@ -190,7 +190,7 @@ class VpnServersTests(unittest.TestCase):
         servers = [{"id": "s1", "name": "Server 1", "enabled": True, "weight": 1}]
         saved = []
         module.get_server_configs = lambda: servers
-        module.save_server_configs = lambda value: saved.append([dict(item) for item in value]) or True
+        module.update_server_config = lambda server_id, **changes: saved.append((server_id, changes)) or True
         module.server_admin_state[1] = {"state": "waiting_server_weight", "server_id": "s1"}
         message = types.SimpleNamespace(
             from_user=types.SimpleNamespace(id=1),
@@ -201,7 +201,7 @@ class VpnServersTests(unittest.TestCase):
 
         module.handle_server_weight_input(message)
 
-        self.assertEqual(saved[0][0]["weight"], 0)
+        self.assertEqual(saved[0], ("s1", {"weight": 0.0}))
         self.assertNotIn(1, module.server_admin_state)
         self.assertEqual(len(module.VPN_SERVER_MENU_EXECUTOR.jobs), 1)
 
@@ -229,7 +229,7 @@ class VpnServersTests(unittest.TestCase):
     def test_toggle_reports_persistence_failure(self):
         module, bot = load_vpn_servers_module()
         module.get_server_configs = lambda: [{"id": "s1", "name": "Server 1", "enabled": True}]
-        module.save_server_configs = lambda _servers: False
+        module.update_server_config = lambda _server_id, **_changes: False
         call = types.SimpleNamespace(
             id="callback",
             data="vpn_server:toggle:s1",

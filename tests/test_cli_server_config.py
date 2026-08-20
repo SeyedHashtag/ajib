@@ -58,7 +58,7 @@ class CLIServerConfigTests(unittest.TestCase):
         self.assertEqual(server["default_inbound_ids"], [4, 7])
         self.assertEqual(server["default_limit_ip"], 2)
 
-    def test_enabled_three_x_requires_default_inbounds(self):
+    def test_three_x_requires_default_inbounds(self):
         start, _commands = load_start_telegram_bot()
 
         with self.assertRaisesRegex(InvalidInputError, "require default inbound"):
@@ -66,28 +66,25 @@ class CLIServerConfigTests(unittest.TestCase):
                 "hy2=https://x.example,bearer-token,1,true,3x-ui"
             ])
 
-    def test_disabled_three_x_can_be_copy_only(self):
+    def test_disabled_three_x_still_requires_inbounds(self):
+        start, _commands = load_start_telegram_bot()
+
+        with self.assertRaisesRegex(InvalidInputError, "require default inbound"):
+            start("bot", "1", "", "", servers=[
+                "hy2=https://x.example,bearer-token,1,false,3x-ui,,1"
+            ])
+
+    def test_zero_weight_is_preserved_with_three_x_inbounds(self):
         start, commands = load_start_telegram_bot()
 
         start("bot", "1", "", "", servers=[
-            "hy2=https://x.example,bearer-token,1,false,3x-ui,,1"
-        ])
-
-        server = json.loads(commands[0][-1])[0]
-        self.assertFalse(server["enabled"])
-        self.assertEqual(server["default_inbound_ids"], [])
-
-    def test_zero_weight_is_preserved_and_three_x_inbounds_are_optional(self):
-        start, commands = load_start_telegram_bot()
-
-        start("bot", "1", "", "", servers=[
-            "hy2=https://x.example,bearer-token,0,true,3x-ui,,1"
+            "hy2=https://x.example,bearer-token,0,true,3x-ui,4,1"
         ])
 
         server = json.loads(commands[0][-1])[0]
         self.assertEqual(server["weight"], 0)
         self.assertTrue(server["enabled"])
-        self.assertEqual(server["default_inbound_ids"], [])
+        self.assertEqual(server["default_inbound_ids"], [4])
 
     def test_negative_and_non_finite_weights_are_rejected(self):
         start, _commands = load_start_telegram_bot()

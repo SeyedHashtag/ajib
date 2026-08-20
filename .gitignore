@@ -164,6 +164,12 @@ ajib_venv/
 
 # Telegram bot runtime state
 core/scripts/telegrambot/*.json
+core/scripts/telegrambot/*.db
+core/scripts/telegrambot/*.db-wal
+core/scripts/telegrambot/*.db-shm
+core/scripts/telegrambot/.env.previous
+core/scripts/telegrambot/.env.failed
+core/scripts/telegrambot/.env.lock
 core/scripts/telegrambot/logs/
 core/scripts/telegrambot/broadcast_logs/
 

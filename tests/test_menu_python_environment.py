@@ -29,24 +29,28 @@ class MenuPythonEnvironmentTests(unittest.TestCase):
         path_text = (REPO_ROOT / "core" / "scripts" / "path.sh").read_text(encoding="utf-8")
         helper_body = shell_function_body(menu_text, "run_ajib_cli")
 
-        self.assertIn('AJIB_PYTHON="/etc/ajib/ajib_venv/bin/python"', path_text)
+        self.assertIn('AJIB_INSTALL_DIR=${AJIB_INSTALL_DIR:-/etc/ajib}', path_text)
+        self.assertIn('AJIB_PYTHON="$AJIB_INSTALL_DIR/ajib_venv/bin/python"', path_text)
         self.assertIn('"$AJIB_PYTHON" "$CLI_PATH" "$@"', helper_body)
-        self.assertEqual(menu_text.count("run_ajib_cli telegram"), 3)
+        self.assertIn("run_ajib_cli setup", menu_text)
+        self.assertIn("run_ajib_cli server manage", menu_text)
+        self.assertNotIn("run_ajib_cli telegram", menu_text)
         self.assertNotIn('python3 "$CLI_PATH"', menu_text)
 
-    def test_inline_json_parser_keeps_using_system_python(self):
+    def test_setup_and_server_parsing_live_in_python(self):
         menu_text = (REPO_ROOT / "menu.sh").read_text(encoding="utf-8")
+        cli_text = (REPO_ROOT / "core" / "cli.py").read_text(encoding="utf-8")
 
-        self.assertIn('python3 - "$TELEGRAM_ENV"', menu_text)
+        self.assertNotIn('python3 - "$TELEGRAM_ENV"', menu_text)
+        self.assertIn("def _interactive_setup", cli_text)
+        self.assertIn("hide_input=True", cli_text)
 
     def test_server_weight_reader_accepts_zero(self):
-        menu_text = (REPO_ROOT / "menu.sh").read_text(encoding="utf-8")
-        helper_body = shell_function_body(menu_text, "read_nonnegative_number")
+        operator_text = (REPO_ROOT / "core" / "ajib_operator.py").read_text(encoding="utf-8")
+        cli_text = (REPO_ROOT / "core" / "cli.py").read_text(encoding="utf-8")
 
-        self.assertIn('$value >= 0', helper_body)
-        self.assertNotIn('$value > 0', helper_body)
-        self.assertEqual(menu_text.count('read_nonnegative_number "Balancing weight'), 2)
-        self.assertIn("0 pauses automatic placement", menu_text)
+        self.assertIn("weight < 0", operator_text)
+        self.assertIn("0 pauses new placement", cli_text)
 
     def test_missing_virtual_environment_has_actionable_error(self):
         menu_text = (REPO_ROOT / "menu.sh").read_text(encoding="utf-8")
@@ -56,7 +60,7 @@ class MenuPythonEnvironmentTests(unittest.TestCase):
                 'AJIB_PYTHON="/definitely/missing/ajib/python"',
                 'CLI_PATH="/definitely/missing/ajib/cli.py"',
                 helper_body,
-                "run_ajib_cli telegram -a stop",
+                "run_ajib_cli stop",
             )
         )
 
@@ -84,8 +88,8 @@ class MenuPythonEnvironmentTests(unittest.TestCase):
         ).read_text()
 
         self.assertIn("'/etc/ajib/ajib_venv/bin/python'", command_text)
-        self.assertIn('[AJIB_PYTHON, CLI_PATH, "backup-ajib"]', backup_text)
-        self.assertIn('[AJIB_PYTHON, CLI_PATH, "check-version"]', version_text)
+        self.assertIn('[AJIB_PYTHON, CLI_PATH, "backup"]', backup_text)
+        self.assertIn('[AJIB_PYTHON, CLI_PATH, "version", "--check"]', version_text)
         self.assertNotIn("python3 {CLI_PATH}", backup_text + version_text)
 
     def test_cli_runner_executes_argument_lists_without_a_shell(self):

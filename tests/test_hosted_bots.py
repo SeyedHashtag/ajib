@@ -326,7 +326,9 @@ class HostedLifecycleScriptTests(unittest.TestCase):
 
     def test_upgrade_migrates_existing_service(self):
         script = (ROOT / "upgrade.sh").read_text(encoding="utf-8")
-        self.assertIn("supervisor.py", script)
+        runbot = (BOT_DIR / "runbot.sh").read_text(encoding="utf-8")
+        self.assertIn("core/scripts/telegrambot/runbot.sh", script)
+        self.assertIn("supervisor.py", runbot)
         self.assertIn("ajib-telegram-bot.service", script)
 
 

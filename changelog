@@ -1,3 +1,12 @@
+## v2.3.0
+✨ Add a real `ajib` operator command with secure setup, diagnostics, recovery, and complete VPN server lifecycle management
+✨ Add resumable CLI copy and migration controls with explicit notification policy, progress, cancellation, resume, and report export
+🔒 Centralize validation and locked atomic configuration writes, hide credential input, preserve unrelated environment values, and keep protected rollback copies
+🛡️ Block unsafe server removal using live account, database reference, final-server, and active-migration checks with a backed-up break-glass flow
+🛠️ Add configuration-specific readiness, advisory preflight checks, transactional systemd rollback, stable-release channels, and exact legacy-alias migration
+📚 Expand operator documentation for credentials, 3x-ui inbounds, server states, migration, diagnostics, recovery, and non-interactive setup
+✅ Add Python 3.10–3.12 Linux CI, shell validation, deterministic service tests, and CLI/configuration safety coverage
+
 ## v2.2.0
 ✨ Add resumable bulk account transfers with eligibility previews, conflict handling, progress tracking, and durable customer notifications
 ✨ Support copying Hysteria2 users from 3x-ui to Blitz while preserving credentials, access limits, state, notes, traffic, and expiry semantics
