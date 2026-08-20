@@ -1,3 +1,9 @@
+## v2.7.1
+✨ Add end-to-end support for unlimited-duration accounts across creation, editing, renewal, copying, bulk transfers, cleanup, and customer displays
+🛠️ Preserve unlimited expiry semantics consistently across Blitz and 3x-ui APIs without converting them into finite or expired accounts
+🐛 Prevent unlimited-duration accounts from being selected for expiration cleanup and show their status correctly in admin and customer workflows
+📚 Document the unlimited-duration API contract and expand regression coverage for account state, transfers, renewals, cleanup, and 3x-ui integration
+
 ## v2.3.0
 ✨ Add a real `ajib` operator command with secure setup, diagnostics, recovery, and complete VPN server lifecycle management
 ✨ Add resumable CLI copy and migration controls with explicit notification policy, progress, cancellation, resume, and report export
