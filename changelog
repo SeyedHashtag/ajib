@@ -1,3 +1,8 @@
+## v2.7.2
+🚀 Add manual release dispatch support and grant the release job explicit permission to publish repository contents
+🛠️ Limit GitHub release descriptions to the changelog section matching the version being published
+🐛 Fail the release workflow with a clear error when the matching changelog section is missing
+
 ## v2.7.1
 ✨ Add end-to-end support for unlimited-duration accounts across creation, editing, renewal, copying, bulk transfers, cleanup, and customer displays
 🛠️ Preserve unlimited expiry semantics consistently across Blitz and 3x-ui APIs without converting them into finite or expired accounts
