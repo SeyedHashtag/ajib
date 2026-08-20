@@ -113,6 +113,27 @@ ajib-created 3x-ui accounts keep their configured duration in a non-secret
 comment marker. This allows reset to restore delayed-start expiry. Reset fails
 closed for pre-existing clients whose original duration cannot be determined.
 
+## Copy contract
+
+The admin Copy User action supports Blitz-to-Blitz, Blitz-to-3x-ui, and
+Hysteria/Hysteria2 3x-ui-to-Blitz transfers. 3x-ui-to-3x-ui copying is not
+supported. Reverse copies require a nonempty `auth` credential and at least one
+live Hysteria-family inbound attached to the source account.
+
+Copies preserve credentials, finite quota semantics, access/IP policy, timer
+state, blocked state, and canonical nonblank notes. Blitz destinations receive
+the remaining allowance rounded up to GiB and start with zero counters; sources
+with unlimited traffic or no remaining allowance are rejected. 3x-ui
+destinations retain exact byte quotas and counters, use `limitIp=0` for
+unlimited access, and otherwise apply the destination server's configured IP
+limit.
+
+Blitz stores started-account dates at day precision. If a 3x-ui absolute expiry
+has a time component, the copy rounds it outward to the next UTC day so service
+is never shortened. Successful copy results report `source_panel_type`,
+`expiry_rounded`, and `expiry_extension_seconds`; the Telegram confirmation
+shows both panel types and warns about any extension.
+
 ## Renewal contract
 
 Renewal checkout may select any plan currently eligible for the sales audience,

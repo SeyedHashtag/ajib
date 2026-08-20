@@ -76,6 +76,36 @@ class UserCopySpec:
     inbound_ids: tuple[int, ...] = ()
 
 
+@dataclass(frozen=True)
+class _UserTransferSnapshot:
+    username: str
+    source_panel_type: str
+    password: str
+    total_bytes: int
+    upload_bytes: int
+    download_bytes: int
+    duration_days: int
+    blocked: bool
+    delayed_start: bool
+    absolute_expiry: datetime | None
+    note: str | None
+    unlimited_access: bool
+
+
+def _canonical_note(value) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _ceil_utc_day(value: datetime) -> datetime:
+    current = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    midnight = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight if current == midnight else midnight + timedelta(days=1)
+
+
 def _float_env(name, default, minimum=0.1):
     try:
         value = float(os.getenv(name, default))
@@ -931,6 +961,28 @@ class ThreeXUIAPIClient(APIClient):
             traffic = {}
         return dict(client), inbound_ids, dict(traffic)
 
+    @staticmethod
+    def _client_update_payload(client: dict) -> dict:
+        """Sanitize a full 3x-ui read record for the replacement endpoint."""
+        payload = dict(client or {})
+        if "id" in payload and not isinstance(payload.get("id"), str):
+            payload.pop("id", None)
+        # 3x-ui v3 serializes the database value as a string on reads even
+        # though its Go update model requires []string. Preserve configured
+        # values while making the empty/default representation writable.
+        allowed_ips = payload.get("allowedIPs")
+        if isinstance(allowed_ips, str):
+            normalized = allowed_ips.strip()
+            if not normalized:
+                payload["allowedIPs"] = []
+            else:
+                try:
+                    parsed = json.loads(normalized)
+                except (TypeError, ValueError):
+                    parsed = [item.strip() for item in normalized.split(",") if item.strip()]
+                payload["allowedIPs"] = parsed if isinstance(parsed, list) else []
+        return payload
+
     def _normalise_user(self, item, online_emails: set[str] | None = None, traffic_override=None) -> dict | None:
         client, inbound_ids, traffic = self._record_parts(item)
         if isinstance(traffic_override, dict):
@@ -969,6 +1021,10 @@ class ThreeXUIAPIClient(APIClient):
         online = username in (online_emails or set())
         status = "Disabled" if blocked else ("On-hold" if delayed_start else ("Online" if online else "Offline"))
         credential_fields = [name for name in ("auth", "password", "uuid", "id") if client.get(name)]
+        selected_credential = next(
+            (name for name in ("auth", "password", "uuid", "id") if isinstance(client.get(name), str) and client.get(name)),
+            None,
+        )
         return {
             "username": username,
             "panel_type": THREE_X_UI_PANEL,
@@ -992,8 +1048,12 @@ class ThreeXUIAPIClient(APIClient):
             "note": self._comment_without_marker(client.get("comment")),
             "inbound_ids": inbound_ids,
             "sub_id": client.get("subId"),
-            "password": client.get("auth") or client.get("password"),
-            "credential_metadata": {"panel": THREE_X_UI_PANEL, "fields_present": credential_fields},
+            "password": client.get(selected_credential) if selected_credential else None,
+            "credential_metadata": {
+                "panel": THREE_X_UI_PANEL,
+                "fields_present": credential_fields,
+                "selected_field": selected_credential,
+            },
         }
 
     def get_users(self):
@@ -1163,7 +1223,11 @@ class ThreeXUIAPIClient(APIClient):
             if not duration:
                 return None
             client["expiryTime"] = int((utc_now() + timedelta(days=duration)).timestamp() * 1000)
-        result = self._xui_result("POST", f"clients/update/{quote(str(username), safe='')}", client)
+        result = self._xui_result(
+            "POST",
+            f"clients/update/{quote(str(username), safe='')}",
+            self._client_update_payload(client),
+        )
         if result.get("status") == "succeeded":
             MultiServerAPI.invalidate_all_caches()
             return {"message": result.get("message") or "Client updated"}
@@ -1182,7 +1246,11 @@ class ThreeXUIAPIClient(APIClient):
             return reset
         client["expiryTime"] = -duration * MILLISECONDS_PER_DAY
         client["enable"] = True
-        updated = self._xui_result("POST", f"clients/update/{quote(str(username), safe='')}", client)
+        updated = self._xui_result(
+            "POST",
+            f"clients/update/{quote(str(username), safe='')}",
+            self._client_update_payload(client),
+        )
         if updated.get("status") != "succeeded":
             return updated
         MultiServerAPI.invalidate_all_caches()
@@ -1259,7 +1327,9 @@ class ThreeXUIAPIClient(APIClient):
         client["enable"] = True
 
         updated = self._xui_result(
-            "POST", f"clients/update/{quote(str(username), safe='')}", client
+            "POST",
+            f"clients/update/{quote(str(username), safe='')}",
+            self._client_update_payload(client),
         )
         if updated.get("status") != "succeeded":
             return _renewal_failure(updated, "reconfigure")
@@ -1834,13 +1904,13 @@ class MultiServerAPI:
                 usernames.update(self.extract_usernames(users))
         return usernames
 
-    def copy_blitz_user(
+    def _copy_user(
         self,
         source_ref: UserRef,
         destination_server_id: str,
         inbound_ids: list[int] | None = None,
     ) -> dict:
-        """Copy a live Blitz account without changing its source identity.
+        """Copy a supported live account without changing its source identity.
 
         Every post-create failure attempts to remove only the newly-created
         destination.  The returned error code is safe to show or log and never
@@ -1852,12 +1922,17 @@ class MultiServerAPI:
         )
         if source_result.get("status") != "found" or source is None:
             return {"ok": False, "error": f"source_{source_result.get('status', 'unavailable')}"}
-        if getattr(source_client, "panel_type", BLITZ_PANEL) != BLITZ_PANEL:
+        source_panel = getattr(source_client, "panel_type", BLITZ_PANEL)
+        if source_panel not in {BLITZ_PANEL, THREE_X_UI_PANEL}:
             return {"ok": False, "error": "source_panel_not_supported"}
 
         destination = self.get_client(destination_server_id)
         if destination is None or destination.server_id == source_client.server_id:
             return {"ok": False, "error": "destination_invalid"}
+        if destination.panel_type not in {BLITZ_PANEL, THREE_X_UI_PANEL}:
+            return {"ok": False, "error": "destination_panel_not_supported"}
+        if source_panel == THREE_X_UI_PANEL and destination.panel_type != BLITZ_PANEL:
+            return {"ok": False, "error": "destination_panel_not_supported"}
         destination_result = destination.get_user_result(source_ref.username)
         if destination_result.get("status") == "found":
             return {"ok": False, "error": "destination_exists"}
@@ -1865,7 +1940,26 @@ class MultiServerAPI:
             return {"ok": False, "error": "destination_unavailable"}
 
         password = source.get("password")
-        if not isinstance(password, str) or not password:
+        if source_panel == THREE_X_UI_PANEL:
+            credential_metadata = source.get("credential_metadata")
+            credential_fields = (
+                credential_metadata.get("fields_present")
+                if isinstance(credential_metadata, dict)
+                else []
+            )
+            selected_field = (
+                credential_metadata.get("selected_field")
+                if isinstance(credential_metadata, dict)
+                else None
+            )
+            if (
+                "auth" not in (credential_fields or [])
+                or selected_field != "auth"
+                or not isinstance(password, str)
+                or not password.strip()
+            ):
+                return {"ok": False, "error": "source_auth_missing"}
+        elif not isinstance(password, str) or not password:
             return {"ok": False, "error": "source_password_missing"}
 
         def required_int(field, minimum=0):
@@ -1887,12 +1981,22 @@ class MultiServerAPI:
                 return None
             return parsed if parsed >= 0 else None
 
+        def parsed_destination_counter(value):
+            # A newly-created started Blitz account has no traffic row until
+            # its first connection, so 2.5.x reports null counters. Within
+            # this owned post-create verification that state is exactly zero.
+            if destination.panel_type == BLITZ_PANEL and value is None:
+                return 0
+            return parsed_nonnegative(value)
+
         total_bytes = required_int("max_download_bytes")
         upload_bytes = required_int("upload_bytes")
         download_bytes = required_int("download_bytes")
         duration_days = required_int("expiration_days", minimum=1)
         blocked = source.get("blocked") if isinstance(source.get("blocked"), bool) else None
-        if None in (total_bytes, upload_bytes, download_bytes, duration_days, blocked):
+        access_field = "unlimited_ip" if source_panel == THREE_X_UI_PANEL else "unlimited_user"
+        unlimited_access = source.get(access_field) if isinstance(source.get(access_field), bool) else None
+        if None in (total_bytes, upload_bytes, download_bytes, duration_days, blocked, unlimited_access):
             return {"ok": False, "error": "source_state_malformed"}
 
         status = " ".join(str(source.get("status") or "").lower().replace("-", " ").replace("_", " ").split())
@@ -1901,12 +2005,44 @@ class MultiServerAPI:
             timer_started = source.get("timer_started")
             delayed_start = (timer_started is False) if isinstance(timer_started, bool) else status == "on hold"
         expiry = panel_deadline(source)
-        note = source.get("note")
-        if note is not None:
-            note = str(note)
+        if not delayed_start and expiry is None:
+            return {"ok": False, "error": "source_state_malformed"}
+        note = _canonical_note(source.get("note"))
+
+        if source_panel == THREE_X_UI_PANEL:
+            source_options = source_client.get_inbound_options()
+            if source_options is None:
+                return {"ok": False, "error": "source_inbounds_unavailable"}
+            source_option_map = {item["id"]: item for item in source_options}
+            source_inbound_ids = _safe_inbound_ids(source.get("inbound_ids"))
+            allowed_protocols = {"hysteria", "hysteria2", "hy2"}
+            if not any(
+                inbound_id in source_option_map
+                and str(source_option_map[inbound_id].get("protocol") or "").lower() in allowed_protocols
+                for inbound_id in source_inbound_ids
+            ):
+                return {"ok": False, "error": "source_not_hysteria2"}
+
+        snapshot = _UserTransferSnapshot(
+            username=source_ref.username,
+            source_panel_type=source_panel,
+            password=password,
+            total_bytes=total_bytes,
+            upload_bytes=upload_bytes,
+            download_bytes=download_bytes,
+            duration_days=duration_days,
+            blocked=blocked,
+            delayed_start=bool(delayed_start),
+            absolute_expiry=expiry,
+            note=note,
+            unlimited_access=unlimited_access,
+        )
 
         selected_inbounds = []
-        if getattr(destination, "panel_type", BLITZ_PANEL) == THREE_X_UI_PANEL:
+        expected_expiry = snapshot.absolute_expiry
+        blitz_creation_date = None
+        expiry_extension_seconds = 0.0
+        if destination.panel_type == THREE_X_UI_PANEL:
             selected_inbounds = _safe_inbound_ids(inbound_ids)
             if not selected_inbounds:
                 return {"ok": False, "error": "inbounds_required"}
@@ -1921,32 +2057,42 @@ class MultiServerAPI:
                 for inbound_id in selected_inbounds
             ):
                 return {"ok": False, "error": "inbounds_not_hysteria2"}
-            destination_limit = total_bytes
+            destination_limit = snapshot.total_bytes
         else:
             # Blitz's ``unlimited_user`` flag describes access/IP policy and
             # can coexist with a finite byte quota. Only a non-positive byte
             # limit is an unlimited allowance that cannot be re-imported.
-            if total_bytes <= 0:
+            if snapshot.total_bytes <= 0:
                 return {"ok": False, "error": "blitz_unlimited_not_representable"}
-            remaining_bytes = total_bytes - upload_bytes - download_bytes
+            remaining_bytes = snapshot.total_bytes - snapshot.upload_bytes - snapshot.download_bytes
             if remaining_bytes <= 0:
                 return {"ok": False, "error": "blitz_allowance_exhausted"}
             destination_limit = int(math.ceil(remaining_bytes / GIB)) * GIB
+            if not snapshot.delayed_start:
+                expected_expiry = _ceil_utc_day(snapshot.absolute_expiry)
+                expiry_extension_seconds = max(
+                    0.0,
+                    (expected_expiry - snapshot.absolute_expiry).total_seconds(),
+                )
+                blitz_creation_date = (
+                    expected_expiry - timedelta(days=snapshot.duration_days)
+                ).date().isoformat()
 
         spec = UserProvisionSpec(
-            username=source_ref.username,
+            username=snapshot.username,
             traffic_limit_bytes=destination_limit,
-            expiration_days=duration_days,
-            password=password,
-            creation_date=source.get("account_creation_date") if not delayed_start else None,
-            absolute_expiry=expiry,
-            delayed_start=bool(delayed_start),
-            upload_bytes=upload_bytes if destination.panel_type == THREE_X_UI_PANEL else 0,
-            download_bytes=download_bytes if destination.panel_type == THREE_X_UI_PANEL else 0,
+            expiration_days=snapshot.duration_days,
+            password=snapshot.password,
+            creation_date=blitz_creation_date,
+            absolute_expiry=snapshot.absolute_expiry,
+            delayed_start=snapshot.delayed_start,
+            upload_bytes=snapshot.upload_bytes if destination.panel_type == THREE_X_UI_PANEL else 0,
+            download_bytes=snapshot.download_bytes if destination.panel_type == THREE_X_UI_PANEL else 0,
             blocked=False,
-            note=note,
+            unlimited_ip=snapshot.unlimited_access,
+            note=snapshot.note,
             inbound_ids=selected_inbounds,
-            limit_ip=(destination.server_config or {}).get("default_limit_ip"),
+            limit_ip=None,
         )
 
         created = False
@@ -1965,15 +2111,20 @@ class MultiServerAPI:
                 }
             return {"ok": False, "error": error_code, "rolled_back": True}
 
+        defer_note = False
         if destination.panel_type == THREE_X_UI_PANEL:
             creation_result = destination.create_from_spec(spec)
         else:
+            # Blitz 2.5.x duplicates its positional ``false`` argument when a
+            # limited started user has both a note and creation date. Defer the
+            # note to a verified PATCH so existing servers remain compatible.
+            defer_note = bool(spec.creation_date and spec.note is not None)
             creation_result = destination.add_user(
                 spec.username,
                 int(destination_limit // GIB),
                 spec.expiration_days,
-                unlimited=False,
-                note=spec.note,
+                unlimited=spec.unlimited_ip,
+                note=None if defer_note else spec.note,
                 password=spec.password,
                 creation_date=spec.creation_date,
                 blocked=False,
@@ -1990,33 +2141,40 @@ class MultiServerAPI:
         created = True
 
         if destination.panel_type == THREE_X_UI_PANEL:
-            if destination.update_traffic(spec.username, upload_bytes, download_bytes) is None:
+            if destination.update_traffic(spec.username, snapshot.upload_bytes, snapshot.download_bytes) is None:
                 return fail("traffic_import_failed")
+        elif defer_note and destination.update_user(spec.username, {"note": spec.note}) is None:
+            return fail("destination_note_failed")
 
         uri_data = destination.get_user_uri(spec.username)
         if not isinstance(uri_data, dict) or not uri_data.get("normal_sub"):
             return fail("destination_uri_failed")
 
-        if blocked and destination.update_user(spec.username, {"blocked": True}) is None:
+        if snapshot.blocked and destination.update_user(spec.username, {"blocked": True}) is None:
             return fail("destination_state_failed")
 
         verification = destination.get_user_result(spec.username)
         copied = verification.get("data") if verification.get("status") == "found" else None
         if not isinstance(copied, dict):
             return fail("destination_verification_failed")
-        expected_upload = upload_bytes if destination.panel_type == THREE_X_UI_PANEL else 0
-        expected_download = download_bytes if destination.panel_type == THREE_X_UI_PANEL else 0
-        verified = (
-            copied.get("password") == password
-            and parsed_nonnegative(copied.get("max_download_bytes")) == destination_limit
-            and parsed_nonnegative(copied.get("upload_bytes")) == expected_upload
-            and parsed_nonnegative(copied.get("download_bytes")) == expected_download
-            and copied.get("blocked") is blocked
-            and parsed_nonnegative(copied.get("expiration_days")) == duration_days
+        expected_upload = snapshot.upload_bytes if destination.panel_type == THREE_X_UI_PANEL else 0
+        expected_download = snapshot.download_bytes if destination.panel_type == THREE_X_UI_PANEL else 0
+        copied_access = (
+            copied.get("unlimited_ip")
+            if destination.panel_type == THREE_X_UI_PANEL
+            else copied.get("unlimited_user")
         )
-        if note is not None:
-            verified = verified and copied.get("note") == note
-        if delayed_start:
+        verified = (
+            copied.get("password") == snapshot.password
+            and parsed_nonnegative(copied.get("max_download_bytes")) == destination_limit
+            and parsed_destination_counter(copied.get("upload_bytes")) == expected_upload
+            and parsed_destination_counter(copied.get("download_bytes")) == expected_download
+            and copied.get("blocked") is snapshot.blocked
+            and parsed_nonnegative(copied.get("expiration_days")) == snapshot.duration_days
+            and copied_access is snapshot.unlimited_access
+            and _canonical_note(copied.get("note")) == snapshot.note
+        )
+        if snapshot.delayed_start:
             copied_status = " ".join(
                 str(copied.get("status") or "").lower().replace("-", " ").replace("_", " ").split()
             )
@@ -2024,9 +2182,13 @@ class MultiServerAPI:
                 copied.get("delayed_start") is True
                 or (copied_status == "on hold" and not copied.get("account_creation_date"))
             )
-        elif expiry is not None:
+        elif expected_expiry is not None:
             copied_expiry = panel_deadline(copied)
-            verified = verified and copied_expiry is not None and abs((copied_expiry - expiry).total_seconds()) <= 2
+            verified = (
+                verified
+                and copied_expiry is not None
+                and abs((copied_expiry - expected_expiry).total_seconds()) <= 2
+            )
         if destination.panel_type == THREE_X_UI_PANEL:
             verified = verified and set(selected_inbounds).issubset(set(_safe_inbound_ids(copied.get("inbound_ids"))))
         if not verified:
@@ -2037,6 +2199,7 @@ class MultiServerAPI:
             "ok": True,
             "username": spec.username,
             "source_server_id": source_client.server_id,
+            "source_panel_type": snapshot.source_panel_type,
             "destination_server_id": destination.server_id,
             "destination_server_name": destination.server_name,
             "panel_type": destination.panel_type,
@@ -2044,13 +2207,24 @@ class MultiServerAPI:
             "normal_sub": uri_data["normal_sub"],
             "direct_link": bool(uri_data.get("direct")),
             "blitz_quota_gib": int(destination_limit // GIB) if destination.panel_type == BLITZ_PANEL else None,
+            "expiry_rounded": expiry_extension_seconds > 0,
+            "expiry_extension_seconds": expiry_extension_seconds,
         }
+
+    def copy_blitz_user(
+        self,
+        source_ref: UserRef,
+        destination_server_id: str,
+        inbound_ids: list[int] | None = None,
+    ) -> dict:
+        """Backward-compatible wrapper for legacy copy callers."""
+        return self._copy_user(source_ref, destination_server_id, inbound_ids)
 
     def copy_user(self, spec: UserCopySpec) -> dict:
         """Panel-neutral copy entry point for a structured copy request."""
         if not isinstance(spec, UserCopySpec):
             return {"ok": False, "error": "copy_spec_invalid"}
-        return self.copy_blitz_user(
+        return self._copy_user(
             spec.source,
             spec.destination_server_id,
             list(spec.inbound_ids),

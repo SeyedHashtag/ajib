@@ -169,6 +169,7 @@ class ThreeXUIAdapterTests(unittest.TestCase):
         self.assertTrue(users[1]["delayed_start"])
         self.assertEqual(users[1]["expiration_days"], 15)
         self.assertIn("auth", users[0]["credential_metadata"]["fields_present"])
+        self.assertEqual(users[0]["credential_metadata"]["selected_field"], "auth")
         self.assertEqual(calls[0][0:2], ("GET", "https://x.example/panel/api/clients/list"))
 
     def test_create_uses_defaults_password_marker_and_negative_expiry(self):
@@ -208,7 +209,8 @@ class ThreeXUIAdapterTests(unittest.TestCase):
         calls = []
         full = {
             "client": {
-                "email": "alice", "auth": "keep-this", "subId": "sub",
+                "id": 123, "email": "alice", "auth": "keep-this", "subId": "sub",
+                "allowedIPs": "",
                 "totalGB": api_client.GIB, "expiryTime": -86400000,
                 "comment": "[ajib-duration:1d]", "enable": True,
             },
@@ -229,7 +231,33 @@ class ThreeXUIAdapterTests(unittest.TestCase):
         self.assertTrue(update_call[1].endswith("clients/update/alice"))
         self.assertEqual(update_call[2]["data"]["auth"], "keep-this")
         self.assertFalse(update_call[2]["data"]["enable"])
+        self.assertNotIn("id", update_call[2]["data"])
+        self.assertEqual(update_call[2]["data"]["allowedIPs"], [])
         self.assertNotIn("inboundIds", update_call[2]["data"])
+
+    def test_update_retains_string_protocol_id(self):
+        client = make_client()
+        calls = []
+        full = {
+            "client": {
+                "id": "protocol-id", "email": "alice", "subId": "sub",
+                "totalGB": api_client.GIB, "expiryTime": -86400000,
+                "comment": "[ajib-duration:1d]", "enable": True,
+            },
+            "inboundIds": [4],
+        }
+
+        def request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if method == "GET":
+                return Response({"success": True, "obj": full})
+            return Response({"success": True, "msg": "updated"})
+
+        client._request = request
+        result = client.update_user("alice", {"blocked": True})
+
+        self.assertIsNotNone(result)
+        self.assertEqual(calls[-1][2]["data"]["id"], "protocol-id")
 
     def test_reset_fails_closed_before_mutation_without_duration_marker(self):
         client = make_client()
@@ -246,6 +274,31 @@ class ThreeXUIAdapterTests(unittest.TestCase):
 
         self.assertEqual(result["error"], "duration_unknown")
         self.assertEqual(len(calls), 1)
+
+    def test_reset_removes_numeric_database_id_from_update_payload(self):
+        client = make_client()
+        calls = []
+
+        def request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if method == "GET":
+                return Response({"success": True, "obj": {"client": {
+                    "id": 456, "email": "alice", "auth": "keep-this",
+                    "allowedIPs": "",
+                    "expiryTime": 1893456000000, "enable": False,
+                    "comment": "note [ajib-duration:30d]",
+                }, "inboundIds": [4]}})
+            return Response({"success": True, "msg": "ok"})
+
+        client._request = request
+        result = client.reset_user_result("alice")
+
+        self.assertEqual(result["status"], "succeeded")
+        update_payload = calls[-1][2]["data"]
+        self.assertNotIn("id", update_payload)
+        self.assertEqual(update_payload["auth"], "keep-this")
+        self.assertEqual(update_payload["allowedIPs"], [])
+        self.assertTrue(update_payload["enable"])
 
     def test_blitz_renewal_patches_then_resets_and_verifies(self):
         client = api_client.APIClient({
@@ -335,8 +388,10 @@ class ThreeXUIAdapterTests(unittest.TestCase):
         client = make_client()
         calls = []
         stored_client = {
+            "id": 789,
             "email": "alice",
             "auth": "keep-this",
+            "allowedIPs": '["10.0.0.1"]',
             "subId": "keep-sub",
             "totalGB": api_client.GIB,
             "expiryTime": 1893456000000,
@@ -382,6 +437,8 @@ class ThreeXUIAdapterTests(unittest.TestCase):
         )
         update_payload = calls[1][2]["data"]
         self.assertEqual(update_payload["auth"], "keep-this")
+        self.assertNotIn("id", update_payload)
+        self.assertEqual(update_payload["allowedIPs"], ["10.0.0.1"])
         self.assertEqual(update_payload["subId"], "keep-sub")
         self.assertEqual(update_payload["protocolSettings"], {"keep": True})
         self.assertEqual(update_payload["totalGB"], 10 * api_client.GIB)

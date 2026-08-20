@@ -1,4 +1,4 @@
-"""Admin user inspection, exact-server editing, and Blitz user copying."""
+"""Admin user inspection, exact-server editing, and panel-aware user copying."""
 
 import io
 import secrets
@@ -256,7 +256,7 @@ def _send_user_details(message, api_client, user_details, ref):
         types.InlineKeyboardButton("Renew Creation Date", callback_data=f"renew_creation:{token}"),
         types.InlineKeyboardButton("Block User", callback_data=f"block_user:{token}"),
     )
-    if panel_type == BLITZ_PANEL:
+    if panel_type in {BLITZ_PANEL, THREE_X_UI_PANEL}:
         markup.add(types.InlineKeyboardButton("📋 Copy User", callback_data=f"copy_user:{token}"))
 
     caption = f"{formatted_details}\n\n"
@@ -377,13 +377,18 @@ def process_edit_expiration(message, token):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("copy_user:"))
 def handle_copy_user(call):
     ref = _get_user_context(call.data.split(":", 1)[1])
-    if ref is None or ref.panel_type != BLITZ_PANEL:
-        bot.send_message(call.message.chat.id, "This copy selection expired or the source is not Blitz.")
+    if ref is None or ref.panel_type not in {BLITZ_PANEL, THREE_X_UI_PANEL}:
+        bot.send_message(call.message.chat.id, "This copy selection expired or the source panel is unsupported.")
         return
     multi_api = MultiServerAPI()
     destinations = [server for server in multi_api.servers if str(server.get("id")) != str(ref.server_id)]
+    if ref.panel_type == THREE_X_UI_PANEL:
+        destinations = [
+            server for server in destinations
+            if server.get("panel", BLITZ_PANEL) == BLITZ_PANEL
+        ]
     if not destinations:
-        bot.send_message(call.message.chat.id, "No other VPN server is configured.")
+        bot.send_message(call.message.chat.id, "No compatible destination VPN server is configured.")
         return
     markup = types.InlineKeyboardMarkup(row_width=1)
     for server in destinations:
@@ -474,7 +479,8 @@ def _send_copy_confirmation(chat_id, token, context, destination):
     )
     bot.send_message(
         chat_id,
-        f"Copy '{context['source_ref'].username}' from '{context['source_ref'].server_id}' to "
+        f"Copy '{context['source_ref'].username}' from '{context['source_ref'].server_id}' "
+        f"({context['source_ref'].panel_type}) to "
         f"'{destination.server_name}' ({destination.panel_type})?{inbound_line}\n\n"
         "The source will not be changed. A destination collision will stop the copy.",
         reply_markup=markup,
@@ -490,10 +496,15 @@ COPY_ERRORS = {
     "source_missing": "The source no longer exists.",
     "source_unavailable": "The source server is unavailable; nothing was copied.",
     "source_password_missing": "The source password is unavailable; nothing was copied.",
+    "source_auth_missing": "The 3x-ui source has no reusable Hysteria2 auth credential.",
+    "source_inbounds_unavailable": "The 3x-ui source inbound list is unavailable.",
+    "source_not_hysteria2": "The 3x-ui source is not attached to a Hysteria2 inbound.",
     "source_state_malformed": "The source quota, traffic, duration, or block state is malformed.",
+    "destination_panel_not_supported": "That source-to-destination panel combination is not supported.",
     "destination_exists": "That username already exists on the destination; nothing was changed.",
     "destination_unavailable": "The destination could not be checked safely; nothing was copied.",
     "destination_create_outcome_unknown": "The create request had an uncertain outcome.",
+    "destination_note_failed": "The account was created, but its note could not be restored.",
     "inbounds_required": "Select at least one Hysteria2 inbound.",
     "inbounds_unavailable": "The destination inbound list is unavailable.",
     "inbounds_not_hysteria2": "The selected destination inbounds are not all Hysteria2.",
@@ -551,10 +562,19 @@ def handle_copy_confirm(call):
         if result.get("inbound_ids") else ""
     )
     link_type = "Direct connection link" if result.get("direct_link") else "Subscription URL"
+    expiry_line = ""
+    if result.get("expiry_rounded"):
+        extension_seconds = max(0, int(result.get("expiry_extension_seconds") or 0))
+        extension_hours = extension_seconds / 3600
+        expiry_line = (
+            f"\n⚠️ Blitz day precision rounded expiry outward by {extension_hours:.2f} hours."
+        )
     caption = (
         f"User '{_escape_markdown(result['username'])}' copied successfully.\n"
+        f"Source: `{result.get('source_server_id')}`, `{result.get('source_panel_type', BLITZ_PANEL)}`\n"
         f"Target: {_escape_markdown(result['destination_server_name'])} "
-        f"(`{result['destination_server_id']}`, `{result['panel_type']}`){inbound_line}\n\n"
+        f"(`{result['destination_server_id']}`, `{result['panel_type']}`){inbound_line}"
+        f"{expiry_line}\n\n"
         f"{link_type}:\n{sub_url}"
     )
     bot.send_photo(call.message.chat.id, bio, caption=caption, parse_mode="Markdown")

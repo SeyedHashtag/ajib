@@ -196,6 +196,68 @@ class AdminServerDisplayTests(unittest.TestCase):
         self.assertEqual(resets, ["alice"])
         self.assertIn("reset successfully", bot.sent_messages[-1][0][1].lower())
 
+    def test_three_x_copy_destination_selector_shows_only_blitz(self):
+        edituser, bot = load_edituser()
+        ref = types.SimpleNamespace(
+            server_id="x-source", username="alice", panel_type="3x-ui"
+        )
+        token = edituser._store_user_context(ref)
+        edituser.MultiServerAPI = lambda: types.SimpleNamespace(servers=[
+            {"id": "x-source", "name": "Source", "panel": "3x-ui"},
+            {"id": "x-target", "name": "Other X", "panel": "3x-ui"},
+            {"id": "b-target", "name": "Blitz Target", "panel": "blitz"},
+        ])
+        call = types.SimpleNamespace(
+            data=f"copy_user:{token}",
+            message=types.SimpleNamespace(chat=types.SimpleNamespace(id=555)),
+        )
+
+        edituser.handle_copy_user(call)
+
+        markup = bot.sent_messages[-1][1]["reply_markup"]
+        self.assertEqual(len(markup.buttons), 1)
+        self.assertIn("Blitz Target", markup.buttons[0].args[0])
+        copy_token = markup.buttons[0].kwargs["callback_data"].split(":", 1)[1]
+        self.assertEqual(
+            edituser._get_copy_context(copy_token)["destination_server_id"],
+            "b-target",
+        )
+
+    def test_copy_success_identifies_panels_and_warns_about_expiry_extension(self):
+        edituser, bot = load_edituser()
+        source_ref = types.SimpleNamespace(
+            server_id="x-source", username="alice", panel_type="3x-ui"
+        )
+        token = edituser._store_copy_context(source_ref, "b-target")
+        result = {
+            "ok": True,
+            "username": "alice",
+            "source_server_id": "x-source",
+            "source_panel_type": "3x-ui",
+            "destination_server_id": "b-target",
+            "destination_server_name": "Blitz Target",
+            "panel_type": "blitz",
+            "inbound_ids": [],
+            "normal_sub": "https://sub.example/alice",
+            "direct_link": False,
+            "expiry_rounded": True,
+            "expiry_extension_seconds": 41400,
+        }
+        edituser.MultiServerAPI = lambda: types.SimpleNamespace(
+            copy_user=lambda _spec: result
+        )
+        call = types.SimpleNamespace(
+            data=f"copy_confirm:{token}",
+            message=types.SimpleNamespace(chat=types.SimpleNamespace(id=555)),
+        )
+
+        edituser.handle_copy_confirm(call)
+
+        caption = bot.sent_photos[-1][1]["caption"]
+        self.assertIn("`x-source`, `3x-ui`", caption)
+        self.assertIn("`b-target`, `blitz`", caption)
+        self.assertIn("rounded expiry outward by 11.50 hours", caption)
+
 
 if __name__ == "__main__":
     unittest.main()
