@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TRANSLATIONS_PATH = ROOT / "core/scripts/telegrambot/utils/translations.py"
 
 JOURNEY_KEYS = {
+    "migration_connection_updated",
     "referral_stats",
     "referral_share_text",
     "referral_share_button",
@@ -135,6 +136,16 @@ def test_customer_journey_placeholders_match_english_catalog():
             assert _placeholders(catalogs[language][key]) == expected, (
                 f"{language}.{key} placeholders do not match English"
             )
+
+
+def test_migration_notice_exposes_only_customer_credentials():
+    catalogs = _load_translations().MESSAGE_TRANSLATIONS
+
+    for language in ("en", "fa", "ru", "tk"):
+        assert _placeholders(catalogs[language]["migration_connection_updated"]) == {
+            "username",
+            "link",
+        }
 
 
 def test_reseller_config_delivery_omits_price_in_all_supported_languages():

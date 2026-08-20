@@ -45,6 +45,7 @@ EXPECTED_GROUP_ROWS = {
     "users": (
         ("➕ Add User", "👤 Show User"),
         ("❌ Delete User", "🧪 Manage Test Accounts"),
+        ("🔁 Mass Copy / Migrate",),
         ("🧹 Expired Cleanup",),
         ("🏠 Admin Menu",),
     ),
@@ -90,6 +91,7 @@ EXPECTED_ACTION_KEYS = {
     "vpn_servers",
     "confirmations",
     "expired_cleanup",
+    "bulk_transfer",
     "bot_logs",
     "hosted_bots",
     "growth_funnel",
@@ -126,6 +128,7 @@ def test_admin_menu_serializes_native_semantic_styles():
         "➕ Add User": "success",
         "❌ Delete User": "danger",
         "🧹 Expired Cleanup": "danger",
+        "🔁 Mass Copy / Migrate": "primary",
         "📈 Growth Funnel": "primary",
         "🏠 Admin Menu": "primary",
         **{category["text"]: "primary" for category in common.ADMIN_CATEGORIES.values()},

@@ -77,6 +77,22 @@ class UserCopySpec:
 
 
 @dataclass(frozen=True)
+class BulkUserTransferSpec:
+    """Persistent server-to-server copy or migration request.
+
+    Only stable identifiers are carried here.  Live credentials and links are
+    deliberately fetched from the panels while an item is processed.
+    """
+
+    mode: str
+    source_server_id: str
+    destination_server_id: str
+    inbound_ids: tuple[int, ...] = ()
+    requesting_admin: str = ""
+    notification_policy: str = "disabled"
+
+
+@dataclass(frozen=True)
 class _UserTransferSnapshot:
     username: str
     source_panel_type: str

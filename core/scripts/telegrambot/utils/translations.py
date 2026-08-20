@@ -1604,6 +1604,7 @@ MESSAGE_TRANSLATIONS = {
 # new key ships in all supported languages.
 CUSTOMER_JOURNEY_TRANSLATIONS = {
     "en": {
+        "migration_connection_updated": "✅ Your VPN configuration details were updated.\n\n👤 Username: {username}\n\n🔗 New connection link:\n{link}\n\nReplace or re-import this link in your VPN app. If you need help, contact support.",
         "customer_reseller_only_plan": "This plan is available only to resellers.",
         "payment_status_checking": "Checking payment status…",
         "payment_status_check_in_progress": "A payment status check is already in progress.",
@@ -1662,6 +1663,7 @@ CUSTOMER_JOURNEY_TRANSLATIONS = {
         "reseller_renewal_in_progress": "A renewal is already being processed.",
     },
     "ru": {
+        "migration_connection_updated": "✅ Данные подключения VPN обновлены.\n\n👤 Имя пользователя: {username}\n\n🔗 Новая ссылка для подключения:\n{link}\n\nЗамените сохранённую ссылку в VPN-приложении или импортируйте эту ссылку заново. Если нужна помощь, обратитесь в поддержку.",
         "customer_reseller_only_plan": "Этот план доступен только реселлерам.",
         "payment_status_checking": "Проверяем статус платежа…",
         "payment_status_check_in_progress": "Проверка статуса платежа уже выполняется.",
@@ -1720,6 +1722,7 @@ CUSTOMER_JOURNEY_TRANSLATIONS = {
         "reseller_renewal_in_progress": "Продление уже обрабатывается.",
     },
     "fa": {
+        "migration_connection_updated": "✅ اطلاعات اتصال VPN شما به‌روزرسانی شد.\n\n👤 نام کاربری: {username}\n\n🔗 لینک اتصال جدید:\n{link}\n\nاین لینک را در برنامه VPN خود جایگزین یا دوباره وارد کنید. اگر به راهنمایی نیاز دارید، با پشتیبانی تماس بگیرید.",
         "customer_reseller_only_plan": "این طرح فقط برای نمایندگان در دسترس است.",
         "payment_status_checking": "در حال بررسی وضعیت پرداخت…",
         "payment_status_check_in_progress": "بررسی وضعیت پرداخت از قبل در حال انجام است.",
@@ -1778,6 +1781,7 @@ CUSTOMER_JOURNEY_TRANSLATIONS = {
         "reseller_renewal_in_progress": "یک تمدید در حال پردازش است.",
     },
     "tk": {
+        "migration_connection_updated": "✅ VPN birikme maglumatlaryňyz täzelendi.\n\n👤 Ulanyjy ady: {username}\n\n🔗 Täze birikme salgysy:\n{link}\n\nVPN programmaňyzda öňki salgyny şu salgy bilen çalşyň ýa-da ony täzeden import ediň. Kömek gerek bolsa, goldawa ýüz tutuň.",
         "customer_reseller_only_plan": "Bu meýilnama diňe satyjylar üçin elýeterli.",
         "payment_status_checking": "Töleg statusy barlanýar…",
         "payment_status_check_in_progress": "Töleg statusy eýýäm barlanýar.",

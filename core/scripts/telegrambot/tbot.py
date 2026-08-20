@@ -248,6 +248,30 @@ def automated_backup_thread():
         time.sleep(10800)
 
 
+def bulk_transfer_monitoring_thread():
+    """Resume persisted transfers and deliver main-bot migration notices."""
+    from utils.bulk_transfer import (
+        deliver_notifications,
+        recover_stale_notification_claims,
+        start_transfer_worker,
+    )
+
+    recover_stale_notification_claims()
+    while True:
+        try:
+            start_transfer_worker()
+            deliver_notifications(
+                "main",
+                lambda recipient_id, text: safe_send_message(bot, recipient_id, text),
+                language_resolver=get_user_language,
+            )
+        except Exception:
+            logging.getLogger("ajib.bulk_transfer").exception(
+                "Error in bulk-transfer monitoring"
+            )
+        time.sleep(30)
+
+
 def run_polling_forever():
     """Keep polling alive across transient Telegram/network failures."""
     retry_delay_seconds = 3
@@ -276,4 +300,6 @@ if __name__ == '__main__':
     traffic_thread.start()
     backup_thread = threading.Thread(target=automated_backup_thread, daemon=True)
     backup_thread.start()
+    bulk_thread = threading.Thread(target=bulk_transfer_monitoring_thread, daemon=True)
+    bulk_thread.start()
     run_polling_forever()

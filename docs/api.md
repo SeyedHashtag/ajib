@@ -134,6 +134,31 @@ is never shortened. Successful copy results report `source_panel_type`,
 `expiry_rounded`, and `expiry_extension_seconds`; the Telegram confirmation
 shows both panel types and warns about any extension.
 
+## Mass copy and migration contract
+
+The admin Users menu can apply the same copy matrix to a fixed, confirmation-
+time snapshot of one server. Mass Copy leaves every source account and local
+record unchanged. Migrate handles each account sequentially: it verifies the
+destination, atomically rehomes exact operational bot references, deletes the
+source, and verifies that the source is absent. A collision is never
+overwritten, and one user's failure does not undo completed users.
+
+Jobs, per-user stages, and notification recipients are stored in schema v5 so
+an interrupted run can be resumed. This journal stores server IDs, usernames,
+status/error metadata, and Telegram recipient IDs only; it never stores panel
+passwords, API tokens, or subscription/direct links. Current links are fetched
+from the destination immediately before notification delivery.
+
+Migration notices can be sent after each confirmed source deletion, disabled,
+or held indefinitely for a later admin decision. Main customers are delivered
+through the main bot; hosted-store customers are delivered only through their
+own hosted bot worker. The recipient's current bot-specific language is resolved
+at delivery time, with English fallback. Customer copy is deliberately neutral:
+it contains only the username, refreshed connection link, and re-import guidance;
+it does not disclose server, panel, migration-reason, quota, status, or expiry
+details. Locale, rendered text, and links are never persisted in the journal.
+Discarding held notices does not modify migrated VPN accounts or bot records.
+
 ## Renewal contract
 
 Renewal checkout may select any plan currently eligible for the sales audience,

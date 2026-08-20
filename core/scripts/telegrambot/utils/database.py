@@ -16,7 +16,7 @@ from .renewal_migration import migrate_v4_renewal_timezone_rechecks
 
 DEFAULT_BOT_DIR = "/etc/ajib/core/scripts/telegrambot"
 DATABASE_NAME = "ajib.db"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 BUSY_TIMEOUT_MS = 5000
 
 _local = threading.local()
@@ -432,6 +432,88 @@ SCHEMA_STATEMENTS = (
     CREATE INDEX IF NOT EXISTS recruitment_milestones_status_idx
     ON recruitment_milestones(status, qualified_at)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS bulk_transfer_jobs (
+        job_id TEXT PRIMARY KEY,
+        mode TEXT NOT NULL CHECK(mode IN ('copy', 'migrate')),
+        source_server_id TEXT NOT NULL,
+        destination_server_id TEXT NOT NULL,
+        inbound_ids_json TEXT NOT NULL DEFAULT '[]',
+        requested_by TEXT NOT NULL,
+        notification_policy TEXT NOT NULL
+            CHECK(notification_policy IN ('send', 'disabled', 'deferred')),
+        status TEXT NOT NULL,
+        snapshot_at TEXT NOT NULL,
+        total_users INTEGER NOT NULL DEFAULT 0,
+        eligible_users INTEGER NOT NULL DEFAULT 0,
+        status_chat_id TEXT,
+        status_message_id INTEGER,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        notification_decided_at TEXT,
+        last_error TEXT
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS bulk_transfer_one_active_idx
+    ON bulk_transfer_jobs((1))
+    WHERE status IN ('queued', 'running', 'cancel_requested')
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS bulk_transfer_jobs_created_idx
+    ON bulk_transfer_jobs(created_at DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS bulk_transfer_items (
+        job_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        username TEXT NOT NULL,
+        source_panel_type TEXT,
+        stage TEXT NOT NULL,
+        error_code TEXT,
+        result_json TEXT NOT NULL DEFAULT '{}',
+        copy_attempts INTEGER NOT NULL DEFAULT 0,
+        delete_attempts INTEGER NOT NULL DEFAULT 0,
+        records_updated INTEGER NOT NULL DEFAULT 0,
+        recipient_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        PRIMARY KEY (job_id, ordinal),
+        UNIQUE (job_id, username),
+        FOREIGN KEY (job_id) REFERENCES bulk_transfer_jobs(job_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS bulk_transfer_items_stage_idx
+    ON bulk_transfer_items(job_id, stage, ordinal)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS bulk_transfer_notifications (
+        notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        item_ordinal INTEGER NOT NULL,
+        username TEXT NOT NULL,
+        route_scope TEXT NOT NULL,
+        recipient_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        sent_at TEXT,
+        UNIQUE(job_id, item_ordinal, route_scope, recipient_id),
+        FOREIGN KEY (job_id, item_ordinal)
+            REFERENCES bulk_transfer_items(job_id, ordinal) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS bulk_transfer_notifications_delivery_idx
+    ON bulk_transfer_notifications(route_scope, status, next_attempt_at)
+    """,
 )
 
 
@@ -684,6 +766,9 @@ def user_table_row_count(path: str | os.PathLike[str] | None = None) -> int:
         "account_credit_transactions",
         "account_credit_reservations",
         "recruitment_milestones",
+        "bulk_transfer_jobs",
+        "bulk_transfer_items",
+        "bulk_transfer_notifications",
     )
     application_metadata = int(
         connection.execute(

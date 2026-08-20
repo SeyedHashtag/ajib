@@ -60,7 +60,7 @@ class GrowthEventTests(unittest.TestCase):
 
         connection = database.get_connection(self.db_path)
 
-        self.assertEqual(database.schema_version(self.db_path), 4)
+        self.assertEqual(database.schema_version(self.db_path), 5)
         tables = {
             row["name"]
             for row in connection.execute(
@@ -74,6 +74,9 @@ class GrowthEventTests(unittest.TestCase):
                 "account_credit_transactions",
                 "account_credit_reservations",
                 "recruitment_milestones",
+                "bulk_transfer_jobs",
+                "bulk_transfer_items",
+                "bulk_transfer_notifications",
             }.issubset(tables)
         )
         columns = {

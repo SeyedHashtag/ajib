@@ -235,6 +235,7 @@ class AdminPromptCancellationTests(unittest.TestCase):
                     [
                         ["➕ Add User", "👤 Show User"],
                         ["❌ Delete User", "🧪 Manage Test Accounts"],
+                        ["🔁 Mass Copy / Migrate"],
                         ["🧹 Expired Cleanup"],
                         ["🏠 Admin Menu"],
                     ],

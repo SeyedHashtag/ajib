@@ -1,4 +1,5 @@
 from telebot import types
+from types import MethodType
 
 
 ADMIN_ACTIONS = {
@@ -18,6 +19,7 @@ ADMIN_ACTIONS = {
     "vpn_servers": {"text": "⚖️ VPN Servers", "style": None, "group": "system"},
     "confirmations": {"text": "✅ Confirmations", "style": "success", "group": "sales"},
     "expired_cleanup": {"text": "🧹 Expired Cleanup", "style": "danger", "group": "users"},
+    "bulk_transfer": {"text": "🔁 Mass Copy / Migrate", "style": "primary", "group": "users"},
     "bot_logs": {"text": "📄 Bot Logs", "style": None, "group": "system"},
     "hosted_bots": {"text": "🤖 Hosted Bots", "style": None, "group": "resellers"},
     "growth_funnel": {"text": "📈 Growth Funnel", "style": "primary", "group": "reports"},
@@ -53,6 +55,7 @@ ADMIN_GROUP_MENU_ROWS = {
     "users": (
         (admin_action_text("add_user"), admin_action_text("show_user")),
         (admin_action_text("delete_user"), admin_action_text("manage_test_accounts")),
+        (admin_action_text("bulk_transfer"),),
         (admin_action_text("expired_cleanup"),),
         (ADMIN_HOME_BUTTON_TEXT,),
     ),
@@ -114,7 +117,25 @@ def resolve_admin_menu_view(text):
 def _create_admin_button(text):
     """Create a reply button with its configured semantic style."""
     style = _ADMIN_BUTTON_STYLES[text]
-    return types.KeyboardButton(text, **({"style": style} if style else {}))
+    try:
+        return types.KeyboardButton(text, **({"style": style} if style else {}))
+    except TypeError as error:
+        # pyTelegramBotAPI releases predating Telegram's semantic button style
+        # field reject the constructor keyword.  Retain wire compatibility so
+        # rolling upgrades do not make the entire admin keyboard unusable.
+        if not style or "style" not in str(error):
+            raise
+        button = types.KeyboardButton(text)
+        base_to_dict = button.to_dict
+        button.style = style
+
+        def styled_to_dict(self):
+            payload = base_to_dict()
+            payload["style"] = self.style
+            return payload
+
+        button.to_dict = MethodType(styled_to_dict, button)
+        return button
 
 
 def create_admin_markup(view="root"):

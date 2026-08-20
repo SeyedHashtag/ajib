@@ -30,6 +30,7 @@ if __name__ == "__main__":
     bootstrap_storage(BOT_DIR)
 
 from utils.api_client import MultiServerAPI
+from utils.bulk_transfer import deliver_notifications, recover_stale_notification_claims
 from utils.account_state import (
     EntitlementState,
     PanelState,
@@ -4873,6 +4874,24 @@ def _owner_stats_monitor():
         time.sleep(OWNER_STATS_MONITOR_INTERVAL_SECONDS)
 
 
+def _migration_notification_monitor():
+    route_scope = f"hosted:{OWNER_ID}"
+    while True:
+        try:
+            deliver_notifications(
+                route_scope,
+                lambda recipient_id, text: bot.send_message(recipient_id, text),
+                language_resolver=_language,
+            )
+        except Exception as error:
+            print(
+                f"Hosted migration notification monitor failed for reseller "
+                f"{OWNER_ID}: {type(error).__name__}",
+                flush=True,
+            )
+        time.sleep(30)
+
+
 def run():
     try:
         bot.get_me()
@@ -4884,9 +4903,15 @@ def run():
     _recover_saved_receipts()
     _reconcile_credit_reservations()
     _reconcile_invite_discount_reservations()
+    recover_stale_notification_claims()
     threading.Thread(target=_crypto_monitor, daemon=True, name="hosted-crypto").start()
     threading.Thread(target=_customer_notification_monitor, daemon=True, name="hosted-notifications").start()
     threading.Thread(target=_owner_stats_monitor, daemon=True, name="hosted-owner-stats").start()
+    threading.Thread(
+        target=_migration_notification_monitor,
+        daemon=True,
+        name="hosted-migration-notifications",
+    ).start()
     retry = 3
     while True:
         try:
