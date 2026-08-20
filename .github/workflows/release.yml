@@ -22,8 +22,18 @@ jobs:
       id: get_version
 
     - name: Read changelog for release description
+      env:
+        RELEASE_VERSION: ${{ steps.get_version.outputs.version }}
       run: |
-        changelog=$(cat changelog)
+        changelog=$(awk -v heading="## v${RELEASE_VERSION}" '
+          $0 == heading { capture = 1 }
+          capture && /^## v/ && $0 != heading { exit }
+          capture { print }
+          END { if (!capture) exit 1 }
+        ' changelog) || {
+          echo "::error::No changelog section found for v${RELEASE_VERSION}"
+          exit 1
+        }
         echo "changelog<<EOF" >> $GITHUB_OUTPUT
         echo "$changelog" >> $GITHUB_OUTPUT
         echo "EOF" >> $GITHUB_OUTPUT
