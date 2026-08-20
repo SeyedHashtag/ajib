@@ -633,6 +633,69 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
             fields={},
         )
 
+    def test_hosted_owner_confirmations_recover_receipts_referrals_and_renewals(self):
+        self.worker._save_payment("receipt", {
+            "status": "pending_approval",
+            "receipt_received_at": "2026-08-20T10:00:00Z",
+        })
+        self.worker._save_payment("renewal", {
+            "status": "completed",
+            "type": "renewal",
+            "renewal_mode": "reserved",
+            "renewal_status": "attention",
+            "renewal_attention_reason": "server_unavailable",
+        })
+        referral = {
+            "id": "ref-1",
+            "status": "pending",
+            "user_id": 99,
+            "amount": 2.0,
+            "wallet": "wallet99",
+            "requested_at": "2026-08-20T09:00:00Z",
+        }
+        self.worker.bot = mock.Mock()
+
+        with (
+            mock.patch.object(self.worker, "_referral_data", return_value={"pending_withdrawals": [referral]}),
+            mock.patch.object(self.worker, "_send_owner_receipt_confirmation") as send_receipt,
+            mock.patch.object(self.worker, "_send_hosted_renewal_confirmation") as send_renewal,
+        ):
+            self.worker._show_hosted_confirmations(7)
+
+        summary = self.worker.bot.send_message.call_args_list[0].args[1]
+        self.assertIn("Pending confirmations: 3", summary)
+        self.assertIn("Receipts: 1", summary)
+        self.assertIn("Renewals: 1", summary)
+        self.assertIn("Referral payouts: 1", summary)
+        send_receipt.assert_called_once()
+        send_renewal.assert_called_once()
+        self.assertEqual(
+            self.worker._owner_menu_command(
+                self.worker._hosted_message(self.worker.OWNER_ID, "confirmations")
+            ),
+            ("action", "confirmations"),
+        )
+
+    def test_hosted_renewal_feedback_is_outcome_specific(self):
+        waiting, waiting_outcome = self.worker._hosted_renewal_feedback({
+            "status": "waiting",
+            "reason": "deadline_normalized",
+        })
+        attention, attention_outcome = self.worker._hosted_renewal_feedback({
+            "status": "attention",
+            "reason": "renewal_internal_error",
+            "record": {
+                "renewal_internal_error_stage": "lookup",
+                "renewal_internal_error_code": "lookup_failed",
+            },
+        })
+
+        self.assertEqual(waiting_outcome, "reserved")
+        self.assertIn("timezone normalization", waiting)
+        self.assertEqual(attention_outcome, "attention")
+        self.assertIn("lookup", attention)
+        self.assertNotIn("Renewal reservation updated", attention)
+
     def test_stale_hosted_test_recovers_persisted_ht_allocation(self):
         message = mock.Mock()
         message.from_user.id = 100

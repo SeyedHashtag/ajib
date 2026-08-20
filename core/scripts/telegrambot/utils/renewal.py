@@ -4,7 +4,7 @@ import logging
 import math
 import os
 import uuid
-from datetime import timedelta
+from datetime import timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
 from utils.account_state import (
@@ -43,7 +43,11 @@ INTERNAL_ERROR_REASON = 'renewal_internal_error'
 INTERNAL_ERROR_FIELDS = (
     'renewal_internal_error_type',
     'renewal_internal_error_at',
+    'renewal_internal_error_stage',
+    'renewal_internal_error_code',
 )
+RENEWAL_REVIEW_HISTORY_LIMIT = 50
+RENEWAL_MESSAGE_REF_LIMIT = 25
 
 
 def _load_json_file(path, default):
@@ -1131,7 +1135,8 @@ def claim_payment_renewal(
             )
         if status == 'attention':
             reason = str(record.get('renewal_attention_reason') or '')
-            if not force and (reason == 'external_renewal' or not _retry_is_due(record, current)):
+            repair_recheck = record.get('renewal_recheck_pending') == 'v4_timezone_normalization'
+            if not force and ((reason == 'external_renewal' and not repair_recheck) or not _retry_is_due(record, current)):
                 return None
         elif status not in {'reserved', 'processing'}:
             return None
@@ -1140,6 +1145,7 @@ def claim_payment_renewal(
         record['renewal_claim_id'] = claim_id
         record['renewal_claimed_at'] = timestamp
         record['renewal_processing_from'] = status
+        record.pop('renewal_recheck_pending', None)
         record['updated_at'] = timestamp
         return {'claim_id': claim_id, 'payment_id': str(payment_id), 'record': dict(record)}
 
@@ -1168,6 +1174,7 @@ def finish_payment_renewal(
         record.pop('renewal_claim_id', None)
         record.pop('renewal_claimed_at', None)
         record.pop('renewal_processing_from', None)
+        record.pop('renewal_recheck_pending', None)
         if status == 'applied':
             record['renewal_applied_at'] = timestamp
             record.pop('renewal_next_attempt_at', None)
@@ -1185,13 +1192,20 @@ def finish_payment_renewal(
             record.pop('renewal_api_http_status', None)
             for field in INTERNAL_ERROR_FIELDS:
                 record.pop(field, None)
-        elif retry:
-            attempts = max(0, _safe_int(record.get('renewal_attempts'), 0) or 0) + 1
-            record['renewal_attempts'] = attempts
-            record['renewal_next_attempt_at'] = (
-                current + timedelta(seconds=RESERVATION_RETRY_SECONDS)
-            )
-            record['renewal_next_attempt_at'] = _format_time(record['renewal_next_attempt_at'])
+        else:
+            reason = str(record.get('renewal_attention_reason') or '')
+            if reason != INTERNAL_ERROR_REASON:
+                for field in INTERNAL_ERROR_FIELDS:
+                    record.pop(field, None)
+            if retry:
+                attempts = max(0, _safe_int(record.get('renewal_attempts'), 0) or 0) + 1
+                record['renewal_attempts'] = attempts
+                record['renewal_next_attempt_at'] = (
+                    current + timedelta(seconds=RESERVATION_RETRY_SECONDS)
+                )
+                record['renewal_next_attempt_at'] = _format_time(record['renewal_next_attempt_at'])
+            else:
+                record.pop('renewal_next_attempt_at', None)
         return True
 
 
@@ -1207,6 +1221,53 @@ def list_payment_renewal_ids(payments_file=None):
     ]
 
 
+def reservation_deadline_normalization(record, user_data):
+    """Return a canonical deadline for the known legacy-local date-only shift.
+
+    Older captures interpreted a panel date as midnight in the configured legacy
+    timezone, while current panel parsing treats the same date as midnight UTC.
+    Ignore only that exact representation change and only when independent cycle
+    fields prove that the account itself did not renew.
+    """
+    baseline = record.get('renewal_baseline') or record.get('renewal_before_state') or {}
+    if not isinstance(baseline, dict) or not isinstance(user_data, dict):
+        return None
+    baseline_creation = _parse_account_creation_time(baseline.get('account_creation_date'))
+    live_creation = _parse_account_creation_time(user_data.get('account_creation_date'))
+    if baseline_creation is None or live_creation is None or live_creation != baseline_creation:
+        return None
+    baseline_deadline = _parse_time(baseline.get('expiration_deadline'))
+    live_deadline = _parse_time(_expiration_deadline(user_data))
+    if baseline_deadline is None or live_deadline is None:
+        return None
+    baseline_days = _safe_int(baseline.get('expiration_days'))
+    live_days = _safe_int(user_data.get('expiration_days'))
+    if baseline_days is None or live_days is None or live_days != baseline_days:
+        return None
+    baseline_limit = _safe_bytes(baseline.get('max_download_bytes'))
+    live_limit = _safe_bytes(user_data.get('max_download_bytes'))
+    if baseline.get('max_download_bytes') is None or user_data.get('max_download_bytes') is None:
+        return None
+    if baseline_limit != live_limit:
+        return None
+    baseline_used = _safe_bytes(baseline.get('upload_bytes')) + _safe_bytes(baseline.get('download_bytes'))
+    live_used = _safe_bytes(user_data.get('upload_bytes')) + _safe_bytes(user_data.get('download_bytes'))
+    if live_used < baseline_used:
+        return None
+
+    local_baseline = baseline_deadline.astimezone(legacy_timezone())
+    utc_live = live_deadline.astimezone(timezone.utc)
+    if (local_baseline.hour, local_baseline.minute, local_baseline.second, local_baseline.microsecond) != (0, 0, 0, 0):
+        return None
+    if (utc_live.hour, utc_live.minute, utc_live.second, utc_live.microsecond) != (0, 0, 0, 0):
+        return None
+    if local_baseline.date() != utc_live.date():
+        return None
+    if abs((live_deadline - baseline_deadline).total_seconds()) <= 1:
+        return None
+    return format_utc_timestamp(live_deadline)
+
+
 def reservation_generation_changed(record, user_data):
     baseline = record.get('renewal_baseline') or record.get('renewal_before_state') or {}
     if not isinstance(baseline, dict) or not isinstance(user_data, dict):
@@ -1218,7 +1279,8 @@ def reservation_generation_changed(record, user_data):
     baseline_deadline = _parse_time(baseline.get('expiration_deadline'))
     live_deadline = _parse_time(_expiration_deadline(user_data))
     if baseline_deadline is not None and live_deadline is not None and live_deadline > baseline_deadline + timedelta(seconds=1):
-        return True
+        if reservation_deadline_normalization(record, user_data) is None:
+            return True
     baseline_days = _safe_int(baseline.get('expiration_days'))
     live_days = _safe_int(user_data.get('expiration_days'))
     if baseline_days is not None and live_days is not None and live_days > baseline_days:
@@ -1245,10 +1307,17 @@ def inspect_reserved_renewal(record, user_data, force_apply=False, lookup_result
         }
     if force_apply:
         return {'action': 'apply'}
+    normalized_deadline = reservation_deadline_normalization(record, user_data)
     if reservation_generation_changed(record, user_data):
         return {'action': 'attention', 'reason': 'external_renewal', 'retry': False}
     if is_user_expired(user_data):
         return {'action': 'apply'}
+    if normalized_deadline is not None:
+        return {
+            'action': 'wait',
+            'normalized_deadline': normalized_deadline,
+            'normalization_reason': 'legacy_local_date_to_utc_date',
+        }
     return {'action': 'wait'}
 
 
@@ -1305,6 +1374,9 @@ def refresh_payment_renewal_baseline(payment_id, user_data, payments_file=None):
         record.pop('renewal_attention_reason', None)
         record.pop('renewal_last_error', None)
         record.pop('renewal_next_attempt_at', None)
+        record.pop('renewal_api_error', None)
+        record.pop('renewal_api_http_status', None)
+        record.pop('renewal_recheck_pending', None)
         for field in INTERNAL_ERROR_FIELDS:
             record.pop(field, None)
         record['updated_at'] = _now_str()
@@ -1328,6 +1400,73 @@ def mark_payment_renewal_alerted(payment_id, payments_file=None, now=None, audie
         return True
 
 
+def record_payment_renewal_review(
+    payment_id,
+    reviewer_id,
+    action,
+    outcome,
+    payments_file=None,
+    now=None,
+):
+    path = payments_file or PAYMENTS_FILE
+    timestamp = _format_time(_current_time(now))
+    with locked_json(path, {}) as payments:
+        record = payments.get(str(payment_id)) if isinstance(payments, dict) else None
+        if not isinstance(record, dict):
+            return False
+        history = record.get('renewal_review_history')
+        if not isinstance(history, list):
+            history = []
+        history.append({
+            'reviewed_by_user_id': str(reviewer_id),
+            'action': str(action),
+            'outcome': str(outcome),
+            'reviewed_at': timestamp,
+        })
+        record['renewal_review_history'] = history[-RENEWAL_REVIEW_HISTORY_LIMIT:]
+        record['renewal_last_reviewed_by_user_id'] = str(reviewer_id)
+        record['renewal_last_review_action'] = str(action)
+        record['renewal_last_review_outcome'] = str(outcome)
+        record['renewal_last_reviewed_at'] = timestamp
+        record['updated_at'] = timestamp
+        return True
+
+
+def add_payment_renewal_message_ref(payment_id, message_ref, payments_file=None):
+    path = payments_file or PAYMENTS_FILE
+    reference = dict(message_ref or {})
+    if reference.get('chat_id') is None or reference.get('message_id') is None:
+        return False
+    with locked_json(path, {}) as payments:
+        record = payments.get(str(payment_id)) if isinstance(payments, dict) else None
+        if not isinstance(record, dict):
+            return False
+        refs = record.get('renewal_review_message_refs')
+        if not isinstance(refs, list):
+            refs = []
+        key = (str(reference.get('chat_id')), str(reference.get('message_id')))
+        refs = [
+            item for item in refs
+            if isinstance(item, dict)
+            and (str(item.get('chat_id')), str(item.get('message_id'))) != key
+        ]
+        refs.append(reference)
+        record['renewal_review_message_refs'] = refs[-RENEWAL_MESSAGE_REF_LIMIT:]
+        record['updated_at'] = _now_str()
+        return True
+
+
+def take_payment_renewal_message_refs(payment_id, payments_file=None):
+    path = payments_file or PAYMENTS_FILE
+    with locked_json(path, {}) as payments:
+        record = payments.get(str(payment_id)) if isinstance(payments, dict) else None
+        if not isinstance(record, dict):
+            return []
+        refs = record.pop('renewal_review_message_refs', [])
+        record['updated_at'] = _now_str()
+        return [dict(item) for item in refs if isinstance(item, dict)]
+
+
 def _event_record(record, status, fields=None):
     updated = dict(record or {})
     updated.update(dict(fields or {}))
@@ -1335,6 +1474,7 @@ def _event_record(record, status, fields=None):
     updated.pop('renewal_claim_id', None)
     updated.pop('renewal_claimed_at', None)
     updated.pop('renewal_processing_from', None)
+    updated.pop('renewal_recheck_pending', None)
     if status in {'reserved', 'applied'}:
         updated.pop('renewal_next_attempt_at', None)
         updated.pop('renewal_attention_reason', None)
@@ -1343,15 +1483,27 @@ def _event_record(record, status, fields=None):
         updated.pop('renewal_api_http_status', None)
         for field in INTERNAL_ERROR_FIELDS:
             updated.pop(field, None)
+    elif status == 'attention' and updated.get('renewal_attention_reason') != INTERNAL_ERROR_REASON:
+        for field in INTERNAL_ERROR_FIELDS:
+            updated.pop(field, None)
     return updated
 
 
-def _internal_error_fields(error, current):
+def _internal_error_fields(error, current, stage='unknown'):
+    safe_stage = str(stage or 'unknown').strip().lower()
+    if safe_stage not in {
+        'api_client', 'lookup', 'inspect', 'finish_waiting', 'finish_attention',
+        'debt_policy', 'finish_debt_attention', 'execute',
+        'finish_execute_attention', 'finish_applied',
+    }:
+        safe_stage = 'unknown'
     return {
         'renewal_attention_reason': INTERNAL_ERROR_REASON,
         'renewal_last_error': INTERNAL_ERROR_REASON,
         'renewal_internal_error_type': type(error).__name__,
         'renewal_internal_error_at': _format_time(current),
+        'renewal_internal_error_stage': safe_stage,
+        'renewal_internal_error_code': f'{safe_stage}_failed',
     }
 
 
@@ -1419,6 +1571,16 @@ def process_payment_renewal_reservation(
             lookup_result=lookup_result,
         )
         if inspection['action'] == 'wait':
+            waiting_fields = {}
+            normalized_deadline = inspection.get('normalized_deadline')
+            if normalized_deadline:
+                baseline = dict(record.get('renewal_baseline') or record.get('renewal_before_state') or {})
+                baseline['expiration_deadline'] = normalized_deadline
+                waiting_fields = {
+                    'renewal_baseline': baseline,
+                    'renewal_baseline_normalized_at': _format_time(current),
+                    'renewal_baseline_normalization': inspection.get('normalization_reason'),
+                }
             stage = 'finish_waiting'
             persisted = finish_payment_renewal(
                 payment_id,
@@ -1426,13 +1588,15 @@ def process_payment_renewal_reservation(
                 'reserved',
                 payments_file=path,
                 now=current,
+                fields=waiting_fields,
             )
             if not persisted:
                 raise RuntimeError('Could not persist waiting renewal state')
             return {
                 'payment_id': str(payment_id),
                 'status': 'waiting',
-                'record': _event_record(record, 'reserved'),
+                'reason': 'deadline_normalized' if normalized_deadline else None,
+                'record': _event_record(record, 'reserved', waiting_fields),
             }
         if inspection['action'] == 'attention':
             reason = inspection.get('reason')
@@ -1529,7 +1693,7 @@ def process_payment_renewal_reservation(
             'api_client': result.get('api_client') or api_client,
         }
     except Exception as error:
-        fields = _internal_error_fields(error, current)
+        fields = _internal_error_fields(error, current, stage=stage)
         try:
             recovered = finish_payment_renewal(
                 payment_id,
@@ -1630,6 +1794,16 @@ def process_reseller_renewal_reservation(
             lookup_result=lookup_result,
         )
         if inspection['action'] == 'wait':
+            waiting_fields = {}
+            normalized_deadline = inspection.get('normalized_deadline')
+            if normalized_deadline:
+                baseline = dict(record.get('renewal_baseline') or record.get('renewal_before_state') or {})
+                baseline['expiration_deadline'] = normalized_deadline
+                waiting_fields = {
+                    'renewal_baseline': baseline,
+                    'renewal_baseline_normalized_at': _format_time(current),
+                    'renewal_baseline_normalization': inspection.get('normalization_reason'),
+                }
             stage = 'finish_waiting'
             persisted = finish_reseller_renewal_reservation(
                 reseller_id,
@@ -1637,6 +1811,7 @@ def process_reseller_renewal_reservation(
                 claim['claim_id'],
                 'reserved',
                 now=current,
+                fields=waiting_fields,
             )
             if not persisted:
                 raise RuntimeError('Could not persist waiting reseller renewal state')
@@ -1644,7 +1819,8 @@ def process_reseller_renewal_reservation(
                 'reservation_id': str(reservation_id),
                 'reseller_id': str(reseller_id),
                 'status': 'waiting',
-                'record': _event_record(record, 'reserved'),
+                'reason': 'deadline_normalized' if normalized_deadline else None,
+                'record': _event_record(record, 'reserved', waiting_fields),
             }
         if inspection['action'] == 'attention':
             reason = inspection.get('reason')
@@ -1778,7 +1954,7 @@ def process_reseller_renewal_reservation(
             'api_client': result.get('api_client') or api_client,
         }
     except Exception as error:
-        fields = _internal_error_fields(error, current)
+        fields = _internal_error_fields(error, current, stage=stage)
         try:
             recovered = finish_reseller_renewal_reservation(
                 reseller_id,

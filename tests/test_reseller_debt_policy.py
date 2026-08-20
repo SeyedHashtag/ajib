@@ -40,6 +40,41 @@ class ResellerDebtPolicyTests(unittest.TestCase):
     def hours_ago(self, hours):
         return (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
 
+    def test_reseller_application_review_is_atomic_and_audited(self):
+        self.write_resellers({
+            "1988": {
+                "status": "pending",
+                "telegram_username": "alice",
+                "configs": [],
+            }
+        })
+
+        approved, first = self.reseller.review_reseller_application(
+            "1988",
+            "approved",
+            "7",
+            now=datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc),
+        )
+        rejected, second = self.reseller.review_reseller_application(
+            "1988",
+            "rejected",
+            "8",
+            now=datetime(2026, 8, 20, 12, 1, tzinfo=timezone.utc),
+        )
+        saved = self.read_resellers()["1988"]
+
+        self.assertTrue(approved)
+        self.assertEqual(first["status"], "approved")
+        self.assertFalse(rejected)
+        self.assertEqual(second["status"], "approved")
+        self.assertEqual(saved["status"], "approved")
+        self.assertEqual(saved["reseller_application_reviewed_by"], "7")
+        self.assertEqual(saved["reseller_application_decision"], "approved")
+        self.assertEqual(
+            saved["reseller_application_reviewed_at"],
+            "2026-08-20T12:00:00.000000Z",
+        )
+
     def test_external_bulk_username_parser_is_exact_and_case_insensitive(self):
         self.assertEqual(
             self.reseller.parse_external_bulk_reseller_username("r7784615720c184"),

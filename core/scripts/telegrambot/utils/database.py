@@ -11,11 +11,12 @@ from pathlib import Path
 
 from .time_utils import format_utc_timestamp
 from .timestamp_migration import migrate_v3_utc_timestamps
+from .renewal_migration import migrate_v4_renewal_timezone_rechecks
 
 
 DEFAULT_BOT_DIR = "/etc/ajib/core/scripts/telegrambot"
 DATABASE_NAME = "ajib.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 BUSY_TIMEOUT_MS = 5000
 
 _local = threading.local()
@@ -498,6 +499,8 @@ def _ensure_schema(connection: sqlite3.Connection, path: str) -> None:
             if current < SCHEMA_VERSION:
                 if current < 3:
                     migrate_v3_utc_timestamps(connection)
+                if current < 4:
+                    migrate_v4_renewal_timezone_rechecks(connection)
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (SCHEMA_VERSION, format_utc_timestamp()),
@@ -686,7 +689,7 @@ def user_table_row_count(path: str | os.PathLike[str] | None = None) -> int:
         connection.execute(
             """
             SELECT COUNT(*) FROM state_metadata
-            WHERE key != 'utc_timestamp_migration_v3'
+            WHERE key NOT IN ('utc_timestamp_migration_v3', 'renewal_timezone_recheck_v4')
             """
         ).fetchone()[0]
     )

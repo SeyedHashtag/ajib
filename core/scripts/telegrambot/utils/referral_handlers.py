@@ -544,20 +544,27 @@ def handle_admin_mark_paid(call):
         return
 
     request_id = call.data.split(":", 1)[1]
+    try:
+        bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=None,
+        )
+    except Exception:
+        pass
     success, result = mark_withdrawal_request_paid(request_id, user_id_admin)
     if not success and result == "Withdrawal request not found":
         success, result = mark_referral_payout_paid(request_id, user_id_admin)
-    audit_note = ""
     if success:
         audit_note = f"\nAudit recorded: `${result['amount']:.2f}`"
-    else:
-        audit_note = f"\nAudit not recorded: {result}"
-    
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text=f"{call.message.text}\n\n✅ **Paid by Admin {user_id_admin}**{audit_note}",
-        reply_markup=None,
-        parse_mode="Markdown"
-    )
-    bot.answer_callback_query(call.id, "Marked as paid." if success else f"Marked in message only: {result}")
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=f"{call.message.text}\n\n✅ **Paid by Admin {user_id_admin}**{audit_note}",
+            reply_markup=None,
+            parse_mode="Markdown"
+        )
+        bot.answer_callback_query(call.id, "Marked as paid.")
+        return
+
+    bot.answer_callback_query(call.id, f"Already processed or unavailable: {result}", show_alert=True)

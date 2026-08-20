@@ -18,6 +18,7 @@ os.environ.setdefault("AJIB_BOT_ROLE", "supervisor")
 database = importlib.import_module("utils.database")
 time_utils = importlib.import_module("utils.time_utils")
 timestamp_migration = importlib.import_module("utils.timestamp_migration")
+renewal_migration = importlib.import_module("utils.renewal_migration")
 state_archive = importlib.import_module("state_archive")
 
 
@@ -157,7 +158,7 @@ class TimestampMigrationTests(unittest.TestCase):
             "DELETE FROM state_metadata WHERE key=?",
             (timestamp_migration.MIGRATION_METADATA_KEY,),
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version=3")
+        connection.execute("DELETE FROM schema_migrations WHERE version>=3")
 
         aug17 = self._payload(
             "a6971cd0-590a-43bb-a205-fece95902da8",
@@ -206,7 +207,7 @@ class TimestampMigrationTests(unittest.TestCase):
         ).fetchone()
 
         expected = "2026-08-17T10:48:54.000000Z"
-        self.assertEqual(database.schema_version(self.db_path), 3)
+        self.assertEqual(database.schema_version(self.db_path), 4)
         self.assertEqual(repaired["completed_at"], expected)
         self.assertEqual(repaired["renewal_reserved_at"], expected)
         self.assertEqual(repaired["updates"][0]["timestamp"], expected)
@@ -251,6 +252,74 @@ class TimestampMigrationTests(unittest.TestCase):
         ).fetchone()["payload_json"]
         self.assertEqual(second, metadata)
         self.assertEqual(after, before)
+
+    def test_v4_marks_external_attention_for_read_only_reinspection(self):
+        connection = database.get_connection(self.db_path)
+        connection.execute(
+            "DELETE FROM state_metadata WHERE key=?",
+            (renewal_migration.MIGRATION_METADATA_KEY,),
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version=4")
+        payment = {
+            "payment_id": "timezone-payment",
+            "type": "renewal",
+            "status": "completed",
+            "renewal_mode": "reserved",
+            "renewal_status": "attention",
+            "renewal_attention_reason": "external_renewal",
+            "renewal_next_attempt_at": "2099-01-01T00:00:00.000000Z",
+        }
+        connection.execute(
+            """
+            INSERT INTO payments(scope, payment_id, status, kind, payload_json)
+            VALUES ('main', ?, 'completed', 'renewal', ?)
+            """,
+            (payment["payment_id"], json.dumps(payment)),
+        )
+        connection.execute(
+            "INSERT INTO resellers(reseller_id, status, payload_json) VALUES ('7', 'approved', '{}')"
+        )
+        connection.execute(
+            """
+            INSERT INTO reseller_configs(
+                reseller_id, config_index, username, server_id, payload_json
+            ) VALUES ('7', 0, 'r7', 'primary', '{}')
+            """
+        )
+        reseller_renewal = {
+            "reservation_id": "timezone-reseller",
+            "renewal_mode": "reserved",
+            "renewal_status": "attention",
+            "renewal_attention_reason": "external_renewal",
+            "renewal_next_attempt_at": "2099-01-01T00:00:00.000000Z",
+        }
+        connection.execute(
+            """
+            INSERT INTO reseller_renewals(
+                reseller_id, config_index, renewal_index, payload_json
+            ) VALUES ('7', 0, 0, ?)
+            """,
+            (json.dumps(reseller_renewal),),
+        )
+        database.reset_connection(self.db_path)
+
+        migrated = database.get_connection(self.db_path)
+        payment_after = json.loads(migrated.execute(
+            "SELECT payload_json FROM payments WHERE scope='main' AND payment_id='timezone-payment'"
+        ).fetchone()["payload_json"])
+        reseller_after = json.loads(migrated.execute(
+            "SELECT payload_json FROM reseller_renewals WHERE reseller_id='7'"
+        ).fetchone()["payload_json"])
+        self.assertEqual(database.schema_version(self.db_path), 4)
+        for record in (payment_after, reseller_after):
+            self.assertEqual(record["renewal_status"], "attention")
+            self.assertEqual(record["renewal_attention_reason"], "external_renewal")
+            self.assertEqual(record["renewal_recheck_pending"], "v4_timezone_normalization")
+            self.assertNotIn("renewal_next_attempt_at", record)
+
+        metadata = renewal_migration.migrate_v4_renewal_timezone_rechecks(migrated)
+        self.assertEqual(metadata["payment_rechecks"], 1)
+        self.assertEqual(metadata["reseller_rechecks"], 1)
 
 
 class NaiveTimestampRegressionGuardTests(unittest.TestCase):

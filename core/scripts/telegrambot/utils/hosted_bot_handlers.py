@@ -289,9 +289,19 @@ def hosted_admin_callback(call):
         return
     if action == "resolve" and len(parts) == 5:
         resolution, reseller_id, request_id = parts[2], parts[3], parts[4]
+        try:
+            bot.edit_message_reply_markup(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
         success, result = resolve_earnings_withdrawal(reseller_id, request_id, resolution, call.from_user.id)
-        safe_answer_callback_query(bot, call.id, "Updated." if success else str(result), show_alert=True)
+        feedback = f"Hosted-bot withdrawal marked {resolution}." if success else str(result)
+        safe_answer_callback_query(bot, call.id, feedback, show_alert=True)
         if success:
             safe_send_message(bot, int(reseller_id), f"Your earnings withdrawal was {resolution} by an operator.")
+            safe_send_message(bot, call.message.chat.id, feedback)
         return
     safe_answer_callback_query(bot, call.id, "Invalid action.", show_alert=True)

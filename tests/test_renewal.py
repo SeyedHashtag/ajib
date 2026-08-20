@@ -1037,7 +1037,7 @@ class RenewalTests(unittest.TestCase):
 
         self.assertTrue(self.renewal.reservation_generation_changed(record, extended))
 
-    def test_utc_date_only_deadline_does_not_hide_earlier_offset_baseline(self):
+    def test_utc_date_only_deadline_normalization_keeps_reservation(self):
         now = datetime(2026, 8, 13, 18, 0, tzinfo=timezone.utc)
         active_user = {
             "account_creation_date": "2026-07-14",
@@ -1075,11 +1075,92 @@ class RenewalTests(unittest.TestCase):
             )
 
         saved = self.read_json(self.renewal.PAYMENTS_FILE)["production-reservation"]
-        self.assertEqual(result["status"], "attention")
-        self.assertEqual(saved["renewal_status"], "attention")
+        self.assertEqual(result["status"], "waiting")
+        self.assertEqual(result["reason"], "deadline_normalized")
+        self.assertEqual(saved["renewal_status"], "reserved")
+        self.assertEqual(
+            saved["renewal_baseline"]["expiration_deadline"],
+            "2026-09-12T00:00:00.000000Z",
+        )
+        self.assertEqual(
+            saved["renewal_baseline_normalization"],
+            "legacy_local_date_to_utc_date",
+        )
         self.assertNotIn("renewal_claim_id", saved)
         self.assertEqual(client.reset_calls, [])
         self.assertIn("renewal_stale_claim_reclaimed", "\n".join(captured.output))
+
+    def test_utc_date_only_shift_with_usage_reset_still_requires_review(self):
+        now = datetime(2026, 8, 13, 18, 0, tzinfo=timezone.utc)
+        baseline_user = {
+            "account_creation_date": "2026-07-14",
+            "expiration_days": 60,
+            "blocked": False,
+            "upload_bytes": 2 * GB_BYTES,
+            "download_bytes": 2 * GB_BYTES,
+            "max_download_bytes": 5 * GB_BYTES,
+            "status": "Online",
+        }
+        record = {
+            "renewal_baseline": {
+                **self.renewal.capture_user_state(baseline_user, now=now),
+                "expiration_deadline": "2026-09-11T20:30:00+00:00",
+            }
+        }
+        live_user = {**baseline_user, "upload_bytes": 0, "download_bytes": 0}
+
+        self.assertIsNone(self.renewal.reservation_deadline_normalization(record, live_user))
+        self.assertTrue(self.renewal.reservation_generation_changed(record, live_user))
+
+    def test_v4_external_attention_marker_forces_safe_reinspection(self):
+        now = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+        active_user = {
+            "account_creation_date": "2026-07-14",
+            "expiration_days": 60,
+            "blocked": False,
+            "upload_bytes": 2 * GB_BYTES,
+            "download_bytes": 3 * GB_BYTES,
+            "max_download_bytes": 200 * GB_BYTES,
+            "status": "Offline",
+        }
+        payment = {
+            **self.base_payment(type="renewal"),
+            "renewal_source": "customer",
+            "renewal_username": "alice",
+            "renewal_server_id": "s1",
+            "renewal_mode": "reserved",
+            "renewal_status": "attention",
+            "renewal_attention_reason": "external_renewal",
+            "renewal_recheck_pending": "v4_timezone_normalization",
+            "renewal_internal_error_type": "OperationalError",
+            "renewal_internal_error_at": "2026-08-17T15:17:44Z",
+            "renewal_internal_error_stage": "unknown",
+            "renewal_internal_error_code": "unknown_failed",
+            "renewal_baseline": {
+                **self.renewal.capture_user_state(active_user, now=now),
+                "expiration_deadline": "2026-09-11T20:30:00+00:00",
+                "upload_bytes": GB_BYTES,
+                "download_bytes": 3 * GB_BYTES,
+            },
+            "renewal_plan_snapshot": {"plan_gb": "200", "days": 60, "unlimited": False},
+        }
+        self.write_json(self.renewal.PAYMENTS_FILE, {"reported-payment": payment})
+        client = FakeClient("s1", {"alice": active_user})
+
+        result = self.renewal.process_payment_renewal_reservation(
+            "reported-payment",
+            payments_file=self.renewal.PAYMENTS_FILE,
+            multi_api=FakeMultiAPI({"s1": client}),
+            now=now,
+        )
+        saved = self.read_json(self.renewal.PAYMENTS_FILE)["reported-payment"]
+
+        self.assertEqual(result["status"], "waiting")
+        self.assertEqual(saved["renewal_status"], "reserved")
+        self.assertNotIn("renewal_recheck_pending", saved)
+        for field in self.renewal.INTERNAL_ERROR_FIELDS:
+            self.assertNotIn(field, saved)
+        self.assertEqual(client.reset_calls, [])
 
     def test_real_deadline_extension_is_detected_across_offsets(self):
         baseline_user = {
@@ -1483,6 +1564,8 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(saved["renewal_status"], "attention")
         self.assertEqual(saved["renewal_attempts"], 1)
         self.assertEqual(saved["renewal_internal_error_type"], "RuntimeError")
+        self.assertEqual(saved["renewal_internal_error_stage"], "lookup")
+        self.assertEqual(saved["renewal_internal_error_code"], "lookup_failed")
         self.assertNotIn("renewal_claim_id", saved)
         self.assertNotIn("secret.example", logs)
         self.assertIn("stage=lookup", logs)
@@ -1524,6 +1607,40 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(saved["renewal_status"], "reserved")
         self.assertNotIn("renewal_internal_error_type", saved)
         self.assertNotIn("renewal_internal_error_at", saved)
+        self.assertNotIn("renewal_internal_error_stage", saved)
+        self.assertNotIn("renewal_internal_error_code", saved)
+
+    def test_non_internal_attention_clears_stale_internal_diagnostics(self):
+        payment = {
+            **self.base_payment(type="renewal"),
+            "renewal_mode": "reserved",
+            "renewal_status": "reserved",
+            "renewal_internal_error_type": "OperationalError",
+            "renewal_internal_error_at": "2026-08-20T10:00:00Z",
+            "renewal_internal_error_stage": "finish_attention",
+            "renewal_internal_error_code": "finish_attention_failed",
+        }
+        self.write_json(self.renewal.PAYMENTS_FILE, {"stale-error": payment})
+        claim = self.renewal.claim_payment_renewal(
+            "stale-error",
+            payments_file=self.renewal.PAYMENTS_FILE,
+            force=True,
+        )
+
+        self.assertTrue(self.renewal.finish_payment_renewal(
+            "stale-error",
+            claim["claim_id"],
+            "attention",
+            payments_file=self.renewal.PAYMENTS_FILE,
+            fields={
+                "renewal_attention_reason": "server_unavailable",
+                "renewal_last_error": "server_unavailable",
+            },
+            retry=True,
+        ))
+        saved = self.read_json(self.renewal.PAYMENTS_FILE)["stale-error"]
+        for field in self.renewal.INTERNAL_ERROR_FIELDS:
+            self.assertNotIn(field, saved)
 
     def test_claim_recovery_persistence_failure_is_critical_and_remains_stale(self):
         now = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)

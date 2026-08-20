@@ -645,41 +645,56 @@ def _finish_receipt_notification(payment_id, error=None):
         return True
 
 
+def _send_owner_receipt_confirmation(chat_id, payment_id, record):
+    caption = _hosted_message(
+        OWNER_ID,
+        "receipt_owner_caption",
+        user_id=record["user_id"],
+        plan_gb=record["plan_gb"],
+        days=record["days"],
+        toman_price=format_toman_amount(
+            record.get("converted_amount", record["retail_price"])
+        ),
+    )
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton(
+            _hosted_message(OWNER_ID, "approved"),
+            callback_data=f"hb:approve:{payment_id}",
+        ),
+        types.InlineKeyboardButton(
+            _hosted_message(OWNER_ID, "rejected"),
+            callback_data=f"hb:reject:{payment_id}",
+        ),
+    )
+    with open(record["receipt_path"], "rb") as handle:
+        return bot.send_photo(
+            chat_id,
+            handle,
+            caption=caption,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+
+
+def _clear_clicked_keyboard(call):
+    try:
+        bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+
 def _notify_owner_of_receipt(payment_id):
     record = _claim_receipt_notification(payment_id)
     if not record:
         current = _tenant_payments().get(payment_id, {})
         return bool(isinstance(current, dict) and current.get("owner_receipt_notified_at"))
     try:
-        caption = _hosted_message(
-            OWNER_ID,
-            "receipt_owner_caption",
-            user_id=record["user_id"],
-            plan_gb=record["plan_gb"],
-            days=record["days"],
-            toman_price=format_toman_amount(
-                record.get("converted_amount", record["retail_price"])
-            ),
-        )
-        markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton(
-                _hosted_message(OWNER_ID, "approved"),
-                callback_data=f"hb:approve:{payment_id}",
-            ),
-            types.InlineKeyboardButton(
-                _hosted_message(OWNER_ID, "rejected"),
-                callback_data=f"hb:reject:{payment_id}",
-            ),
-        )
-        with open(record["receipt_path"], "rb") as handle:
-            bot.send_photo(
-                OWNER_ID,
-                handle,
-                caption=caption,
-                parse_mode="Markdown",
-                reply_markup=markup,
-            )
+        _send_owner_receipt_confirmation(OWNER_ID, payment_id, record)
     except Exception as error:
         detail = f"{type(error).__name__}: {error}"
         _finish_receipt_notification(payment_id, detail)
@@ -2458,6 +2473,7 @@ def owner_receipt(call):
         bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "owner_panel"), show_alert=True)
         return
     action, payment_id = call.data.split(":")[1:]
+    _clear_clicked_keyboard(call)
     record = _claim_payment(payment_id, {"pending_approval"})
     if not record:
         bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "already_processed"), show_alert=True)
@@ -2473,6 +2489,16 @@ def owner_receipt(call):
         payment_id, record, funded=False, retry_status="pending_approval"
     )
     if not success:
+        current = _tenant_payments().get(payment_id)
+        if isinstance(current, dict) and current.get("status") == "pending_approval":
+            try:
+                _send_owner_receipt_confirmation(OWNER_ID, payment_id, current)
+            except Exception as error:
+                print(
+                    f"Hosted receipt retry notification failed for reseller {OWNER_ID}, "
+                    f"payment {payment_id}: {type(error).__name__}: {error}",
+                    flush=True,
+                )
         bot.answer_callback_query(call.id, result, show_alert=True)
         return
     bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "approved"))
@@ -3059,6 +3085,7 @@ def referral_resolve(call):
     if action not in {"paid", "rejected"}:
         bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "invalid_payout"), show_alert=True)
         return
+    _clear_clicked_keyboard(call)
     with locked_json(tenant_file(OWNER_ID, "referrals.json"), _referral_data()) as data:
         request = next((item for item in data.get("pending_withdrawals", []) if item.get("id") == request_id), None)
         if not request or request.get("status") != "pending":
@@ -3093,7 +3120,7 @@ OWNER_CUSTOMER_ROWS = (
 OWNER_MONEY_ROWS = (
     ("debt", "earnings"),
     ("refpercent", "referrals"),
-    ("stats",),
+    ("stats", "confirmations"),
     ("owner_home",),
 )
 LEGACY_OWNER_MENU_ROWS = (
@@ -3731,8 +3758,65 @@ def _owner_plans_markup(settings=None):
     return markup
 
 
+def _show_hosted_confirmations(chat_id):
+    payments = _tenant_payments()
+    receipts = [
+        (str(payment_id), record)
+        for payment_id, record in payments.items()
+        if isinstance(record, dict) and record.get('status') == 'pending_approval'
+    ]
+    renewals = [
+        (str(payment_id), record)
+        for payment_id, record in payments.items()
+        if isinstance(record, dict)
+        and record.get('status') == 'completed'
+        and record.get('renewal_mode') == 'reserved'
+        and record.get('renewal_status') == 'attention'
+    ]
+    referrals = [
+        item for item in _referral_data().get('pending_withdrawals', [])
+        if isinstance(item, dict) and item.get('status') == 'pending'
+    ]
+    receipts.sort(key=lambda item: str(item[1].get('receipt_received_at') or item[1].get('created_at') or ''))
+    renewals.sort(key=lambda item: str(item[1].get('renewal_reserved_at') or item[1].get('created_at') or ''))
+    referrals.sort(key=lambda item: str(item.get('requested_at') or ''))
+    total = len(receipts) + len(renewals) + len(referrals)
+    bot.send_message(
+        chat_id,
+        f"Pending confirmations: {total}\nReceipts: {len(receipts)} · Renewals: {len(renewals)} · Referral payouts: {len(referrals)}",
+    )
+    for payment_id, record in receipts:
+        try:
+            _send_owner_receipt_confirmation(chat_id, payment_id, record)
+        except Exception as error:
+            bot.send_message(chat_id, f"Failed to show receipt {payment_id}: {type(error).__name__}")
+    for request in referrals:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton(_hosted_message(OWNER_ID, 'mark_paid'), callback_data=f"hb:refresolve:paid:{request['id']}"),
+            types.InlineKeyboardButton(_hosted_message(OWNER_ID, 'rejected'), callback_data=f"hb:refresolve:rejected:{request['id']}"),
+        )
+        bot.send_message(
+            chat_id,
+            _hosted_message(
+                OWNER_ID,
+                'referral_request_detail',
+                user_id=request['user_id'],
+                amount=f"{request['amount']:.2f}",
+                wallet=request['wallet'],
+            ),
+            parse_mode='Markdown',
+            reply_markup=markup,
+        )
+    for payment_id, record in renewals:
+        _send_hosted_renewal_confirmation(chat_id, payment_id, record)
+
+
 def _handle_owner_action(chat_id, action, feedback):
     settings = get_settings(OWNER_ID)
+    if action == "confirmations":
+        _show_hosted_confirmations(chat_id)
+        return
     if action == "stats":
         _send_owner_stats(chat_id)
         return
@@ -4227,7 +4311,20 @@ def _sync_hosted_renewal_event(event):
             fields.update({
                 "renewal_internal_error_type": (event.get("record") or {}).get("renewal_internal_error_type"),
                 "renewal_internal_error_at": (event.get("record") or {}).get("renewal_internal_error_at"),
+                "renewal_internal_error_stage": (event.get("record") or {}).get("renewal_internal_error_stage"),
+                "renewal_internal_error_code": (event.get("record") or {}).get("renewal_internal_error_code"),
             })
+    elif status == "reserved":
+        record = event.get("record") or {}
+        fields = {
+            key: record.get(key)
+            for key in (
+                "renewal_baseline",
+                "renewal_baseline_normalized_at",
+                "renewal_baseline_normalization",
+            )
+            if record.get(key) is not None
+        }
     elif status == "applied":
         result = event.get("result") or {}
         fields = {
@@ -4259,6 +4356,95 @@ def _hosted_renewal_review_markup(payment_id, reason):
             types.InlineKeyboardButton("Apply now", callback_data=f"hb:rr:apply:{payment_id}"),
         )
     return markup
+
+
+def _hosted_human_renewal_reason(reason, record=None):
+    record = record or {}
+    if reason == 'renewal_internal_error':
+        stage = str(record.get('renewal_internal_error_stage') or 'unknown').replace('_', ' ')
+        code = str(record.get('renewal_internal_error_code') or 'internal check failed').replace('_', ' ')
+        return f"An internal safety check failed during {stage} ({code}). Nothing was applied."
+    return {
+        'external_renewal': 'The account appears to have entered a different service cycle. Choose whether to keep or apply the reservation.',
+        'server_unavailable': 'The assigned server could not be read. Nothing was applied and the reservation remains safe.',
+        'renewal_ineligible_missing': 'The assigned account could not be found. Nothing was applied.',
+        'renewal_reset_failed': 'The server did not confirm the renewal. Nothing was applied and the reservation remains safe.',
+        'deadline_normalized': 'The difference was only legacy Tehran-midnight to UTC-midnight normalization; the account was not changed.',
+    }.get(reason, f"This reservation needs review ({str(reason or 'unknown').replace('_', ' ')}). Nothing was applied.")
+
+
+def _send_hosted_renewal_confirmation(chat_id, payment_id, record, reason=None):
+    from utils.renewal import add_payment_renewal_message_ref
+
+    reason = reason or record.get('renewal_attention_reason') or 'renewal_reset_failed'
+    username = record.get('renew_username') or record.get('renewal_username') or record.get('username') or 'unknown'
+    server_id = record.get('server_id') or record.get('renewal_server_id') or 'unknown'
+    sent = bot.send_message(
+        chat_id,
+        "⚠️ *Reserved Renewal Needs Attention*\n\n"
+        f"Customer: `{record.get('user_id')}`\nConfig: `{username}`\nServer: `{server_id}`\n"
+        f"Reservation: `{payment_id}`\n\n{_hosted_human_renewal_reason(reason, record)}",
+        reply_markup=_hosted_renewal_review_markup(payment_id, reason),
+        parse_mode='Markdown',
+    )
+    if sent is not None:
+        add_payment_renewal_message_ref(
+            payment_id,
+            {
+                'chat_id': sent.chat.id,
+                'message_id': sent.message_id,
+                'recipient_role': 'hosted_owner',
+            },
+            payments_file=tenant_file(OWNER_ID, 'payments.json'),
+        )
+    return sent
+
+
+def _clear_hosted_renewal_keyboards(call, payment_id):
+    try:
+        from utils.renewal import take_payment_renewal_message_refs
+
+        refs = take_payment_renewal_message_refs(
+            payment_id,
+            payments_file=tenant_file(OWNER_ID, 'payments.json'),
+        )
+    except Exception:
+        refs = []
+    refs.append({'chat_id': call.message.chat.id, 'message_id': call.message.message_id})
+    seen = set()
+    for ref in refs:
+        key = (str(ref.get('chat_id')), str(ref.get('message_id')))
+        if key in seen or ref.get('chat_id') is None or ref.get('message_id') is None:
+            continue
+        seen.add(key)
+        try:
+            bot.edit_message_reply_markup(
+                chat_id=ref.get('chat_id'),
+                message_id=ref.get('message_id'),
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+
+def _hosted_renewal_feedback(event):
+    if not event:
+        return 'This reservation is no longer pending or is already being processed.', 'already_processed'
+    status = event.get('status')
+    record = event.get('record') or {}
+    if status == 'waiting':
+        if event.get('reason') == 'deadline_normalized':
+            return 'Reservation kept. The difference was only timezone normalization; the account was not changed.', 'reserved'
+        return 'Reservation kept for the next expiry. The account was not changed.', 'reserved'
+    if status == 'applied':
+        plan = record.get('renewal_plan_snapshot') or {}
+        gb = plan.get('plan_gb') or record.get('plan_gb') or 'the purchased'
+        days = plan.get('days') or record.get('days') or 'the purchased'
+        return f'Renewal applied successfully: {gb} GB and {days} days.', 'applied'
+    if status == 'attention':
+        reason = event.get('reason') or record.get('renewal_attention_reason')
+        return f"Still needs owner attention. {_hosted_human_renewal_reason(reason, record)}", 'attention'
+    return f"Reservation is now {status or 'unknown'}.", str(status or 'unknown')
 
 
 def _handle_hosted_renewal_event(event):
@@ -4308,16 +4494,7 @@ def _handle_hosted_renewal_event(event):
         mark_reseller_renewal_alerted(OWNER_ID, event["payment_id"], audience="buyer")
     if operator_alert_due:
         try:
-            owner_reason = _message(OWNER_ID, reason)
-            if owner_reason == reason:
-                owner_reason = reason
-            server_id = record.get("server_id") or record.get("renewal_server_id") or "unknown"
-            bot.send_message(
-                OWNER_ID,
-                f"Reserved renewal needs attention.\nCustomer: `{customer_id}`\nConfig: `{username}`\nServer: `{server_id}`\nReason: {owner_reason}",
-                reply_markup=_hosted_renewal_review_markup(event["payment_id"], reason),
-                parse_mode="Markdown",
-            )
+            _send_hosted_renewal_confirmation(OWNER_ID, event['payment_id'], record, reason=reason)
         except Exception:
             pass
         mark_payment_renewal_alerted(
@@ -4376,19 +4553,21 @@ def hosted_renewal_review(call):
         bot.answer_callback_query(call.id, "Invalid renewal review action.", show_alert=True)
         return
     action, payment_id = parts[2], parts[3]
+    _clear_hosted_renewal_keyboards(call, payment_id)
     try:
         from utils.renewal import (
             capture_user_state,
             lookup_renewal_user,
             process_payment_renewal_reservation,
+            record_payment_renewal_review,
             refresh_payment_renewal_baseline,
         )
-        from utils.reseller import refresh_reseller_renewal_baseline
+        from utils.reseller import record_reseller_renewal_review, refresh_reseller_renewal_baseline
 
         payments_file = tenant_file(OWNER_ID, "payments.json")
         record = _tenant_payments().get(payment_id, {})
         if action == "wait":
-            client, live, _lookup_result = lookup_renewal_user(
+            _client, live, lookup_result = lookup_renewal_user(
                 MultiServerAPI(),
                 record.get("renew_username"),
                 server_id=record.get("server_id"),
@@ -4404,6 +4583,19 @@ def hosted_renewal_review(call):
                     payment_id,
                     capture_user_state(live),
                 )
+                event = {
+                    'payment_id': payment_id,
+                    'status': 'waiting',
+                    'record': _tenant_payments().get(payment_id, record),
+                }
+            else:
+                reason = 'server_unavailable' if (lookup_result or {}).get('status') == 'unavailable' else 'renewal_ineligible_missing'
+                event = {
+                    'payment_id': payment_id,
+                    'status': 'attention',
+                    'reason': reason,
+                    'record': record,
+                }
         else:
             event = process_payment_renewal_reservation(
                 payment_id,
@@ -4411,16 +4603,49 @@ def hosted_renewal_review(call):
                 force=True,
                 force_apply=action == "apply",
             )
-            success = bool(event)
             if event:
-                _handle_hosted_renewal_event(event)
+                if event.get('status') == 'attention':
+                    _sync_hosted_renewal_event(event)
+                else:
+                    try:
+                        _handle_hosted_renewal_event(event)
+                    except Exception as delivery_error:
+                        logging.getLogger('ajib.renewals').error(
+                            'renewal_delivery_error kind=hosted reservation_id=%s error_type=%s',
+                            payment_id,
+                            type(delivery_error).__name__,
+                        )
+        feedback, outcome = _hosted_renewal_feedback(event)
+        record_payment_renewal_review(
+            payment_id,
+            call.from_user.id,
+            action,
+            outcome,
+            payments_file=payments_file,
+        )
+        record_reseller_renewal_review(
+            OWNER_ID,
+            payment_id,
+            call.from_user.id,
+            action,
+            outcome,
+        )
+        if event and event.get('status') == 'attention':
+            latest = _tenant_payments().get(payment_id, event.get('record') or record)
+            _send_hosted_renewal_confirmation(call.message.chat.id, payment_id, latest)
+        else:
+            bot.send_message(call.message.chat.id, feedback)
         bot.answer_callback_query(
             call.id,
-            "Renewal reservation updated." if success else "Renewal reservation could not be updated.",
+            feedback[:190],
             show_alert=True,
         )
     except Exception:
-        bot.answer_callback_query(call.id, "Renewal review failed.", show_alert=True)
+        bot.answer_callback_query(
+            call.id,
+            "Renewal review encountered an error. Open Confirmations to verify the saved status before retrying.",
+            show_alert=True,
+        )
 
 
 def _crypto_monitor():

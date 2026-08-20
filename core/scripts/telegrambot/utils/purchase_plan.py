@@ -2807,6 +2807,138 @@ def handle_text_while_waiting(message):
     bot.reply_to(message, get_message_text(language, "upload_receipt"), reply_markup=markup)
 
 
+def _pending_admin_confirmation_data(payments):
+    result = {
+        'renewals': [],
+        'reseller_applications': [],
+        'referral_withdrawals': get_pending_withdrawal_requests(),
+        'hosted_withdrawals': [],
+        'cleanup_manual_review': 0,
+        'cleanup_duplicate_payment': 0,
+    }
+    for payment_id, record in (payments or {}).items():
+        if not isinstance(record, dict):
+            continue
+        if (
+            record.get('status') == 'completed'
+            and record.get('renewal_mode') == 'reserved'
+            and record.get('renewal_status') == 'attention'
+        ):
+            result['renewals'].append(('p', str(payment_id), record))
+    try:
+        import utils.reseller as reseller_store
+
+        get_all_resellers = getattr(reseller_store, 'get_all_resellers', lambda: {})
+        list_reseller_renewal_reservations = getattr(
+            reseller_store,
+            'list_reseller_renewal_reservations',
+            lambda: [],
+        )
+        for reseller_id, reseller in get_all_resellers().items():
+            if isinstance(reseller, dict) and reseller.get('status') == 'pending':
+                result['reseller_applications'].append((str(reseller_id), reseller))
+        for item in list_reseller_renewal_reservations():
+            reservation = item.get('reservation') or {}
+            if (
+                reservation.get('renewal_status') == 'attention'
+                and reservation.get('renewal_source') != 'hosted_customer'
+            ):
+                result['renewals'].append(('r', str(item.get('reseller_id')), item))
+    except (ImportError, AttributeError):
+        pass
+    try:
+        from utils.hosted_bots import list_pending_earnings_withdrawals
+
+        result['hosted_withdrawals'] = list_pending_earnings_withdrawals()
+    except (ImportError, AttributeError):
+        pass
+    try:
+        from utils.expired_cleanup import get_expired_cleanup_counts
+
+        counts = get_expired_cleanup_counts()
+        result['cleanup_manual_review'] = int(counts.get('manual_review', 0) or 0)
+        result['cleanup_duplicate_payment'] = int(counts.get('duplicate_payment', 0) or 0)
+    except (ImportError, AttributeError):
+        pass
+
+    def created(item):
+        record = item[-1] if isinstance(item, tuple) else item
+        if isinstance(record, dict) and isinstance(record.get('reservation'), dict):
+            record = record['reservation']
+        return str((record or {}).get('renewal_reserved_at') or (record or {}).get('created_at') or '')
+
+    result['renewals'].sort(key=created)
+    result['reseller_applications'].sort(
+        key=lambda item: str(item[1].get('reseller_application_requested_at') or '')
+    )
+    result['referral_withdrawals'].sort(key=lambda item: str(item.get('requested_at') or ''))
+    result['hosted_withdrawals'].sort(key=lambda item: str(item.get('requested_at') or ''))
+    return result
+
+
+def _send_reseller_application_confirmation(chat_id, reseller_id, reseller):
+    username = str(reseller.get('telegram_username') or '').strip().lstrip('@')
+    username_line = f"\nTelegram: `@{username}`" if username else ''
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton('✅ Approve', callback_data=f'admin_reseller:approve:{reseller_id}'),
+        types.InlineKeyboardButton('❌ Reject', callback_data=f'admin_reseller:reject:{reseller_id}'),
+    )
+    return bot.send_message(
+        chat_id,
+        f"🧾 *Pending Reseller Application*\n\nUser: `{reseller_id}`{username_line}",
+        reply_markup=markup,
+        parse_mode='Markdown',
+    )
+
+
+def _send_hosted_withdrawal_confirmation(chat_id, request):
+    reseller_id = str(request.get('reseller_id'))
+    request_id = str(request.get('id'))
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton(
+            '✅ Mark Paid',
+            callback_data=f'hosted_admin:resolve:paid:{reseller_id}:{request_id}',
+        ),
+        types.InlineKeyboardButton(
+            '❌ Reject',
+            callback_data=f'hosted_admin:resolve:rejected:{reseller_id}:{request_id}',
+        ),
+    )
+    return bot.send_message(
+        chat_id,
+        "🤖 *Pending Hosted-Bot Earnings Withdrawal*\n\n"
+        f"Reseller: `{reseller_id}`\n"
+        f"Request: `{request_id}`\n"
+        f"Amount: `${float(request.get('amount', 0) or 0):.2f}`\n"
+        f"Destination: `{request.get('destination')}`",
+        reply_markup=markup,
+        parse_mode='Markdown',
+    )
+
+
+def _send_cleanup_confirmation_summary(chat_id, manual_count, duplicate_count):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if manual_count:
+        markup.add(types.InlineKeyboardButton(
+            f'Manual reviews ({manual_count})',
+            callback_data='admin_expired_cleanup:list:manual_review:0',
+        ))
+    if duplicate_count:
+        markup.add(types.InlineKeyboardButton(
+            f'Duplicate-payment reviews ({duplicate_count})',
+            callback_data='admin_expired_cleanup:list:duplicate_payment:0',
+        ))
+    return bot.send_message(
+        chat_id,
+        "🧹 *Expired Cleanup Reviews*\n\n"
+        f"Manual review: *{manual_count}*\nDuplicate payment: *{duplicate_count}*",
+        reply_markup=markup,
+        parse_mode='Markdown',
+    )
+
+
 @bot.message_handler(func=lambda message: message.text == admin_action_text("confirmations") and _is_confirmation_viewer(message.from_user.id))
 def show_pending_confirmations(message):
     user_id = message.from_user.id
@@ -2819,9 +2951,19 @@ def show_pending_confirmations(message):
         if not can_review_receipt(user_id, record, is_admin_user=user_is_admin):
             continue
         pending_items.append((payment_id, record))
-    pending_withdrawals = get_pending_withdrawal_requests() if user_is_admin else []
+    admin_data = _pending_admin_confirmation_data(payments) if user_is_admin else None
+    pending_withdrawals = admin_data['referral_withdrawals'] if admin_data else []
+    admin_only_count = 0
+    if admin_data:
+        admin_only_count = (
+            len(admin_data['renewals'])
+            + len(admin_data['reseller_applications'])
+            + len(admin_data['hosted_withdrawals'])
+            + admin_data['cleanup_manual_review']
+            + admin_data['cleanup_duplicate_payment']
+        )
 
-    if not pending_items and not pending_withdrawals:
+    if not pending_items and not pending_withdrawals and not admin_only_count:
         if not user_is_admin and is_receipt_checker(user_id):
             markup = types.InlineKeyboardMarkup(row_width=1)
             markup.add(types.InlineKeyboardButton("📊 My Stats", callback_data="checker_stats:my"))
@@ -2830,8 +2972,18 @@ def show_pending_confirmations(message):
             bot.reply_to(message, "No pending confirmations.", reply_markup=create_main_markup(is_admin=user_is_admin, user_id=user_id))
         return
 
-    total_pending = len(pending_items) + len(pending_withdrawals)
-    bot.reply_to(message, f"Pending confirmations: {total_pending}")
+    total_pending = len(pending_items) + len(pending_withdrawals) + admin_only_count
+    if user_is_admin:
+        bot.reply_to(
+            message,
+            "Pending confirmations: " + str(total_pending) + "\n"
+            f"Receipts: {len(pending_items)} · Renewals: {len(admin_data['renewals'])} · "
+            f"Reseller applications: {len(admin_data['reseller_applications'])}\n"
+            f"Referral payouts: {len(pending_withdrawals)} · Hosted payouts: {len(admin_data['hosted_withdrawals'])} · "
+            f"Cleanup reviews: {admin_data['cleanup_manual_review'] + admin_data['cleanup_duplicate_payment']}",
+        )
+    else:
+        bot.reply_to(message, f"Pending receipt confirmations: {len(pending_items)}")
     for payment_id, record in pending_items:
         try:
             sent_message = _send_receipt_confirmation(message.chat.id, payment_id, record)
@@ -2851,6 +3003,48 @@ def show_pending_confirmations(message):
             _send_referral_withdrawal_confirmation(message.chat.id, withdrawal_request)
         except Exception as e:
             bot.send_message(message.chat.id, f"Failed to show withdrawal {withdrawal_request.get('id')}: {str(e)}")
+    if admin_data:
+        for kind, identity, item in admin_data['renewals']:
+            try:
+                if kind == 'p':
+                    event = {
+                        'payment_id': identity,
+                        'reason': item.get('renewal_attention_reason'),
+                        'record': item,
+                    }
+                    _send_reserved_renewal_confirmation(message.chat.id, 'p', event, item.get('user_id'))
+                else:
+                    reservation = item.get('reservation') or {}
+                    config = item.get('config') or {}
+                    event = {
+                        'reseller_id': identity,
+                        'reservation_id': reservation.get('reservation_id'),
+                        'reason': reservation.get('renewal_attention_reason'),
+                        'record': {
+                            **reservation,
+                            'renewal_username': config.get('username'),
+                            'renewal_server_id': config.get('server_id'),
+                        },
+                    }
+                    _send_reserved_renewal_confirmation(message.chat.id, 'r', event, identity)
+            except Exception as error:
+                bot.send_message(message.chat.id, f"Failed to show renewal review: {type(error).__name__}")
+        for reseller_id, reseller in admin_data['reseller_applications']:
+            try:
+                _send_reseller_application_confirmation(message.chat.id, reseller_id, reseller)
+            except Exception as error:
+                bot.send_message(message.chat.id, f"Failed to show reseller application {reseller_id}: {type(error).__name__}")
+        for request in admin_data['hosted_withdrawals']:
+            try:
+                _send_hosted_withdrawal_confirmation(message.chat.id, request)
+            except Exception as error:
+                bot.send_message(message.chat.id, f"Failed to show hosted payout {request.get('id')}: {type(error).__name__}")
+        if admin_data['cleanup_manual_review'] or admin_data['cleanup_duplicate_payment']:
+            _send_cleanup_confirmation_summary(
+                message.chat.id,
+                admin_data['cleanup_manual_review'],
+                admin_data['cleanup_duplicate_payment'],
+            )
 
 def _process_admin_approval_job(call, action, payment_id, payment_record, reviewer_role, language):
     try:
@@ -3530,6 +3724,139 @@ def _reserved_renewal_review_markup(kind, event):
     return markup
 
 
+def _human_renewal_reason(reason, record=None):
+    record = record or {}
+    messages = {
+        'external_renewal': (
+            'The account appears to have started a different service cycle. '
+            'Choose whether to keep this purchase for the next expiry or apply it now.'
+        ),
+        'server_unavailable': (
+            'The assigned server could not be read. The reservation was not applied and will retry safely.'
+        ),
+        'renewal_ineligible_missing': (
+            'The assigned account could not be found. The reservation was not applied.'
+        ),
+        'renewal_reset_failed': (
+            'The server did not confirm the renewal. The reservation remains unapplied for a safe retry.'
+        ),
+        'reseller_debt_review': (
+            'The reseller account requires a debt-policy review before this reservation can be applied.'
+        ),
+        'deadline_normalized': (
+            'The deadline was only normalized from legacy Tehran midnight to UTC midnight; the service cycle did not change.'
+        ),
+    }
+    if reason == 'renewal_internal_error':
+        stage = str(record.get('renewal_internal_error_stage') or 'unknown').replace('_', ' ')
+        code = str(record.get('renewal_internal_error_code') or 'internal check failed').replace('_', ' ')
+        return (
+            f'An internal safety check failed during {stage} ({code}). '
+            'Nothing was applied and the reservation remains recoverable.'
+        )
+    return messages.get(
+        reason,
+        f"The reservation needs review ({str(reason or 'unknown').replace('_', ' ')}). Nothing was applied.",
+    )
+
+
+def _store_reserved_renewal_message_ref(kind, event, sent_message, role='admin'):
+    if sent_message is None:
+        return False
+    reference = {
+        'chat_id': sent_message.chat.id,
+        'message_id': sent_message.message_id,
+        'recipient_role': role,
+    }
+    if kind == 'p':
+        from utils.renewal import add_payment_renewal_message_ref
+
+        return add_payment_renewal_message_ref(event.get('payment_id'), reference)
+    from utils.reseller import add_reseller_renewal_message_ref
+
+    return add_reseller_renewal_message_ref(
+        event.get('reseller_id'),
+        event.get('reservation_id'),
+        reference,
+    )
+
+
+def _send_reserved_renewal_confirmation(chat_id, kind, event, recipient_id):
+    record = event.get('record') or {}
+    reason = event.get('reason') or record.get('renewal_attention_reason') or 'renewal_reset_failed'
+    username = record.get('renewal_username') or record.get('username') or 'unknown'
+    server_id = record.get('renewal_server_id') or record.get('server_id') or 'unknown'
+    identity = event.get('payment_id') if kind == 'p' else event.get('reservation_id')
+    sent = bot.send_message(
+        chat_id,
+        "⚠️ *Reserved Renewal Needs Attention*\n\n"
+        f"User: `{recipient_id}`\nConfig: `{username}`\nServer: `{server_id}`\n"
+        f"Reservation: `{identity}`\n\n{_human_renewal_reason(reason, record)}",
+        reply_markup=_reserved_renewal_review_markup(kind, event),
+        parse_mode='Markdown',
+    )
+    _store_reserved_renewal_message_ref(kind, event, sent)
+    return sent
+
+
+def _take_reserved_renewal_message_refs(kind, parts):
+    if kind == 'p':
+        from utils.renewal import take_payment_renewal_message_refs
+
+        return take_payment_renewal_message_refs(parts[3])
+    from utils.reseller import take_reseller_renewal_message_refs
+
+    return take_reseller_renewal_message_refs(parts[3], parts[4])
+
+
+def _clear_reserved_renewal_keyboards(call, kind, parts):
+    try:
+        refs = _take_reserved_renewal_message_refs(kind, parts)
+    except Exception:
+        refs = []
+    refs.append({
+        'chat_id': call.message.chat.id,
+        'message_id': call.message.message_id,
+    })
+    seen = set()
+    for ref in refs:
+        key = (str(ref.get('chat_id')), str(ref.get('message_id')))
+        if key in seen or None in (ref.get('chat_id'), ref.get('message_id')):
+            continue
+        seen.add(key)
+        try:
+            bot.edit_message_reply_markup(
+                chat_id=ref.get('chat_id'),
+                message_id=ref.get('message_id'),
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+
+def _renewal_review_feedback(event, action):
+    if not event:
+        return 'This reservation is no longer pending or is already being processed.', 'already_processed'
+    status = event.get('status')
+    record = event.get('record') or {}
+    if status == 'waiting':
+        if event.get('reason') == 'deadline_normalized':
+            return (
+                'Reservation kept for the next expiry. The deadline difference was only a legacy timezone normalization; the account was not changed.',
+                'reserved',
+            )
+        return 'Reservation kept for the next expiry. The account was not changed.', 'reserved'
+    if status == 'applied':
+        plan = record.get('renewal_plan_snapshot') or {}
+        gb = plan.get('plan_gb') or record.get('plan_gb') or record.get('gb') or 'the purchased'
+        days = plan.get('days') or record.get('days') or 'the purchased'
+        return f'Renewal applied successfully: {gb} GB and {days} days.', 'applied'
+    if status == 'attention':
+        reason = event.get('reason') or record.get('renewal_attention_reason')
+        return f"Still needs administrator attention. {_human_renewal_reason(reason, record)}", 'attention'
+    return f"Reservation is now {status or 'unknown'}.", str(status or 'unknown')
+
+
 def _deliver_reserved_renewal(event, recipient_id):
     from utils.renewal import format_renewal_success
 
@@ -3592,16 +3919,9 @@ def _notify_reserved_renewal_attention(kind, event, recipient_id):
             pass
 
     if operator_alert_due:
-        markup = _reserved_renewal_review_markup(kind, event)
-        server_id = record.get('renewal_server_id') or record.get('server_id') or 'unknown'
         for admin_id in ADMIN_USER_IDS:
             try:
-                bot.send_message(
-                    admin_id,
-                    f"Reserved renewal needs attention.\nUser: `{recipient_id}`\nConfig: `{username}`\nServer: `{server_id}`\nReason: {reason}",
-                    reply_markup=markup,
-                    parse_mode='Markdown',
-                )
+                _send_reserved_renewal_confirmation(admin_id, kind, event, recipient_id)
             except Exception:
                 pass
     if kind == 'p':
@@ -3684,27 +4004,35 @@ def handle_reserved_renewal_review(call):
         safe_answer_callback_query(bot, call.id, text='Invalid renewal review action.', show_alert=True)
         return
     kind, action = parts[1], parts[2]
+    _clear_reserved_renewal_keyboards(call, kind, parts)
     try:
         from utils.renewal import (
             capture_user_state,
             lookup_renewal_user,
             process_payment_renewal_reservation,
             process_reseller_renewal_reservation,
+            record_payment_renewal_review,
             refresh_payment_renewal_baseline,
         )
-        from utils.reseller import get_reseller_renewal_reservation, refresh_reseller_renewal_baseline
-
         if kind == 'p':
             payment_id = parts[3]
             record = get_payment_record(payment_id) or {}
             if action == 'wait':
-                client, live, _lookup_result = lookup_renewal_user(
+                _client, live, lookup_result = lookup_renewal_user(
                     MultiServerAPI(),
                     record.get('renewal_username'),
                     server_id=record.get('renewal_server_id'),
                 )
                 success = bool(live) and refresh_payment_renewal_baseline(payment_id, live)
-                event = None
+                if success:
+                    event = {
+                        'payment_id': payment_id,
+                        'status': 'waiting',
+                        'record': get_payment_record(payment_id) or record,
+                    }
+                else:
+                    reason = 'server_unavailable' if (lookup_result or {}).get('status') == 'unavailable' else 'renewal_ineligible_missing'
+                    event = {'payment_id': payment_id, 'status': 'attention', 'reason': reason, 'record': record}
             else:
                 event = process_payment_renewal_reservation(
                     payment_id,
@@ -3713,13 +4041,29 @@ def handle_reserved_renewal_review(call):
                 )
                 success = bool(event)
                 if event and event.get('status') == 'applied':
-                    _deliver_reserved_renewal(event, (event.get('record') or {}).get('user_id'))
+                    try:
+                        _deliver_reserved_renewal(event, (event.get('record') or {}).get('user_id'))
+                    except Exception as delivery_error:
+                        logging.getLogger('ajib.renewals').error(
+                            'renewal_delivery_error kind=payment reservation_id=%s error_type=%s',
+                            payment_id,
+                            type(delivery_error).__name__,
+                        )
+            feedback, outcome = _renewal_review_feedback(event, action)
+            record_payment_renewal_review(payment_id, call.from_user.id, action, outcome)
+            recipient_id = (event.get('record') or record).get('user_id') if event else record.get('user_id')
         else:
+            from utils.reseller import (
+                get_reseller_renewal_reservation,
+                record_reseller_renewal_review,
+                refresh_reseller_renewal_baseline,
+            )
+
             reseller_id, reservation_id = parts[3], parts[4]
             item = get_reseller_renewal_reservation(reseller_id, reservation_id) or {}
             if action == 'wait':
                 config = item.get('config') or {}
-                client, live, _lookup_result = lookup_renewal_user(
+                _client, live, lookup_result = lookup_renewal_user(
                     MultiServerAPI(),
                     config.get('username'),
                     server_id=config.get('server_id'),
@@ -3729,7 +4073,31 @@ def handle_reserved_renewal_review(call):
                     reservation_id,
                     capture_user_state(live),
                 )
-                event = None
+                if success:
+                    latest = get_reseller_renewal_reservation(reseller_id, reservation_id) or item
+                    event = {
+                        'reseller_id': reseller_id,
+                        'reservation_id': reservation_id,
+                        'status': 'waiting',
+                        'record': {
+                            **(latest.get('reservation') or {}),
+                            'renewal_username': (latest.get('config') or {}).get('username'),
+                            'renewal_server_id': (latest.get('config') or {}).get('server_id'),
+                        },
+                    }
+                else:
+                    reason = 'server_unavailable' if (lookup_result or {}).get('status') == 'unavailable' else 'renewal_ineligible_missing'
+                    event = {
+                        'reseller_id': reseller_id,
+                        'reservation_id': reservation_id,
+                        'status': 'attention',
+                        'reason': reason,
+                        'record': {
+                            **(item.get('reservation') or {}),
+                            'renewal_username': config.get('username'),
+                            'renewal_server_id': config.get('server_id'),
+                        },
+                    }
             else:
                 event = process_reseller_renewal_reservation(
                     reseller_id,
@@ -3739,16 +4107,42 @@ def handle_reserved_renewal_review(call):
                 )
                 success = bool(event)
                 if event and event.get('status') == 'applied':
-                    _deliver_reserved_renewal(event, int(reseller_id))
+                    try:
+                        _deliver_reserved_renewal(event, int(reseller_id))
+                    except Exception as delivery_error:
+                        logging.getLogger('ajib.renewals').error(
+                            'renewal_delivery_error kind=reseller reservation_id=%s error_type=%s',
+                            reservation_id,
+                            type(delivery_error).__name__,
+                        )
+            feedback, outcome = _renewal_review_feedback(event, action)
+            record_reseller_renewal_review(
+                reseller_id,
+                reservation_id,
+                call.from_user.id,
+                action,
+                outcome,
+            )
+            recipient_id = reseller_id
+
+        if event and event.get('status') == 'attention':
+            _send_reserved_renewal_confirmation(call.message.chat.id, kind, event, recipient_id)
+        else:
+            bot.send_message(call.message.chat.id, feedback)
         safe_answer_callback_query(
             bot,
             call.id,
-            text='Renewal reservation updated.' if success else 'Renewal reservation could not be updated.',
+            text=feedback[:190],
             show_alert=True,
         )
     except Exception as error:
         logging.getLogger('ajib.renewals').exception('Renewal review failed: %s', error)
-        safe_answer_callback_query(bot, call.id, text='Renewal review failed.', show_alert=True)
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            text='Renewal review encountered an error. Open Confirmations to verify the saved status before retrying.',
+            show_alert=True,
+        )
 
 
 def check_pending_payments():

@@ -26,6 +26,14 @@ from utils.reseller import (
     get_reseller_level_summary,
 )
 try:
+    from utils.reseller import review_reseller_application
+except ImportError:  # Rolling-upgrade/test compatibility.
+    def review_reseller_application(user_id, decision, admin_id, now=None):
+        current = get_reseller_data(user_id) or {}
+        if current.get('status') != 'pending':
+            return False, {'status': current.get('status') or 'missing'}
+        return update_reseller_status(user_id, decision), {'status': decision}
+try:
     from utils.reseller import get_reseller_credit_policy
 except ImportError:  # Rolling-upgrade/test compatibility.
     def get_reseller_credit_policy(data):
@@ -777,14 +785,42 @@ def handle_reseller_request(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_reseller:"))
 def handle_admin_reseller(call):
     if not is_admin(call.from_user.id):
+        safe_answer_callback_query(bot, call.id, "Unauthorized", show_alert=True)
         return
-        
+
+    try:
+        bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=None,
+        )
+    except Exception:
+        pass
     action, target_user_id = call.data.split(':')[1], call.data.split(':')[2]
     target_user_id = int(target_user_id)
     target_language = get_user_language(target_user_id)
-    
+    decision = {'approve': 'approved', 'reject': 'rejected'}.get(action)
+    if decision is None:
+        safe_answer_callback_query(bot, call.id, "Invalid reseller decision.", show_alert=True)
+        return
+    success, outcome = review_reseller_application(
+        target_user_id,
+        decision,
+        call.from_user.id,
+    )
+    if not success:
+        status = outcome.get('status', 'unknown') if isinstance(outcome, dict) else 'unknown'
+        text = f"This reseller application is already {status}."
+        safe_edit_message_text(
+            bot,
+            text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+        safe_answer_callback_query(bot, call.id, text, show_alert=True)
+        return
+
     if action == 'approve':
-        update_reseller_status(target_user_id, 'approved')
         _record_reseller_growth(
             "reseller_approved",
             target_user_id,
@@ -795,15 +831,26 @@ def handle_admin_reseller(call):
         except:
             pass
         present_pending_reseller_level(bot, target_user_id, target_language)
-        bot.edit_message_text(f"✅ User {target_user_id} approved as reseller.", chat_id=call.message.chat.id, message_id=call.message.message_id)
+        safe_edit_message_text(
+            bot,
+            f"✅ User {target_user_id} approved as reseller.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+        safe_answer_callback_query(bot, call.id, "Reseller application approved.")
         
     elif action == 'reject':
-        update_reseller_status(target_user_id, 'rejected')
         try:
             bot.send_message(target_user_id, get_message_text(target_language, "reseller_rejected_notification"))
         except:
             pass
-        bot.edit_message_text(f"❌ User {target_user_id} rejected as reseller.", chat_id=call.message.chat.id, message_id=call.message.message_id)
+        safe_edit_message_text(
+            bot,
+            f"❌ User {target_user_id} rejected as reseller.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+        safe_answer_callback_query(bot, call.id, "Reseller application rejected.")
 
 @bot.callback_query_handler(func=lambda call: call.data == "reseller:generate")
 def handle_reseller_generate(call):

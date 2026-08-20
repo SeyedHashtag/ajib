@@ -41,7 +41,11 @@ RENEWAL_LOGGER = logging.getLogger('ajib.renewals')
 RENEWAL_INTERNAL_ERROR_FIELDS = (
     'renewal_internal_error_type',
     'renewal_internal_error_at',
+    'renewal_internal_error_stage',
+    'renewal_internal_error_code',
 )
+RENEWAL_REVIEW_HISTORY_LIMIT = 50
+RENEWAL_MESSAGE_REF_LIMIT = 25
 
 
 def _sqlite_managed():
@@ -1082,6 +1086,8 @@ def update_reseller_status(user_id, status, telegram_username=None, suspended_re
                 previous_status = current.get('status')
                 previous_reason = current.get('suspended_reason')
                 current['status'] = status
+                if status == 'pending' and previous_status != 'pending':
+                    current['reseller_application_requested_at'] = _now_str()
                 if status == 'suspended':
                     current['suspended_reason'] = suspended_reason
                     if previous_status != 'suspended' or previous_reason != suspended_reason or not current.get('suspended_at'):
@@ -1529,8 +1535,12 @@ def claim_reseller_renewal_reservation(
                             )
                         elif status == 'attention':
                             next_attempt = _parse_renewal_time(reservation.get('renewal_next_attempt_at'))
+                            repair_recheck = reservation.get('renewal_recheck_pending') == 'v4_timezone_normalization'
                             if not force and (
-                                reservation.get('renewal_attention_reason') == 'external_renewal'
+                                (
+                                    reservation.get('renewal_attention_reason') == 'external_renewal'
+                                    and not repair_recheck
+                                )
                                 or (next_attempt is not None and next_attempt > current_time)
                             ):
                                 return None
@@ -1541,6 +1551,7 @@ def claim_reseller_renewal_reservation(
                         reservation['renewal_status'] = 'processing'
                         reservation['renewal_claim_id'] = claim_id
                         reservation['renewal_claimed_at'] = _format_renewal_time(current_time)
+                        reservation.pop('renewal_recheck_pending', None)
                         resellers[user_id] = _ensure_reseller_defaults(current)
                         _write_resellers_file(resellers)
                         return {'claim_id': claim_id, 'reservation': dict(reservation), 'config': dict(config), 'reseller': current}
@@ -1580,6 +1591,7 @@ def finish_reseller_renewal_reservation(
                         reservation.pop('renewal_claim_id', None)
                         reservation.pop('renewal_claimed_at', None)
                         reservation.pop('renewal_processing_from', None)
+                        reservation.pop('renewal_recheck_pending', None)
                         if status == 'applied':
                             reservation['renewal_applied_at'] = _format_renewal_time(current_time)
                             reservation.pop('renewal_attention_reason', None)
@@ -1587,6 +1599,7 @@ def finish_reseller_renewal_reservation(
                             reservation.pop('renewal_next_attempt_at', None)
                             reservation.pop('renewal_api_error', None)
                             reservation.pop('renewal_api_http_status', None)
+                            reservation.pop('renewal_recheck_pending', None)
                             for field in RENEWAL_INTERNAL_ERROR_FIELDS:
                                 reservation.pop(field, None)
                             config['cleanup_status'] = 'renewed'
@@ -1601,11 +1614,17 @@ def finish_reseller_renewal_reservation(
                             reservation.pop('renewal_api_http_status', None)
                             for field in RENEWAL_INTERNAL_ERROR_FIELDS:
                                 reservation.pop(field, None)
-                        elif retry:
-                            reservation['renewal_attempts'] = int(reservation.get('renewal_attempts', 0) or 0) + 1
-                            reservation['renewal_next_attempt_at'] = _format_renewal_time(
-                                current_time + timedelta(hours=1)
-                            )
+                        else:
+                            if reservation.get('renewal_attention_reason') != 'renewal_internal_error':
+                                for field in RENEWAL_INTERNAL_ERROR_FIELDS:
+                                    reservation.pop(field, None)
+                            if retry:
+                                reservation['renewal_attempts'] = int(reservation.get('renewal_attempts', 0) or 0) + 1
+                                reservation['renewal_next_attempt_at'] = _format_renewal_time(
+                                    current_time + timedelta(hours=1)
+                                )
+                            else:
+                                reservation.pop('renewal_next_attempt_at', None)
                         resellers[user_id] = _ensure_reseller_defaults(current)
                         _write_resellers_file(resellers)
                         return True
@@ -1630,6 +1649,8 @@ def refresh_reseller_renewal_baseline(user_id, reservation_id, user_data):
                             reservation.pop('renewal_attention_reason', None)
                             reservation.pop('renewal_last_error', None)
                             reservation.pop('renewal_next_attempt_at', None)
+                            reservation.pop('renewal_api_error', None)
+                            reservation.pop('renewal_api_http_status', None)
                             for field in RENEWAL_INTERNAL_ERROR_FIELDS:
                                 reservation.pop(field, None)
                             resellers[user_id] = _ensure_reseller_defaults(current)
@@ -1665,6 +1686,127 @@ def mark_reseller_renewal_alerted(user_id, reservation_id, now=None, audience=No
             return False
 
 
+def review_reseller_application(user_id, decision, admin_id, now=None):
+    """Atomically resolve a still-pending reseller application."""
+    user_id = str(user_id)
+    normalized = str(decision or '').strip().lower()
+    if normalized not in {'approved', 'rejected'}:
+        return False, {'status': 'invalid'}
+    reviewed_at = _format_renewal_time(_renewal_current_time(now))
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                if user_id not in resellers:
+                    return False, {'status': 'missing'}
+                current = _ensure_reseller_defaults(resellers[user_id])
+                if current.get('status') != 'pending':
+                    return False, {
+                        'status': current.get('status') or 'unknown',
+                        'reseller': dict(current),
+                    }
+                current['status'] = normalized
+                current['suspended_reason'] = None
+                current['suspended_at'] = None
+                current['reseller_application_reviewed_at'] = reviewed_at
+                current['reseller_application_reviewed_by'] = str(admin_id)
+                current['reseller_application_decision'] = normalized
+                resellers[user_id] = _ensure_reseller_defaults(current)
+                _write_resellers_file(resellers)
+                return True, {'status': normalized, 'reseller': dict(current)}
+        except Exception:
+            return False, {'status': 'error'}
+
+
+def _find_reseller_renewal(current, reservation_id):
+    for config in current.get('configs', []):
+        for reservation in config.get('renewals', []) if isinstance(config, dict) else []:
+            if isinstance(reservation, dict) and str(reservation.get('reservation_id') or '') == str(reservation_id):
+                return reservation
+    return None
+
+
+def record_reseller_renewal_review(user_id, reservation_id, reviewer_id, action, outcome, now=None):
+    user_id = str(user_id)
+    timestamp = _format_renewal_time(_renewal_current_time(now))
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                current = _ensure_reseller_defaults(resellers.get(user_id, {}))
+                reservation = _find_reseller_renewal(current, reservation_id)
+                if reservation is None:
+                    return False
+                history = reservation.get('renewal_review_history')
+                if not isinstance(history, list):
+                    history = []
+                history.append({
+                    'reviewed_by_user_id': str(reviewer_id),
+                    'action': str(action),
+                    'outcome': str(outcome),
+                    'reviewed_at': timestamp,
+                })
+                reservation['renewal_review_history'] = history[-RENEWAL_REVIEW_HISTORY_LIMIT:]
+                reservation['renewal_last_reviewed_by_user_id'] = str(reviewer_id)
+                reservation['renewal_last_review_action'] = str(action)
+                reservation['renewal_last_review_outcome'] = str(outcome)
+                reservation['renewal_last_reviewed_at'] = timestamp
+                resellers[user_id] = _ensure_reseller_defaults(current)
+                _write_resellers_file(resellers)
+                return True
+        except Exception:
+            return False
+
+
+def add_reseller_renewal_message_ref(user_id, reservation_id, message_ref):
+    user_id = str(user_id)
+    reference = dict(message_ref or {})
+    if reference.get('chat_id') is None or reference.get('message_id') is None:
+        return False
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                current = _ensure_reseller_defaults(resellers.get(user_id, {}))
+                reservation = _find_reseller_renewal(current, reservation_id)
+                if reservation is None:
+                    return False
+                refs = reservation.get('renewal_review_message_refs')
+                if not isinstance(refs, list):
+                    refs = []
+                key = (str(reference.get('chat_id')), str(reference.get('message_id')))
+                refs = [
+                    item for item in refs
+                    if isinstance(item, dict)
+                    and (str(item.get('chat_id')), str(item.get('message_id'))) != key
+                ]
+                refs.append(reference)
+                reservation['renewal_review_message_refs'] = refs[-RENEWAL_MESSAGE_REF_LIMIT:]
+                resellers[user_id] = _ensure_reseller_defaults(current)
+                _write_resellers_file(resellers)
+                return True
+        except Exception:
+            return False
+
+
+def take_reseller_renewal_message_refs(user_id, reservation_id):
+    user_id = str(user_id)
+    with reseller_lock:
+        try:
+            with _resellers_file_lock():
+                resellers = _read_resellers_file()
+                current = _ensure_reseller_defaults(resellers.get(user_id, {}))
+                reservation = _find_reseller_renewal(current, reservation_id)
+                if reservation is None:
+                    return []
+                refs = reservation.pop('renewal_review_message_refs', [])
+                resellers[user_id] = _ensure_reseller_defaults(current)
+                _write_resellers_file(resellers)
+                return [dict(item) for item in refs if isinstance(item, dict)]
+        except Exception:
+            return []
+
+
 def sync_reseller_renewal_reservation(user_id, reservation_id, status, fields=None):
     """Idempotently mirror hosted payment fulfillment into reseller history."""
     if status not in {'reserved', 'attention', 'applied'}:
@@ -1681,6 +1823,7 @@ def sync_reseller_renewal_reservation(user_id, reservation_id, status, fields=No
                             continue
                         reservation.update(dict(fields or {}))
                         reservation['renewal_status'] = status
+                        reservation.pop('renewal_recheck_pending', None)
                         if status == 'applied':
                             reservation.setdefault('renewal_applied_at', _now_str())
                             reservation.pop('renewal_attention_reason', None)
@@ -1700,6 +1843,9 @@ def sync_reseller_renewal_reservation(user_id, reservation_id, status, fields=No
                             reservation.pop('renewal_next_attempt_at', None)
                             reservation.pop('renewal_api_error', None)
                             reservation.pop('renewal_api_http_status', None)
+                            for field in RENEWAL_INTERNAL_ERROR_FIELDS:
+                                reservation.pop(field, None)
+                        elif reservation.get('renewal_attention_reason') != 'renewal_internal_error':
                             for field in RENEWAL_INTERNAL_ERROR_FIELDS:
                                 reservation.pop(field, None)
                         resellers[user_id] = _ensure_reseller_defaults(current)

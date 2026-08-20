@@ -1840,6 +1840,9 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         bot = DummyBot()
         purchase_plan = load_purchase_plan(bot, [])
         purchase_plan.is_receipt_checker = lambda _user_id: True
+        purchase_plan._pending_admin_confirmation_data = lambda _payments: self.fail(
+            "receipt checker entered the admin decision collector"
+        )
 
         message = types.SimpleNamespace(
             text="✅ Confirmations",
@@ -1853,6 +1856,134 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         markup = reply_kwargs["reply_markup"]
         self.assertEqual(markup.buttons[0].args[0], "📊 My Stats")
         self.assertEqual(markup.buttons[0].kwargs["callback_data"], "checker_stats:my")
+
+    def test_admin_confirmations_collect_every_durable_decision_type(self):
+        bot = DummyBot()
+        purchase_plan = load_purchase_plan(bot, [])
+        purchase_plan.is_admin = lambda _user_id: True
+        purchase_plan.load_payments = lambda: {
+            "renewal-main": {
+                "status": "completed",
+                "type": "renewal",
+                "user_id": "20",
+                "renewal_mode": "reserved",
+                "renewal_status": "attention",
+                "renewal_attention_reason": "renewal_internal_error",
+                "renewal_internal_error_stage": "lookup",
+                "renewal_internal_error_code": "lookup_failed",
+                "renewal_username": "s20",
+                "renewal_server_id": "primary",
+            },
+        }
+        purchase_plan.get_pending_withdrawal_requests = lambda: [{
+            "id": "ref-1", "user_id": "21", "amount": 2, "wallet": "wallet",
+        }]
+        reseller_store = sys.modules["utils.reseller"]
+        reseller_store.get_all_resellers = lambda: {
+            "22": {"status": "pending", "telegram_username": "reseller22"},
+        }
+        reseller_store.list_reseller_renewal_reservations = lambda: [{
+            "reseller_id": "22",
+            "config": {"username": "r22c1", "server_id": "primary"},
+            "reservation": {
+                "reservation_id": "renewal-reseller",
+                "renewal_mode": "reserved",
+                "renewal_status": "attention",
+                "renewal_attention_reason": "server_unavailable",
+            },
+        }]
+        reseller_store.add_reseller_renewal_message_ref = lambda *args, **kwargs: True
+        renewal_store = types.ModuleType("utils.renewal")
+        renewal_store.add_payment_renewal_message_ref = lambda *args, **kwargs: True
+        sys.modules["utils.renewal"] = renewal_store
+        hosted_store = types.ModuleType("utils.hosted_bots")
+        hosted_store.list_pending_earnings_withdrawals = lambda: [{
+            "reseller_id": "23", "id": "hosted-1", "amount": 5, "destination": "wallet23",
+        }]
+        sys.modules["utils.hosted_bots"] = hosted_store
+        cleanup_store = types.ModuleType("utils.expired_cleanup")
+        cleanup_store.get_expired_cleanup_counts = lambda: {
+            "manual_review": 2, "duplicate_payment": 1,
+        }
+        sys.modules["utils.expired_cleanup"] = cleanup_store
+
+        message = types.SimpleNamespace(
+            text="✅ Confirmations",
+            from_user=types.SimpleNamespace(id=1),
+            chat=types.SimpleNamespace(id=555),
+        )
+        purchase_plan.show_pending_confirmations(message)
+
+        summary = bot.replies[0][0][1]
+        self.assertIn("Pending confirmations: 8", summary)
+        self.assertIn("Renewals: 2", summary)
+        self.assertIn("Reseller applications: 1", summary)
+        self.assertIn("Hosted payouts: 1", summary)
+        self.assertIn("Cleanup reviews: 3", summary)
+        rendered = "\n".join(str(item[0][1]) for item in bot.sent_messages)
+        self.assertIn("Reserved Renewal Needs Attention", rendered)
+        self.assertIn("Pending Reseller Application", rendered)
+        self.assertIn("Pending Referral Withdrawal", rendered)
+        self.assertIn("Pending Hosted-Bot Earnings Withdrawal", rendered)
+        self.assertIn("Expired Cleanup Reviews", rendered)
+        self.assertNotIn("renewal_internal_error", rendered)
+
+    def test_renewal_retry_removes_buttons_and_reports_attention_outcome(self):
+        bot = DummyBot()
+        purchase_plan = load_purchase_plan(bot, [])
+        purchase_plan.is_admin = lambda _user_id: True
+        purchase_plan.get_payment_record = lambda _payment_id: {
+            "user_id": 20,
+            "renewal_status": "attention",
+            "renewal_username": "s20",
+            "renewal_server_id": "primary",
+        }
+        audits = []
+        renewal_store = types.ModuleType("utils.renewal")
+        renewal_store.capture_user_state = lambda value: value
+        renewal_store.lookup_renewal_user = lambda *args, **kwargs: (None, None, {"status": "unavailable"})
+        renewal_store.refresh_payment_renewal_baseline = lambda *args, **kwargs: False
+        renewal_store.process_reseller_renewal_reservation = lambda *args, **kwargs: None
+        renewal_store.process_payment_renewal_reservation = lambda *args, **kwargs: {
+            "payment_id": "renewal-main",
+            "status": "attention",
+            "reason": "renewal_internal_error",
+            "record": {
+                "user_id": 20,
+                "renewal_username": "s20",
+                "renewal_server_id": "primary",
+                "renewal_internal_error_stage": "lookup",
+                "renewal_internal_error_code": "lookup_failed",
+            },
+        }
+        renewal_store.record_payment_renewal_review = (
+            lambda payment_id, reviewer, action, outcome: audits.append(
+                (payment_id, reviewer, action, outcome)
+            ) or True
+        )
+        renewal_store.take_payment_renewal_message_refs = lambda _payment_id: [
+            {"chat_id": 1, "message_id": 10}
+        ]
+        renewal_store.add_payment_renewal_message_ref = lambda *args, **kwargs: True
+        sys.modules["utils.renewal"] = renewal_store
+        call = types.SimpleNamespace(
+            id="callback-1",
+            data="rr:p:retry:renewal-main",
+            from_user=types.SimpleNamespace(id=7),
+            message=types.SimpleNamespace(
+                chat=types.SimpleNamespace(id=555),
+                message_id=99,
+            ),
+        )
+
+        purchase_plan.handle_reserved_renewal_review(call)
+
+        self.assertGreaterEqual(len(bot.edited_reply_markups), 2)
+        self.assertEqual(audits, [("renewal-main", 7, "retry", "attention")])
+        answer = bot.callback_answers[-1][1]["text"]
+        self.assertIn("Still needs administrator attention", answer)
+        self.assertNotIn("Renewal reservation updated", answer)
+        self.assertIn("lookup", bot.sent_messages[-1][0][1])
 
     def test_admin_pending_confirmations_include_referral_withdrawals(self):
         bot = DummyBot()
@@ -1877,7 +2008,8 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         )
         purchase_plan.show_pending_confirmations(message)
 
-        self.assertEqual(bot.replies[0][0][1], "Pending confirmations: 1")
+        self.assertTrue(bot.replies[0][0][1].startswith("Pending confirmations: 1\n"))
+        self.assertIn("Referral payouts: 1", bot.replies[0][0][1])
         self.assertIn("Pending Referral Withdrawal", bot.sent_messages[0][0][1])
         self.assertIn("Request ID: `req-1`", bot.sent_messages[0][0][1])
         markup = bot.sent_messages[0][1]["reply_markup"]
