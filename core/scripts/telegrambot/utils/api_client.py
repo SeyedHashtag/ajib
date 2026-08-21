@@ -1547,12 +1547,27 @@ class ThreeXUIAPIClient(APIClient):
         sub_id = str(client.get("subId") or "").strip()
         settings = self.get_settings()
         sub_uri = str((settings or {}).get("subURI") or "").strip()
-        if sub_uri and sub_id and _safe_bool((settings or {}).get("subEnable", True), True):
-            return {"normal_sub": f"{sub_uri}{sub_id}", "ipv4": "", "direct": False}
+        # Always resolve direct links so the payload mirrors the Blitz
+        # adapter's shape (``normal_sub`` plus ``ipv4``); every downstream
+        # message (purchase, renewal, My Configs, trial) then renders
+        # identically regardless of panel type.
         links = self._xui_result("GET", f"clients/links/{quote(str(username), safe='')}")
         direct_links = links.get("data") if links.get("status") == "succeeded" else None
-        if isinstance(direct_links, list) and direct_links:
-            return {"normal_sub": str(direct_links[0]), "ipv4": "", "direct": True, "links": direct_links}
+        if not isinstance(direct_links, list):
+            direct_links = []
+        direct_links = [str(link).strip() for link in direct_links if str(link or "").strip()]
+        if sub_uri and sub_id and _safe_bool((settings or {}).get("subEnable", True), True):
+            return {
+                "normal_sub": f"{sub_uri}{sub_id}",
+                "ipv4": direct_links[0] if direct_links else "",
+                "direct": False,
+                "links": direct_links,
+            }
+        if direct_links:
+            # Degraded setup without public subscription settings: fall back
+            # to the first direct link and leave ``ipv4`` empty so the same
+            # link is never rendered twice.
+            return {"normal_sub": direct_links[0], "ipv4": "", "direct": True, "links": direct_links}
         return None
 
 

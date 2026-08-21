@@ -661,11 +661,74 @@ class ThreeXUIAdapterTests(unittest.TestCase):
                 return Response({"success": True, "obj": [{"id": 4, "remark": "HY2", "protocol": "hysteria"}]})
             if url.endswith("setting/all"):
                 return Response({"success": True, "obj": {"subURI": "https://sub.example/s/", "subEnable": True}})
+            if url.endswith("clients/links/alice"):
+                return Response({"success": True, "obj": ["hysteria2://direct-a", " hysteria2://direct-b "]})
             raise AssertionError(url)
 
         client._request = request
-        self.assertEqual(client.get_user_uri("alice")["normal_sub"], "https://sub.example/s/abc")
+        uri = client.get_user_uri("alice")
+        self.assertEqual(uri["normal_sub"], "https://sub.example/s/abc")
+        # Blitz parity: ipv4 carries the first direct link for QR + IPv4 line.
+        self.assertEqual(uri["ipv4"], "hysteria2://direct-a")
+        self.assertFalse(uri["direct"])
+        self.assertEqual(uri["links"], ["hysteria2://direct-a", "hysteria2://direct-b"])
         self.assertEqual(client.is_creation_ready(verify_remote=True), (True, None))
+
+    def test_user_uri_keeps_subscription_when_direct_links_unavailable(self):
+        client = make_client([4])
+
+        def request(method, url, **kwargs):
+            if url.endswith("clients/get/alice"):
+                return Response({"success": True, "obj": {"client": {
+                    "email": "alice", "subId": "abc", "auth": "pw"
+                }}})
+            if url.endswith("setting/all"):
+                return Response({"success": True, "obj": {"subURI": "https://sub.example/s/", "subEnable": True}})
+            if url.endswith("clients/links/alice"):
+                return Response({"success": False, "msg": "links endpoint down"})
+            raise AssertionError(url)
+
+        client._request = request
+        uri = client.get_user_uri("alice")
+        self.assertEqual(uri["normal_sub"], "https://sub.example/s/abc")
+        self.assertEqual(uri["ipv4"], "")
+        self.assertFalse(uri["direct"])
+
+    def test_user_uri_falls_back_to_first_direct_link_without_subscription(self):
+        client = make_client([4])
+
+        def request(method, url, **kwargs):
+            if url.endswith("clients/get/alice"):
+                return Response({"success": True, "obj": {"client": {
+                    "email": "alice", "subId": "abc", "auth": "pw"
+                }}})
+            if url.endswith("setting/all"):
+                return Response({"success": True, "obj": {"subURI": "", "subEnable": True}})
+            if url.endswith("clients/links/alice"):
+                return Response({"success": True, "obj": ["hysteria2://only-link"]})
+            raise AssertionError(url)
+
+        client._request = request
+        uri = client.get_user_uri("alice")
+        self.assertEqual(uri["normal_sub"], "hysteria2://only-link")
+        self.assertTrue(uri["direct"])
+
+    def test_user_uri_returns_none_without_subscription_or_links(self):
+        client = make_client([4])
+
+        def request(method, url, **kwargs):
+            if url.endswith("clients/get/alice"):
+                return Response({"success": True, "obj": {"client": {
+                    "email": "alice", "subId": "abc", "auth": "pw"
+                }}})
+            if url.endswith("setting/all"):
+                return Response({"success": True, "obj": {"subURI": "", "subEnable": True}})
+            if url.endswith("clients/links/alice"):
+                return Response({"success": True, "obj": []})
+            raise AssertionError(url)
+
+        client._request = request
+        self.assertIsNone(client.get_user_uri("alice"))
 
     def test_invalid_success_envelope_is_rejected(self):
         client = make_client()
