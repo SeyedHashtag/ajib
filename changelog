@@ -1,3 +1,7 @@
+## v2.7.4
+🛠️ Resolve 3x-ui direct links consistently so user URI payloads mirror the Blitz adapter shape across purchase, renewal, My Configs, and trial messages
+🐛 Fall back to the first direct link when public subscription settings are missing or disabled and never render the same link twice
+✅ Add regression coverage for subscription-based and direct-link fallback URI building in the 3x-ui client
 ## v2.7.3
 🛠️ Prefix Blitz passwords with the username when copying or migrating accounts to 3x-ui for valid Hysteria2 credentials
 🐛 Verify the transformed destination password during transfers and safely recover matching interrupted bulk jobs
