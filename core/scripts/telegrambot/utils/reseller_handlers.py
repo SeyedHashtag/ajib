@@ -1317,7 +1317,7 @@ def handle_reseller_wholesale_balance(call):
         get_message_text(language, "reseller_wholesale_balance_screen").format(
             available=balance['available'],
             reserved=balance['reserved'],
-            credit_mode=policy['mode'],
+            credit_mode=_escape_markdown(policy['mode']),
             effective_limit=policy['effective_limit'],
         ),
         chat_id=call.message.chat.id,

@@ -148,6 +148,12 @@ def install_stubs():
         ),
         "reseller_effective_credit_line": "Credit: ${effective_limit} ({credit_mode})",
         "reseller_wholesale_balance_line": "Balance: ${balance}",
+        "reseller_wholesale_balance_screen": (
+            "💼 **Wholesale Balance**\n\n"
+            "Available: ${available:.2f}\nReserved: ${reserved:.2f}\n"
+            "Credit mode: {credit_mode}\nEffective trust limit: ${effective_limit:.2f}\n"
+            "This balance is non-withdrawable and can only fund wholesale orders."
+        ),
         "admin_reseller_credit_outcomes_line": "Outcomes: {outcomes}",
         "admin_username_unknown": "N/A",
         "admin_debt_cancel": "Cancel",
@@ -430,6 +436,64 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
 
         self.assertIn("prepaid\\_only", detail)
         self.assertIn("half\\_credit", detail)
+
+    def test_wholesale_balance_screen_escapes_restricted_credit_modes(self):
+        original_active = reseller_handlers._get_active_reseller_data
+        original_balance = reseller_handlers.get_wholesale_balance
+        original_account_credit = reseller_handlers.get_account_credit
+        original_policy = reseller_handlers.get_reseller_credit_policy
+        for name, value in (
+            ("_get_active_reseller_data", original_active),
+            ("get_wholesale_balance", original_balance),
+            ("get_account_credit", original_account_credit),
+            ("get_reseller_credit_policy", original_policy),
+        ):
+            self.addCleanup(setattr, reseller_handlers, name, value)
+        reseller_handlers._get_active_reseller_data = (
+            lambda user_id: {"status": "approved", "debt": 0.0}
+        )
+        reseller_handlers.get_wholesale_balance = lambda user_id: {
+            "available": 3.0,
+            "reserved": 0.5,
+        }
+        reseller_handlers.get_account_credit = lambda user_id: {"available": 0}
+        call = types.SimpleNamespace(
+            id="callback",
+            from_user=types.SimpleNamespace(id=7),
+            message=types.SimpleNamespace(
+                chat=types.SimpleNamespace(id=8),
+                message_id=9,
+            ),
+        )
+
+        for mode in ("prepaid_only", "half_credit"):
+            reseller_handlers.bot.edits.clear()
+            reseller_handlers.bot.answers.clear()
+            reseller_handlers.get_reseller_credit_policy = (
+                lambda data, resolved_mode=mode: {
+                    "effective_limit": 5,
+                    "mode": resolved_mode,
+                    "outcomes": [],
+                }
+            )
+            reseller_handlers.handle_reseller_wholesale_balance(call)
+
+            self.assertEqual(len(reseller_handlers.bot.edits), 1)
+            args, kwargs = reseller_handlers.bot.edits[0]
+            self.assertEqual(kwargs["parse_mode"], "Markdown")
+            self.assertIn(mode.replace("_", "\\_"), args[0])
+            self.assertEqual(kwargs["chat_id"], 8)
+            self.assertEqual(kwargs["message_id"], 9)
+            callback_data = [
+                button.callback_data for button in kwargs["reply_markup"].buttons
+            ]
+            self.assertIn("reseller:cancel", callback_data)
+            self.assertIn("reseller:wholesale_fund:20.00", callback_data)
+            self.assertFalse(
+                any(entry.startswith("reseller:settle:") for entry in callback_data)
+            )
+            self.assertEqual(len(reseller_handlers.bot.answers), 1)
+
 
     def test_admin_detail_plaintext_fallback_only_for_entity_parse_errors(self):
         original_get = reseller_handlers.get_reseller_data
