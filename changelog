@@ -1,3 +1,7 @@
+## v2.7.5
+🐛 Escape the credit mode on the reseller wholesale balance screen with Markdown escaping so underscored credit modes render correctly
+✅ Add regression coverage for credit-mode Markdown escaping in wholesale balance displays
+
 ## v2.7.4
 🛠️ Resolve 3x-ui direct links consistently so user URI payloads mirror the Blitz adapter shape across purchase, renewal, My Configs, and trial messages
 🐛 Fall back to the first direct link when public subscription settings are missing or disabled and never render the same link twice
