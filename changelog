@@ -1,3 +1,9 @@
+## v2.7.6
+🛠️ Prewarm and periodically refresh the server-info dashboard cache so monitoring views stay responsive and current
+🐛 Reduce traffic-monitor state writes while preserving renewal-boundary detection, and add structured scan and slow-transaction diagnostics
+🛡️ Harden main and hosted Telegram polling with authentication checks, rate-limit-aware backoff, and recoverable customer-notification claims
+✅ Expand regression coverage for server-info refreshes, traffic monitoring, hosted runtime recovery, state backups, logging, and bulk-transfer notifications
+
 ## v2.7.5
 🐛 Escape the credit mode on the reseller wholesale balance screen with Markdown escaping so underscored credit modes render correctly
 ✅ Add regression coverage for credit-mode Markdown escaping in wholesale balance displays
