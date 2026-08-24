@@ -557,6 +557,116 @@ def install_payment_store(purchase_plan, store):
 
 
 class CryptoPaymentDiscountTests(unittest.TestCase):
+    def test_config_delivery_formats_incident_url_and_records_success(self):
+        bot = DummyBot()
+        purchase_plan = load_purchase_plan(bot, [])
+        updates = []
+        purchase_plan.update_payment_record_fields = (
+            lambda payment_id, fields: updates.append((payment_id, dict(fields))) or True
+        )
+
+        raw_url = r"https://sub.example/sub_id?direct=[one]`two\three"
+        message = purchase_plan._format_config_delivery_message(
+            "en",
+            "payment_approved",
+            plan_gb="70",
+            days=60,
+            username="s7951744600d",
+            sub_url=raw_url,
+        )
+        purchase_plan._deliver_payment_config(
+            "receipt-payment",
+            7951744600,
+            message,
+            username="s7951744600d",
+            server_id="primary",
+        )
+
+        delivered = bot.sent_messages[-1]
+        self.assertIn(r"sub\_id", delivered[0][1])
+        self.assertIn(r"direct=\[one\]\`two\\three", delivered[0][1])
+        self.assertEqual(delivered[1]["parse_mode"], "Markdown")
+        self.assertEqual([fields["config_delivery_status"] for _pid, fields in updates], ["attempting", "sent"])
+        self.assertIn("config_delivery_attempted_at", updates[0][1])
+        self.assertIn("config_delivered_at", updates[1][1])
+
+    def test_final_config_delivery_failure_is_audited_and_alerts_without_url(self):
+        class FailingBot(DummyBot):
+            def send_message(self, *args, **kwargs):
+                if args and args[0] == 7951744600:
+                    raise RuntimeError("network exploded https://secret.example/sub_id")
+                return super().send_message(*args, **kwargs)
+
+        bot = FailingBot()
+        purchase_plan = load_purchase_plan(bot, [])
+        purchase_plan.ADMIN_USER_IDS = [1]
+        updates = []
+        purchase_plan.update_payment_record_fields = (
+            lambda payment_id, fields: updates.append((payment_id, dict(fields))) or True
+        )
+
+        with self.assertRaises(RuntimeError):
+            purchase_plan._deliver_payment_config(
+                "receipt-payment",
+                7951744600,
+                "credential https://secret.example/sub_id",
+                username="s7951744600d",
+                server_id="primary",
+            )
+
+        self.assertEqual([fields["config_delivery_status"] for _pid, fields in updates], ["attempting", "failed"])
+        self.assertEqual(updates[-1][1]["config_delivery_error"], "network exploded https://secret.example/sub_id")
+        admin_message = bot.sent_messages[-1][0][1]
+        self.assertIn("Payment ID: receipt-payment", admin_message)
+        self.assertIn("Username: s7951744600d", admin_message)
+        self.assertIn("Error: RuntimeError", admin_message)
+        self.assertNotIn("secret.example", admin_message)
+
+    def test_receipt_delivery_failure_keeps_completed_payment_and_does_not_reprovision(self):
+        class FailingPhotoBot(DummyBot):
+            def send_photo(self, *args, **kwargs):
+                recipient_id = args[0] if args else kwargs.get("chat_id")
+                if recipient_id == 1988:
+                    raise RuntimeError("network exploded")
+                return super().send_photo(*args, **kwargs)
+
+        bot = FailingPhotoBot()
+        purchase_plan = load_purchase_plan(bot, [])
+        store = {
+            "receipt-payment": {
+                "status": "pending_approval",
+                "user_id": 1988,
+                "plan_gb": "40",
+                "days": 30,
+                "price": 100.0,
+                "payment_method": "Card to Card",
+            }
+        }
+        statuses, _field_updates, _claims = install_payment_store(purchase_plan, store)
+        purchase_plan.ADMIN_USER_IDS = [1]
+        purchase_plan.is_admin = lambda _user_id: True
+        purchase_plan.send_admin_payment_notification = lambda *args, **kwargs: None
+        created = []
+        client = DummySaleClient()
+        client.get_user_uri = lambda _username: {
+            "normal_sub": "https://secret.example/config_id",
+            "ipv4": "",
+        }
+        purchase_plan.create_sale_user_with_note = (
+            lambda *args, **kwargs: created.append(args) or ("s1988a", {"ok": True}, client)
+        )
+
+        purchase_plan.handle_admin_approval(make_receipt_approval_call("approve"))
+        purchase_plan.handle_admin_approval(make_receipt_approval_call("approve"))
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(store["receipt-payment"]["status"], "completed")
+        self.assertEqual(store["receipt-payment"]["config_delivery_status"], "failed")
+        self.assertEqual(statuses.count(("receipt-payment", "completed")), 1)
+        admin_messages = [args[1] for args, _kwargs in bot.sent_messages if args[0] == 1]
+        self.assertTrue(any("Config delivery failed" in message for message in admin_messages))
+        self.assertFalse(any("secret.example" in message for message in admin_messages))
+
     def test_main_outage_alerts_operator_before_buyer_and_only_offers_retry(self):
         bot = DummyBot()
         purchase_plan = load_purchase_plan(bot, [])
@@ -1045,6 +1155,10 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         admin_notifications = []
         nested_call_sent = {"value": False}
         client = DummySaleClient()
+        client.get_user_uri = lambda _username: {
+            "normal_sub": "https://sub.example/config_id",
+            "ipv4": "",
+        }
         purchase_plan.is_admin = lambda _user_id: True
         purchase_plan.send_admin_payment_notification = lambda *args, **kwargs: admin_notifications.append((args, kwargs))
 
@@ -1065,6 +1179,8 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         self.assertEqual(store["receipt-payment"]["server_id"], "s1")
         self.assertEqual(store["receipt-payment"]["updates"][-1]["previous_status"], "processing")
         self.assertEqual(statuses.count(("receipt-payment", "completed")), 1)
+        self.assertEqual(store["receipt-payment"]["config_delivery_status"], "sent")
+        self.assertIn(r"config\_id", bot.sent_photos[-1][1]["caption"])
         self.assertEqual(admin_notifications[0][1]["server_name"], "Germany")
         self.assertEqual(admin_notifications[0][1]["server_id"], "s1")
         self.assertTrue(any(answer[1].get("text") == "Already processed: processing" for answer in bot.callback_answers))

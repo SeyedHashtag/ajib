@@ -82,6 +82,7 @@ from utils.username_utils import (
     RecordedUsernameLoadError,
 )
 from utils.telegram_safe import safe_answer_callback_query, safe_send_message
+from utils.telegram_formatting import escape_markdown_code, escape_markdown_text
 from utils.download_guidance import send_download_prompt_safely
 from utils.time_utils import (
     format_utc_display,
@@ -602,7 +603,112 @@ def _localized_payment_status(language, status):
 def _localized_ipv4_info(language, ipv4_url):
     if not ipv4_url:
         return ''
-    return get_message_text(language, 'renewal_ipv4_line').format(ipv4_url=ipv4_url)
+    return get_message_text(language, 'renewal_ipv4_line').format(
+        ipv4_url=escape_markdown_code(ipv4_url)
+    )
+
+
+def _format_config_delivery_message(
+    language,
+    message_key,
+    *,
+    plan_gb,
+    username,
+    sub_url,
+    ipv4_url='',
+    days=None,
+):
+    return get_message_text(language, message_key).format(
+        plan_gb=plan_gb,
+        days=days,
+        username=escape_markdown_code(username),
+        sub_url=escape_markdown_text(sub_url),
+        ipv4_info=_localized_ipv4_info(language, ipv4_url),
+    )
+
+
+def _record_config_delivery(payment_id, status, error=None):
+    if not payment_id:
+        return
+    now = format_utc_timestamp()
+    fields = {
+        'config_delivery_status': status,
+        'config_delivery_error': str(error)[:500] if error else None,
+    }
+    if status == 'attempting':
+        fields['config_delivery_attempted_at'] = now
+    if status == 'sent':
+        fields['config_delivered_at'] = now
+    try:
+        updated = update_payment_record_fields(payment_id, fields)
+        if updated is False:
+            logging.getLogger('ajib.payments').warning(
+                'Config delivery audit record was not updated payment_id=%s status=%s',
+                payment_id,
+                status,
+            )
+    except Exception:
+        logging.getLogger('ajib.payments').exception(
+            'Failed to persist config delivery audit payment_id=%s status=%s',
+            payment_id,
+            status,
+        )
+
+
+def _notify_config_delivery_failure(payment_id, recipient_id, username, server_id, error):
+    message = (
+        "Config delivery failed after account provisioning.\n\n"
+        f"Payment ID: {payment_id or 'N/A'}\n"
+        f"User ID: {recipient_id}\n"
+        f"Username: {username or 'N/A'}\n"
+        f"Server ID: {server_id or 'N/A'}\n"
+        f"Error: {type(error).__name__}\n\n"
+        "The payment remains completed. Do not create another VPN account; resend the existing config."
+    )
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            bot.send_message(admin_id, message)
+        except Exception:
+            pass
+
+
+def _deliver_payment_config(
+    payment_id,
+    recipient_id,
+    message,
+    *,
+    username,
+    server_id,
+    photo=None,
+    parse_mode='Markdown',
+    delivery_failure_code=None,
+):
+    _record_config_delivery(payment_id, 'attempting')
+    try:
+        if photo is not None:
+            result = bot.send_photo(
+                recipient_id,
+                photo=photo,
+                caption=message,
+                parse_mode=parse_mode,
+            )
+        else:
+            result = bot.send_message(recipient_id, message, parse_mode=parse_mode)
+    except Exception as error:
+        _record_config_delivery(payment_id, 'failed', error)
+        _notify_config_delivery_failure(payment_id, recipient_id, username, server_id, error)
+        raise
+    if delivery_failure_code:
+        error = ConfigDeliveryUnavailableError(delivery_failure_code)
+        _record_config_delivery(payment_id, 'failed', error)
+        _notify_config_delivery_failure(payment_id, recipient_id, username, server_id, error)
+        return result
+    _record_config_delivery(payment_id, 'sent')
+    return result
+
+
+class ConfigDeliveryUnavailableError(RuntimeError):
+    """A safe, credential-free reason for an unavailable config payload."""
 
 
 def _invite_discount_preview(user_id):
@@ -1171,15 +1277,24 @@ def _process_customer_renewal_payment(payment_id, payment_record, notify_chat_id
         bio = io.BytesIO()
         qr.save(bio, 'PNG')
         bio.seek(0)
-        bot.send_photo(
+        _deliver_payment_config(
+            payment_id,
             notify_chat_id,
+            success_message,
             photo=bio,
-            caption=success_message,
-            parse_mode="Markdown"
+            username=username,
+            server_id=result.get('server_id') or getattr(api_client, 'server_id', None),
         )
         send_download_prompt_safely(bot, notify_chat_id, language)
     else:
-        bot.send_message(notify_chat_id, success_message, parse_mode="Markdown")
+        _deliver_payment_config(
+            payment_id,
+            notify_chat_id,
+            success_message,
+            username=username,
+            server_id=result.get('server_id') or getattr(api_client, 'server_id', None),
+            delivery_failure_code='subscription_url_unavailable',
+        )
     return True
 
 
@@ -1608,7 +1723,6 @@ def _fulfill_credit_funded_purchase(call, plan_gb, plan, quote):
     uri_data = api_client.get_user_uri(username) if api_client else None
     sub_url = uri_data.get('normal_sub') if uri_data else None
     ipv4_url = uri_data.get('ipv4', '') if uri_data else ''
-    ipv4_info = _localized_ipv4_info(language, ipv4_url)
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -1618,23 +1732,30 @@ def _fulfill_credit_funded_purchase(call, plan_gb, plan, quote):
         bio = io.BytesIO()
         qr.save(bio, 'PNG')
         bio.seek(0)
-        bot.send_photo(
+        _deliver_payment_config(
+            payment_id,
             call.message.chat.id,
-            photo=bio,
-            caption=get_message_text(language, 'payment_completed').format(
+            _format_config_delivery_message(
+                language,
+                'payment_completed',
                 plan_gb=plan_gb,
                 username=username,
                 sub_url=sub_url,
-                ipv4_info=ipv4_info,
+                ipv4_url=ipv4_url,
             ),
-            parse_mode='Markdown',
+            photo=bio,
+            username=username,
+            server_id=getattr(api_client, 'server_id', None),
         )
         send_download_prompt_safely(bot, call.message.chat.id, language)
     else:
-        bot.send_message(
+        _deliver_payment_config(
+            payment_id,
             call.message.chat.id,
             get_message_text(language, 'payment_completed_no_url'),
-            parse_mode='Markdown',
+            username=username,
+            server_id=getattr(api_client, 'server_id', None),
+            delivery_failure_code='subscription_url_unavailable',
         )
     return True
 
@@ -1996,7 +2117,7 @@ def _show_customer_renewal_plan_picker(call, token, offer, language):
     ))
     bot.edit_message_text(
         get_message_text(language, 'renewal_choose_plan').format(
-            username=offer.get('username') or '—'
+            username=escape_markdown_code(offer.get('username') or '—')
         ),
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
@@ -3199,22 +3320,39 @@ def _process_admin_approval_job(call, action, payment_id, payment_record, review
                 if user_uri_data and 'normal_sub' in user_uri_data:
                     sub_url = user_uri_data['normal_sub']
                     ipv4_url = user_uri_data.get('ipv4', '')
-                    ipv4_info = _localized_ipv4_info(user_language, ipv4_url)
 
                     qr = qrcode.make(ipv4_url or sub_url)
                     bio = io.BytesIO()
                     qr.save(bio, 'PNG')
                     bio.seek(0)
-                    success_message = get_message_text(user_language, "payment_approved").format(plan_gb=plan_gb, days=days, username=username, sub_url=sub_url, ipv4_info=ipv4_info)
-                    bot.send_photo(
+                    success_message = _format_config_delivery_message(
+                        user_language,
+                        "payment_approved",
+                        plan_gb=plan_gb,
+                        days=days,
+                        username=username,
+                        sub_url=sub_url,
+                        ipv4_url=ipv4_url,
+                    )
+                    _deliver_payment_config(
+                        payment_id,
                         user_to_notify,
+                        success_message,
                         photo=bio,
-                        caption=success_message,
-                        parse_mode="Markdown"
+                        username=username,
+                        server_id=getattr(api_client, 'server_id', None),
                     )
                     send_download_prompt_safely(bot, user_to_notify, user_language)
                 else:
-                    bot.send_message(user_to_notify, get_message_text(user_language, "payment_approved_no_url"))
+                    _deliver_payment_config(
+                        payment_id,
+                        user_to_notify,
+                        get_message_text(user_language, "payment_approved_no_url"),
+                        username=username,
+                        server_id=getattr(api_client, 'server_id', None),
+                        parse_mode=None,
+                        delivery_failure_code='subscription_url_unavailable',
+                    )
                 _update_receipt_message_refs(
                     payment_id,
                     payment_record,
@@ -3456,19 +3594,31 @@ def _process_check_payment_job(call):
                 bio = io.BytesIO()
                 qr.save(bio, 'PNG')
                 bio.seek(0)
-                success_message = get_message_text(user_language, "payment_completed").format(plan_gb=plan_gb, username=username, sub_url=sub_url, ipv4_info=ipv4_info)
-                bot.send_photo(
+                success_message = _format_config_delivery_message(
+                    user_language,
+                    "payment_completed",
+                    plan_gb=plan_gb,
+                    username=username,
+                    sub_url=sub_url,
+                    ipv4_url=ipv4_url,
+                )
+                _deliver_payment_config(
+                    payment_id,
                     user_id,
+                    success_message,
                     photo=bio,
-                    caption=success_message,
-                    parse_mode="Markdown"
+                    username=username,
+                    server_id=getattr(api_client, 'server_id', None),
                 )
                 send_download_prompt_safely(bot, user_id, user_language)
             else:
-                bot.send_message(
+                _deliver_payment_config(
+                    payment_id,
                     user_id,
                     get_message_text(user_language, "payment_completed_no_url"),
-                    parse_mode="Markdown"
+                    username=username,
+                    server_id=getattr(api_client, 'server_id', None),
+                    delivery_failure_code='subscription_url_unavailable',
                 )
         else:
             bot.send_message(
@@ -3662,13 +3812,24 @@ def process_payment_webhook(request_data):
                     user_uri_data = api_client.get_user_uri(username)
                     sub_url = user_uri_data.get('normal_sub') if user_uri_data else None
                     ipv4_url = user_uri_data.get('ipv4', '') if user_uri_data else ''
-                    ipv4_info = _localized_ipv4_info(user_language, ipv4_url)
 
-                    success_message = get_message_text(user_language, "payment_completed").format(plan_gb=plan_gb, username=username, sub_url=sub_url, ipv4_info=ipv4_info)
-                    bot.send_message(
+                    success_message = _format_config_delivery_message(
+                        user_language,
+                        "payment_completed",
+                        plan_gb=plan_gb,
+                        username=username,
+                        sub_url=sub_url or get_message_text(user_language, 'value_not_available'),
+                        ipv4_url=ipv4_url,
+                    )
+                    _deliver_payment_config(
+                        record_key,
                         user_id,
                         success_message,
-                        parse_mode="Markdown"
+                        username=username,
+                        server_id=getattr(api_client, 'server_id', None),
+                        delivery_failure_code=(
+                            None if sub_url else 'subscription_url_unavailable'
+                        ),
                     )
                     if sub_url:
                         qr = qrcode.make(ipv4_url or sub_url)
@@ -3879,15 +4040,41 @@ def _deliver_reserved_renewal(event, recipient_id):
         sub_url=sub_url,
         ipv4_url=ipv4_url,
     )
+    payment_id = record.get('payment_id') or event.get('payment_id')
+    server_id = result.get('server_id') or record.get('renewal_server_id') or getattr(
+        api_client,
+        'server_id',
+        None,
+    )
     if sub_url:
         qr = qrcode.make(ipv4_url or sub_url)
         bio = io.BytesIO()
         qr.save(bio, 'PNG')
         bio.seek(0)
-        bot.send_photo(recipient_id, photo=bio, caption=message, parse_mode='Markdown')
+        if payment_id:
+            _deliver_payment_config(
+                payment_id,
+                recipient_id,
+                message,
+                photo=bio,
+                username=username,
+                server_id=server_id,
+            )
+        else:
+            bot.send_photo(recipient_id, photo=bio, caption=message, parse_mode='Markdown')
         send_download_prompt_safely(bot, recipient_id, language)
     else:
-        bot.send_message(recipient_id, message, parse_mode='Markdown')
+        if payment_id:
+            _deliver_payment_config(
+                payment_id,
+                recipient_id,
+                message,
+                username=username,
+                server_id=server_id,
+                delivery_failure_code='subscription_url_unavailable',
+            )
+        else:
+            bot.send_message(recipient_id, message, parse_mode='Markdown')
 
 
 def _notify_reserved_renewal_attention(kind, event, recipient_id):
@@ -3910,7 +4097,7 @@ def _notify_reserved_renewal_attention(kind, event, recipient_id):
     if buyer_alert_due:
         message_key = 'renewal_reserved_server_unavailable' if reason == 'server_unavailable' else 'renewal_reserved_attention'
         user_text = get_message_text(user_language, message_key).format(
-            username=username,
+            username=escape_markdown_code(username),
             reason=reason_text,
         )
         try:
@@ -4312,29 +4499,40 @@ def check_pending_payments():
                             if user_uri_data and 'normal_sub' in user_uri_data:
                                 sub_url = user_uri_data['normal_sub']
                                 ipv4_url = user_uri_data.get('ipv4', '')
-                                ipv4_info = _localized_ipv4_info(user_language, ipv4_url)
 
                                 qr = qrcode.make(ipv4_url or sub_url)
                                 bio = io.BytesIO()
                                 qr.save(bio, 'PNG')
                                 bio.seek(0)
-                                success_message = get_message_text(user_language, "payment_completed").format(plan_gb=plan_gb, username=username, sub_url=sub_url, ipv4_info=ipv4_info)
+                                success_message = _format_config_delivery_message(
+                                    user_language,
+                                    "payment_completed",
+                                    plan_gb=plan_gb,
+                                    username=username,
+                                    sub_url=sub_url,
+                                    ipv4_url=ipv4_url,
+                                )
                                 try:
-                                    bot.send_photo(
+                                    _deliver_payment_config(
+                                        payment_id,
                                         user_id,
+                                        success_message,
                                         photo=bio,
-                                        caption=success_message,
-                                        parse_mode="Markdown"
+                                        username=username,
+                                        server_id=getattr(api_client, 'server_id', None),
                                     )
                                     send_download_prompt_safely(bot, user_id, user_language)
                                 except Exception as e:
                                     print(f"Failed to send success message to user {user_id}: {e}")
                             else:
                                 try:
-                                    bot.send_message(
+                                    _deliver_payment_config(
+                                        payment_id,
                                         user_id,
                                         get_message_text(user_language, "payment_completed_no_url"),
-                                        parse_mode="Markdown"
+                                        username=username,
+                                        server_id=getattr(api_client, 'server_id', None),
+                                        delivery_failure_code='subscription_url_unavailable',
                                     )
                                 except Exception as e:
                                     print(f"Failed to send success message to user {user_id}: {e}")

@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import logging
 import os
 import sys
@@ -250,6 +251,104 @@ class TelegramSafeTests(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             telegram_safe.safe_send_message(Bot(), 123, "hello")
+
+    def test_safe_send_retries_parse_entity_error_without_formatting(self):
+        telegram_safe = load_telegram_safe()
+
+        class Bot:
+            def __init__(self):
+                self.calls = []
+
+            def send_message(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                if len(self.calls) == 1:
+                    raise RuntimeError("Bad Request: can't parse entities: Can't find end of the entity")
+                return "sent"
+
+        bot = Bot()
+
+        self.assertEqual(
+            telegram_safe.safe_send_message(bot, 123, "https://example/a\\_b", parse_mode="Markdown"),
+            "sent",
+        )
+        self.assertEqual(bot.calls[0][1]["parse_mode"], "Markdown")
+        self.assertNotIn("parse_mode", bot.calls[1][1])
+        self.assertIn("timeout", bot.calls[1][1])
+
+    def test_safe_photo_rewinds_media_before_plain_text_retry(self):
+        telegram_safe = load_telegram_safe()
+        payload = io.BytesIO(b"qr-image")
+
+        class Bot:
+            def __init__(self):
+                self.reads = []
+
+            def send_photo(self, *args, **kwargs):
+                self.reads.append(kwargs["photo"].read())
+                if len(self.reads) == 1:
+                    raise RuntimeError("400: can't parse entities")
+                return "sent"
+
+        bot = Bot()
+
+        self.assertEqual(
+            telegram_safe.safe_send_photo(
+                bot,
+                123,
+                photo=payload,
+                caption="https://example/a\\_b",
+                parse_mode="Markdown",
+            ),
+            "sent",
+        )
+        self.assertEqual(bot.reads, [b"qr-image", b"qr-image"])
+
+    def test_safe_send_does_not_fallback_for_non_entity_bad_request(self):
+        telegram_safe = load_telegram_safe()
+
+        class TelegramError(RuntimeError):
+            error_code = 400
+
+        class Bot:
+            def __init__(self):
+                self.calls = 0
+
+            def send_message(self, *args, **kwargs):
+                self.calls += 1
+                raise TelegramError("Bad Request: chat not found")
+
+        bot = Bot()
+        with self.assertRaises(TelegramError):
+            telegram_safe.safe_send_message(bot, 123, "hello", parse_mode="Markdown")
+        self.assertEqual(bot.calls, 1)
+
+    def test_safe_edit_retries_parse_entity_error_without_formatting(self):
+        telegram_safe = load_telegram_safe()
+
+        class Bot:
+            def __init__(self):
+                self.calls = []
+
+            def edit_message_text(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                if len(self.calls) == 1:
+                    raise RuntimeError("400: can't parse entities")
+                return "edited"
+
+        bot = Bot()
+
+        self.assertEqual(
+            telegram_safe.safe_edit_message_text(
+                bot,
+                "broken _ caption",
+                chat_id=1,
+                message_id=2,
+                parse_mode="Markdown",
+            ),
+            "edited",
+        )
+        self.assertEqual(bot.calls[0][1]["parse_mode"], "Markdown")
+        self.assertNotIn("parse_mode", bot.calls[1][1])
 
     def test_install_safe_telegram_methods_wraps_direct_bot_calls(self):
         telegram_safe = load_telegram_safe()

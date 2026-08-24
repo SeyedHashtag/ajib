@@ -20,6 +20,11 @@ EXPECTED_TELEGRAM_ERROR_MARKERS = (
     "message to edit not found",
     "message to delete not found",
 )
+PARSE_ENTITY_ERROR_MARKERS = (
+    "can't parse entities",
+    "can't find end of the entity",
+    "can't find end of entity",
+)
 
 
 def _int_env(name, default, minimum=1):
@@ -51,6 +56,12 @@ CALLBACK_ANSWER_EXECUTOR = ThreadPoolExecutor(
 def is_expected_telegram_error(error):
     text = str(error).lower()
     return any(marker in text for marker in EXPECTED_TELEGRAM_ERROR_MARKERS)
+
+
+def is_parse_entity_error(error):
+    text = str(error).lower()
+    code = telegram_error_code(error)
+    return code in (None, 400) and any(marker in text for marker in PARSE_ENTITY_ERROR_MARKERS)
 
 
 def telegram_error_code(error):
@@ -195,26 +206,67 @@ def run_polling_with_backoff(
         bot.exception_handler = previous_handler
 
 
-def _call_with_timeout(func, timeout_seconds, *args, ignore_expected=True, **kwargs):
+def _invoke_with_timeout(func, timeout_seconds, args, kwargs):
+    call_kwargs = dict(kwargs)
     if timeout_seconds is not None:
-        kwargs.setdefault("timeout", timeout_seconds)
+        call_kwargs.setdefault("timeout", timeout_seconds)
     try:
-        return func(*args, **kwargs)
+        return func(*args, **call_kwargs)
     except TypeError as error:
         if "unexpected keyword argument 'timeout'" not in str(error):
             raise
-        kwargs.pop("timeout", None)
+        call_kwargs.pop("timeout", None)
+        return func(*args, **call_kwargs)
+
+
+def _rewind_media_payload(func, args, kwargs):
+    method_name = str(getattr(func, "__name__", ""))
+    media_key_by_method = {
+        "send_photo": "photo",
+        "send_document": "document",
+        "send_video": "video",
+        "send_audio": "audio",
+        "send_animation": "animation",
+    }
+    media_key = media_key_by_method.get(method_name)
+    if not media_key:
+        return
+    payload = kwargs.get(media_key)
+    if payload is None and len(args) >= 2:
+        payload = args[1]
+    seek = getattr(payload, "seek", None)
+    if callable(seek):
         try:
-            return func(*args, **kwargs)
-        except Exception as retry_error:
-            if ignore_expected and is_expected_telegram_error(retry_error):
-                logging.getLogger("ajib.bot.telegram").debug("Ignored Telegram API error: %s", retry_error)
-                return None
-            raise
+            seek(0)
+        except Exception:
+            pass
+
+
+def _call_with_timeout(func, timeout_seconds, *args, ignore_expected=True, **kwargs):
+    try:
+        return _invoke_with_timeout(func, timeout_seconds, args, kwargs)
     except Exception as error:
         if ignore_expected and is_expected_telegram_error(error):
             logging.getLogger("ajib.bot.telegram").debug("Ignored Telegram API error: %s", error)
             return None
+        if kwargs.get("parse_mode") and is_parse_entity_error(error):
+            fallback_kwargs = dict(kwargs)
+            fallback_kwargs.pop("parse_mode", None)
+            _rewind_media_payload(func, args, fallback_kwargs)
+            logging.getLogger("ajib.bot.telegram").warning(
+                "Telegram rejected formatted entities; retrying without parse mode method=%s",
+                getattr(func, "__name__", type(func).__name__),
+            )
+            try:
+                return _invoke_with_timeout(func, timeout_seconds, args, fallback_kwargs)
+            except Exception as fallback_error:
+                if ignore_expected and is_expected_telegram_error(fallback_error):
+                    logging.getLogger("ajib.bot.telegram").debug(
+                        "Ignored Telegram API error after parse fallback: %s",
+                        fallback_error,
+                    )
+                    return None
+                raise
         raise
 
 

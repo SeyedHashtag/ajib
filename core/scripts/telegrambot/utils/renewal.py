@@ -46,6 +46,7 @@ INTERNAL_ERROR_FIELDS = (
     'renewal_internal_error_stage',
     'renewal_internal_error_code',
 )
+from utils.telegram_formatting import escape_markdown_code, escape_markdown_text
 RENEWAL_REVIEW_HISTORY_LIMIT = 50
 RENEWAL_MESSAGE_REF_LIMIT = 25
 
@@ -182,10 +183,7 @@ def _record_renewal_completed(plan_record, result, source):
 
 
 def _escape_markdown(value):
-    text = str(value if value is not None else '—')
-    for char in ('\\', '`', '*', '_', '[', ']'):
-        text = text.replace(char, f"\\{char}")
-    return text
+    return escape_markdown_text(value if value is not None else '—')
 
 
 def capture_user_state(user_data, now=None, cycle=None):
@@ -2331,16 +2329,20 @@ def format_renewal_success(language, result, plan_gb, days, sub_url=None, ipv4_u
     from utils.translations import get_message_text
 
     ipv4_info = (
-        get_message_text(language, 'renewal_ipv4_line').format(ipv4_url=ipv4_url)
+        get_message_text(language, 'renewal_ipv4_line').format(
+            ipv4_url=escape_markdown_code(ipv4_url)
+        )
         if ipv4_url
         else ""
     )
     return get_message_text(language, 'renewal_success').format(
-        username=_escape_markdown(result.get('username')),
+        username=escape_markdown_code(result.get('username')),
         plan_gb=plan_gb,
         days=days,
         before=format_state_summary(result.get('before_state'), language),
         after=format_state_summary(result.get('after_state'), language),
-        sub_url=sub_url or get_message_text(language, 'value_not_available'),
+        sub_url=escape_markdown_text(
+            sub_url or get_message_text(language, 'value_not_available')
+        ),
         ipv4_info=ipv4_info,
     )

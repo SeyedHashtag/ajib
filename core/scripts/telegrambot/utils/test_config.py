@@ -36,6 +36,7 @@ from utils.telegram_safe import safe_answer_callback_query, safe_edit_message_te
 from utils.download_guidance import send_download_prompt_safely
 from utils import test_config_store
 from utils.time_utils import format_utc_timestamp, parse_utc_timestamp, utc_now
+from utils.telegram_formatting import escape_markdown_code, escape_markdown_text
 
 TEST_CONFIGS_FILE = '/etc/ajib/core/scripts/telegrambot/test_configs.json'
 TEST_SETTINGS_FILE = '/etc/ajib/core/scripts/telegrambot/test_settings.json'
@@ -798,12 +799,14 @@ def _send_created_test_config(chat_id, username, user_uri_data, is_automatic=Fal
         success_message = get_message_text(language, "test_config_created").format(
             traffic_gb=TEST_TRAFFIC_GB,
             days=TEST_DAYS,
-            username=username,
+            username=escape_markdown_code(username),
             ipv4_line=(
-                get_message_text(language, "test_config_ipv4_line").format(ipv4_url=ipv4_url)
+                get_message_text(language, "test_config_ipv4_line").format(
+                    ipv4_url=escape_markdown_code(ipv4_url)
+                )
                 if ipv4_url else ""
             ),
-            sub_url=sub_url,
+            sub_url=escape_markdown_text(sub_url),
         )
         safe_send_photo(
             bot,

@@ -121,6 +121,8 @@ from utils.time_utils import (
     utc_date,
     utc_now,
 )
+from utils.telegram_formatting import escape_markdown_code, escape_markdown_text
+from utils.telegram_safe import install_safe_telegram_methods
 from utils.telegram_safe import (
     authenticate_bot_with_backoff,
     is_permanent_telegram_auth_error,
@@ -171,6 +173,7 @@ BUYER_DISCOUNTS_ENABLED = is_growth_feature_enabled(BUYER_DISCOUNTS)
 REMINDERS_ENABLED = is_growth_feature_enabled(REMINDERS)
 
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=4)
+install_safe_telegram_methods(bot)
 
 
 def _now():
@@ -291,10 +294,7 @@ def _settlement_financials(record):
 
 
 def _escape_markdown(value):
-    text = str(value or "")
-    for character in ("\\", "`", "*", "_", "[", "]"):
-        text = text.replace(character, f"\\{character}")
-    return text
+    return escape_markdown_text(value)
 
 
 def _set_input_state(user_id, state):
@@ -1375,7 +1375,12 @@ def _deliver_config(chat_id, username, client, renewed=False, include_downloads=
     uri = client.get_user_uri(username) if client else None
     action = _hosted_message(chat_id, "renewed" if renewed else "created")
     if not uri or not uri.get("normal_sub"):
-        bot.send_message(chat_id, _hosted_message(chat_id, "config_no_url", action=action, username=username),
+        bot.send_message(chat_id, _hosted_message(
+            chat_id,
+            "config_no_url",
+            action=action,
+            username=escape_markdown_code(username),
+        ),
                          parse_mode="Markdown")
         return
     url = uri.get("ipv4") or uri["normal_sub"]
@@ -1383,8 +1388,13 @@ def _deliver_config(chat_id, username, client, renewed=False, include_downloads=
     qrcode.make(url).save(image, "PNG")
     image.seek(0)
     bot.send_photo(chat_id, image,
-                   caption=_hosted_message(chat_id, "config_ready", action=action, username=username,
-                                           subscription=uri["normal_sub"]),
+                   caption=_hosted_message(
+                       chat_id,
+                       "config_ready",
+                       action=action,
+                       username=escape_markdown_code(username),
+                       subscription=escape_markdown_code(uri["normal_sub"]),
+                   ),
                    parse_mode="Markdown")
     if include_downloads:
         send_download_prompt_safely(
@@ -4491,7 +4501,7 @@ def _handle_hosted_renewal_event(event):
             message = _hosted_message(
                 int(customer_id),
                 message_key,
-                username=username,
+                username=escape_markdown_code(username),
                 reason=customer_reason,
             )
             bot.send_message(int(customer_id), message, parse_mode="Markdown")
@@ -4933,7 +4943,11 @@ def _run_customer_notification_scan():
                 try:
                     bot.send_message(
                         user_id,
-                        _hosted_message(user_id, "expired_alert", username=username),
+                        _hosted_message(
+                            user_id,
+                            "expired_alert",
+                            username=escape_markdown_code(username),
+                        ),
                         parse_mode="Markdown",
                         reply_markup=markup,
                     )
@@ -4984,7 +4998,7 @@ def _run_customer_notification_scan():
                 _hosted_message(
                     user_id,
                     "usage_alert",
-                    username=username,
+                    username=escape_markdown_code(username),
                     percent=percent,
                     basis=_hosted_message(user_id, f"usage_basis_{basis}"),
                 ),

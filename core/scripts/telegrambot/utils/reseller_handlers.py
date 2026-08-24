@@ -130,6 +130,7 @@ from utils.telegram_safe import (
     safe_send_photo,
     safe_reply_to,
 )
+from utils.telegram_formatting import escape_markdown_code, escape_markdown_text
 
 
 def _configured_primary_api_client():
@@ -1164,16 +1165,20 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
         sub_url = user_uri_data.get('normal_sub') if user_uri_data else None
         ipv4_url = user_uri_data.get('ipv4', '') if user_uri_data else ''
         ipv4_info = (
-            get_message_text(language, "renewal_ipv4_line").format(ipv4_url=ipv4_url)
+            get_message_text(language, "renewal_ipv4_line").format(
+                ipv4_url=escape_markdown_code(ipv4_url)
+            )
             if ipv4_url
             else ""
         )
 
         msg = get_message_text(language, "reseller_config_created").format(
-            username=username,
+            username=escape_markdown_code(username),
             plan_gb=gb,
             days=days,
-            sub_url=sub_url or get_message_text(language, "value_not_available"),
+            sub_url=escape_markdown_text(
+                sub_url or get_message_text(language, "value_not_available")
+            ),
             ipv4_info=ipv4_info
         )
 
@@ -2509,7 +2514,7 @@ def _render_reseller_customer_config_job(
         safe_edit_message_text(
             bot,
             get_message_text(language, "reseller_config_data_unavailable").format(
-                username=username,
+                username=escape_markdown_code(username),
             ),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
@@ -2565,7 +2570,7 @@ def _render_reseller_customer_config_job(
                 if max_traffic_gb > 0
                 else get_message_text(language, "value_unlimited")
             ),
-            status=status,
+            status=escape_markdown_text(status),
         )
 
     if shared_state.panel_state == PanelState.HOLD and is_expired:
@@ -2582,10 +2587,10 @@ def _render_reseller_customer_config_job(
             "reseller_config_status_blocked" if is_expired else "reseller_config_status_active",
         )
     formatted_details = get_message_text(language, "reseller_config_live_details").format(
-        username=username,
+        username=escape_markdown_code(username),
         traffic_limit=traffic_limit_display,
         days_remaining=expiration_days,
-        creation_date=account_creation_date,
+        creation_date=escape_markdown_text(account_creation_date),
         account_status=account_status,
         traffic_message=traffic_message,
     )
@@ -2682,7 +2687,7 @@ def _render_reseller_customer_config_job(
         safe_edit_message_text(
             bot,
             get_message_text(language, "reseller_subscription_unavailable").format(
-                username=username,
+                username=escape_markdown_code(username),
             ),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
@@ -2728,11 +2733,13 @@ def _render_reseller_customer_config_job(
     caption = get_message_text(language, "reseller_config_subscription_caption").format(
         details=formatted_details,
         ipv4_info=(
-            get_message_text(language, "renewal_ipv4_line").format(ipv4_url=ipv4_url)
+            get_message_text(language, "renewal_ipv4_line").format(
+                ipv4_url=escape_markdown_code(ipv4_url)
+            )
             if ipv4_url
             else ""
         ),
-        sub_url=sub_url,
+        sub_url=escape_markdown_text(sub_url),
         reservation_status=f"\n\n{reservation_status}" if reservation_status else "",
     )
 
@@ -2742,7 +2749,6 @@ def _render_reseller_customer_config_job(
         qr_code.save(bio, 'PNG')
         bio.seek(0)
 
-        safe_delete_message(bot, chat_id=call.message.chat.id, message_id=call.message.message_id)
         safe_send_photo(
             bot,
             call.message.chat.id,
@@ -2751,6 +2757,7 @@ def _render_reseller_customer_config_job(
             parse_mode="Markdown",
             reply_markup=back_markup
         )
+        safe_delete_message(bot, chat_id=call.message.chat.id, message_id=call.message.message_id)
     except Exception as e:
         safe_send_message(
             bot,
@@ -2881,7 +2888,7 @@ def handle_reseller_renewal_start(call):
     markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
     bot.edit_message_text(
         get_message_text(language, 'renewal_choose_plan').format(
-            username=offer.get('username') or '—'
+            username=escape_markdown_code(offer.get('username') or '—')
         ),
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
@@ -3094,7 +3101,7 @@ def _process_reseller_renewal_confirm_job(
             return
         reserved_text = get_message_text(language, 'renewal_reserved_reseller_success')
         reserved_text = reserved_text.format(
-            username=offer.get('username'),
+            username=escape_markdown_code(offer.get('username')),
             price=format_usd_amount(price),
         )
         safe_edit_message_text(
@@ -3184,7 +3191,6 @@ def _process_reseller_renewal_confirm_job(
         bio = io.BytesIO()
         qr.save(bio, 'PNG')
         bio.seek(0)
-        safe_delete_message(bot, chat_id=call.message.chat.id, message_id=call.message.message_id)
         safe_send_photo(
             bot,
             call.message.chat.id,
@@ -3192,6 +3198,7 @@ def _process_reseller_renewal_confirm_job(
             caption=success_message,
             parse_mode="Markdown",
         )
+        safe_delete_message(bot, chat_id=call.message.chat.id, message_id=call.message.message_id)
     else:
         safe_edit_message_text(
             bot,
@@ -3316,7 +3323,7 @@ def _username_display(language, reseller_data):
 
 
 def _escape_markdown(value):
-    return str(value).replace("\\", "\\\\").replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
+    return escape_markdown_text(value)
 
 
 def _is_markdown_entity_parse_error(error):

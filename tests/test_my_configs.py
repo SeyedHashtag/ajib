@@ -23,6 +23,8 @@ class DummyBot:
         self.edited_messages = []
         self.callback_answers = []
         self.sent_photos = []
+        self.deleted_messages = []
+        self.events = []
 
     def message_handler(self, *args, **kwargs):
         return lambda func: func
@@ -48,10 +50,13 @@ class DummyBot:
         return None
 
     def delete_message(self, *args, **kwargs):
+        self.deleted_messages.append((args, kwargs))
+        self.events.append("delete")
         return None
 
     def send_photo(self, *args, **kwargs):
         self.sent_photos.append((args, kwargs))
+        self.events.append("send_photo")
         return None
 
 
@@ -228,6 +233,8 @@ class MyConfigsTests(unittest.TestCase):
         my_configs_module.bot.edited_messages = []
         my_configs_module.bot.callback_answers = []
         my_configs_module.bot.sent_photos = []
+        my_configs_module.bot.deleted_messages = []
+        my_configs_module.bot.events = []
         my_configs_module.MY_CONFIGS_REFRESH_INFLIGHT.clear()
         my_configs_module.MY_CONFIGS_INFLIGHT.clear()
         my_configs_module.SHOW_CONFIG_INFLIGHT.clear()
@@ -485,6 +492,116 @@ class MyConfigsTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0][1:], (456, "en"))
+
+    def test_active_callback_escapes_caption_keeps_raw_qr_and_deletes_after_send(self):
+        class DummyQR:
+            def save(self, target, image_format):
+                target.write(b"qr")
+
+        raw_url = r"https://example.com/sub_id?token=a+b&direct=[one]`two\three"
+        qr_values = []
+        client = types.SimpleNamespace(
+            server_id="primary",
+            get_user_uri=lambda username: {"normal_sub": raw_url},
+        )
+        sys.modules["utils.payment_records"].load_payments = lambda: {
+            "incident-payment": {
+                "status": "completed",
+                "user_id": 7951744600,
+                "username": "s7951744600d",
+                "server_id": "primary",
+                "days": 60,
+                "completed_at": "2026-08-01T00:00:00+00:00",
+            }
+        }
+        original_make = my_configs_module.qrcode.make
+        original_guidance = my_configs_module.send_download_prompt_safely
+        my_configs_module.display_config = REAL_DISPLAY_CONFIG
+        try:
+            my_configs_module.qrcode.make = (
+                lambda value: qr_values.append(value) or DummyQR()
+            )
+            my_configs_module.send_download_prompt_safely = lambda *args, **kwargs: None
+            my_configs_module.display_config(
+                456,
+                "s7951744600d",
+                {
+                    "blocked": False,
+                    "status": "On Hold",
+                    "account_creation_date": None,
+                    "expiration_days": 60,
+                    "max_download_bytes": 70 * 1024 ** 3,
+                },
+                client,
+                is_callback=True,
+                message_id=99,
+                user_id=7951744600,
+            )
+        finally:
+            my_configs_module.qrcode.make = original_make
+            my_configs_module.send_download_prompt_safely = original_guidance
+
+        caption = my_configs_module.bot.sent_photos[-1][1]["caption"]
+        self.assertIn(r"sub\_id", caption)
+        self.assertIn(r"direct=\[one\]\`two\\three", caption)
+        self.assertEqual(qr_values, [raw_url])
+        self.assertEqual(my_configs_module.bot.events[:2], ["send_photo", "delete"])
+        self.assertEqual(my_configs_module.bot.deleted_messages[-1][1]["message_id"], 99)
+
+    def test_active_callback_retains_selection_and_edits_actionable_error_when_send_fails(self):
+        class DummyQR:
+            def save(self, target, image_format):
+                target.write(b"qr")
+
+        client = types.SimpleNamespace(
+            server_id="primary",
+            get_user_uri=lambda username: {"normal_sub": "https://example.com/sub_id"},
+        )
+        sys.modules["utils.payment_records"].load_payments = lambda: {
+            "incident-payment": {
+                "status": "completed",
+                "user_id": 7951744600,
+                "username": "s7951744600d",
+                "server_id": "primary",
+                "days": 60,
+                "completed_at": "2026-08-01T00:00:00+00:00",
+            }
+        }
+        original_make = my_configs_module.qrcode.make
+        original_send_photo = my_configs_module.bot.send_photo
+        original_guidance = my_configs_module.send_download_prompt_safely
+        my_configs_module.display_config = REAL_DISPLAY_CONFIG
+        try:
+            my_configs_module.qrcode.make = lambda value: DummyQR()
+            my_configs_module.bot.send_photo = (
+                lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("network exploded"))
+            )
+            my_configs_module.send_download_prompt_safely = lambda *args, **kwargs: None
+            my_configs_module.display_config(
+                456,
+                "s7951744600d",
+                {
+                    "blocked": False,
+                    "status": "On Hold",
+                    "account_creation_date": None,
+                    "expiration_days": 60,
+                    "max_download_bytes": 70 * 1024 ** 3,
+                },
+                client,
+                is_callback=True,
+                message_id=99,
+                user_id=7951744600,
+            )
+        finally:
+            my_configs_module.qrcode.make = original_make
+            my_configs_module.bot.send_photo = original_send_photo
+            my_configs_module.send_download_prompt_safely = original_guidance
+
+        self.assertEqual(my_configs_module.bot.deleted_messages, [])
+        self.assertTrue(my_configs_module.bot.edited_messages)
+        error_text = my_configs_module.bot.edited_messages[-1][0][0]
+        self.assertIn("Error displaying configuration", error_text)
+        self.assertIn("select the configuration again", error_text)
 
     def test_paid_hold_shows_first_connection_timer_and_entitlement_deadline(self):
         class DummyQR:

@@ -16,6 +16,7 @@ from utils.language import get_user_language
 from utils.telegram_safe import safe_answer_callback_query, safe_delete_message, safe_edit_message_text, safe_send_message, safe_send_photo
 from utils.download_guidance import send_download_prompt_safely
 from utils.time_utils import format_utc_display
+from utils.telegram_formatting import escape_markdown_code, escape_markdown_text
 
 MY_CONFIGS_CACHE_TTL_SECONDS = 300
 MY_CONFIGS_INFLIGHT_LOCK = threading.Lock()
@@ -396,7 +397,7 @@ def display_config(
             )
             if max_traffic_gb > 0:
                 traffic_message += f" / {max_traffic_gb:.2f} GB"
-            traffic_message += f"\n🌐 Status: {status}"
+            traffic_message += f"\n🌐 Status: {escape_markdown_text(status)}"
 
         traffic_limit_display = f"{max_traffic_gb:.2f} GB" if max_traffic_gb > 0 else "Unlimited"
         unlimited_duration = shared_state.configured_days == 0
@@ -439,10 +440,10 @@ def display_config(
             )
 
         formatted_details = (
-            f"\n🆔 Username: {username}\n"
+            f"\n🆔 Username: {escape_markdown_text(username)}\n"
             f"📊 Traffic Limit: {traffic_limit_display}\n"
             f"📅 Server Days Remaining: {days_display}\n"
-            f"⏳ Creation Date: {account_creation_date}\n"
+            f"⏳ Creation Date: {escape_markdown_text(account_creation_date)}\n"
             f"💡 Status: {status_display}{entitlement_line}\n\n"
             f"{traffic_message}"
         )
@@ -511,7 +512,7 @@ def display_config(
                 if offer.get('eligible'):
                     message = (
                         f"❌ **Your configuration has expired!**\n{formatted_details}\n\n"
-                        f"{get_message_text(language, 'renewal_choose_plan').format(username=username)}"
+                        f"{get_message_text(language, 'renewal_choose_plan').format(username=escape_markdown_code(username))}"
                     )
                     renewal_markup = types.InlineKeyboardMarkup()
                     renewal_markup.add(
@@ -594,9 +595,9 @@ def display_config(
         # Prepare caption with formatted details and subscription URL
         caption = f"{formatted_details}\n\n"
         if ipv4_url:
-            caption += f"IPv4 URL: `{ipv4_url}`\n\n"
+            caption += f"IPv4 URL: `{escape_markdown_code(ipv4_url)}`\n\n"
             
-        caption += f"Subscription URL:\n{sub_url}"
+        caption += f"Subscription URL:\n{escape_markdown_text(sub_url)}"
         if caption_status:
             caption += f"\n\n{caption_status}"
         caption = _append_my_configs_cache_notice(
@@ -607,7 +608,6 @@ def display_config(
         
         # Send QR code with details
         if is_callback:
-            safe_delete_message(bot, chat_id=chat_id, message_id=message_id)
             safe_send_photo(
                 bot,
                 chat_id,
@@ -616,6 +616,7 @@ def display_config(
                 parse_mode="Markdown",
                 reply_markup=renewal_markup,
             )
+            safe_delete_message(bot, chat_id=chat_id, message_id=message_id)
         else:
             safe_send_photo(
                 bot,
@@ -631,7 +632,10 @@ def display_config(
             get_user_language(user_id or chat_id),
         )
     except Exception as e:
-        error_message = f"⚠️ Error displaying configuration: {str(e)}"
+        error_message = (
+            f"⚠️ Error displaying configuration: {str(e)}\n\n"
+            "Please select the configuration again. If it still fails, contact support."
+        )
         print(f"Error in display_config: {str(e)}")
         if is_callback:
             safe_edit_message_text(bot, error_message, chat_id=chat_id, message_id=message_id)

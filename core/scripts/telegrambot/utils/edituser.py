@@ -25,6 +25,7 @@ except ImportError:  # Lightweight handler tests may provide the legacy surface.
     UserRef = SimpleNamespace
     UserCopySpec = SimpleNamespace
 from utils.account_state import inspect_account
+from utils.telegram_formatting import escape_markdown_code, escape_markdown_text
 
 
 CONTEXT_TTL_SECONDS = 20 * 60
@@ -34,19 +35,16 @@ _COPY_CONTEXTS = {}
 
 
 def _escape_markdown(value):
-    escaped = str(value or "").replace("\\", "\\\\")
-    for char in ("`", "*", "_", "["):
-        escaped = escaped.replace(char, f"\\{char}")
-    return escaped
+    return escape_markdown_text(value)
 
 
 def _format_server_label(api_client):
     server_name = str(getattr(api_client, "server_name", None) or "").strip()
     server_id = str(getattr(api_client, "server_id", None) or "").strip()
     if server_name and server_id and server_name != server_id:
-        return f"{_escape_markdown(server_name)} (`{server_id}`)"
+        return f"{_escape_markdown(server_name)} (`{escape_markdown_code(server_id)}`)"
     if server_id:
-        return f"`{server_id}`"
+        return f"`{escape_markdown_code(server_id)}`"
     if server_name:
         return _escape_markdown(server_name)
     return None
@@ -236,7 +234,7 @@ def _send_user_details(message, api_client, user_details, ref):
     formatted_details = (
         f"\n🆔 Name: {_escape_markdown(actual_username)}\n"
         f"🌐 Server: {server_label}\n"
-        f"🧩 Panel: `{panel_type}`\n"
+        f"🧩 Panel: `{escape_markdown_code(panel_type)}`\n"
         f"📊 Traffic Limit: {traffic_limit:.2f} GB\n"
         f"🔖 State: {shared_state.state}\n"
         f"📅 Configured Duration: {configured_duration}\n"
@@ -276,8 +274,8 @@ def _send_user_details(message, api_client, user_details, ref):
 
     caption = f"{formatted_details}\n\n"
     if ipv4_url:
-        caption += f"IPv4 URL: `{ipv4_url}`\n\n"
-    caption += f"Subscription URL:\n{sub_url}"
+        caption += f"IPv4 URL: `{escape_markdown_code(ipv4_url)}`\n\n"
+    caption += f"Subscription URL:\n{escape_markdown_text(sub_url)}"
     bot.send_photo(message.chat.id, bio, caption=caption, reply_markup=markup, parse_mode="Markdown")
 
 
@@ -581,7 +579,8 @@ def handle_copy_confirm(call):
     qr_code.save(bio, "PNG")
     bio.seek(0)
     inbound_line = (
-        f"\nHysteria2 inbound IDs: {', '.join(map(str, result.get('inbound_ids') or []))}"
+        f"\nHysteria2 inbound IDs: "
+        f"{', '.join(escape_markdown_text(value) for value in (result.get('inbound_ids') or []))}"
         if result.get("inbound_ids") else ""
     )
     link_type = "Direct connection link" if result.get("direct_link") else "Subscription URL"
@@ -594,10 +593,12 @@ def handle_copy_confirm(call):
         )
     caption = (
         f"User '{_escape_markdown(result['username'])}' copied successfully.\n"
-        f"Source: `{result.get('source_server_id')}`, `{result.get('source_panel_type', BLITZ_PANEL)}`\n"
+        f"Source: `{escape_markdown_code(result.get('source_server_id'))}`, "
+        f"`{escape_markdown_code(result.get('source_panel_type', BLITZ_PANEL))}`\n"
         f"Target: {_escape_markdown(result['destination_server_name'])} "
-        f"(`{result['destination_server_id']}`, `{result['panel_type']}`){inbound_line}"
+        f"(`{escape_markdown_code(result['destination_server_id'])}`, "
+        f"`{escape_markdown_code(result['panel_type'])}`){inbound_line}"
         f"{expiry_line}\n\n"
-        f"{link_type}:\n{sub_url}"
+        f"{link_type}:\n{escape_markdown_text(sub_url)}"
     )
     bot.send_photo(call.message.chat.id, bio, caption=caption, parse_mode="Markdown")

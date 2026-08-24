@@ -4,6 +4,7 @@ from telebot import types
 from utils.command import *
 from utils.common import admin_action_text, create_main_markup
 from utils.api_client import APIClient, MultiServerAPI
+from utils.telegram_formatting import escape_markdown_code, escape_markdown_text
 
 
 def create_cancel_markup(back_step=None):
@@ -160,15 +161,15 @@ def process_add_user_step4(call):
         
         # Create success message
         unlimited_text = "Yes" if unlimited else "No"
-        success_message = f"User '{username}' added successfully!\n"
+        success_message = f"User '{escape_markdown_text(username)}' added successfully!\n"
         success_message += f"Traffic limit: {traffic_limit} GB\n"
         success_message += f"Expiration days: {expiration_days}\n"
         success_message += f"Unlimited Access: {unlimited_text}\n\n"
         
         if ipv4_url:
-            success_message += f"IPv4 URL: `{ipv4_url}`\n\n"
+            success_message += f"IPv4 URL: `{escape_markdown_code(ipv4_url)}`\n\n"
             
-        success_message += f"Subscription URL:\n{sub_url}"
+        success_message += f"Subscription URL:\n{escape_markdown_text(sub_url)}"
         
         bot.send_photo(call.message.chat.id, photo=bio, caption=success_message, parse_mode="Markdown", reply_markup=create_main_markup(is_admin=True))
 
