@@ -222,7 +222,7 @@ def install_stubs():
             "Plan: {plan_gb} GB\nDuration: {days} days\n\n"
             "{ipv4_info}Subscription URL:\n{sub_url}"
         ),
-        "renewal_ipv4_line": "IPv4 URL: `{ipv4_url}`\n\n",
+        "renewal_ipv4_line": "IPv4 URL:\n`{ipv4_url}`\n\n",
     }
     translations_stub = types.ModuleType("utils.translations")
     translations_stub.get_message_text = lambda language, key: translations.get(key, key)

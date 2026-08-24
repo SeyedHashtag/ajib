@@ -269,6 +269,14 @@ class HostedStorefrontTranslationTests(unittest.TestCase):
             with self.subTest(language=language):
                 self.assertNotEqual(HOSTED_TRANSLATIONS[language]["owner_guide"], english)
 
+    def test_subscription_value_starts_on_the_line_after_its_label(self):
+        for language in ("en", "fa", "ru", "tk"):
+            with self.subTest(language=language):
+                self.assertIn(
+                    "\n`{subscription}`",
+                    HOSTED_TRANSLATIONS[language]["config_ready"],
+                )
+
     def test_customer_copy_never_exposes_the_reseller_relationship(self):
         customer_keys = {
             "purchase_unavailable",

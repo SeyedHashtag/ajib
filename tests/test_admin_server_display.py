@@ -112,7 +112,10 @@ class AdminServerDisplayTests(unittest.TestCase):
         api_client = types.SimpleNamespace(
             server_name="Germany *West*",
             server_id="de-1",
-            get_user_uri=lambda _username: {"normal_sub": "https://sub.example/alice"},
+            get_user_uri=lambda _username: {
+                "normal_sub": "https://sub.example/alice_id",
+                "ipv4": "hysteria2://sub.example/alice_id",
+            },
         )
         user_details = {
             "upload_bytes": 0,
@@ -136,6 +139,11 @@ class AdminServerDisplayTests(unittest.TestCase):
 
         caption = bot.sent_photos[0][1]["caption"]
         self.assertIn("🌐 Server: Germany \\*West\\* (`de-1`)", caption)
+        self.assertIn(
+            "IPv4 URL:\n`hysteria2://sub.example/alice_id`\n\n"
+            "Subscription URL:\nhttps://sub.example/alice\\_id",
+            caption,
+        )
 
     def test_server_label_falls_back_to_id(self):
         edituser, _bot = load_edituser()

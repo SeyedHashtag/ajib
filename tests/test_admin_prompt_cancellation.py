@@ -235,8 +235,7 @@ class AdminPromptCancellationTests(unittest.TestCase):
                     [
                         ["➕ Add User", "👤 Show User"],
                         ["❌ Delete User", "🧪 Manage Test Accounts"],
-                        ["🔁 Mass Copy / Migrate"],
-                        ["🧹 Expired Cleanup"],
+                        ["🧹 Expired Cleanup", "🔁 Mass Copy / Migrate"],
                         ["🏠 Admin Menu"],
                     ],
                 )
@@ -309,7 +308,10 @@ class AdminPromptCancellationTests(unittest.TestCase):
 
             def __init__(self, add_result=True, uri=None):
                 self.add_result = add_result
-                self.uri = {"normal_sub": "https://example.test/sub"} if uri is None else uri
+                self.uri = {
+                    "normal_sub": "https://example.test/sub_id",
+                    "ipv4": "hysteria2://example.test/config_id",
+                } if uri is None else uri
 
             def add_user(self, *_args, **_kwargs):
                 return self.add_result
@@ -343,7 +345,13 @@ class AdminPromptCancellationTests(unittest.TestCase):
                 adduser.process_add_user_step4(make_add_user_call())
 
                 if scenario == "success":
-                    markup = bot.sent_photos[-1][1]["reply_markup"]
+                    photo_kwargs = bot.sent_photos[-1][1]
+                    markup = photo_kwargs["reply_markup"]
+                    self.assertIn(
+                        "IPv4 URL:\n`hysteria2://example.test/config_id`\n\n"
+                        "Subscription URL:\nhttps://example.test/sub\\_id",
+                        photo_kwargs["caption"],
+                    )
                 else:
                     self.assertEqual(
                         bot.sent_messages[-1][0],

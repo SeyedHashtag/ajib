@@ -595,7 +595,7 @@ def display_config(
         # Prepare caption with formatted details and subscription URL
         caption = f"{formatted_details}\n\n"
         if ipv4_url:
-            caption += f"IPv4 URL: `{escape_markdown_code(ipv4_url)}`\n\n"
+            caption += f"IPv4 URL:\n`{escape_markdown_code(ipv4_url)}`\n\n"
             
         caption += f"Subscription URL:\n{escape_markdown_text(sub_url)}"
         if caption_status:

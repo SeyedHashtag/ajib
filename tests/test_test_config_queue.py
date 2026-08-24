@@ -114,7 +114,12 @@ def install_stubs():
 
     translations_stub = types.ModuleType("utils.translations")
     translations_stub.BUTTON_TRANSLATIONS = {"en": {"test_config": "Test Config"}}
-    translations_stub.get_message_text = lambda language, key: key
+    translations_stub.get_message_text = lambda language, key: {
+        "test_config_created": (
+            "ready {username}\n\n{ipv4_line}Subscription URL:\n{sub_url}"
+        ),
+        "test_config_ipv4_line": "IPv4 URL:\n`{ipv4_url}`\n\n",
+    }.get(key, key)
     sys.modules["utils.translations"] = translations_stub
 
     language_stub = types.ModuleType("utils.language")
@@ -510,17 +515,30 @@ class TestConfigQueueTests(unittest.TestCase):
                 target.write(b"qr")
 
         original_make = test_config_module.qrcode.make
+        qr_values = []
+        raw_sub = r"https://example.com/sub_id?direct=[one]`two\three"
+        raw_ipv4 = r"hysteria2://edge.example/config_id?token=a+b"
         try:
-            test_config_module.qrcode.make = lambda value: DummyQR()
+            test_config_module.qrcode.make = (
+                lambda value: qr_values.append(value) or DummyQR()
+            )
             test_config_module._send_created_test_config(
                 456,
                 "t123",
-                {"normal_sub": "https://example.com/sub"},
+                {"normal_sub": raw_sub, "ipv4": raw_ipv4},
             )
         finally:
             test_config_module.qrcode.make = original_make
 
         self.assertEqual(len(test_config_module.bot.sent_photos), 1)
+        caption = test_config_module.bot.sent_photos[0][1]["caption"]
+        self.assertIn(
+            "IPv4 URL:\n`hysteria2://edge.example/config_id?token=a+b`\n\n"
+            "Subscription URL:\nhttps://example.com/sub\\_id",
+            caption,
+        )
+        self.assertIn(r"direct=\[one\]\`two\\three", caption)
+        self.assertEqual(qr_values, [raw_ipv4])
         self.assertEqual(test_config_module.bot.sent_messages[0][0], (456, "trial_activation_steps"))
         markup = test_config_module.bot.sent_messages[0][1]["reply_markup"]
         self.assertEqual(

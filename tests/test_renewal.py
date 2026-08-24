@@ -177,7 +177,7 @@ def load_renewal_module():
         "select_payment_method": "Select payment method",
         "renewal_state_summary": "Days remaining: {days_remaining}\nUsage: {gb_used} / {gb_limit}",
         "renewal_generic_unavailable_reason": "Renewal is currently unavailable.",
-        "renewal_ipv4_line": "IPv4 URL: `{ipv4_url}`\n\n",
+        "renewal_ipv4_line": "IPv4 URL:\n`{ipv4_url}`\n\n",
         "value_not_available": "Not available",
         "value_unknown": "Unknown",
         "value_unlimited": "Unlimited",

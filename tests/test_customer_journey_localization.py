@@ -148,6 +148,19 @@ def test_migration_notice_exposes_only_customer_credentials():
         }
 
 
+def test_connection_values_start_on_the_line_after_their_labels():
+    catalogs = _load_translations().MESSAGE_TRANSLATIONS
+
+    for language in ("en", "fa", "ru", "tk"):
+        catalog = catalogs[language]
+        assert "\n`{ipv4_url}`" in catalog["test_config_ipv4_line"]
+        assert "\n`{ipv4_url}`" in catalog["renewal_ipv4_line"]
+        assert "\n{sub_url}" in catalog["test_config_created"]
+        assert "\n{sub_url}" in catalog["reseller_config_created"]
+        assert "\n{sub_url}" in catalog["reseller_config_subscription_caption"]
+        assert "\n{link}" in catalog["migration_connection_updated"]
+
+
 def test_reseller_config_delivery_omits_price_in_all_supported_languages():
     catalogs = _load_translations().MESSAGE_TRANSLATIONS
     expected_placeholders = {"username", "plan_gb", "days", "ipv4_info", "sub_url"}

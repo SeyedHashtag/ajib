@@ -45,8 +45,7 @@ EXPECTED_GROUP_ROWS = {
     "users": (
         ("➕ Add User", "👤 Show User"),
         ("❌ Delete User", "🧪 Manage Test Accounts"),
-        ("🔁 Mass Copy / Migrate",),
-        ("🧹 Expired Cleanup",),
+        ("🧹 Expired Cleanup", "🔁 Mass Copy / Migrate"),
         ("🏠 Admin Menu",),
     ),
     "sales": (

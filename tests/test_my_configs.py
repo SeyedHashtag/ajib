@@ -499,10 +499,11 @@ class MyConfigsTests(unittest.TestCase):
                 target.write(b"qr")
 
         raw_url = r"https://example.com/sub_id?token=a+b&direct=[one]`two\three"
+        raw_ipv4 = r"hysteria2://edge.example/config_id?token=a+b"
         qr_values = []
         client = types.SimpleNamespace(
             server_id="primary",
-            get_user_uri=lambda username: {"normal_sub": raw_url},
+            get_user_uri=lambda username: {"normal_sub": raw_url, "ipv4": raw_ipv4},
         )
         sys.modules["utils.payment_records"].load_payments = lambda: {
             "incident-payment": {
@@ -542,9 +543,14 @@ class MyConfigsTests(unittest.TestCase):
             my_configs_module.send_download_prompt_safely = original_guidance
 
         caption = my_configs_module.bot.sent_photos[-1][1]["caption"]
+        self.assertIn(
+            "IPv4 URL:\n`hysteria2://edge.example/config_id?token=a+b`\n\n"
+            "Subscription URL:\n",
+            caption,
+        )
         self.assertIn(r"sub\_id", caption)
         self.assertIn(r"direct=\[one\]\`two\\three", caption)
-        self.assertEqual(qr_values, [raw_url])
+        self.assertEqual(qr_values, [raw_ipv4])
         self.assertEqual(my_configs_module.bot.events[:2], ["send_photo", "delete"])
         self.assertEqual(my_configs_module.bot.deleted_messages[-1][1]["message_id"], 99)
 

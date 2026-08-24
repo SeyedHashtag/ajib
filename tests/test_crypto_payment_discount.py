@@ -249,7 +249,7 @@ def install_common_stubs(bot, payment_records):
         "renewal_generic_unavailable_reason": "renewal unavailable",
         "renewal_reserved_attention": "Reserved renewal for `{username}` needs attention: {reason}.",
         "renewal_reserved_server_unavailable": "Your reserved renewal for `{username}` is safe, but its server is temporarily unavailable.",
-        "renewal_ipv4_line": "IPv4 URL: `{ipv4_url}`\n\n",
+        "renewal_ipv4_line": "IPv4 URL:\n`{ipv4_url}`\n\n",
         "payment_already_processed": "Already processed: {status}",
         "payment_status_completed": "completed",
         "payment_status_processing": "processing",
@@ -262,7 +262,9 @@ def install_common_stubs(bot, payment_records):
         "payment_status_unknown": "unknown",
         "payment_status_checking": "Checking payment status...",
         "payment_status_check_in_progress": "Payment status check is already in progress.",
-        "payment_approved": "approved {username} {sub_url}",
+        "payment_approved": (
+            "approved {username}\n{ipv4_info}Subscription URL:\n{sub_url}"
+        ),
         "payment_completed": "completed {username} {sub_url}",
         "payment_completed_no_url": "completed no url",
         "payment_completed_user_error": "completed user error",
@@ -566,6 +568,7 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         )
 
         raw_url = r"https://sub.example/sub_id?direct=[one]`two\three"
+        raw_ipv4 = r"hysteria2://edge.example/config_id?direct=[one]`two\three"
         message = purchase_plan._format_config_delivery_message(
             "en",
             "payment_approved",
@@ -573,6 +576,7 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
             days=60,
             username="s7951744600d",
             sub_url=raw_url,
+            ipv4_url=raw_ipv4,
         )
         purchase_plan._deliver_payment_config(
             "receipt-payment",
@@ -585,6 +589,11 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         delivered = bot.sent_messages[-1]
         self.assertIn(r"sub\_id", delivered[0][1])
         self.assertIn(r"direct=\[one\]\`two\\three", delivered[0][1])
+        self.assertIn(
+            "IPv4 URL:\n`hysteria2://edge.example/config_id?direct=[one]\\`two\\\\three`\n\n"
+            "Subscription URL:\n",
+            delivered[0][1],
+        )
         self.assertEqual(delivered[1]["parse_mode"], "Markdown")
         self.assertEqual([fields["config_delivery_status"] for _pid, fields in updates], ["attempting", "sent"])
         self.assertIn("config_delivery_attempted_at", updates[0][1])

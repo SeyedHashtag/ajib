@@ -167,7 +167,7 @@ def process_add_user_step4(call):
         success_message += f"Unlimited Access: {unlimited_text}\n\n"
         
         if ipv4_url:
-            success_message += f"IPv4 URL: `{escape_markdown_code(ipv4_url)}`\n\n"
+            success_message += f"IPv4 URL:\n`{escape_markdown_code(ipv4_url)}`\n\n"
             
         success_message += f"Subscription URL:\n{escape_markdown_text(sub_url)}"
         

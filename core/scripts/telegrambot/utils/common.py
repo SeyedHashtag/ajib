@@ -55,8 +55,7 @@ ADMIN_GROUP_MENU_ROWS = {
     "users": (
         (admin_action_text("add_user"), admin_action_text("show_user")),
         (admin_action_text("delete_user"), admin_action_text("manage_test_accounts")),
-        (admin_action_text("bulk_transfer"),),
-        (admin_action_text("expired_cleanup"),),
+        (admin_action_text("expired_cleanup"), admin_action_text("bulk_transfer")),
         (ADMIN_HOME_BUTTON_TEXT,),
     ),
     "sales": (

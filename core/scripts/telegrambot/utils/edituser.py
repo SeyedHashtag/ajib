@@ -274,7 +274,7 @@ def _send_user_details(message, api_client, user_details, ref):
 
     caption = f"{formatted_details}\n\n"
     if ipv4_url:
-        caption += f"IPv4 URL: `{escape_markdown_code(ipv4_url)}`\n\n"
+        caption += f"IPv4 URL:\n`{escape_markdown_code(ipv4_url)}`\n\n"
     caption += f"Subscription URL:\n{escape_markdown_text(sub_url)}"
     bot.send_photo(message.chat.id, bio, caption=caption, reply_markup=markup, parse_mode="Markdown")
 
