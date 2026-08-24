@@ -327,6 +327,7 @@ def write_readiness_marker():
 
 if __name__ == '__main__':
     write_readiness_marker()
+    start_server_info_cache_monitor()
     monitor_thread = threading.Thread(target=monitoring_thread, daemon=True)
     monitor_thread.start()
     version_thread = threading.Thread(target=version_monitoring, daemon=True)

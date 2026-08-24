@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 import threading
@@ -21,9 +22,13 @@ SERVER_INFO_SECTIONS = (
 SERVER_INFO_CACHE_LOCK = threading.RLock()
 SERVER_INFO_REFRESH_LOCK = threading.Lock()
 SERVER_INFO_JOB_LOCK = threading.Lock()
+SERVER_INFO_MONITOR_LOCK = threading.Lock()
 SERVER_INFO_MIN_REFRESH_SECONDS = 60
+SERVER_INFO_REFRESH_INTERVAL_SECONDS = 3600
 SERVER_INFO_SNAPSHOT_CACHE = {"snapshot": None, "cached_at": 0.0}
 SERVER_INFO_RENDER_INFLIGHT = set()
+SERVER_INFO_MONITOR_THREAD = None
+SERVER_INFO_LOGGER = logging.getLogger("ajib.server_info")
 
 
 def _int_env(name, default, minimum=1):
@@ -97,6 +102,52 @@ def _get_server_info_snapshot(force_refresh=False):
         return snapshot
     finally:
         SERVER_INFO_REFRESH_LOCK.release()
+
+
+def refresh_server_info_cache():
+    """Refresh the shared dashboard snapshot without rendering a message."""
+    return _get_server_info_snapshot(force_refresh=True)
+
+
+def server_info_cache_monitoring_loop(interval_seconds=SERVER_INFO_REFRESH_INTERVAL_SECONDS):
+    """Prewarm the server-info cache now and then on a fixed cadence."""
+    interval_seconds = max(1.0, float(interval_seconds))
+    next_refresh_at = time.monotonic()
+
+    while True:
+        wait_seconds = next_refresh_at - time.monotonic()
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+        try:
+            refresh_server_info_cache()
+        except Exception:
+            SERVER_INFO_LOGGER.exception("Scheduled server-info cache refresh failed")
+
+        next_refresh_at += interval_seconds
+        now = time.monotonic()
+        if next_refresh_at <= now:
+            missed_intervals = int((now - next_refresh_at) // interval_seconds) + 1
+            next_refresh_at += missed_intervals * interval_seconds
+
+
+def start_server_info_cache_monitor():
+    """Start the main bot's single server-info cache prewarming thread."""
+    global SERVER_INFO_MONITOR_THREAD
+
+    with SERVER_INFO_MONITOR_LOCK:
+        thread = SERVER_INFO_MONITOR_THREAD
+        if thread is not None and thread.is_alive():
+            return thread
+
+        thread = threading.Thread(
+            target=server_info_cache_monitoring_loop,
+            daemon=True,
+            name="ajib-server-info-cache",
+        )
+        SERVER_INFO_MONITOR_THREAD = thread
+        thread.start()
+        return thread
 
 
 def _build_server_info_text(section=SERVER_INFO_DEFAULT_SECTION, force_refresh=False):

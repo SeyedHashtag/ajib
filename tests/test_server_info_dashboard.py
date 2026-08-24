@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import threading
 import types
 import unittest
 from datetime import datetime, timezone
@@ -664,6 +665,173 @@ def load_serverinfo_module():
 
 
 class ServerInfoTelegramTests(unittest.TestCase):
+    def test_cache_prewarm_refreshes_without_rendering_messages(self):
+        module, bot, cli_api = load_serverinfo_module()
+
+        snapshot = module.refresh_server_info_cache()
+
+        self.assertEqual(snapshot["snapshot_id"], 1)
+        self.assertEqual(cli_api.build_count, 1)
+        self.assertEqual(module.SERVER_INFO_SNAPSHOT_CACHE["snapshot"], snapshot)
+        self.assertEqual(bot.replies, [])
+        self.assertEqual(bot.edits, [])
+
+    def test_cache_monitor_runs_immediately_then_on_fixed_hourly_cadence(self):
+        module, _bot, _cli_api = load_serverinfo_module()
+        clock = {"now": 0.0}
+        refreshes = []
+        sleeps = []
+
+        class StopMonitoring(Exception):
+            pass
+
+        def refresh():
+            refreshes.append(clock["now"])
+            clock["now"] += 25.0
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(refreshes) >= 2:
+                raise StopMonitoring
+            clock["now"] += seconds
+
+        module.refresh_server_info_cache = refresh
+        module.time = types.SimpleNamespace(
+            monotonic=lambda: clock["now"],
+            sleep=sleep,
+        )
+
+        with self.assertRaises(StopMonitoring):
+            module.server_info_cache_monitoring_loop(interval_seconds=3600)
+
+        self.assertEqual(refreshes, [0.0, 3600.0])
+        self.assertEqual(sleeps, [3575.0, 3575.0])
+
+    def test_cache_monitor_logs_failure_and_continues_next_hour(self):
+        module, _bot, _cli_api = load_serverinfo_module()
+        clock = {"now": 0.0}
+        attempts = []
+
+        class StopMonitoring(Exception):
+            pass
+
+        def refresh():
+            attempts.append(clock["now"])
+            if len(attempts) == 1:
+                raise RuntimeError("scan unavailable")
+
+        def sleep(seconds):
+            if len(attempts) >= 2:
+                raise StopMonitoring
+            clock["now"] += seconds
+
+        module.refresh_server_info_cache = refresh
+        module.time = types.SimpleNamespace(
+            monotonic=lambda: clock["now"],
+            sleep=sleep,
+        )
+
+        with self.assertLogs("ajib.server_info", level="ERROR") as logs:
+            with self.assertRaises(StopMonitoring):
+                module.server_info_cache_monitoring_loop(interval_seconds=3600)
+
+        self.assertEqual(attempts, [0.0, 3600.0])
+        self.assertIn("Scheduled server-info cache refresh failed", logs.output[0])
+
+    def test_cache_monitor_starter_creates_one_named_daemon(self):
+        module, _bot, _cli_api = load_serverinfo_module()
+        created = []
+
+        class FakeThread:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.started = False
+                created.append(self)
+
+            def start(self):
+                self.started = True
+
+            def is_alive(self):
+                return self.started
+
+        module.threading = types.SimpleNamespace(Thread=FakeThread)
+
+        first = module.start_server_info_cache_monitor()
+        second = module.start_server_info_cache_monitor()
+
+        self.assertIs(first, second)
+        self.assertEqual(len(created), 1)
+        self.assertTrue(first.started)
+        self.assertTrue(first.kwargs["daemon"])
+        self.assertEqual(first.kwargs["name"], "ajib-server-info-cache")
+        self.assertIs(first.kwargs["target"], module.server_info_cache_monitoring_loop)
+
+    def test_failed_prewarm_preserves_last_successful_snapshot(self):
+        module, _bot, cli_api = load_serverinfo_module()
+        previous = module.refresh_server_info_cache()
+        module.SERVER_INFO_MIN_REFRESH_SECONDS = 0
+        cli_api.build_server_info_snapshot = lambda: (_ for _ in ()).throw(
+            RuntimeError("scan unavailable")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "scan unavailable"):
+            module.refresh_server_info_cache()
+
+        self.assertIs(module.SERVER_INFO_SNAPSHOT_CACHE["snapshot"], previous)
+
+    def test_concurrent_prewarm_reuses_inflight_refresh(self):
+        module, _bot, cli_api = load_serverinfo_module()
+        previous = module.refresh_server_info_cache()
+        module.SERVER_INFO_MIN_REFRESH_SECONDS = 0
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_build():
+            cli_api.build_count += 1
+            entered.set()
+            release.wait(timeout=2)
+            return {
+                "snapshot_id": cli_api.build_count,
+                "generated_at": datetime(2026, 6, 4, 13, 0, 0),
+            }
+
+        cli_api.build_server_info_snapshot = blocking_build
+        worker = threading.Thread(target=module.refresh_server_info_cache)
+        worker.start()
+        self.assertTrue(entered.wait(timeout=2))
+
+        concurrent = module.refresh_server_info_cache()
+        release.set()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertIs(concurrent, previous)
+        self.assertEqual(cli_api.build_count, 2)
+        self.assertEqual(
+            module.SERVER_INFO_SNAPSHOT_CACHE["snapshot"]["snapshot_id"],
+            2,
+        )
+
+    def test_dashboard_navigation_uses_prewarmed_snapshot(self):
+        module, bot, cli_api = load_serverinfo_module()
+        module.SERVER_INFO_MIN_REFRESH_SECONDS = 0
+        module.refresh_server_info_cache()
+        module.refresh_server_info_cache()
+        executor = HoldingExecutor()
+        module.SERVER_INFO_JOB_EXECUTOR = executor
+        call = types.SimpleNamespace(
+            id="view",
+            data="server_info:view:customers",
+            from_user=types.SimpleNamespace(id=1),
+            message=types.SimpleNamespace(chat=types.SimpleNamespace(id=10), message_id=77),
+        )
+
+        module.handle_server_info_callback(call)
+        executor.run_next()
+
+        self.assertEqual(bot.edits[0][0][0], "customers dashboard text 2")
+        self.assertEqual(cli_api.build_count, 2)
+
     def test_server_info_reply_includes_category_markup(self):
         module, bot, cli_api = load_serverinfo_module()
         executor = HoldingExecutor()
