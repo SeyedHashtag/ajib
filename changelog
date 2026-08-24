@@ -1,3 +1,8 @@
+## v2.7.7
+🛠️ Refactor Telegram message formatting and delivery with shared Markdown escaping and safer notification handling across customer, reseller, hosted, purchase, renewal, and configuration flows
+🐛 Format IPv4 URLs consistently on their own Markdown-safe lines and keep admin menu actions aligned for reliable rendering across supported languages
+✅ Expand regression coverage for Telegram formatting, safe delivery, IPv4 URL presentation, hosted notifications, and affected customer journeys
+
 ## v2.7.6
 🛠️ Prewarm and periodically refresh the server-info dashboard cache so monitoring views stay responsive and current
 🐛 Reduce traffic-monitor state writes while preserving renewal-boundary detection, and add structured scan and slow-transaction diagnostics
