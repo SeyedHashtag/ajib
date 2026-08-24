@@ -7,6 +7,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKER_PATH = ROOT / "core" / "scripts" / "telegrambot" / "hosted_worker.py"
 ACCOUNT_STATE_PATH = ROOT / "core" / "scripts" / "telegrambot" / "utils" / "account_state.py"
+UTILS_PATH = ACCOUNT_STATE_PATH.parent
+if str(UTILS_PATH) not in sys.path:
+    sys.path.insert(0, str(UTILS_PATH))
 
 
 def _load_account_state():
@@ -74,7 +77,7 @@ def test_hosted_onboarding_ignores_old_issuance_after_connection():
 def test_hosted_notifications_use_canonical_service_fields():
     source = ast.get_source_segment(
         WORKER_PATH.read_text(encoding="utf-8"),
-        _worker_function("_customer_notification_monitor"),
+        _worker_function("_run_customer_notification_scan"),
     )
 
     assert "account.service_days_remaining" in source

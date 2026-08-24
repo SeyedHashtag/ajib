@@ -1,6 +1,8 @@
 import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -750,3 +752,113 @@ def test_notification_failures_never_roll_back_completed_migration(tmp_path):
     assert notification_counts(job_id, path=path) == {"permanent_failed": 1}
     assert "alice" in destination.users and "alice" not in source.users
     assert get_job(job_id, path=path)["status"] == "completed"
+
+
+def test_empty_notification_queue_does_not_request_a_write_lock(tmp_path, monkeypatch):
+    path = tmp_path / "empty-notifications.db"
+    database.get_connection(path)
+    write_attempts = []
+
+    def unexpected_write(*args, **kwargs):
+        write_attempts.append((args, kwargs))
+        raise AssertionError("empty queue must not open a write transaction")
+
+    monkeypatch.setattr(bulk_transfer.database, "write_transaction", unexpected_write)
+
+    assert bulk_transfer._claim_notification("main", path=path) is None
+    assert write_attempts == []
+
+
+def test_slow_notification_io_does_not_block_backup_or_key_persistence(tmp_path, monkeypatch):
+    path = tmp_path / "contention.db"
+    monkeypatch.setenv("AJIB_BOT_DIR", str(tmp_path))
+    monkeypatch.setenv("AJIB_DB_PATH", str(path))
+    monkeypatch.setenv("AJIB_SQLITE_ACTIVE", "1")
+    job_id, multi, destination = create_pending_migration_notice(path)
+    traffic_path = tmp_path / "traffic_alerts.json"
+    barrier = threading.Barrier(5)
+    errors = []
+    delivered = []
+    sent = []
+    original_get_user_uri = destination.get_user_uri
+
+    def assert_outside_transaction():
+        resolved = database.database_path(path)
+        assert database._transaction_depths().get(resolved, 0) == 0
+
+    def slow_get_user_uri(username):
+        assert_outside_transaction()
+        time.sleep(0.03)
+        return original_get_user_uri(username)
+
+    destination.get_user_uri = slow_get_user_uri
+
+    def slow_sender(recipient_id, text):
+        assert_outside_transaction()
+        time.sleep(0.03)
+        sent.append((recipient_id, text))
+
+    def deliver():
+        try:
+            barrier.wait()
+            delivered.append(
+                deliver_notifications(
+                    "main",
+                    slow_sender,
+                    path=path,
+                    max_items=1,
+                    multi_api=multi,
+                )
+            )
+        except Exception as error:
+            errors.append(error)
+        finally:
+            database.close_connections()
+
+    def persist_alerts():
+        try:
+            from utils.state_store import patch_dict_state
+
+            barrier.wait()
+            for index in range(40):
+                patch_dict_state(
+                    traffic_path,
+                    {f"user-{index}": {"notified": [80]}},
+                )
+        except Exception as error:
+            errors.append(error)
+        finally:
+            database.close_connections()
+
+    def create_backups():
+        try:
+            barrier.wait()
+            for index in range(5):
+                database.backup_database(tmp_path / f"snapshot-{index}.db", path)
+        except Exception as error:
+            errors.append(error)
+        finally:
+            database.close_connections()
+
+    threads = [
+        threading.Thread(target=deliver),
+        threading.Thread(target=deliver),
+        threading.Thread(target=persist_alerts),
+        threading.Thread(target=create_backups),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert sum(delivered) == 1
+    assert len(sent) == 1
+    assert notification_counts(job_id, path=path) == {"sent": 1}
+    assert database.integrity_check(path, quick=True) == "ok"
+    assert database.get_connection(path).execute(
+        "SELECT COUNT(*) FROM kv_state WHERE namespace='traffic_alerts'"
+    ).fetchone()[0] == 40
+    database.close_connections()

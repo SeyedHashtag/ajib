@@ -16,7 +16,10 @@ from contextlib import closing
 from pathlib import Path, PurePosixPath
 
 
-os.environ.setdefault("AJIB_BOT_ROLE", "supervisor")
+# Backup/restore helpers are always infrastructure processes. Do not inherit a
+# main-worker role from the bot that launched an automated backup, because that
+# would import the complete handler graph while opening the live database.
+os.environ["AJIB_BOT_ROLE"] = "supervisor"
 BOT_SOURCE_DIR = Path(__file__).resolve().parent
 if str(BOT_SOURCE_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_SOURCE_DIR))

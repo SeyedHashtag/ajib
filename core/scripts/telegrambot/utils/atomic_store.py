@@ -116,3 +116,29 @@ def write_json(path, data, mode=0o600):
                 os.remove(temporary)
         except OSError:
             pass
+
+
+def patch_json_dict(path, updates=None, remove_keys=(), mode=0o600):
+    """Atomically patch selected keys without rewriting managed KV state."""
+
+    normalized_updates = {
+        str(key): value for key, value in dict(updates or {}).items()
+    }
+    normalized_removals = {
+        str(key) for key in (remove_keys or ())
+    } - set(normalized_updates)
+    if not normalized_updates and not normalized_removals:
+        return
+    if state_store.is_managed_path(path):
+        state_store.patch_dict_state(
+            path,
+            normalized_updates,
+            normalized_removals,
+        )
+        return
+    with locked_json(path, {}) as stored:
+        if not isinstance(stored, dict):
+            raise ValueError(f"JSON state must contain an object: {path}")
+        stored.update(normalized_updates)
+        for key in normalized_removals:
+            stored.pop(key, None)

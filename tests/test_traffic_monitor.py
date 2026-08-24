@@ -7,6 +7,7 @@ import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = (
@@ -200,6 +201,30 @@ class TrafficMonitorTests(unittest.TestCase):
         self.assertEqual(self.bot.sent_messages[0][0], 123)
         self.assertIn("regular s123 95", self.bot.sent_messages[0][1])
         self.assertEqual(self.read_alerts()["s123"]["notified"], [80, 90])
+
+    def test_unchanged_usage_band_does_not_persist_the_alert_again(self):
+        user = (
+            True,
+            "s123",
+            {
+                "account_creation_date": "2026-08-01 00:00:00",
+                "upload_bytes": 10 * GB,
+                "download_bytes": 0,
+                "max_download_bytes": 100 * GB,
+            },
+        )
+        original_patch = self.monitor._patch_alerts
+
+        with mock.patch.object(
+            self.monitor,
+            "_patch_alerts",
+            wraps=original_patch,
+        ) as patch_alerts:
+            self.run_monitor([user])
+            self.run_monitor([user])
+
+        self.assertIn("s123", patch_alerts.call_args_list[0].args[0])
+        self.assertEqual(patch_alerts.call_args_list[1].args[0], {})
 
     def test_reseller_client_at_95_percent_gb_gets_one_alert_and_marks_all_crossed_thresholds(self):
         self.write_reseller_config(456, "r456", customer_name="ali123")

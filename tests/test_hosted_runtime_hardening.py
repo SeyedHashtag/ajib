@@ -4,7 +4,9 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -174,6 +176,177 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
 
         self.assertEqual(recovered, ["payment"])
         self.assertEqual(self.worker._tenant_payments()["payment"]["status"], "pending_approval")
+
+    def test_customer_notification_claims_are_leased_retryable_and_idempotent(self):
+        now = datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc)
+        delivery_key = "allowance:alice:cycle-1"
+
+        first = self.worker._claim_customer_notification(
+            delivery_key, 80, numeric=True, now=now
+        )
+        duplicate = self.worker._claim_customer_notification(
+            delivery_key, 80, numeric=True, now=now + timedelta(seconds=299)
+        )
+        recovered = self.worker._claim_customer_notification(
+            delivery_key, 80, numeric=True, now=now + timedelta(seconds=301)
+        )
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(duplicate)
+        self.assertIsNotNone(recovered)
+        self.assertNotEqual(first, recovered)
+        self.assertTrue(
+            self.worker._finish_customer_notification(
+                delivery_key, 80, recovered, success=False
+            )
+        )
+
+        retry = self.worker._claim_customer_notification(
+            delivery_key, 80, numeric=True, now=now + timedelta(seconds=302)
+        )
+        self.assertIsNotNone(retry)
+        self.assertTrue(
+            self.worker._finish_customer_notification(
+                delivery_key, 80, retry, success=True
+            )
+        )
+        self.assertIsNone(
+            self.worker._claim_customer_notification(
+                delivery_key, 80, numeric=True, now=now + timedelta(seconds=303)
+            )
+        )
+        self.assertIsNotNone(
+            self.worker._claim_customer_notification(
+                delivery_key, 90, numeric=True, now=now + timedelta(seconds=303)
+            )
+        )
+        self.assertIsNotNone(
+            self.worker._claim_customer_notification(
+                "allowance:alice:cycle-2",
+                80,
+                numeric=True,
+                now=now + timedelta(seconds=303),
+            )
+        )
+
+    def test_concurrent_customer_notification_claims_have_one_winner(self):
+        barrier = threading.Barrier(3)
+        claims = []
+        errors = []
+
+        def claim():
+            try:
+                barrier.wait()
+                claims.append(
+                    self.worker._claim_customer_notification(
+                        "allowance:alice:cycle-1", 80, numeric=True
+                    )
+                )
+            except Exception as error:
+                errors.append(error)
+            finally:
+                self.hosted_bots.database.close_connections()
+
+        threads = [threading.Thread(target=claim) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertFalse(errors)
+        self.assertEqual(sum(value is not None for value in claims), 1)
+
+    def test_customer_notification_scan_performs_io_outside_claim_transaction(self):
+        notifications = {}
+        transaction_open = {"value": False}
+        live = {
+            "max_download_bytes": 100,
+            "upload_bytes": 90,
+            "download_bytes": 0,
+        }
+        client = mock.Mock(server_id="server-a")
+        reseller = {
+            "configs": [
+                {
+                    "username": "Bob",
+                    "server_id": "server-b",
+                    "customer_telegram_id": 200,
+                    "plan_gb": 10,
+                },
+                {
+                    "username": "Alice",
+                    "server_id": "server-a",
+                    "customer_telegram_id": 100,
+                    "plan_gb": 10,
+                }
+            ]
+        }
+        account = mock.Mock(
+            panel_state=self.worker.PanelState.CONNECTED,
+            entitlement_state=self.worker.EntitlementState.CURRENT,
+            service_days_remaining=1,
+            service_duration_days=10,
+            service_marker="cycle-1",
+        )
+
+        @contextmanager
+        def short_transaction(_path, _default):
+            self.assertFalse(transaction_open["value"])
+            transaction_open["value"] = True
+            try:
+                yield notifications
+            finally:
+                transaction_open["value"] = False
+
+        def snapshot():
+            self.assertFalse(transaction_open["value"])
+            return {("server-a", "alice"): (client, live)}, {}
+
+        def send_message(*_args, **_kwargs):
+            self.assertFalse(transaction_open["value"])
+
+        def record_growth(*_args, **_kwargs):
+            self.assertFalse(transaction_open["value"])
+
+        with (
+            mock.patch.object(self.worker, "locked_json", short_transaction),
+            mock.patch.object(self.worker, "get_reseller_data", return_value=reseller),
+            mock.patch.object(self.worker, "_hosted_notification_live_users", side_effect=snapshot),
+            mock.patch.object(self.worker, "_hosted_service_cycle", return_value=None),
+            mock.patch.object(self.worker, "inspect_account", return_value=account),
+            mock.patch.object(self.worker, "_hosted_message", return_value="message"),
+            mock.patch.object(
+                self.worker.bot, "send_message", side_effect=send_message
+            ) as sender,
+            mock.patch.object(self.worker, "_record_growth", side_effect=record_growth) as growth,
+        ):
+            stats = self.worker._run_customer_notification_scan()
+
+        self.assertEqual(stats["sent"], 1)
+        self.assertEqual(notifications["allowance:Alice:cycle-1"], 90)
+        self.assertFalse(any(key.startswith("__customer_claim__:") for key in notifications))
+        markup = sender.call_args.kwargs["reply_markup"]
+        self.assertEqual(markup.keyboard[0][0].callback_data, "hb:renewcfg:0")
+        growth.assert_called_once()
+
+    def test_customer_notification_snapshot_keeps_exact_and_fallback_lookup(self):
+        first_client = mock.Mock(server_id="server-a")
+        exact_client = mock.Mock(server_id="server-b")
+        calls = []
+
+        class Multi:
+            def iter_all_users(self, **kwargs):
+                calls.append(kwargs)
+                yield first_client, "Alice", {"source": "fallback"}
+                yield exact_client, "alice", {"source": "exact"}
+
+        with mock.patch.object(self.worker, "MultiServerAPI", return_value=Multi()):
+            exact, fallback = self.worker._hosted_notification_live_users()
+
+        self.assertEqual(calls, [{"include_disabled": True, "force_refresh": True}])
+        self.assertEqual(exact[("server-b", "alice")][1]["source"], "exact")
+        self.assertEqual(fallback["alice"][1]["source"], "fallback")
 
     def test_provisioning_exception_releases_claim_for_retry(self):
         self.worker._save_payment("payment", {"status": "pending"})
@@ -1099,6 +1272,22 @@ class HostedSupervisorHardeningTests(unittest.TestCase):
 
         self.assertEqual(worker.failures, 0)
         self.assertEqual(worker.next_start, 0)
+
+    def test_telegram_401_blocks_restart_until_worker_is_replaced(self):
+        worker = self.supervisor.Worker("7", ["worker"], {}, hosted=True)
+        worker.process = mock.Mock()
+        worker.process.poll.return_value = self.supervisor.HOSTED_AUTH_CONFIGURATION_EXIT_CODE
+
+        with mock.patch.object(self.supervisor, "_set_hosted_status") as set_status:
+            worker.poll()
+
+        self.assertTrue(worker.restart_blocked)
+        self.assertFalse(worker.start())
+        set_status.assert_called_once_with(
+            "7",
+            "error",
+            "Telegram rejected the bot token; update the token to retry",
+        )
 
 
 if __name__ == "__main__":

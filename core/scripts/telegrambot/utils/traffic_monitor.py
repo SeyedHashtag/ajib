@@ -97,8 +97,8 @@ def _record_renewal_prompt(
 
 def _atomic_helpers():
     try:
-        from utils.atomic_store import locked_json, read_json
-        return locked_json, read_json
+        from utils.atomic_store import locked_json, patch_json_dict, read_json
+        return locked_json, read_json, patch_json_dict
     except ImportError:
         return None
 
@@ -132,6 +132,26 @@ def _save_alerts(alerts):
             os.makedirs(os.path.dirname(ALERTS_FILE), exist_ok=True)
             with open(ALERTS_FILE, 'w') as f:
                 json.dump(alerts, f, indent=2)
+
+
+def _patch_alerts(updates):
+    if not updates:
+        return
+    with _alerts_lock:
+        helpers = _atomic_helpers()
+        if helpers:
+            helpers[2](ALERTS_FILE, updates)
+            return
+        existing = {}
+        if os.path.exists(ALERTS_FILE):
+            with open(ALERTS_FILE, 'r') as handle:
+                existing = json.load(handle)
+        if not isinstance(existing, dict):
+            raise ValueError("Traffic alerts must contain a JSON object.")
+        existing.update(updates)
+        os.makedirs(os.path.dirname(ALERTS_FILE), exist_ok=True)
+        with open(ALERTS_FILE, 'w') as handle:
+            json.dump(existing, handle, indent=2)
 
 
 def _extract_telegram_id(username):
@@ -180,6 +200,22 @@ def _should_reset_alerts(state, max_download_bytes, total_usage_bytes, cycle_mar
         return True
 
     return False
+
+
+def _usage_checkpoint(state, max_download_bytes, total_usage_bytes):
+    """Persist usage only when crossing the renewal-reset boundary.
+
+    Exact counters change on nearly every scan, but reset detection only needs
+    to know whether usage was above or below the configured reset ratio.
+    """
+
+    previous_usage = state.get('last_usage_bytes')
+    if previous_usage is None or max_download_bytes <= 0:
+        return total_usage_bytes
+    boundary = max_download_bytes * ALERT_RESET_RATIO
+    if (previous_usage > boundary) != (total_usage_bytes > boundary):
+        return total_usage_bytes
+    return previous_usage
 
 
 def _select_threshold_alert(usage_percent, notified):
@@ -419,23 +455,33 @@ def _should_reset_days_alerts(state, total_days, expiration_days):
 
 
 def monitor_user_traffic():
+    stats = {
+        'scanned': 0,
+        'evaluated': 0,
+        'sent': 0,
+        'failed': 0,
+        'updated': 0,
+        'stored': 0,
+    }
     if not _reminders_enabled():
-        return
+        return stats
 
     multi_api = MultiServerAPI()
     if not multi_api.servers:
-        return
+        return stats
 
     plans, payments = _load_customer_context()
     alerts = _load_alerts()
-    changed = False
+    alert_updates = {}
     updated_at = format_utc_timestamp()
 
     for api_client, username, user_data in multi_api.iter_all_users(include_disabled=False):
+        stats['scanned'] += 1
         if not username or not user_data:
             continue
         if inspect_account(user_data, source='traffic_monitor').panel_state == PanelState.UNKNOWN:
             continue
+        stats['evaluated'] += 1
 
         # ── Regular user GB alerts ──────────────────────────────────────────
         telegram_id = _extract_telegram_id(username)
@@ -538,8 +584,10 @@ def monitor_user_traffic():
                             reply_markup=markup,
                         )
                     except Exception as error:
+                        stats['failed'] += 1
                         print(f"Failed to notify user {telegram_id} for {username}: {error}")
                     else:
+                        stats['sent'] += 1
                         notified.update(handled_thresholds)
                         if payment is not None:
                             _record_renewal_prompt(
@@ -561,16 +609,27 @@ def monitor_user_traffic():
                 state.pop('renewal_notified', None)
             if max_download_bytes > 0:
                 state['max_download_bytes'] = max_download_bytes
-                state['last_usage_bytes'] = total_usage_bytes
+                state['last_usage_bytes'] = _usage_checkpoint(
+                    state,
+                    max_download_bytes,
+                    total_usage_bytes,
+                )
             if total_days is not None and total_days > 0:
                 state['total_days'] = total_days
             if expiration_days is not None:
                 state['last_expiration_days'] = expiration_days
             if marker:
                 state['cycle_marker'] = marker
-            state['updated_at'] = updated_at
+            comparable_state = dict(state)
+            comparable_state.pop('updated_at', None)
+            comparable_previous = dict(previous_state)
+            comparable_previous.pop('updated_at', None)
+            if comparable_state != comparable_previous:
+                state['updated_at'] = updated_at
+                alert_updates[username] = state
+            else:
+                state = previous_state
             alerts[username] = state
-            changed = changed or state != previous_state
 
         # ── Reseller client alerts (GB + days) ─────────────────────────────
         reseller_id = _extract_reseller_id(username)
@@ -683,11 +742,13 @@ def monitor_user_traffic():
                         reply_markup=markup,
                     )
                 except Exception as error:
+                    stats['failed'] += 1
                     print(
                         f"Failed to notify reseller {reseller_id} for client "
                         f"{username} ({basis}): {error}"
                     )
                 else:
+                    stats['sent'] += 1
                     notified.update(handled_thresholds)
                     legacy_key = 'gb_notified' if basis == 'traffic' else 'days_notified'
                     legacy_notified = set(state.get(legacy_key, []))
@@ -711,7 +772,11 @@ def monitor_user_traffic():
             state.pop('renewal_notified', None)
         if max_download_bytes > 0:
             state['max_download_bytes'] = max_download_bytes
-            state['last_usage_bytes'] = total_usage_bytes
+            state['last_usage_bytes'] = _usage_checkpoint(
+                state,
+                max_download_bytes,
+                total_usage_bytes,
+            )
         if total_days and total_days > 0:
             state['total_days'] = total_days
         if expiration_days is not None:
@@ -719,9 +784,18 @@ def monitor_user_traffic():
         if marker:
             state['cycle_marker'] = marker
 
-        state['updated_at'] = updated_at
+        comparable_state = dict(state)
+        comparable_state.pop('updated_at', None)
+        comparable_previous = dict(previous_state)
+        comparable_previous.pop('updated_at', None)
+        if comparable_state != comparable_previous:
+            state['updated_at'] = updated_at
+            alert_updates[username] = state
+        else:
+            state = previous_state
         alerts[username] = state
-        changed = changed or state != previous_state
 
-    if changed:
-        _save_alerts(alerts)
+    _patch_alerts(alert_updates)
+    stats['updated'] = len(alert_updates)
+    stats['stored'] = len(alerts)
+    return stats

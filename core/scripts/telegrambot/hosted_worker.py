@@ -121,6 +121,11 @@ from utils.time_utils import (
     utc_date,
     utc_now,
 )
+from utils.telegram_safe import (
+    authenticate_bot_with_backoff,
+    is_permanent_telegram_auth_error,
+    run_polling_with_backoff,
+)
 
 
 OWNER_ID = int(os.environ["AJIB_HOSTED_RESELLER_ID"])
@@ -158,6 +163,10 @@ OWNER_STATS_SEND_HOUR = 0
 OWNER_STATS_SEND_MINUTE = 5
 OWNER_STATS_CLAIM_LEASE_SECONDS = 600
 OWNER_STATS_MONITOR_INTERVAL_SECONDS = 60
+CUSTOMER_NOTIFICATION_CLAIM_LEASE_SECONDS = 300
+CUSTOMER_NOTIFICATION_INTERVAL_SECONDS = 7200
+CUSTOMER_NOTIFICATION_MAX_INITIAL_DELAY_SECONDS = 300
+AUTH_CONFIGURATION_EXIT_CODE = 78
 BUYER_DISCOUNTS_ENABLED = is_growth_feature_enabled(BUYER_DISCOUNTS)
 REMINDERS_ENABLED = is_growth_feature_enabled(REMINDERS)
 
@@ -868,14 +877,15 @@ def _find_customer_configs(user_id):
     ]
 
 
-def _hosted_service_cycle(config):
+def _hosted_service_cycle(config, *, payments=None):
     """Resolve the exact successful tenant/reseller issuance cycle."""
     if not isinstance(config, dict):
         return None
     username = config.get("username")
     server_id = config.get("server_id")
     matching_records = []
-    for record in _tenant_payments().values():
+    payment_records = payments if isinstance(payments, dict) else _tenant_payments()
+    for record in payment_records.values():
         if not isinstance(record, dict):
             continue
         record_username = record.get("renew_username") or record.get("username")
@@ -4762,104 +4772,272 @@ def _crypto_monitor():
         time.sleep(300)
 
 
-def _customer_notification_monitor():
-    while True:
-        try:
-            reseller = get_reseller_data(OWNER_ID) or {}
-            with locked_json(tenant_file(OWNER_ID, "notifications.json"), {}) as sent:
-                for config in reseller.get("configs", []):
-                    if not isinstance(config, dict) or not config.get("customer_telegram_id") or config.get("removed_from_vpn"):
-                        continue
-                    username = config.get("username")
-                    client, live = MultiServerAPI().find_user(username, preferred_server_id=config.get("server_id"))
-                    if not client or not live:
-                        continue
-                    user_id = int(config["customer_telegram_id"])
-                    customer_configs = _find_customer_configs(user_id)
-                    customer_index = next(
-                        (
-                            index for index, candidate in enumerate(customer_configs)
-                            if candidate.get("username") == config.get("username")
-                            and candidate.get("server_id") == config.get("server_id")
-                        ),
-                        None,
-                    )
-                    service_cycle = _hosted_service_cycle(config)
-                    account = inspect_account(
-                        live,
-                        cycle=service_cycle,
-                        source="hosted_notification",
-                    )
-                    if (
-                        account.panel_state == PanelState.UNKNOWN
-                        or account.entitlement_state == EntitlementState.UNKNOWN
-                    ):
-                        continue
-                    expiration = account.service_days_remaining
-                    cycle_marker = account.service_marker
-                    is_expired = account.entitlement_state == EntitlementState.EXPIRED
-                    if is_expired:
-                        from utils.renewal import find_reseller_reservation
+def _customer_notification_claim_key(delivery_key):
+    return f"__customer_claim__:{delivery_key}"
 
-                        if find_reseller_reservation(config):
-                            continue
-                    if is_expired and sent.get(f"expired:{username}") != cycle_marker:
-                        markup = types.InlineKeyboardMarkup()
-                        if customer_index is not None:
-                            markup.add(types.InlineKeyboardButton(
-                                _hosted_message(user_id, "renew_action"),
-                                callback_data=f"hb:renewcfg:{customer_index}",
-                            ))
-                        bot.send_message(
-                            user_id,
-                            _hosted_message(user_id, "expired_alert", username=username),
-                            parse_mode="Markdown",
-                            reply_markup=markup,
-                        )
-                        sent[f"expired:{username}"] = cycle_marker
-                    if is_expired:
-                        continue
-                    maximum = float(live.get("max_download_bytes", 0) or 0)
-                    used = float(live.get("upload_bytes", 0) or 0) + float(live.get("download_bytes", 0) or 0)
-                    progress = []
-                    if maximum > 0:
-                        progress.append((int((used / maximum) * 100), "traffic"))
-                    plan_days = account.service_duration_days
-                    if plan_days and plan_days > 0 and expiration is not None:
-                        progress.append((int((1 - min(expiration, plan_days) / plan_days) * 100), "time"))
-                    percent, basis = max(progress, default=(0, "traffic"), key=lambda item: item[0])
-                    percent = max(0, min(100, percent))
-                    threshold = 90 if percent >= 90 else 80 if percent >= 80 else None
-                    alert_key = f"allowance:{username}:{cycle_marker}"
-                    if threshold and int(sent.get(alert_key, 0) or 0) < threshold:
-                        markup = types.InlineKeyboardMarkup()
-                        if customer_index is not None:
-                            markup.add(types.InlineKeyboardButton(
-                                _hosted_message(user_id, "reserve_renewal_action"),
-                                callback_data=f"hb:renewcfg:{customer_index}",
-                            ))
-                        bot.send_message(
-                            user_id,
-                            _hosted_message(
-                                user_id,
-                                "usage_alert",
-                                username=username,
-                                percent=percent,
-                                basis=_hosted_message(user_id, f"usage_basis_{basis}"),
-                            ),
-                            parse_mode="Markdown",
-                            reply_markup=markup,
-                        )
-                        sent[alert_key] = threshold
-                        _record_growth(
-                            "renewal_prompted",
-                            user_id,
-                            plan=config.get("plan_gb") or config.get("gb"),
-                            deduplication_key=f"hosted-renewal-alert:{OWNER_ID}:{username}:{cycle_marker}:{threshold}",
-                        )
+
+def _customer_notification_delivered(current, target, numeric):
+    if not numeric:
+        return current == target
+    try:
+        return int(current or 0) >= int(target)
+    except (TypeError, ValueError):
+        return False
+
+
+def _claim_customer_notification(delivery_key, target, *, numeric=False, now=None):
+    requested_time = parse_utc_timestamp(now) if now is not None else None
+    claim_key = _customer_notification_claim_key(delivery_key)
+    with locked_json(tenant_file(OWNER_ID, "notifications.json"), {}) as notifications:
+        current = requested_time or utc_now()
+        if _customer_notification_delivered(
+            notifications.get(delivery_key), target, numeric
+        ):
+            return None
+        existing = notifications.get(claim_key, {})
+        claimed_at = _parse_time(existing.get("claimed_at")) if isinstance(existing, dict) else None
+        claim_age = (current - claimed_at).total_seconds() if claimed_at is not None else None
+        if (
+            isinstance(existing, dict)
+            and claim_age is not None
+            and 0 <= claim_age < CUSTOMER_NOTIFICATION_CLAIM_LEASE_SECONDS
+        ):
+            return None
+        claim_id = uuid.uuid4().hex
+        notifications[claim_key] = {
+            "claim_id": claim_id,
+            "claimed_at": format_utc_timestamp(current),
+            "target": target,
+            "numeric": bool(numeric),
+        }
+        return claim_id
+
+
+def _finish_customer_notification(
+    delivery_key,
+    target,
+    claim_id,
+    *,
+    success,
+):
+    claim_key = _customer_notification_claim_key(delivery_key)
+    with locked_json(tenant_file(OWNER_ID, "notifications.json"), {}) as notifications:
+        claim = notifications.get(claim_key, {})
+        if not isinstance(claim, dict) or claim.get("claim_id") != claim_id:
+            return False
+        notifications.pop(claim_key, None)
+        if success:
+            notifications[delivery_key] = target
+        return True
+
+
+def _hosted_notification_live_users():
+    exact = {}
+    fallback = {}
+    multi_api = MultiServerAPI()
+    for client, username, live in multi_api.iter_all_users(
+        include_disabled=True,
+        force_refresh=True,
+    ):
+        if client is None or not username or not isinstance(live, dict):
+            continue
+        username_key = str(username).casefold()
+        server_key = str(getattr(client, "server_id", "")).casefold()
+        exact.setdefault((server_key, username_key), (client, live))
+        fallback.setdefault(username_key, (client, live))
+    return exact, fallback
+
+
+def _run_customer_notification_scan():
+    reseller = get_reseller_data(OWNER_ID) or {}
+    configs = reseller.get("configs", [])
+    configs = configs if isinstance(configs, list) else []
+    payment_records = _tenant_payments()
+    customer_indexes = {}
+    customer_counts = {}
+    for config_index, config in enumerate(configs):
+        if not isinstance(config, dict) or config.get("removed_from_vpn"):
+            continue
+        raw_customer_id = config.get("customer_telegram_id")
+        try:
+            customer_key = str(int(raw_customer_id))
+        except (TypeError, ValueError):
+            continue
+        if str(raw_customer_id) != customer_key:
+            continue
+        customer_indexes[config_index] = customer_counts.get(customer_key, 0)
+        customer_counts[customer_key] = customer_indexes[config_index] + 1
+    exact_users, fallback_users = _hosted_notification_live_users()
+    stats = {
+        "configs": len(configs),
+        "eligible": 0,
+        "live": 0,
+        "due": 0,
+        "sent": 0,
+        "failed": 0,
+    }
+
+    for config_index, config in enumerate(configs):
+        if (
+            not isinstance(config, dict)
+            or not config.get("customer_telegram_id")
+            or config.get("removed_from_vpn")
+        ):
+            continue
+        stats["eligible"] += 1
+        username = config.get("username")
+        username_key = str(username or "").casefold()
+        preferred_key = str(config.get("server_id") or "").casefold()
+        client, live = exact_users.get(
+            (preferred_key, username_key),
+            fallback_users.get(username_key, (None, None)),
+        )
+        if client is None or live is None:
+            continue
+        stats["live"] += 1
+        try:
+            user_id = int(config["customer_telegram_id"])
+        except (TypeError, ValueError):
+            continue
+        service_cycle = _hosted_service_cycle(config, payments=payment_records)
+        account = inspect_account(
+            live,
+            cycle=service_cycle,
+            source="hosted_notification",
+        )
+        if (
+            account.panel_state == PanelState.UNKNOWN
+            or account.entitlement_state == EntitlementState.UNKNOWN
+        ):
+            continue
+        expiration = account.service_days_remaining
+        cycle_marker = account.service_marker
+        is_expired = account.entitlement_state == EntitlementState.EXPIRED
+        if is_expired:
+            from utils.renewal import find_reseller_reservation
+
+            if find_reseller_reservation(config):
+                continue
+        if is_expired:
+            delivery_key = f"expired:{username}"
+            claim_id = _claim_customer_notification(delivery_key, cycle_marker)
+            if claim_id:
+                stats["due"] += 1
+                markup = types.InlineKeyboardMarkup()
+                customer_index = customer_indexes.get(config_index)
+                if customer_index is not None:
+                    markup.add(types.InlineKeyboardButton(
+                        _hosted_message(user_id, "renew_action"),
+                        callback_data=f"hb:renewcfg:{customer_index}",
+                    ))
+                try:
+                    bot.send_message(
+                        user_id,
+                        _hosted_message(user_id, "expired_alert", username=username),
+                        parse_mode="Markdown",
+                        reply_markup=markup,
+                    )
+                except Exception:
+                    stats["failed"] += 1
+                    _finish_customer_notification(
+                        delivery_key, cycle_marker, claim_id, success=False
+                    )
+                else:
+                    if _finish_customer_notification(
+                        delivery_key, cycle_marker, claim_id, success=True
+                    ):
+                        stats["sent"] += 1
+            continue
+
+        maximum = float(live.get("max_download_bytes", 0) or 0)
+        used = float(live.get("upload_bytes", 0) or 0) + float(live.get("download_bytes", 0) or 0)
+        progress = []
+        if maximum > 0:
+            progress.append((int((used / maximum) * 100), "traffic"))
+        plan_days = account.service_duration_days
+        if plan_days and plan_days > 0 and expiration is not None:
+            progress.append((int((1 - min(expiration, plan_days) / plan_days) * 100), "time"))
+        percent, basis = max(progress, default=(0, "traffic"), key=lambda item: item[0])
+        percent = max(0, min(100, percent))
+        threshold = 90 if percent >= 90 else 80 if percent >= 80 else None
+        if not threshold:
+            continue
+        delivery_key = f"allowance:{username}:{cycle_marker}"
+        claim_id = _claim_customer_notification(
+            delivery_key,
+            threshold,
+            numeric=True,
+        )
+        if not claim_id:
+            continue
+        stats["due"] += 1
+        markup = types.InlineKeyboardMarkup()
+        customer_index = customer_indexes.get(config_index)
+        if customer_index is not None:
+            markup.add(types.InlineKeyboardButton(
+                _hosted_message(user_id, "reserve_renewal_action"),
+                callback_data=f"hb:renewcfg:{customer_index}",
+            ))
+        try:
+            bot.send_message(
+                user_id,
+                _hosted_message(
+                    user_id,
+                    "usage_alert",
+                    username=username,
+                    percent=percent,
+                    basis=_hosted_message(user_id, f"usage_basis_{basis}"),
+                ),
+                parse_mode="Markdown",
+                reply_markup=markup,
+            )
+        except Exception:
+            stats["failed"] += 1
+            _finish_customer_notification(
+                delivery_key, threshold, claim_id, success=False
+            )
+        else:
+            if _finish_customer_notification(
+                delivery_key, threshold, claim_id, success=True
+            ):
+                stats["sent"] += 1
+                _record_growth(
+                    "renewal_prompted",
+                    user_id,
+                    plan=config.get("plan_gb") or config.get("gb"),
+                    deduplication_key=f"hosted-renewal-alert:{OWNER_ID}:{username}:{cycle_marker}:{threshold}",
+                )
+    return stats
+
+
+def _customer_notification_initial_delay():
+    return (OWNER_ID * 2654435761) % (CUSTOMER_NOTIFICATION_MAX_INITIAL_DELAY_SECONDS + 1)
+
+
+def _customer_notification_monitor():
+    initial_delay = _customer_notification_initial_delay()
+    if initial_delay:
+        time.sleep(initial_delay)
+    while True:
+        started_at = time.monotonic()
+        try:
+            stats = _run_customer_notification_scan()
+            print(
+                "hosted_notification_scan "
+                f"pid={os.getpid()} role=hosted owner_id={OWNER_ID} "
+                f"configs={stats['configs']} eligible={stats['eligible']} "
+                f"live={stats['live']} due={stats['due']} sent={stats['sent']} "
+                f"failed={stats['failed']} elapsed_ms={int((time.monotonic() - started_at) * 1000)}",
+                flush=True,
+            )
         except Exception as error:
-            print(f"Hosted notification monitor failed for reseller {OWNER_ID}: {type(error).__name__}", flush=True)
-        time.sleep(7200)
+            print(
+                f"Hosted notification monitor failed for reseller {OWNER_ID}: "
+                f"{type(error).__name__} pid={os.getpid()} role=hosted "
+                f"elapsed_ms={int((time.monotonic() - started_at) * 1000)}",
+                flush=True,
+            )
+        time.sleep(CUSTOMER_NOTIFICATION_INTERVAL_SECONDS)
 
 
 def _owner_stats_monitor():
@@ -4893,11 +5071,25 @@ def _migration_notification_monitor():
 
 
 def run():
+    def auth_retry(error, wait_seconds):
+        set_bot_runtime_status(
+            OWNER_ID,
+            "error",
+            f"Telegram authentication temporarily unavailable: {type(error).__name__}; "
+            f"retry in {wait_seconds}s",
+        )
+
     try:
-        bot.get_me()
+        authenticate_bot_with_backoff(bot, on_error=auth_retry)
     except Exception as error:
-        set_bot_runtime_status(OWNER_ID, "error", f"Telegram authentication failed: {type(error).__name__}")
-        raise SystemExit(2)
+        if is_permanent_telegram_auth_error(error):
+            set_bot_runtime_status(
+                OWNER_ID,
+                "error",
+                "Telegram rejected the bot token; update the token to retry",
+            )
+            raise SystemExit(AUTH_CONFIGURATION_EXIT_CODE)
+        raise
     set_bot_runtime_status(OWNER_ID, "active")
     _recover_stale_payment_claims()
     _recover_saved_receipts()
@@ -4912,17 +5104,26 @@ def run():
         daemon=True,
         name="hosted-migration-notifications",
     ).start()
-    retry = 3
-    while True:
-        try:
-            bot.polling(none_stop=False, timeout=25, long_polling_timeout=25, skip_pending=False)
-            retry = 3
-        except Exception as error:
-            set_bot_runtime_status(OWNER_ID, "error", f"Telegram polling failed: {type(error).__name__}")
-            print(f"Hosted bot polling failed for reseller {OWNER_ID}: {type(error).__name__}", flush=True)
-            time.sleep(retry)
-            retry = min(60, retry * 2)
-            set_bot_runtime_status(OWNER_ID, "active")
+    def polling_error(error, wait_seconds):
+        if is_permanent_telegram_auth_error(error):
+            set_bot_runtime_status(
+                OWNER_ID,
+                "error",
+                "Telegram rejected the bot token; update the token to retry",
+            )
+            raise SystemExit(AUTH_CONFIGURATION_EXIT_CODE)
+        set_bot_runtime_status(
+            OWNER_ID,
+            "error",
+            f"Telegram polling failed: {type(error).__name__}; retry in {wait_seconds}s",
+        )
+
+    run_polling_with_backoff(
+        bot,
+        on_error=polling_error,
+        on_retry=lambda: set_bot_runtime_status(OWNER_ID, "active"),
+        skip_pending=False,
+    )
 
 
 if __name__ == "__main__":

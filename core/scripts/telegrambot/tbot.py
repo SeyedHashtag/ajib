@@ -13,7 +13,6 @@ from telebot import types
 from utils import *
 import threading
 import time
-import traceback
 import logging
 import json
 import tempfile
@@ -232,10 +231,26 @@ def expired_cleanup_monitoring_thread():
 def traffic_monitoring_thread():
     """Background thread to notify users when nearing traffic quota"""
     while True:
+        started_at = time.monotonic()
         try:
-            monitor_user_traffic()
+            stats = monitor_user_traffic() or {}
+            logging.getLogger("ajib.traffic_monitor").info(
+                "traffic_monitor_scan scanned=%s evaluated=%s sent=%s failed=%s "
+                "updated=%s stored=%s elapsed_ms=%s",
+                stats.get("scanned", 0),
+                stats.get("evaluated", 0),
+                stats.get("sent", 0),
+                stats.get("failed", 0),
+                stats.get("updated", 0),
+                stats.get("stored", 0),
+                int((time.monotonic() - started_at) * 1000),
+            )
         except Exception as e:
-            print(f"Error in traffic monitoring: {e}")
+            logging.getLogger("ajib.traffic_monitor").exception(
+                "traffic_monitor_scan_failed elapsed_ms=%s error=%s",
+                int((time.monotonic() - started_at) * 1000),
+                type(e).__name__,
+            )
         # Check every 2 hours
         time.sleep(7200)
 
@@ -276,18 +291,9 @@ def bulk_transfer_monitoring_thread():
 
 def run_polling_forever():
     """Keep polling alive across transient Telegram/network failures."""
-    retry_delay_seconds = 3
-    max_retry_delay_seconds = 60
+    from utils.telegram_safe import run_polling_with_backoff
 
-    while True:
-        try:
-            bot.polling(none_stop=True, timeout=25, long_polling_timeout=25)
-            retry_delay_seconds = 3
-        except Exception as e:
-            print(f"Telegram polling crashed: {e}")
-            traceback.print_exc()
-            time.sleep(retry_delay_seconds)
-            retry_delay_seconds = min(max_retry_delay_seconds, retry_delay_seconds * 2)
+    run_polling_with_backoff(bot)
 
 
 def write_readiness_marker():

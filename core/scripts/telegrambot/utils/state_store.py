@@ -1185,6 +1185,64 @@ def write_state(path, data) -> None:
         save_descriptor(connection, descriptor, data)
 
 
+def patch_dict_state(path, updates=None, remove_keys=()) -> None:
+    """Update selected keys in managed ``kv_dict`` state atomically.
+
+    Unlike the legacy document write path, this does not delete and recreate
+    unrelated rows. It is intended for high-cardinality state such as traffic
+    reminders and for short-lived notification claims.
+    """
+
+    descriptor = describe_path(path)
+    if descriptor is None or descriptor.kind != "kv_dict":
+        raise ValueError(f"Path is not managed SQLite dictionary state: {path}")
+    normalized_updates = {
+        str(key): value for key, value in dict(updates or {}).items()
+    }
+    normalized_removals = {
+        str(key) for key in (remove_keys or ())
+    } - set(normalized_updates)
+    serialized = {
+        key: _dump(value) for key, value in normalized_updates.items()
+    }
+    if not serialized and not normalized_removals:
+        return
+
+    timestamp = format_utc_timestamp()
+    with database.write_transaction(
+        operation=f"patch_{descriptor.namespace}:{descriptor.scope}"
+    ) as connection:
+        for key, value_json in serialized.items():
+            connection.execute(
+                """
+                INSERT INTO kv_state(namespace, scope, state_key, value_json, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(namespace, scope, state_key) DO UPDATE SET
+                    value_json=excluded.value_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    descriptor.namespace,
+                    descriptor.scope,
+                    key,
+                    value_json,
+                    timestamp,
+                ),
+            )
+        if normalized_removals:
+            placeholders = ",".join("?" for _ in normalized_removals)
+            connection.execute(
+                f"""DELETE FROM kv_state
+                    WHERE namespace=? AND scope=?
+                    AND state_key IN ({placeholders})""",
+                (
+                    descriptor.namespace,
+                    descriptor.scope,
+                    *sorted(normalized_removals),
+                ),
+            )
+
+
 def claim_payment_for_processing(path, payment_id, allowed_statuses, timestamp):
     """Atomically claim one payment with a conditional SQL update."""
 

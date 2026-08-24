@@ -1,5 +1,7 @@
 import logging
 import os
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 
@@ -7,6 +9,9 @@ from functools import wraps
 DEFAULT_TELEGRAM_TIMEOUT_SECONDS = 5
 DEFAULT_CALLBACK_TIMEOUT_SECONDS = 3
 DEFAULT_CALLBACK_WORKERS = 4
+DEFAULT_POLL_RETRY_SECONDS = 3
+MAX_POLL_RETRY_SECONDS = 60
+STABLE_POLLING_SECONDS = 300
 EXPECTED_TELEGRAM_ERROR_MARKERS = (
     "query is too old",
     "response timeout expired",
@@ -48,6 +53,148 @@ def is_expected_telegram_error(error):
     return any(marker in text for marker in EXPECTED_TELEGRAM_ERROR_MARKERS)
 
 
+def telegram_error_code(error):
+    value = getattr(error, "error_code", None)
+    if value is None:
+        result = getattr(error, "result_json", None)
+        value = result.get("error_code") if isinstance(result, dict) else None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def telegram_retry_after_seconds(error):
+    result = getattr(error, "result_json", None)
+    parameters = result.get("parameters") if isinstance(result, dict) else None
+    value = parameters.get("retry_after") if isinstance(parameters, dict) else None
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_permanent_telegram_auth_error(error):
+    return telegram_error_code(error) == 401
+
+
+def polling_retry_delay(error, fallback_seconds):
+    retry_after = telegram_retry_after_seconds(error)
+    if telegram_error_code(error) == 429 and retry_after is not None:
+        return retry_after
+    return max(1, min(MAX_POLL_RETRY_SECONDS, int(fallback_seconds)))
+
+
+class PollingExceptionCapture:
+    """Capture TeleBot polling failures so the outer loop owns backoff."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._error = None
+
+    def clear(self):
+        with self._lock:
+            self._error = None
+
+    def handle(self, error):
+        with self._lock:
+            self._error = error
+        # False asks TeleBot's one-shot polling loop to stop cleanly.
+        return False
+
+    def pop(self):
+        with self._lock:
+            error = self._error
+            self._error = None
+            return error
+
+
+def authenticate_bot_with_backoff(
+    bot,
+    *,
+    on_error=None,
+    sleep=time.sleep,
+):
+    """Authenticate indefinitely across transient failures, but reject 401."""
+
+    retry_seconds = DEFAULT_POLL_RETRY_SECONDS
+    while True:
+        try:
+            return bot.get_me()
+        except Exception as error:
+            if is_permanent_telegram_auth_error(error):
+                raise
+            wait_seconds = polling_retry_delay(error, retry_seconds)
+            logging.getLogger("ajib.bot.telegram").warning(
+                "Telegram authentication interrupted code=%s retry_in=%ss error=%s",
+                telegram_error_code(error),
+                wait_seconds,
+                type(error).__name__,
+            )
+            if callable(on_error):
+                on_error(error, wait_seconds)
+            sleep(wait_seconds)
+            retry_seconds = min(MAX_POLL_RETRY_SECONDS, retry_seconds * 2)
+
+
+def run_polling_with_backoff(
+    bot,
+    *,
+    on_error=None,
+    on_retry=None,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+    stop_event=None,
+    **polling_kwargs,
+):
+    """Run one-shot TeleBot polling with rate-limit-aware outer backoff."""
+
+    capture = PollingExceptionCapture()
+    previous_handler = getattr(bot, "exception_handler", None)
+    bot.exception_handler = capture
+    retry_seconds = DEFAULT_POLL_RETRY_SECONDS
+    options = {
+        "non_stop": False,
+        "timeout": 25,
+        "long_polling_timeout": 25,
+        "logger_level": 0,
+    }
+    options.update(polling_kwargs)
+    try:
+        while stop_event is None or not stop_event.is_set():
+            capture.clear()
+            started_at = monotonic()
+            caught = None
+            try:
+                bot.polling(**options)
+            except Exception as error:
+                caught = error
+            error = caught or capture.pop()
+            uptime = max(0, monotonic() - started_at)
+            if uptime >= STABLE_POLLING_SECONDS:
+                retry_seconds = DEFAULT_POLL_RETRY_SECONDS
+            if error is None:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                error = RuntimeError("Telegram polling exited unexpectedly")
+            wait_seconds = polling_retry_delay(error, retry_seconds)
+            logging.getLogger("ajib.bot.telegram").warning(
+                "Telegram polling interrupted code=%s retry_in=%ss uptime_s=%s error=%s",
+                telegram_error_code(error),
+                wait_seconds,
+                int(uptime),
+                type(error).__name__,
+            )
+            if callable(on_error):
+                on_error(error, wait_seconds)
+            sleep(wait_seconds)
+            retry_seconds = min(MAX_POLL_RETRY_SECONDS, retry_seconds * 2)
+            if callable(on_retry):
+                on_retry()
+    finally:
+        bot.exception_handler = previous_handler
+
+
 def _call_with_timeout(func, timeout_seconds, *args, ignore_expected=True, **kwargs):
     if timeout_seconds is not None:
         kwargs.setdefault("timeout", timeout_seconds)
@@ -61,12 +208,12 @@ def _call_with_timeout(func, timeout_seconds, *args, ignore_expected=True, **kwa
             return func(*args, **kwargs)
         except Exception as retry_error:
             if ignore_expected and is_expected_telegram_error(retry_error):
-                logging.getLogger("ajib.bot.telegram").info("Ignored Telegram API error: %s", retry_error)
+                logging.getLogger("ajib.bot.telegram").debug("Ignored Telegram API error: %s", retry_error)
                 return None
             raise
     except Exception as error:
         if ignore_expected and is_expected_telegram_error(error):
-            logging.getLogger("ajib.bot.telegram").info("Ignored Telegram API error: %s", error)
+            logging.getLogger("ajib.bot.telegram").debug("Ignored Telegram API error: %s", error)
             return None
         raise
 

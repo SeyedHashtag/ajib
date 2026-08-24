@@ -6,6 +6,7 @@ import os
 import sqlite3
 import threading
 import logging
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -18,6 +19,7 @@ DEFAULT_BOT_DIR = "/etc/ajib/core/scripts/telegrambot"
 DATABASE_NAME = "ajib.db"
 SCHEMA_VERSION = 5
 BUSY_TIMEOUT_MS = 5000
+SLOW_WRITE_TRANSACTION_MS = 250
 
 _local = threading.local()
 _schema_lock = threading.RLock()
@@ -624,9 +626,13 @@ def transaction(
     depths = _transaction_depths()
     depth = depths.get(resolved, 0)
     savepoint = f"ajib_sp_{depth}"
+    started_at = None
+    committed = False
     try:
         if depth == 0:
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            if immediate:
+                started_at = time.monotonic()
         else:
             connection.execute(f"SAVEPOINT {savepoint}")
     except sqlite3.OperationalError as error:
@@ -643,6 +649,7 @@ def transaction(
         yield connection
         if depth == 0:
             connection.execute("COMMIT")
+            committed = True
         else:
             connection.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception as error:
@@ -661,6 +668,18 @@ def transaction(
             )
         raise
     finally:
+        if started_at is not None:
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            if elapsed_ms >= SLOW_WRITE_TRANSACTION_MS:
+                logging.getLogger("ajib.database").warning(
+                    "SQLite write transaction slow operation=%s elapsed_ms=%s "
+                    "status=%s pid=%s role=%s",
+                    operation or "unspecified",
+                    elapsed_ms,
+                    "committed" if committed else "rolled_back",
+                    os.getpid(),
+                    os.getenv("AJIB_BOT_ROLE", "unknown"),
+                )
         if depth == 0:
             depths.pop(resolved, None)
         else:

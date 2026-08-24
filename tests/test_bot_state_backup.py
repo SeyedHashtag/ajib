@@ -4,6 +4,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -13,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BACKUP_SCRIPT = ROOT / "core/scripts/ajib/backup.sh"
 RESTORE_SCRIPT = ROOT / "core/scripts/ajib/restore.sh"
+STATE_ARCHIVE = ROOT / "core/scripts/telegrambot/state_archive.py"
 
 
 class BotStateBackupTests(unittest.TestCase):
@@ -41,6 +43,34 @@ class BotStateBackupTests(unittest.TestCase):
         with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
             for name, payload in entries.items():
                 archive.writestr(name, payload)
+
+    def test_state_archive_forces_supervisor_role_when_main_role_is_inherited(self):
+        bot_log = Path(self.temp_dir.name) / "unexpected-bot.log"
+        env = {
+            **os.environ,
+            "AJIB_BOT_ROLE": "main",
+            "AJIB_BOT_LOG_FILE": str(bot_log),
+        }
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os, runpy, sys; "
+                    "os.environ['AJIB_BOT_ROLE'] = 'main'; "
+                    "runpy.run_path(sys.argv[1], run_name='state_archive_role_test'); "
+                    "print(os.environ['AJIB_BOT_ROLE'])"
+                ),
+                str(STATE_ARCHIVE),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        self.assertEqual(result.stdout.strip(), "supervisor")
+        self.assertFalse(bot_log.exists())
 
     def test_backup_contains_only_bot_state(self):
         (self.bot_dir / ".env").write_text("API_TOKEN=secret\n")

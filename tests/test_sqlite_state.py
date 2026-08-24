@@ -162,6 +162,57 @@ class SQLiteStateTests(unittest.TestCase):
         os.environ["AJIB_SQLITE_ACTIVE"] = "1"
         return result
 
+    def test_managed_dictionary_patch_updates_only_selected_keys(self):
+        self.write_json(
+            "traffic_alerts.json",
+            {
+                "unchanged": {"notified": [80]},
+                "changed": {"notified": [80]},
+            },
+        )
+        self.migrate()
+        from utils.atomic_store import patch_json_dict, read_json
+
+        path = self.root / "traffic_alerts.json"
+        patch_json_dict(
+            path,
+            {"changed": {"notified": [80, 90]}, "added": {"notified": [80]}},
+        )
+
+        self.assertEqual(
+            read_json(path, {}),
+            {
+                "unchanged": {"notified": [80]},
+                "changed": {"notified": [80, 90]},
+                "added": {"notified": [80]},
+            },
+        )
+        connection = sqlite3.connect(self.root / "ajib.db")
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM kv_state WHERE namespace='traffic_alerts'"
+                ).fetchone()[0],
+                3,
+            )
+        finally:
+            connection.close()
+
+    def test_slow_outer_write_transaction_logs_operation_pid_and_role(self):
+        path = self.root / "slow-write.db"
+        with (
+            mock.patch.object(self.database.time, "monotonic", side_effect=(10.0, 10.3)),
+            self.assertLogs("ajib.database", level="WARNING") as captured,
+        ):
+            with self.database.write_transaction(path, operation="slow_test"):
+                pass
+
+        output = "\n".join(captured.output)
+        self.assertIn("operation=slow_test", output)
+        self.assertIn("elapsed_ms=300", output)
+        self.assertIn(f"pid={os.getpid()}", output)
+        self.assertIn("role=supervisor", output)
+
     def test_migration_imports_top_level_and_hosted_state_transactionally(self):
         payment = self.write_json(
             "payments.json",

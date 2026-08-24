@@ -140,7 +140,10 @@ class BotLoggingTests(unittest.TestCase):
             self.assertEqual(configured_path, os.path.abspath(log_file))
             self.assertTrue(os.path.exists(log_file))
             with open(log_file, "r", encoding="utf-8") as f:
-                self.assertIn("debug test line", f.read())
+                contents = f.read()
+                self.assertIn("debug test line", contents)
+                self.assertIn("pid=", contents)
+                self.assertIn("role=", contents)
 
             for handler in list(logging.getLogger().handlers):
                 if handler not in before_handlers:
@@ -320,6 +323,106 @@ class TelegramSafeTests(unittest.TestCase):
         self.assertEqual(bot.reply_to(message, "hello"), "sent")
         self.assertEqual(bot.send_calls[0][0], (123, "hello"))
         self.assertIn("timeout", bot.send_calls[0][1])
+
+    def test_polling_honors_telegram_retry_after(self):
+        telegram_safe = load_telegram_safe()
+        stop_event = types.SimpleNamespace(stopped=False)
+        stop_event.is_set = lambda: stop_event.stopped
+        sleeps = []
+
+        class TelegramError(RuntimeError):
+            error_code = 429
+            result_json = {
+                "error_code": 429,
+                "parameters": {"retry_after": 5},
+            }
+
+        class Bot:
+            exception_handler = None
+
+            def polling(self, **kwargs):
+                self.options = kwargs
+                self.exception_handler.handle(TelegramError("too many requests"))
+
+        bot = Bot()
+        telegram_safe.run_polling_with_backoff(
+            bot,
+            sleep=sleeps.append,
+            monotonic=lambda: 0,
+            stop_event=stop_event,
+            on_retry=lambda: setattr(stop_event, "stopped", True),
+        )
+
+        self.assertEqual(sleeps, [5])
+        self.assertFalse(bot.options["non_stop"])
+        self.assertEqual(bot.options["logger_level"], 0)
+
+    def test_polling_uses_exponential_backoff_and_resets_after_stable_period(self):
+        telegram_safe = load_telegram_safe()
+        stop_event = types.SimpleNamespace(stopped=False)
+        stop_event.is_set = lambda: stop_event.stopped
+        sleeps = []
+        monotonic_values = iter((0, 0, 0, 0, 0, 301))
+        attempts = {"count": 0}
+
+        class TelegramError(RuntimeError):
+            error_code = 502
+            result_json = {"error_code": 502}
+
+        class Bot:
+            exception_handler = None
+
+            def polling(self, **_kwargs):
+                self.exception_handler.handle(TelegramError("bad gateway"))
+
+        def retried():
+            attempts["count"] += 1
+            if attempts["count"] == 3:
+                stop_event.stopped = True
+
+        telegram_safe.run_polling_with_backoff(
+            Bot(),
+            sleep=sleeps.append,
+            monotonic=lambda: next(monotonic_values),
+            stop_event=stop_event,
+            on_retry=retried,
+        )
+
+        self.assertEqual(sleeps, [3, 6, 3])
+
+    def test_authentication_retries_transient_errors_but_rejects_401(self):
+        telegram_safe = load_telegram_safe()
+        sleeps = []
+
+        class TelegramError(RuntimeError):
+            def __init__(self, code):
+                super().__init__(f"telegram {code}")
+                self.error_code = code
+                self.result_json = {"error_code": code}
+
+        class RecoveringBot:
+            def __init__(self):
+                self.attempts = 0
+
+            def get_me(self):
+                self.attempts += 1
+                if self.attempts < 3:
+                    raise TelegramError(502)
+                return types.SimpleNamespace(id=123)
+
+        bot = RecoveringBot()
+        result = telegram_safe.authenticate_bot_with_backoff(bot, sleep=sleeps.append)
+
+        self.assertEqual(result.id, 123)
+        self.assertEqual(sleeps, [3, 6])
+
+        class RejectedBot:
+            def get_me(self):
+                raise TelegramError(401)
+
+        with self.assertRaises(TelegramError):
+            telegram_safe.authenticate_bot_with_backoff(RejectedBot(), sleep=sleeps.append)
+        self.assertEqual(sleeps, [3, 6])
 
 
 class AdminLogButtonTests(unittest.TestCase):

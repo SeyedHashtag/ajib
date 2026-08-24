@@ -27,6 +27,7 @@ STOPPING = False
 POLL_INTERVAL_SECONDS = 3
 STABLE_UPTIME_SECONDS = 300
 READY_FILE = os.getenv("AJIB_READY_FILE", "/run/ajib/main.ready")
+HOSTED_AUTH_CONFIGURATION_EXIT_CODE = 78
 
 
 def _clear_main_readiness():
@@ -59,6 +60,7 @@ class Worker:
         self.failures = 0
         self.next_start = 0.0
         self.started_at = None
+        self.restart_blocked = False
 
     def _record_failure(self, detail):
         if not self.hosted:
@@ -72,7 +74,7 @@ class Worker:
             print(f"Primary bot {detail}; retry in {delay}s", flush=True)
 
     def start(self):
-        if STOPPING or time.monotonic() < self.next_start:
+        if STOPPING or self.restart_blocked or time.monotonic() < self.next_start:
             return False
         if self.hosted:
             _set_hosted_status(self.key, "starting")
@@ -101,6 +103,16 @@ class Worker:
             return
         self.process = None
         self.started_at = None
+        if self.hosted and return_code == HOSTED_AUTH_CONFIGURATION_EXIT_CODE:
+            self.restart_blocked = True
+            self.failures = 0
+            self.next_start = 0.0
+            _set_hosted_status(
+                self.key,
+                "error",
+                "Telegram rejected the bot token; update the token to retry",
+            )
+            return
         self._record_failure(f"Worker exited with status {return_code}")
 
     def stop(self):

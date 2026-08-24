@@ -1129,6 +1129,15 @@ def deferred_recipient_preview(job_id, *, path=None, limit=20):
 
 def _claim_notification(route_scope, *, path=None):
     now = format_utc_timestamp()
+    due = database.get_connection(path).execute(
+        """SELECT 1 FROM bulk_transfer_notifications
+           WHERE route_scope=? AND status='pending'
+           AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+           LIMIT 1""",
+        (str(route_scope), now),
+    ).fetchone()
+    if due is None:
+        return None
     with database.write_transaction(path, operation="claim_bulk_notification") as connection:
         row = connection.execute(
             """SELECT n.*, j.destination_server_id, i.result_json

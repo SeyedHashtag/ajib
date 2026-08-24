@@ -9,7 +9,16 @@ DEFAULT_LOG_FILE = "/etc/ajib/core/scripts/telegrambot/logs/bot.log"
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_SLOW_HANDLER_MS = 1000
 MAX_LOG_VALUE_LENGTH = 160
-LOG_FORMAT = "%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s"
+LOG_FORMAT = (
+    "%(asctime)s %(levelname)s "
+    "[pid=%(process)d role=%(bot_role)s %(threadName)s] %(name)s: %(message)s"
+)
+
+
+class _RuntimeContextFilter(logging.Filter):
+    def filter(self, record):
+        record.bot_role = os.getenv("AJIB_BOT_ROLE", "unknown")
+        return True
 
 
 def _coerce_log_level(value):
@@ -60,8 +69,14 @@ def configure_logging(log_file=None):
     )
     file_handler.setLevel(log_level)
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    file_handler.addFilter(_RuntimeContextFilter())
     root_logger.addHandler(file_handler)
-    logging.getLogger("ajib.bot").info("Bot logging initialized log_file=%s", absolute_log_file)
+    logging.getLogger("ajib.bot").info(
+        "Bot logging initialized log_file=%s pid=%s role=%s",
+        absolute_log_file,
+        os.getpid(),
+        os.getenv("AJIB_BOT_ROLE", "unknown"),
+    )
     return absolute_log_file
 
 
