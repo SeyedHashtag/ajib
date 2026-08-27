@@ -1,4 +1,6 @@
+import hashlib
 import json
+import logging
 import os
 import re
 import threading
@@ -33,6 +35,11 @@ from utils.api_client import MultiServerAPI
 from utils.account_state import EntitlementState, PanelState, inspect_account, resolve_service_cycle
 from utils.command import bot
 from utils.language import get_user_language
+from utils.recipient_reachability import (
+    load_unreachable_recipients,
+    mark_recipient_unreachable,
+)
+from utils.telegram_safe import classify_telegram_delivery_error, telegram_error_code
 from utils.translations import get_button_text, get_message_text
 try:
     from utils.reseller import parse_external_bulk_reseller_username
@@ -48,6 +55,29 @@ ALERT_RESET_RATIO = 0.05
 PAID_PAYMENT_STATUSES = {'completed', 'paid', 'succeeded'}
 
 _alerts_lock = threading.Lock()
+logger = logging.getLogger("ajib.traffic_monitor")
+
+
+def _private_identifier(value):
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def _delivery_failure(error, recipient_id, username, server_id, threshold, basis):
+    category = classify_telegram_delivery_error(error)
+    if category == "permanent_recipient":
+        mark_recipient_unreachable(recipient_id)
+    logger.warning(
+        "traffic_delivery_failed recipient=%s config=%s server=%s threshold=%s "
+        "basis=%s error_code=%s category=%s",
+        _private_identifier(recipient_id),
+        _private_identifier(f"{server_id or 'primary'}:{username}"),
+        server_id or "primary",
+        int(threshold),
+        basis,
+        telegram_error_code(error),
+        category,
+    )
+    return category
 
 
 def _reminders_enabled():
@@ -460,6 +490,7 @@ def monitor_user_traffic():
         'evaluated': 0,
         'sent': 0,
         'failed': 0,
+        'suppressed_unreachable': 0,
         'updated': 0,
         'stored': 0,
     }
@@ -470,6 +501,7 @@ def monitor_user_traffic():
     if not multi_api.servers:
         return stats
 
+    unreachable_recipients = load_unreachable_recipients()
     plans, payments = _load_customer_context()
     alerts = _load_alerts()
     alert_updates = {}
@@ -550,56 +582,69 @@ def monitor_user_traffic():
                 usage_percent, basis = max(candidates, key=lambda item: item[0])
                 alert_threshold, handled_thresholds = _select_threshold_alert(usage_percent, notified)
                 if alert_threshold is not None:
-                    language = get_user_language(telegram_id)
-                    if basis == 'traffic':
-                        message = get_message_text(language, "traffic_quota_alert").format(
-                            percent=int(usage_percent),
-                            username=username,
-                            used_gb=total_usage_bytes / (1024 ** 3),
-                            limit_gb=max_download_bytes / (1024 ** 3),
-                        )
+                    recipient_key = str(telegram_id)
+                    if recipient_key in unreachable_recipients:
+                        stats['suppressed_unreachable'] += 1
                     else:
-                        message = get_message_text(language, "time_quota_alert").format(
-                            percent=int(usage_percent),
-                            username=username,
-                            days_used=max(0, total_days - expiration_days),
-                            total_days=total_days,
-                            days_remaining=expiration_days,
-                        )
+                        language = get_user_language(telegram_id)
+                        if basis == 'traffic':
+                            message = get_message_text(language, "traffic_quota_alert").format(
+                                percent=int(usage_percent),
+                                username=username,
+                                used_gb=total_usage_bytes / (1024 ** 3),
+                                limit_gb=max_download_bytes / (1024 ** 3),
+                            )
+                        else:
+                            message = get_message_text(language, "time_quota_alert").format(
+                                percent=int(usage_percent),
+                                username=username,
+                                days_used=max(0, total_days - expiration_days),
+                                total_days=total_days,
+                                days_remaining=expiration_days,
+                            )
 
-                    offer = _customer_renewal_offer(
-                        telegram_id,
-                        username,
-                        api_client,
-                        user_data,
-                        plans,
-                        payments,
-                    )
-                    markup = _renewal_markup(language, offer, 'renew_plan:')
-                    try:
-                        bot.send_message(
+                        offer = _customer_renewal_offer(
                             telegram_id,
-                            message,
-                            parse_mode="Markdown",
-                            reply_markup=markup,
+                            username,
+                            api_client,
+                            user_data,
+                            plans,
+                            payments,
                         )
-                    except Exception as error:
-                        stats['failed'] += 1
-                        print(f"Failed to notify user {telegram_id} for {username}: {error}")
-                    else:
-                        stats['sent'] += 1
-                        notified.update(handled_thresholds)
-                        if payment is not None:
-                            _record_renewal_prompt(
+                        markup = _renewal_markup(language, offer, 'renew_plan:')
+                        try:
+                            bot.send_message(
+                                telegram_id,
+                                message,
+                                parse_mode="Markdown",
+                                reply_markup=markup,
+                            )
+                        except Exception as error:
+                            stats['failed'] += 1
+                            category = _delivery_failure(
+                                error,
                                 telegram_id,
                                 username,
-                                language,
+                                getattr(api_client, 'server_id', None),
                                 alert_threshold,
                                 basis,
-                                state,
-                                plan_id=payment.get('plan_gb'),
-                                server_id=getattr(api_client, 'server_id', None),
                             )
+                            if category == "permanent_recipient":
+                                unreachable_recipients.add(recipient_key)
+                        else:
+                            stats['sent'] += 1
+                            notified.update(handled_thresholds)
+                            if payment is not None:
+                                _record_renewal_prompt(
+                                    telegram_id,
+                                    username,
+                                    language,
+                                    alert_threshold,
+                                    basis,
+                                    state,
+                                    plan_id=payment.get('plan_gb'),
+                                    server_id=getattr(api_client, 'server_id', None),
+                                )
 
             if notified:
                 state['notified'] = sorted(notified)
@@ -707,64 +752,74 @@ def monitor_user_traffic():
             usage_percent, basis = max(candidates, key=lambda item: item[0])
             alert_threshold, handled_thresholds = _select_threshold_alert(usage_percent, notified)
             if alert_threshold is not None:
-                if basis == 'traffic':
-                    message = get_message_text(language, "reseller_client_traffic_alert").format(
-                        percent=int(usage_percent),
-                        customer_name=customer_name,
-                        username=username,
-                        used_gb=total_usage_bytes / (1024 ** 3),
-                        limit_gb=max_download_bytes / (1024 ** 3),
-                    )
+                recipient_key = str(reseller_id)
+                if recipient_key in unreachable_recipients:
+                    stats['suppressed_unreachable'] += 1
                 else:
-                    message = get_message_text(language, "reseller_client_days_alert").format(
-                        percent=int(usage_percent),
-                        customer_name=customer_name,
-                        username=username,
-                        days_used=max(0, total_days - expiration_days),
-                        total_days=total_days,
-                        days_remaining=expiration_days,
-                    )
+                    if basis == 'traffic':
+                        message = get_message_text(language, "reseller_client_traffic_alert").format(
+                            percent=int(usage_percent),
+                            customer_name=customer_name,
+                            username=username,
+                            used_gb=total_usage_bytes / (1024 ** 3),
+                            limit_gb=max_download_bytes / (1024 ** 3),
+                        )
+                    else:
+                        message = get_message_text(language, "reseller_client_days_alert").format(
+                            percent=int(usage_percent),
+                            customer_name=customer_name,
+                            username=username,
+                            days_used=max(0, total_days - expiration_days),
+                            total_days=total_days,
+                            days_remaining=expiration_days,
+                        )
 
-                offer = _reseller_renewal_offer(
-                    reseller_id,
-                    username,
-                    api_client,
-                    user_data,
-                    plans,
-                    reseller_data,
-                )
-                markup = _renewal_markup(language, offer, 'reseller:renew:')
-                try:
-                    bot.send_message(
-                        reseller_id,
-                        message,
-                        parse_mode="Markdown",
-                        reply_markup=markup,
-                    )
-                except Exception as error:
-                    stats['failed'] += 1
-                    print(
-                        f"Failed to notify reseller {reseller_id} for client "
-                        f"{username} ({basis}): {error}"
-                    )
-                else:
-                    stats['sent'] += 1
-                    notified.update(handled_thresholds)
-                    legacy_key = 'gb_notified' if basis == 'traffic' else 'days_notified'
-                    legacy_notified = set(state.get(legacy_key, []))
-                    legacy_notified.update(handled_thresholds)
-                    state[legacy_key] = sorted(legacy_notified)
-                    _record_renewal_prompt(
+                    offer = _reseller_renewal_offer(
                         reseller_id,
                         username,
-                        language,
-                        alert_threshold,
-                        basis,
-                        state,
-                        plan_id=reseller_config.get('gb'),
-                        server_id=getattr(api_client, 'server_id', None),
-                        source='reseller_customer',
+                        api_client,
+                        user_data,
+                        plans,
+                        reseller_data,
                     )
+                    markup = _renewal_markup(language, offer, 'reseller:renew:')
+                    try:
+                        bot.send_message(
+                            reseller_id,
+                            message,
+                            parse_mode="Markdown",
+                            reply_markup=markup,
+                        )
+                    except Exception as error:
+                        stats['failed'] += 1
+                        category = _delivery_failure(
+                            error,
+                            reseller_id,
+                            username,
+                            getattr(api_client, 'server_id', None),
+                            alert_threshold,
+                            basis,
+                        )
+                        if category == "permanent_recipient":
+                            unreachable_recipients.add(recipient_key)
+                    else:
+                        stats['sent'] += 1
+                        notified.update(handled_thresholds)
+                        legacy_key = 'gb_notified' if basis == 'traffic' else 'days_notified'
+                        legacy_notified = set(state.get(legacy_key, []))
+                        legacy_notified.update(handled_thresholds)
+                        state[legacy_key] = sorted(legacy_notified)
+                        _record_renewal_prompt(
+                            reseller_id,
+                            username,
+                            language,
+                            alert_threshold,
+                            basis,
+                            state,
+                            plan_id=reseller_config.get('gb'),
+                            server_id=getattr(api_client, 'server_id', None),
+                            source='reseller_customer',
+                        )
 
         if notified:
             state['renewal_notified'] = sorted(notified)

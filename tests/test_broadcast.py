@@ -315,7 +315,9 @@ class BroadcastSendTests(unittest.TestCase):
         broadcast.bot = SendingBot()
         broadcast.get_user_ids = lambda target: (["1", "2", "3"], {})
         broadcast.load_failed_broadcast_users = lambda: set()
-        broadcast.save_failed_broadcast_users = lambda users: saved_failed_users.extend(sorted(users))
+        broadcast.mark_failed_broadcast_users = (
+            lambda user_ids: saved_failed_users.extend(sorted(map(str, user_ids)))
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = os.path.join(tmpdir, "broadcast.log")

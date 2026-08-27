@@ -38,13 +38,18 @@ def locked_json(path, default=None, mode=0o600):
     """
     descriptor = state_store.describe_path(path)
     if descriptor is not None:
-        operation = f"{descriptor.kind}:{descriptor.scope}"
+        operation = state_store.descriptor_operation(descriptor)
         with database.write_transaction(operation=operation) as connection:
             data = state_store.load_descriptor(connection, descriptor, default)
             original = deepcopy(data)
             yield data
             if data != original:
-                state_store.save_descriptor(connection, descriptor, data)
+                state_store.save_descriptor_delta(
+                    connection,
+                    descriptor,
+                    original,
+                    data,
+                )
         return
 
     directory = os.path.dirname(path) or "."

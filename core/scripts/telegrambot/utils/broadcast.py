@@ -12,7 +12,6 @@ from utils.account_state import (
 from utils.reseller import get_all_resellers
 from utils import test_config_store
 import re
-import json
 import os
 import time
 from datetime import timedelta
@@ -23,73 +22,46 @@ BROADCAST_LOGS_DIR = "/etc/ajib/core/scripts/telegrambot/broadcast_logs"
 TEST_CONFIGS_FILE = "/etc/ajib/core/scripts/telegrambot/test_configs.json"
 
 
-def _state_helpers():
-    try:
-        from utils.atomic_store import locked_json, read_json
-        from utils.state_store import delete_state
-        return locked_json, read_json, delete_state
-    except ImportError:
-        return None
-
-
 def load_failed_broadcast_users():
-    try:
-        helpers = _state_helpers()
-        if helpers:
-            data = helpers[1](BROADCAST_FAILED_USERS_PATH, [])
-        elif os.path.exists(BROADCAST_FAILED_USERS_PATH):
-            with open(BROADCAST_FAILED_USERS_PATH, "r") as handle:
-                data = json.load(handle)
-        else:
-            data = []
-        if not isinstance(data, list):
-            return set()
-        return {str(user_id) for user_id in data}
-    except Exception as e:
-        print(f"Failed to load broadcast failed users list: {str(e)}")
-        return set()
+    """Compatibility wrapper for the shared recipient registry."""
+    from utils.recipient_reachability import load_unreachable_recipients
+
+    return load_unreachable_recipients()
 
 
 def save_failed_broadcast_users(user_ids):
-    try:
-        values = sorted({str(user_id) for user_id in user_ids})
-        helpers = _state_helpers()
-        if helpers:
-            with helpers[0](BROADCAST_FAILED_USERS_PATH, []) as stored:
-                if not isinstance(stored, list):
-                    raise ValueError("Broadcast exclusions must contain a JSON list.")
-                stored.clear()
-                stored.extend(values)
-        else:
-            os.makedirs(os.path.dirname(BROADCAST_FAILED_USERS_PATH), exist_ok=True)
-            with open(BROADCAST_FAILED_USERS_PATH, "w") as handle:
-                json.dump(values, handle)
-    except Exception as e:
-        print(f"Failed to save broadcast failed users list: {str(e)}")
+    """Compatibility wrapper for the shared recipient registry."""
+    from utils.recipient_reachability import save_unreachable_recipients
+
+    save_unreachable_recipients(user_ids)
+
+
+def mark_failed_broadcast_user(user_id):
+    """Register one failed user atomically in the shared recipient registry."""
+    from utils.recipient_reachability import mark_recipient_unreachable
+
+    return mark_recipient_unreachable(user_id)
+
+
+def mark_failed_broadcast_users(user_ids):
+    """Register broadcast failures in one shared-registry transaction."""
+    from utils.recipient_reachability import mark_recipients_unreachable
+
+    return mark_recipients_unreachable(user_ids)
 
 
 def reset_failed_broadcast_users():
-    try:
-        helpers = _state_helpers()
-        if helpers:
-            helpers[2](BROADCAST_FAILED_USERS_PATH)
-        elif os.path.exists(BROADCAST_FAILED_USERS_PATH):
-            os.remove(BROADCAST_FAILED_USERS_PATH)
-    except Exception as e:
-        print(f"Failed to reset broadcast failed users list: {str(e)}")
+    """Compatibility wrapper for the shared recipient registry."""
+    from utils.recipient_reachability import reset_unreachable_recipients
+
+    reset_unreachable_recipients()
 
 
 def is_permanent_broadcast_failure(error_msg):
     """Return True when Telegram indicates this recipient should stay excluded."""
-    lowered = error_msg.lower()
-    permanent_error_terms = [
-        "blocked",
-        "deactivated",
-        "chat not found",
-        "user is bot",
-        "forbidden",
-    ]
-    return any(term in lowered for term in permanent_error_terms)
+    from utils.telegram_safe import is_permanent_recipient_error
+
+    return is_permanent_recipient_error(error_msg)
 
 
 def iter_paid_user_records():
@@ -662,9 +634,7 @@ def send_broadcast(message, target, target_label, explicit_user_ids=None):
     
     # Update failed users list
     if newly_failed_user_ids:
-        existing_failed = load_failed_broadcast_users()
-        existing_failed.update(newly_failed_user_ids)
-        save_failed_broadcast_users(existing_failed)
+        mark_failed_broadcast_users(newly_failed_user_ids)
     
     # Calculate counts
     success_count = len(success_users)

@@ -7,6 +7,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 BOT_LOGGING_PATH = (
@@ -190,6 +191,29 @@ class BotLoggingTests(unittest.TestCase):
 
         self.assertIn("handler_error kind=callback handler=broken_callback", "\n".join(captured.output))
 
+    def test_inbound_message_and_callback_clear_recipient_exclusion(self):
+        bot_logging = load_bot_logging()
+        bot = DummyBot()
+        cleared = []
+        reachability = types.ModuleType("utils.recipient_reachability")
+        reachability.clear_recipient_unreachable = lambda user_id: cleared.append(user_id)
+
+        with mock.patch.dict(sys.modules, {"utils.recipient_reachability": reachability}):
+            bot_logging.instrument_bot(bot)
+
+            @bot.message_handler(func=lambda message: True)
+            def handle_message(message):
+                return "ok"
+
+            @bot.callback_query_handler(func=lambda call: True)
+            def handle_callback(call):
+                return "done"
+
+            bot.message_handlers[0](DummyMessage())
+            bot.callback_handlers[0](DummyCallback())
+
+        self.assertEqual(cleared, [123, 123])
+
 
 class TelegramSafeTests(unittest.TestCase):
     def setUp(self):
@@ -222,6 +246,41 @@ class TelegramSafeTests(unittest.TestCase):
         self.assertIsNone(telegram_safe.safe_answer_callback_query(bot, "callback-1"))
         self.assertEqual(bot.calls[0][0], ("callback-1",))
         self.assertEqual(bot.calls[0][1]["timeout"], 4)
+
+    def test_delivery_error_classification_covers_retry_categories(self):
+        telegram_safe = load_telegram_safe()
+
+        class Error(RuntimeError):
+            def __init__(self, message, code=None):
+                super().__init__(message)
+                self.error_code = code
+
+        self.assertEqual(
+            telegram_safe.classify_telegram_delivery_error(
+                Error("Forbidden: user is deactivated", 403)
+            ),
+            "permanent_recipient",
+        )
+        self.assertEqual(
+            telegram_safe.classify_telegram_delivery_error(Error("retry", 429)),
+            "rate_limited",
+        )
+        self.assertEqual(
+            telegram_safe.classify_telegram_delivery_error(Error("Bad Gateway", 502)),
+            "transient_transport",
+        )
+        self.assertEqual(
+            telegram_safe.classify_telegram_delivery_error(Error("Bad Request", 400)),
+            "invalid_request",
+        )
+        self.assertEqual(
+            telegram_safe.classify_telegram_delivery_error(Error("unexpected")),
+            "unknown",
+        )
+        self.assertEqual(
+            telegram_safe.telegram_error_code("Error code: 403. Forbidden"),
+            403,
+        )
 
     def test_safe_edit_retries_without_timeout_for_test_doubles(self):
         telegram_safe = load_telegram_safe()

@@ -127,6 +127,18 @@ def _wrap_handler(func, kind):
     def wrapped(event, *args, **kwargs):
         started_at = time.monotonic()
         details = _describe_event(kind, event)
+        if details["user_id"] != "unknown":
+            try:
+                from utils.recipient_reachability import clear_recipient_unreachable
+
+                clear_recipient_unreachable(details["user_id"])
+            except Exception as error:
+                # Reachability bookkeeping must never prevent an inbound handler.
+                logger.warning(
+                    "recipient_reachability_clear_failed handler=%s error_type=%s",
+                    func.__name__,
+                    type(error).__name__,
+                )
         logger.info(
             "handler_start kind=%s handler=%s user_id=%s chat_id=%s %s=%r",
             kind,

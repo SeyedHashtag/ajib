@@ -30,6 +30,17 @@ class FakeBot:
         self.sent_messages.append((chat_id, text, kwargs))
 
 
+class RejectingBot(FakeBot):
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+        self.attempts = 0
+
+    def send_message(self, chat_id, text, **kwargs):
+        self.attempts += 1
+        raise RuntimeError(self.error)
+
+
 class FakeButton:
     def __init__(self, text, callback_data=None, **_kwargs):
         self.text = text
@@ -96,6 +107,24 @@ def install_stubs():
     translations_stub.get_button_text = lambda language, key: key
     sys.modules["utils.translations"] = translations_stub
 
+    reachability_stub = types.ModuleType("utils.recipient_reachability")
+    reachability_stub.load_unreachable_recipients = lambda: set()
+    reachability_stub.mark_recipient_unreachable = lambda user_id: True
+    sys.modules["utils.recipient_reachability"] = reachability_stub
+
+    telegram_safe_stub = types.ModuleType("utils.telegram_safe")
+    telegram_safe_stub.telegram_error_code = lambda error: getattr(error, "error_code", None)
+    telegram_safe_stub.classify_telegram_delivery_error = lambda error: (
+        "permanent_recipient"
+        if any(term in str(error).lower() for term in ("blocked", "deactivated", "forbidden"))
+        else "rate_limited"
+        if "too many requests" in str(error).lower()
+        else "transient_transport"
+        if any(term in str(error).lower() for term in ("bad gateway", "timeout", "connection"))
+        else "unknown"
+    )
+    sys.modules["utils.telegram_safe"] = telegram_safe_stub
+
 
 def load_traffic_monitor_module():
     install_stubs()
@@ -116,6 +145,16 @@ class TrafficMonitorTests(unittest.TestCase):
         self.monitor.RESELLERS_FILE = str(Path(self.tmp_dir.name) / "resellers.json")
         self.bot = FakeBot()
         self.monitor.bot = self.bot
+        self.unreachable = set()
+        self.marked_unreachable = []
+        self.monitor.load_unreachable_recipients = lambda: set(self.unreachable)
+
+        def mark_unreachable(user_id):
+            self.marked_unreachable.append(str(user_id))
+            self.unreachable.add(str(user_id))
+            return True
+
+        self.monitor.mark_recipient_unreachable = mark_unreachable
 
     def tearDown(self):
         self.tmp_dir.cleanup()
@@ -137,7 +176,7 @@ class TrafficMonitorTests(unittest.TestCase):
         ]
         multi_api = FakeMultiServerAPI(normalized_users)
         self.monitor.MultiServerAPI = lambda: multi_api
-        self.monitor.monitor_user_traffic()
+        self.last_stats = self.monitor.monitor_user_traffic()
         return multi_api
 
     def read_alerts(self):
@@ -201,6 +240,45 @@ class TrafficMonitorTests(unittest.TestCase):
         self.assertEqual(self.bot.sent_messages[0][0], 123)
         self.assertIn("regular s123 95", self.bot.sent_messages[0][1])
         self.assertEqual(self.read_alerts()["s123"]["notified"], [80, 90])
+
+    def test_permanent_failure_is_registered_then_suppressed_without_marking_delivered(self):
+        self.bot = RejectingBot("Forbidden: bot was blocked by the user")
+        self.monitor.bot = self.bot
+        user = (
+            True,
+            "s123",
+            {"upload_bytes": 95 * GB, "download_bytes": 0, "max_download_bytes": 100 * GB},
+        )
+
+        self.run_monitor([user])
+        first_stats = self.last_stats
+        self.run_monitor([user])
+        second_stats = self.last_stats
+
+        self.assertEqual(self.bot.attempts, 1)
+        self.assertEqual(self.marked_unreachable, ["123"])
+        self.assertEqual(first_stats["failed"], 1)
+        self.assertEqual(second_stats["suppressed_unreachable"], 1)
+        state = self.read_alerts()["s123"]
+        self.assertNotIn("notified", state)
+        self.assertNotIn("renewal_notified", state)
+
+    def test_transient_delivery_failure_remains_retryable(self):
+        self.bot = RejectingBot("Bad Gateway: upstream returned 502")
+        self.monitor.bot = self.bot
+        user = (
+            True,
+            "s123",
+            {"upload_bytes": 95 * GB, "download_bytes": 0, "max_download_bytes": 100 * GB},
+        )
+
+        self.run_monitor([user])
+        self.run_monitor([user])
+
+        self.assertEqual(self.bot.attempts, 2)
+        self.assertEqual(self.unreachable, set())
+        self.assertEqual(self.last_stats["failed"], 1)
+        self.assertEqual(self.last_stats["suppressed_unreachable"], 0)
 
     def test_unchanged_usage_band_does_not_persist_the_alert_again(self):
         user = (

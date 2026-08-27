@@ -236,11 +236,12 @@ def traffic_monitoring_thread():
             stats = monitor_user_traffic() or {}
             logging.getLogger("ajib.traffic_monitor").info(
                 "traffic_monitor_scan scanned=%s evaluated=%s sent=%s failed=%s "
-                "updated=%s stored=%s elapsed_ms=%s",
+                "suppressed_unreachable=%s updated=%s stored=%s elapsed_ms=%s",
                 stats.get("scanned", 0),
                 stats.get("evaluated", 0),
                 stats.get("sent", 0),
                 stats.get("failed", 0),
+                stats.get("suppressed_unreachable", 0),
                 stats.get("updated", 0),
                 stats.get("stored", 0),
                 int((time.monotonic() - started_at) * 1000),

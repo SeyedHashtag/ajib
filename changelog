@@ -1,3 +1,10 @@
+## v2.7.8
+🛡️ Share Telegram recipient reachability across broadcasts, traffic alerts, and recovered-test cleanup, with inbound activity restoring delivery eligibility
+🐛 Suppress repeated permanent-recipient sends without marking notices delivered, while preserving recovered-test retry, grace-period, renewal, and deletion safeguards
+🛠️ Persist managed payment, reseller, test-config, and cleanup state with transactional row deltas instead of whole-collection rewrites
+📊 Add privacy-safe delivery categories and SQLite lock-wait, lock-hold, and total transaction timing diagnostics
+✅ Expand regression coverage for recipient recovery, cleanup suppression, delta child-row maintenance, atomic rollback, and transaction timing
+
 ## v2.7.7
 🛠️ Refactor Telegram message formatting and delivery with shared Markdown escaping and safer notification handling across customer, reseller, hosted, purchase, renewal, and configuration flows
 🐛 Format IPv4 URLs consistently on their own Markdown-safe lines and keep admin menu actions aligned for reliable rendering across supported languages

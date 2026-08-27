@@ -199,6 +199,11 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.cleanup.STATE_FILE = str(self.base / "expired_user_cleanup.json")
         self.cleanup.SCHEDULE_FILE = str(self.base / "expired_cleanup_schedule.json")
         self.now = datetime(2026, 6, 9, 12, 0, 0)
+        self.unreachable = set()
+        self.cleanup.load_unreachable_recipients = lambda: set(self.unreachable)
+        self.cleanup.mark_recipient_unreachable = (
+            lambda user_id: self.unreachable.add(str(user_id)) or True
+        )
 
     def write_json(self, path, data):
         Path(path).write_text(json.dumps(data), encoding="utf-8")
@@ -1097,6 +1102,8 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(failed["cleanup_error"], "notification_failed")
         self.assertNotIn("delete_after", failed)
 
+        # Inbound activity clears the shared reachability exclusion.
+        self.unreachable.clear()
         self.cleanup._notify_candidate = lambda *args, **kwargs: None
         self.cleanup.run_expired_user_cleanup(
             now=self.now + timedelta(hours=1),
@@ -1207,6 +1214,31 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertNotIn("delete_after", state)
         self.assertEqual(client.deleted, [])
 
+    def test_recovered_permanent_failure_is_not_retried_after_registration(self):
+        self.write_default_files()
+        self.write_json(self.cleanup.STATE_FILE, {})
+        client = FakeClient("s1", {"t12345": self.recovered_test_user()})
+        original_notify = self.cleanup._notify_candidate
+        self.cleanup._notify_candidate = mock.Mock(
+            return_value="Forbidden: bot was blocked by the user"
+        )
+        self.addCleanup(setattr, self.cleanup, "_notify_candidate", original_notify)
+
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now,
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now + timedelta(hours=1),
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        state = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.cleanup._notify_candidate.assert_called_once()
+        self.assertEqual(state["cleanup_status"], "notification_pending")
+        self.assertEqual(state["recovery_attempts"], 1)
+        self.assertNotIn("delete_after", state)
+
     def test_recovered_permanent_telegram_failure_waits_for_unreachable_age(self):
         self.write_default_files()
         self.write_json(self.cleanup.STATE_FILE, {
@@ -1312,6 +1344,114 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(state["recovery_attempts"], 10)
         self.assertNotIn("delete_after", state)
         self.assertEqual(client.deleted, [])
+
+    def test_recovered_unreachable_is_suppressed_and_queued_without_another_send(self):
+        self.write_default_files()
+        permanent_error = (
+            "A request to the Telegram API was unsuccessful. Error code: 403. "
+            "Description: Forbidden: bot was blocked by the user"
+        )
+        self.write_json(self.cleanup.STATE_FILE, {
+            "s1:t12345": {
+                "username": "t12345",
+                "server_id": "s1",
+                "source": "test",
+                "cleanup_status": "notification_pending",
+                "cleanup_error": "notification_failed",
+                "notification_error": permanent_error,
+                "recovery_source": "verified_orphan_test",
+                "recovery_attempts": 3,
+                "recovery_last_attempt_at": "2026-06-07 10:00:00",
+                "first_seen_at": "2026-06-07 11:00:00",
+            },
+        })
+        self.unreachable.add("12345")
+        client = FakeClient("s1", {"t12345": self.recovered_test_user()})
+        original_notify = self.cleanup._notify_candidate
+        self.cleanup._notify_candidate = mock.Mock(return_value=None)
+        self.addCleanup(setattr, self.cleanup, "_notify_candidate", original_notify)
+
+        with self.assertLogs("ajib.expired_cleanup", level="INFO") as captured:
+            self.cleanup.run_expired_user_cleanup(
+                now=self.now,
+                multi_api=FakeMultiAPI({"s1": client}),
+            )
+
+        queued = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.cleanup._notify_candidate.assert_not_called()
+        self.assertEqual(queued["cleanup_status"], "notification_unreachable")
+        self.assertEqual(queued["recovery_attempts"], 3)
+        self.assertTrue(queued["recovery_reachability_registered"])
+        self.assertEqual(queued["recovery_last_attempt_at"], "2026-06-07 10:00:00")
+        self.assertIn("recovered_notification_suppressed=1", "\n".join(captured.output))
+
+    def test_recovered_notification_resumes_with_full_grace_after_user_returns(self):
+        self.write_default_files()
+        self.write_json(self.cleanup.STATE_FILE, {
+            "s1:t12345": {
+                "username": "t12345",
+                "server_id": "s1",
+                "source": "test",
+                "cleanup_status": "notification_pending",
+                "cleanup_error": "notification_failed",
+                "notification_error": "Forbidden: bot was blocked by the user",
+                "recovery_source": "verified_orphan_test",
+                "recovery_attempts": 3,
+                "first_seen_at": "2026-06-06 11:00:00",
+            },
+        })
+        client = FakeClient("s1", {"t12345": self.recovered_test_user()})
+        original_notify = self.cleanup._notify_candidate
+        self.cleanup._notify_candidate = mock.Mock(return_value=None)
+        self.addCleanup(setattr, self.cleanup, "_notify_candidate", original_notify)
+
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now,
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        notified = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.cleanup._notify_candidate.assert_called_once()
+        self.assertEqual(notified["cleanup_status"], "notified")
+        self.assertEqual(notified["recovery_attempts"], 4)
+        self.assertEqual(notified["notified_at"], "2026-06-09T12:00:00.000000Z")
+        self.assertEqual(notified["delete_after"], "2026-06-11T12:00:00.000000Z")
+
+    def test_queued_recovered_notification_reopens_after_inbound_return(self):
+        self.write_default_files()
+        self.write_json(self.cleanup.STATE_FILE, {
+            "s1:t12345": {
+                "username": "t12345",
+                "server_id": "s1",
+                "source": "test",
+                "telegram_user_id": 12345,
+                "cleanup_status": "notification_unreachable",
+                "cleanup_error": "notification_unreachable",
+                "notification_error": "Forbidden: bot was blocked by the user",
+                "recovery_source": "verified_orphan_test",
+                "recovery_attempts": 3,
+                "recovery_reachability_registered": True,
+                "recovery_unreachable_queued_at": "2026-06-09 10:00:00",
+                "delete_after": "2026-06-09 10:00:00",
+                "first_seen_at": "2026-06-06 11:00:00",
+            },
+        })
+        client = FakeClient("s1", {"t12345": self.recovered_test_user()})
+        original_notify = self.cleanup._notify_candidate
+        self.cleanup._notify_candidate = mock.Mock(return_value=None)
+        self.addCleanup(setattr, self.cleanup, "_notify_candidate", original_notify)
+
+        self.cleanup.run_expired_user_cleanup(
+            now=self.now,
+            multi_api=FakeMultiAPI({"s1": client}),
+        )
+
+        notified = self.read_json(self.cleanup.STATE_FILE)["s1:t12345"]
+        self.cleanup._notify_candidate.assert_called_once()
+        self.assertEqual(client.deleted, [])
+        self.assertEqual(notified["cleanup_status"], "notified")
+        self.assertEqual(notified["recovery_attempts"], 4)
+        self.assertEqual(notified["delete_after"], "2026-06-11T12:00:00.000000Z")
 
     def test_recovered_unreachable_queued_user_is_removed_from_queue_if_renewed(self):
         self.write_default_files()

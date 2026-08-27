@@ -16,6 +16,7 @@ DIRECT_JSON_COMPATIBILITY_MODULES = {
     "core/scripts/telegrambot/utils/atomic_store.py",
     "core/scripts/telegrambot/utils/broadcast.py",
     "core/scripts/telegrambot/utils/receipt_checker.py",
+    "core/scripts/telegrambot/utils/recipient_reachability.py",
     "core/scripts/telegrambot/utils/referral.py",
     "core/scripts/telegrambot/utils/reseller.py",
     "core/scripts/telegrambot/utils/test_config.py",

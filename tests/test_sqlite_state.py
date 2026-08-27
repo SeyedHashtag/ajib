@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -201,7 +202,7 @@ class SQLiteStateTests(unittest.TestCase):
     def test_slow_outer_write_transaction_logs_operation_pid_and_role(self):
         path = self.root / "slow-write.db"
         with (
-            mock.patch.object(self.database.time, "monotonic", side_effect=(10.0, 10.3)),
+            mock.patch.object(self.database.time, "monotonic", side_effect=(0.0, 0.1, 0.5)),
             self.assertLogs("ajib.database", level="WARNING") as captured,
         ):
             with self.database.write_transaction(path, operation="slow_test"):
@@ -209,9 +210,209 @@ class SQLiteStateTests(unittest.TestCase):
 
         output = "\n".join(captured.output)
         self.assertIn("operation=slow_test", output)
-        self.assertIn("elapsed_ms=300", output)
+        self.assertIn("wait_ms=100", output)
+        self.assertIn("hold_ms=400", output)
+        self.assertIn("elapsed_ms=500", output)
         self.assertIn(f"pid={os.getpid()}", output)
         self.assertIn("role=supervisor", output)
+
+    def test_locked_json_delta_updates_only_changed_kv_rows(self):
+        self.write_json(
+            "test_configs.json",
+            {
+                "a": {"value": 1, "unknown": {"kept": True}},
+                "b": {"value": 2},
+            },
+        )
+        self.migrate()
+        from utils.atomic_store import locked_json, read_json
+
+        path = self.root / "test_configs.json"
+        with closing(sqlite3.connect(self.root / "ajib.db")) as connection:
+            before_b = connection.execute(
+                """SELECT updated_at FROM kv_state
+                   WHERE namespace='test_configs' AND state_key='b'"""
+            ).fetchone()[0]
+            connection.executescript(
+                """
+                CREATE TABLE delta_audit(state_key TEXT NOT NULL);
+                CREATE TRIGGER audit_test_config_update
+                AFTER UPDATE ON kv_state
+                WHEN NEW.namespace='test_configs'
+                BEGIN
+                    INSERT INTO delta_audit(state_key) VALUES (NEW.state_key);
+                END;
+                """
+            )
+
+        with locked_json(path, {}) as configs:
+            configs["a"]["value"] = 3
+
+        with closing(sqlite3.connect(self.root / "ajib.db")) as connection:
+            self.assertEqual(
+                connection.execute("SELECT state_key FROM delta_audit").fetchall(),
+                [("a",)],
+            )
+            after_b = connection.execute(
+                """SELECT updated_at FROM kv_state
+                   WHERE namespace='test_configs' AND state_key='b'"""
+            ).fetchone()[0]
+        self.assertEqual(before_b, after_b)
+        self.assertEqual(read_json(path, {})["a"]["unknown"], {"kept": True})
+
+        with closing(sqlite3.connect(self.root / "ajib.db")) as connection:
+            connection.execute("DELETE FROM delta_audit")
+            connection.commit()
+        sys.modules.pop("utils.test_config_store", None)
+        test_config_store = importlib.import_module("utils.test_config_store")
+
+        test_config_store.update_test_configs(
+            path,
+            lambda configs: configs["b"].update({"value": 4}),
+        )
+        with closing(sqlite3.connect(self.root / "ajib.db")) as connection:
+            self.assertEqual(
+                connection.execute("SELECT state_key FROM delta_audit").fetchall(),
+                [("b",)],
+            )
+
+    def test_descriptor_operation_labels_kv_namespace_and_scope(self):
+        from utils.state_store import StateDescriptor, descriptor_operation
+
+        self.assertEqual(
+            descriptor_operation(StateDescriptor("kv_dict", "main", "expired_cleanup")),
+            "kv:expired_cleanup:main",
+        )
+        self.assertEqual(
+            descriptor_operation(StateDescriptor("payments", "main")),
+            "payments:main",
+        )
+
+    def test_payment_and_reseller_deltas_maintain_child_rows(self):
+        self.write_json(
+            "payments.json",
+            {
+                "p1": {
+                    "status": "pending",
+                    "unknown": "kept",
+                    "updates": [{"status": "pending", "timestamp": "one"}],
+                },
+                "p2": {
+                    "status": "paid",
+                    "updates": [{"status": "paid", "timestamp": "two"}],
+                },
+            },
+        )
+        self.write_json(
+            "resellers.json",
+            {
+                "7": {
+                    "debt": 1,
+                    "configs": [{"username": "r7", "retail_order_id": "o7"}],
+                },
+                "8": {
+                    "debt": 2,
+                    "configs": [{"username": "r8", "retail_order_id": "o8"}],
+                },
+            },
+        )
+        self.migrate()
+        from utils.atomic_store import locked_json, read_json
+
+        with closing(sqlite3.connect(self.root / "ajib.db")) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE delta_audit(table_name TEXT, record_id TEXT);
+                CREATE TRIGGER audit_payment_update AFTER UPDATE ON payments BEGIN
+                    INSERT INTO delta_audit VALUES ('payments', NEW.payment_id);
+                END;
+                CREATE TRIGGER audit_payment_event_delete AFTER DELETE ON payment_events BEGIN
+                    INSERT INTO delta_audit VALUES ('payment_events', OLD.payment_id);
+                END;
+                CREATE TRIGGER audit_reseller_update AFTER UPDATE ON resellers BEGIN
+                    INSERT INTO delta_audit VALUES ('resellers', NEW.reseller_id);
+                END;
+                CREATE TRIGGER audit_reseller_config_delete AFTER DELETE ON reseller_configs BEGIN
+                    INSERT INTO delta_audit VALUES ('reseller_configs', OLD.reseller_id);
+                END;
+                """
+            )
+
+        payments_path = self.root / "payments.json"
+        with locked_json(payments_path, {}) as payments:
+            payments["p1"]["status"] = "paid"
+            payments["p1"]["updates"].append({"status": "paid", "timestamp": "three"})
+
+        resellers_path = self.root / "resellers.json"
+        with locked_json(resellers_path, {}) as resellers:
+            resellers["7"]["debt"] = 3
+
+        with closing(sqlite3.connect(self.root / "ajib.db")) as connection:
+            audit = connection.execute(
+                "SELECT table_name, record_id FROM delta_audit ORDER BY rowid"
+            ).fetchall()
+            self.assertEqual(
+                audit,
+                [
+                    ("payments", "p1"),
+                    ("payment_events", "p1"),
+                    ("resellers", "7"),
+                    ("reseller_configs", "7"),
+                ],
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM payment_events WHERE payment_id='p2'"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM reseller_configs WHERE reseller_id='8'"
+                ).fetchone()[0],
+                1,
+            )
+        self.assertEqual(read_json(payments_path, {})["p1"]["unknown"], "kept")
+
+        with locked_json(payments_path, {}) as payments:
+            payments.pop("p1")
+        with locked_json(resellers_path, {}) as resellers:
+            resellers.pop("7")
+        with closing(sqlite3.connect(self.root / "ajib.db")) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM payment_events WHERE payment_id='p1'"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM reseller_configs WHERE reseller_id='7'"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_invalid_reseller_delta_rolls_back_prior_deletion(self):
+        self.write_json(
+            "resellers.json",
+            {
+                "7": {"debt": 1, "configs": []},
+                "8": {"debt": 2, "configs": []},
+            },
+        )
+        self.migrate()
+        from utils.atomic_store import locked_json, read_json
+
+        path = self.root / "resellers.json"
+        with self.assertRaises(ValueError):
+            with locked_json(path, {}) as resellers:
+                resellers.pop("8")
+                resellers["7"]["configs"] = [
+                    {"username": "one", "retail_order_id": "duplicate"},
+                    {"username": "two", "retail_order_id": "duplicate"},
+                ]
+
+        self.assertEqual(set(read_json(path, {})), {"7", "8"})
 
     def test_migration_imports_top_level_and_hosted_state_transactionally(self):
         payment = self.write_json(

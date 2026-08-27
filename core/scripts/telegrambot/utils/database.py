@@ -626,21 +626,31 @@ def transaction(
     depths = _transaction_depths()
     depth = depths.get(resolved, 0)
     savepoint = f"ajib_sp_{depth}"
-    started_at = None
+    requested_at = None
+    acquired_at = None
     committed = False
     try:
         if depth == 0:
+            if immediate:
+                requested_at = time.monotonic()
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             if immediate:
-                started_at = time.monotonic()
+                acquired_at = time.monotonic()
         else:
             connection.execute(f"SAVEPOINT {savepoint}")
     except sqlite3.OperationalError as error:
+        wait_ms = (
+            int((time.monotonic() - requested_at) * 1000)
+            if requested_at is not None
+            else 0
+        )
         logging.getLogger("ajib.database").error(
-            "SQLite transaction could not start operation=%s path=%s depth=%s error=%s",
+            "SQLite transaction could not start operation=%s path=%s depth=%s "
+            "wait_ms=%s error=%s",
             operation or "unspecified",
             resolved,
             depth,
+            wait_ms,
             error,
         )
         raise
@@ -668,13 +678,18 @@ def transaction(
             )
         raise
     finally:
-        if started_at is not None:
-            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        if requested_at is not None and acquired_at is not None:
+            finished_at = time.monotonic()
+            wait_ms = int((acquired_at - requested_at) * 1000)
+            hold_ms = int((finished_at - acquired_at) * 1000)
+            elapsed_ms = int((finished_at - requested_at) * 1000)
             if elapsed_ms >= SLOW_WRITE_TRANSACTION_MS:
                 logging.getLogger("ajib.database").warning(
-                    "SQLite write transaction slow operation=%s elapsed_ms=%s "
-                    "status=%s pid=%s role=%s",
+                    "SQLite write transaction slow operation=%s wait_ms=%s "
+                    "hold_ms=%s elapsed_ms=%s status=%s pid=%s role=%s",
                     operation or "unspecified",
+                    wait_ms,
+                    hold_ms,
                     elapsed_ms,
                     "committed" if committed else "rolled_back",
                     os.getpid(),

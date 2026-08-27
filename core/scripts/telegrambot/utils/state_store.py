@@ -217,6 +217,71 @@ def _load_payments(connection, scope):
     return result
 
 
+def _save_payment_record(connection, scope, payment_id, raw_record):
+    if not isinstance(raw_record, dict):
+        raise ValueError(f"Payment record {payment_id!r} must contain a JSON object.")
+    record = _normalize_receipt_path(deepcopy(raw_record))
+    payment_key = str(payment_id)
+    connection.execute(
+        """
+        INSERT INTO payments(
+            scope, payment_id, user_id, status, kind, payment_method,
+            amount_cents, currency, created_at, updated_at, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(scope, payment_id) DO UPDATE SET
+            user_id=excluded.user_id,
+            status=excluded.status,
+            kind=excluded.kind,
+            payment_method=excluded.payment_method,
+            amount_cents=excluded.amount_cents,
+            currency=excluded.currency,
+            created_at=excluded.created_at,
+            updated_at=excluded.updated_at,
+            payload_json=excluded.payload_json
+        """,
+        (
+            scope,
+            payment_key,
+            str(record.get("user_id")) if record.get("user_id") is not None else None,
+            str(record.get("status")) if record.get("status") is not None else None,
+            str(record.get("type")) if record.get("type") is not None else None,
+            str(record.get("payment_method")) if record.get("payment_method") is not None else None,
+            _optional_cents(record.get("price")),
+            str(record.get("currency") or "USD"),
+            record.get("created_at"),
+            record.get("updated_at"),
+            _dump(record),
+        ),
+    )
+    connection.execute(
+        "DELETE FROM payment_events WHERE scope=? AND payment_id=?",
+        (scope, payment_key),
+    )
+    updates = record.get("updates", [])
+    if not isinstance(updates, list):
+        updates = []
+    for sequence, event in enumerate(updates):
+        if not isinstance(event, dict):
+            continue
+        connection.execute(
+            """
+            INSERT INTO payment_events(
+                scope, payment_id, sequence, status, previous_status,
+                occurred_at, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scope,
+                payment_key,
+                sequence,
+                event.get("status"),
+                event.get("previous_status"),
+                event.get("timestamp"),
+                _dump(event),
+            ),
+        )
+
+
 def _save_payments(connection, scope, data):
     if not isinstance(data, dict):
         raise ValueError("Payment database must contain a JSON object.")
@@ -230,68 +295,7 @@ def _save_payments(connection, scope, data):
     else:
         connection.execute("DELETE FROM payments WHERE scope=?", (scope,))
     for payment_id, raw_record in data.items():
-        if not isinstance(raw_record, dict):
-            raise ValueError(f"Payment record {payment_id!r} must contain a JSON object.")
-        record = _normalize_receipt_path(deepcopy(raw_record))
-        payment_key = str(payment_id)
-        connection.execute(
-            """
-            INSERT INTO payments(
-                scope, payment_id, user_id, status, kind, payment_method,
-                amount_cents, currency, created_at, updated_at, payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(scope, payment_id) DO UPDATE SET
-                user_id=excluded.user_id,
-                status=excluded.status,
-                kind=excluded.kind,
-                payment_method=excluded.payment_method,
-                amount_cents=excluded.amount_cents,
-                currency=excluded.currency,
-                created_at=excluded.created_at,
-                updated_at=excluded.updated_at,
-                payload_json=excluded.payload_json
-            """,
-            (
-                scope,
-                payment_key,
-                str(record.get("user_id")) if record.get("user_id") is not None else None,
-                str(record.get("status")) if record.get("status") is not None else None,
-                str(record.get("type")) if record.get("type") is not None else None,
-                str(record.get("payment_method")) if record.get("payment_method") is not None else None,
-                _optional_cents(record.get("price")),
-                str(record.get("currency") or "USD"),
-                record.get("created_at"),
-                record.get("updated_at"),
-                _dump(record),
-            ),
-        )
-        connection.execute(
-            "DELETE FROM payment_events WHERE scope=? AND payment_id=?",
-            (scope, payment_key),
-        )
-        updates = record.get("updates", [])
-        if not isinstance(updates, list):
-            updates = []
-        for sequence, event in enumerate(updates):
-            if not isinstance(event, dict):
-                continue
-            connection.execute(
-                """
-                INSERT INTO payment_events(
-                    scope, payment_id, sequence, status, previous_status,
-                    occurred_at, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    scope,
-                    payment_key,
-                    sequence,
-                    event.get("status"),
-                    event.get("previous_status"),
-                    event.get("timestamp"),
-                    _dump(event),
-                ),
-            )
+        _save_payment_record(connection, scope, payment_id, raw_record)
 
 
 def _load_resellers(connection):
@@ -350,6 +354,109 @@ def _load_resellers(connection):
     return result
 
 
+def _save_reseller_record(connection, reseller_id, raw_record):
+    if not isinstance(raw_record, dict):
+        raise ValueError(f"Reseller record {reseller_id!r} must contain a JSON object.")
+    key = str(reseller_id)
+    record = deepcopy(raw_record)
+    connection.execute(
+        """
+        INSERT INTO resellers(
+            reseller_id, status, debt_cents, total_paid_cents, debt_since,
+            telegram_username, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(reseller_id) DO UPDATE SET
+            status=excluded.status,
+            debt_cents=excluded.debt_cents,
+            total_paid_cents=excluded.total_paid_cents,
+            debt_since=excluded.debt_since,
+            telegram_username=excluded.telegram_username,
+            payload_json=excluded.payload_json
+        """,
+        (
+            key,
+            record.get("status"),
+            _money_cents(record.get("debt", 0)),
+            _money_cents(record.get("total_paid", 0)),
+            record.get("debt_since"),
+            record.get("telegram_username"),
+            _dump(record),
+        ),
+    )
+    connection.execute("DELETE FROM reseller_configs WHERE reseller_id=?", (key,))
+    configs = record.get("configs", [])
+    if not isinstance(configs, list):
+        raise ValueError(f"Reseller {key!r} configs must contain a JSON list.")
+    seen_orders = set()
+    for config_index, raw_config in enumerate(configs):
+        if not isinstance(raw_config, dict):
+            raise ValueError(f"Reseller {key!r} config {config_index} must be an object.")
+        config = deepcopy(raw_config)
+        order_id = str(config.get("retail_order_id") or "")
+        if order_id:
+            if order_id in seen_orders:
+                raise ValueError(f"Duplicate reseller order ID {order_id!r} for {key}.")
+            seen_orders.add(order_id)
+        connection.execute(
+            """
+            INSERT INTO reseller_configs(
+                reseller_id, config_index, username, server_id,
+                retail_order_id, price_cents, created_at, cleanup_status,
+                removed, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                key,
+                config_index,
+                config.get("username"),
+                str(config.get("server_id")) if config.get("server_id") is not None else None,
+                order_id or None,
+                _optional_cents(config.get("price")),
+                config.get("timestamp"),
+                config.get("cleanup_status"),
+                int(bool(config.get("removed_from_vpn"))),
+                _dump(config),
+            ),
+        )
+        renewals = config.get("renewals", [])
+        if renewals is None:
+            renewals = []
+        if not isinstance(renewals, list):
+            raise ValueError(
+                f"Reseller {key!r} config {config_index} renewals must be a list."
+            )
+        for renewal_index, raw_renewal in enumerate(renewals):
+            if not isinstance(raw_renewal, dict):
+                raise ValueError(
+                    f"Reseller {key!r} renewal {config_index}:{renewal_index} must be an object."
+                )
+            renewal = deepcopy(raw_renewal)
+            renewal_order = str(renewal.get("retail_order_id") or "")
+            if renewal_order:
+                if renewal_order in seen_orders:
+                    raise ValueError(
+                        f"Duplicate reseller order ID {renewal_order!r} for {key}."
+                    )
+                seen_orders.add(renewal_order)
+            connection.execute(
+                """
+                INSERT INTO reseller_renewals(
+                    reseller_id, config_index, renewal_index,
+                    retail_order_id, price_cents, created_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    key,
+                    config_index,
+                    renewal_index,
+                    renewal_order or None,
+                    _optional_cents(renewal.get("price")),
+                    renewal.get("timestamp"),
+                    _dump(renewal),
+                ),
+            )
+
+
 def _save_resellers(connection, data):
     if not isinstance(data, dict):
         raise ValueError("Reseller database must contain a JSON object.")
@@ -363,106 +470,7 @@ def _save_resellers(connection, data):
     else:
         connection.execute("DELETE FROM resellers")
     for reseller_id, raw_record in data.items():
-        if not isinstance(raw_record, dict):
-            raise ValueError(f"Reseller record {reseller_id!r} must contain a JSON object.")
-        key = str(reseller_id)
-        record = deepcopy(raw_record)
-        connection.execute(
-            """
-            INSERT INTO resellers(
-                reseller_id, status, debt_cents, total_paid_cents, debt_since,
-                telegram_username, payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(reseller_id) DO UPDATE SET
-                status=excluded.status,
-                debt_cents=excluded.debt_cents,
-                total_paid_cents=excluded.total_paid_cents,
-                debt_since=excluded.debt_since,
-                telegram_username=excluded.telegram_username,
-                payload_json=excluded.payload_json
-            """,
-            (
-                key,
-                record.get("status"),
-                _money_cents(record.get("debt", 0)),
-                _money_cents(record.get("total_paid", 0)),
-                record.get("debt_since"),
-                record.get("telegram_username"),
-                _dump(record),
-            ),
-        )
-        connection.execute("DELETE FROM reseller_configs WHERE reseller_id=?", (key,))
-        configs = record.get("configs", [])
-        if not isinstance(configs, list):
-            raise ValueError(f"Reseller {key!r} configs must contain a JSON list.")
-        seen_orders = set()
-        for config_index, raw_config in enumerate(configs):
-            if not isinstance(raw_config, dict):
-                raise ValueError(f"Reseller {key!r} config {config_index} must be an object.")
-            config = deepcopy(raw_config)
-            order_id = str(config.get("retail_order_id") or "")
-            if order_id:
-                if order_id in seen_orders:
-                    raise ValueError(f"Duplicate reseller order ID {order_id!r} for {key}.")
-                seen_orders.add(order_id)
-            connection.execute(
-                """
-                INSERT INTO reseller_configs(
-                    reseller_id, config_index, username, server_id,
-                    retail_order_id, price_cents, created_at, cleanup_status,
-                    removed, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    key,
-                    config_index,
-                    config.get("username"),
-                    str(config.get("server_id")) if config.get("server_id") is not None else None,
-                    order_id or None,
-                    _optional_cents(config.get("price")),
-                    config.get("timestamp"),
-                    config.get("cleanup_status"),
-                    int(bool(config.get("removed_from_vpn"))),
-                    _dump(config),
-                ),
-            )
-            renewals = config.get("renewals", [])
-            if renewals is None:
-                renewals = []
-            if not isinstance(renewals, list):
-                raise ValueError(
-                    f"Reseller {key!r} config {config_index} renewals must be a list."
-                )
-            for renewal_index, raw_renewal in enumerate(renewals):
-                if not isinstance(raw_renewal, dict):
-                    raise ValueError(
-                        f"Reseller {key!r} renewal {config_index}:{renewal_index} must be an object."
-                    )
-                renewal = deepcopy(raw_renewal)
-                renewal_order = str(renewal.get("retail_order_id") or "")
-                if renewal_order:
-                    if renewal_order in seen_orders:
-                        raise ValueError(
-                            f"Duplicate reseller order ID {renewal_order!r} for {key}."
-                        )
-                    seen_orders.add(renewal_order)
-                connection.execute(
-                    """
-                    INSERT INTO reseller_renewals(
-                        reseller_id, config_index, renewal_index,
-                        retail_order_id, price_cents, created_at, payload_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        key,
-                        config_index,
-                        renewal_index,
-                        renewal_order or None,
-                        _optional_cents(renewal.get("price")),
-                        renewal.get("timestamp"),
-                        _dump(renewal),
-                    ),
-                )
+        _save_reseller_record(connection, reseller_id, raw_record)
 
 
 def _load_hosted_registry(connection):
@@ -1156,6 +1164,102 @@ def save_descriptor(connection, descriptor: StateDescriptor, data) -> None:
         raise ValueError(f"Unknown state kind: {descriptor.kind}")
 
 
+def descriptor_operation(descriptor: StateDescriptor) -> str:
+    """Return a stable, cardinality-safe transaction label for diagnostics."""
+
+    if descriptor.kind.startswith("kv_"):
+        return f"kv:{descriptor.namespace}:{descriptor.scope}"
+    return f"{descriptor.kind}:{descriptor.scope}"
+
+
+def _normalized_mapping(data, label):
+    if not isinstance(data, dict):
+        raise ValueError(f"{label} must contain a JSON object.")
+    return {str(key): value for key, value in data.items()}
+
+
+def save_descriptor_delta(
+    connection,
+    descriptor: StateDescriptor,
+    original,
+    updated,
+) -> None:
+    """Persist only changed rows for high-cardinality compatibility stores."""
+
+    # Validate the complete document before any delete or upsert is attempted.
+    _dump(updated)
+    if descriptor.kind == "kv_dict":
+        before = _normalized_mapping(original, descriptor.namespace)
+        after = _normalized_mapping(updated, descriptor.namespace)
+        removed = set(before) - set(after)
+        changed = {
+            key: value
+            for key, value in after.items()
+            if key not in before or before[key] != value
+        }
+        timestamp = format_utc_timestamp()
+        for key, value in changed.items():
+            connection.execute(
+                """
+                INSERT INTO kv_state(namespace, scope, state_key, value_json, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(namespace, scope, state_key) DO UPDATE SET
+                    value_json=excluded.value_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    descriptor.namespace,
+                    descriptor.scope,
+                    key,
+                    _dump(value),
+                    timestamp,
+                ),
+            )
+        if removed:
+            placeholders = ",".join("?" for _ in removed)
+            connection.execute(
+                f"""DELETE FROM kv_state
+                    WHERE namespace=? AND scope=?
+                    AND state_key IN ({placeholders})""",
+                (descriptor.namespace, descriptor.scope, *sorted(removed)),
+            )
+        return
+
+    if descriptor.kind == "payments":
+        before = _normalized_mapping(original, "Payment database")
+        after = _normalized_mapping(updated, "Payment database")
+        removed = set(before) - set(after)
+        if removed:
+            placeholders = ",".join("?" for _ in removed)
+            connection.execute(
+                f"""DELETE FROM payments
+                    WHERE scope=? AND payment_id IN ({placeholders})""",
+                (descriptor.scope, *sorted(removed)),
+            )
+        for payment_id, record in after.items():
+            if payment_id not in before or before[payment_id] != record:
+                _save_payment_record(connection, descriptor.scope, payment_id, record)
+        return
+
+    if descriptor.kind == "resellers":
+        before = _normalized_mapping(original, "Reseller database")
+        after = _normalized_mapping(updated, "Reseller database")
+        removed = set(before) - set(after)
+        if removed:
+            placeholders = ",".join("?" for _ in removed)
+            connection.execute(
+                f"DELETE FROM resellers WHERE reseller_id IN ({placeholders})",
+                tuple(sorted(removed)),
+            )
+        for reseller_id, record in after.items():
+            if reseller_id not in before or before[reseller_id] != record:
+                _save_reseller_record(connection, reseller_id, record)
+        return
+
+    # Small and list-shaped stores retain their established replacement path.
+    save_descriptor(connection, descriptor, updated)
+
+
 def read_state(path, default=None):
     descriptor = describe_path(path)
     if descriptor is None:
@@ -1180,7 +1284,7 @@ def write_state(path, data) -> None:
     if descriptor is None:
         raise ValueError(f"Path is not managed SQLite state: {path}")
     with database.write_transaction(
-        operation=f"{descriptor.kind}:{descriptor.scope}"
+        operation=descriptor_operation(descriptor)
     ) as connection:
         save_descriptor(connection, descriptor, data)
 
@@ -1210,7 +1314,7 @@ def patch_dict_state(path, updates=None, remove_keys=()) -> None:
 
     timestamp = format_utc_timestamp()
     with database.write_transaction(
-        operation=f"patch_{descriptor.namespace}:{descriptor.scope}"
+        operation=descriptor_operation(descriptor)
     ) as connection:
         for key, value_json in serialized.items():
             connection.execute(

@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+from copy import deepcopy
 from contextlib import contextmanager
 
 try:
@@ -120,12 +121,21 @@ def update_test_configs(path, mutator):
         database, state_store = sqlite_modules
         descriptor = state_store.describe_path(path)
         try:
-            with database.transaction() as connection:
+            with database.write_transaction(
+                operation=state_store.descriptor_operation(descriptor)
+            ) as connection:
                 configs = state_store.load_descriptor(connection, descriptor, {})
                 if not isinstance(configs, dict):
                     raise TestConfigStoreError("Test config database must contain a JSON object.")
+                original = deepcopy(configs)
                 result = mutator(configs)
-                state_store.save_descriptor(connection, descriptor, configs)
+                if configs != original:
+                    state_store.save_descriptor_delta(
+                        connection,
+                        descriptor,
+                        original,
+                        configs,
+                    )
                 return result
         except TestConfigStoreError:
             raise

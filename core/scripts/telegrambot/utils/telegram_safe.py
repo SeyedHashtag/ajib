@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +25,23 @@ PARSE_ENTITY_ERROR_MARKERS = (
     "can't parse entities",
     "can't find end of the entity",
     "can't find end of entity",
+)
+PERMANENT_RECIPIENT_ERROR_MARKERS = (
+    "blocked",
+    "deactivated",
+    "chat not found",
+    "user is bot",
+    "forbidden",
+)
+TRANSIENT_TRANSPORT_ERROR_MARKERS = (
+    "timeout",
+    "timed out",
+    "connection error",
+    "connection aborted",
+    "connection reset",
+    "remote disconnected",
+    "temporarily unavailable",
+    "bad gateway",
 )
 
 
@@ -69,10 +87,35 @@ def telegram_error_code(error):
     if value is None:
         result = getattr(error, "result_json", None)
         value = result.get("error_code") if isinstance(result, dict) else None
+    if value is None:
+        match = re.search(r"\berror code\s*:\s*(\d{3})\b", str(error), re.IGNORECASE)
+        value = match.group(1) if match else None
     try:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def classify_telegram_delivery_error(error):
+    """Classify a failed Telegram delivery without coupling callers to SDK types."""
+
+    text = str(error).lower()
+    code = telegram_error_code(error)
+    if any(marker in text for marker in PERMANENT_RECIPIENT_ERROR_MARKERS):
+        return "permanent_recipient"
+    if code == 429 or "too many requests" in text or "retry after" in text:
+        return "rate_limited"
+    if code is not None and 500 <= code <= 599:
+        return "transient_transport"
+    if any(marker in text for marker in TRANSIENT_TRANSPORT_ERROR_MARKERS):
+        return "transient_transport"
+    if code == 400:
+        return "invalid_request"
+    return "unknown"
+
+
+def is_permanent_recipient_error(error):
+    return classify_telegram_delivery_error(error) == "permanent_recipient"
 
 
 def telegram_retry_after_seconds(error):

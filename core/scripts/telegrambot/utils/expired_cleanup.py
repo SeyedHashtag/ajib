@@ -66,6 +66,11 @@ from utils.atomic_store import locked_json, read_json
 from utils.command import bot, is_admin
 from utils.common import admin_action_text
 from utils.language import get_user_language
+from utils.recipient_reachability import (
+    load_unreachable_recipients,
+    mark_recipient_unreachable,
+)
+from utils.telegram_safe import classify_telegram_delivery_error, telegram_error_code
 from utils.time_utils import format_utc_timestamp, parse_utc_timestamp, utc_now
 from utils.translations import get_button_text, get_message_text
 
@@ -2112,14 +2117,65 @@ def _prepare_recovered_test_notification_state(candidates, state, now_value, now
             entry.pop('cleanup_error', None)
 
 
-def _is_permanent_recovered_test_notification_error(error):
-    text = str(error or '').lower()
-    return (
-        ('403' in text or 'forbidden' in text)
-        and (
-            'bot was blocked by the user' in text
-            or 'user is deactivated' in text
+def _resume_returned_recovered_test_notifications(
+    candidates,
+    state,
+    unreachable_recipients,
+    now_value,
+):
+    """Reopen a queued notice only after shared-registry inbound recovery."""
+
+    for candidate in candidates or []:
+        key = _state_key(candidate.get('server_id'), candidate.get('username'))
+        entry = state.get(key) if isinstance(state.get(key), dict) else None
+        if not entry or not entry.get('recovery_reachability_registered'):
+            continue
+        status = entry.get('cleanup_status')
+        queued_status = status == 'notification_unreachable' or (
+            status in {'server_unavailable', 'delete_failed'}
+            and entry.get('recovery_unreachable_queued_at')
         )
+        if not queued_status:
+            continue
+        if entry.get('review_status') or entry.get('reviewed_by'):
+            continue
+        if entry.get('manual_review_reason'):
+            continue
+        recipient_key = str(
+            candidate.get('telegram_user_id')
+            or entry.get('telegram_user_id')
+            or ''
+        )
+        if not recipient_key or recipient_key in unreachable_recipients:
+            continue
+        entry['cleanup_status'] = NOTIFICATION_PENDING_STATUS
+        entry['cleanup_error'] = 'notification_failed'
+        entry['last_checked_at'] = now_value
+        for field in (
+            'delete_after',
+            'deleted_at',
+            'delete_result',
+            'recovery_unreachable_queued_at',
+        ):
+            entry.pop(field, None)
+
+
+def _is_permanent_recovered_test_notification_error(error):
+    return classify_telegram_delivery_error(error) == 'permanent_recipient'
+
+
+def _log_recovered_notification_failure(candidate, error):
+    recipient_id = candidate.get('telegram_user_id')
+    server_id = candidate.get('server_id') or 'primary'
+    config_id = f"{server_id}:{candidate.get('username') or ''}"
+    CLEANUP_LOGGER.warning(
+        'recovered_notification_failed recipient=%s config=%s server=%s '
+        'error_code=%s category=%s',
+        hashlib.sha256(str(recipient_id).encode('utf-8')).hexdigest()[:16],
+        hashlib.sha256(config_id.encode('utf-8')).hexdigest()[:16],
+        server_id,
+        telegram_error_code(error),
+        classify_telegram_delivery_error(error),
     )
 
 
@@ -2134,7 +2190,14 @@ def _recovered_test_unreachable_age_satisfied(entry, now):
     return now >= first_seen + timedelta(hours=RECOVERED_TEST_UNREACHABLE_GRACE_HOURS)
 
 
-def _should_queue_recovered_test_unreachable(entry, notification_error, attempts, now):
+def _should_queue_recovered_test_unreachable(
+    entry,
+    notification_error,
+    attempts,
+    now,
+    *,
+    registered_unreachable=False,
+):
     if not isinstance(entry, dict):
         return False
     if entry.get('review_status') == 'kept' or entry.get('reviewed_by'):
@@ -2142,7 +2205,10 @@ def _should_queue_recovered_test_unreachable(entry, notification_error, attempts
     if entry.get('manual_review_reason'):
         return False
     return (
-        _is_permanent_recovered_test_notification_error(notification_error)
+        (
+            registered_unreachable
+            or _is_permanent_recovered_test_notification_error(notification_error)
+        )
         and attempts >= RECOVERED_TEST_UNREACHABLE_ATTEMPTS
         and _recovered_test_unreachable_age_satisfied(entry, now)
     )
@@ -2166,7 +2232,7 @@ def _queue_recovered_test_unreachable_deletion(
         'notification_error': notification_error,
         'recovery_source': 'verified_orphan_test',
         'recovery_attempts': attempts,
-        'recovery_last_attempt_at': now_value,
+        'recovery_reachability_registered': True,
         'recovery_unreachable_queued_at': now_value,
         'delete_after': now_value,
         'last_checked_at': now_value,
@@ -2672,6 +2738,7 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
         if not isinstance(state, dict):
             state = {}
         previous_state = _cleanup_transition_snapshot(state)
+        unreachable_recipients = load_unreachable_recipients()
 
         multi_api = multi_api or MultiServerAPI()
         record_stores = _load_cleanup_record_stores()
@@ -2693,6 +2760,12 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
             now_value,
             now,
         )
+        _resume_returned_recovered_test_notifications(
+            recovered_test_candidates,
+            state,
+            unreachable_recipients,
+            now_value,
+        )
         recovery_backfill = _backfill_verified_orphan_tests(
             recovered_test_candidates,
             record_stores,
@@ -2707,6 +2780,7 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
             'selected': len(selected_recovered_tests),
             'notified': 0,
             'notification_failed': 0,
+            'notification_suppressed': 0,
             'backfill_created': int((recovery_backfill or {}).get('created', 0)),
             'history_added': int((recovery_backfill or {}).get('history_added', 0)),
         }
@@ -2884,15 +2958,64 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
 
             if candidate.get('_recovered_orphan_test'):
                 last_state = _capture_candidate_state(candidate, user_data, now=now)
+                previous_entry = entry if isinstance(entry, dict) else {}
+                attempts = _safe_int(previous_entry.get('recovery_attempts'), 0)
+                recipient_key = str(candidate.get('telegram_user_id') or '')
+                stored_notification_error = (
+                    previous_entry.get('notification_error')
+                    or previous_entry.get('recovery_first_notification_error')
+                    or 'recipient_registered_unreachable'
+                )
+                if recipient_key in unreachable_recipients:
+                    if not entry:
+                        state[key] = _manual_review_entry(
+                            candidate,
+                            now_value,
+                            last_state=last_state,
+                        )
+                        entry = state[key]
+                    entry.update({
+                        'telegram_user_id': candidate.get('telegram_user_id'),
+                        'source': 'test',
+                        'cleanup_status': NOTIFICATION_PENDING_STATUS,
+                        'cleanup_error': 'notification_failed',
+                        'notification_error': stored_notification_error,
+                        'recovery_source': 'verified_orphan_test',
+                        'recovery_attempts': attempts,
+                        'last_checked_at': now_value,
+                        'last_state': last_state,
+                    })
+                    if _should_queue_recovered_test_unreachable(
+                        entry,
+                        stored_notification_error,
+                        attempts,
+                        now,
+                        registered_unreachable=True,
+                    ):
+                        _queue_recovered_test_unreachable_deletion(
+                            entry,
+                            candidate,
+                            now_value,
+                            stored_notification_error,
+                            attempts,
+                            last_state=last_state,
+                        )
+                    recovery_stats['notification_suppressed'] += 1
+                    continue
+
                 notification_error = _notify_candidate(
                     candidate,
                     grace_hours,
                     last_state=last_state,
                     missing=False,
                 )
-                previous_entry = entry if isinstance(entry, dict) else {}
-                attempts = _safe_int(previous_entry.get('recovery_attempts'), 0) + 1
+                attempts += 1
                 if notification_error:
+                    category = classify_telegram_delivery_error(notification_error)
+                    if category == 'permanent_recipient':
+                        mark_recipient_unreachable(candidate.get('telegram_user_id'))
+                        unreachable_recipients.add(recipient_key)
+                    _log_recovered_notification_failure(candidate, notification_error)
                     if not entry:
                         state[key] = _manual_review_entry(candidate, now_value, last_state=last_state)
                         entry = state[key]
@@ -3047,6 +3170,7 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
             for field in (
                 'notified',
                 'notification_failed',
+                'notification_suppressed',
                 'backfill_created',
                 'history_added',
             )
@@ -3059,13 +3183,15 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
             CLEANUP_LOGGER.info(
                 'cleanup_scan transitions=%s null_counter_accepted=%d '
                 'recovered_verified=%d recovered_selected=%d recovered_notified=%d '
-                'recovered_notification_failed=%d backfill_created=%d history_added=%d',
+                'recovered_notification_failed=%d recovered_notification_suppressed=%d '
+                'backfill_created=%d history_added=%d',
                 transition_summary,
                 null_counter_accepted,
                 recovery_stats['verified'],
                 recovery_stats['selected'],
                 recovery_stats['notified'],
                 recovery_stats['notification_failed'],
+                recovery_stats['notification_suppressed'],
                 recovery_stats['backfill_created'],
                 recovery_stats['history_added'],
             )
