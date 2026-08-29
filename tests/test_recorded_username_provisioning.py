@@ -117,6 +117,42 @@ class RecordedUsernameProvisioningTests(unittest.TestCase):
         self.assertEqual(result, {"created": True})
         self.assertEqual(calls[0][0], "r321a")
 
+    def test_reseller_note_fallback_preserves_unlimited_access(self):
+        calls = []
+
+        class FallbackClient(FakeClient):
+            def add_user(self, username, traffic_limit, expiration_days, **kwargs):
+                self.calls.append((username, traffic_limit, expiration_days, kwargs))
+                return None if len(self.calls) == 1 else {"created": True}
+
+        class FallbackMultiServerAPI(FakeMultiServerAPI):
+            def __init__(self, recorded_calls):
+                self.calls = recorded_calls
+                self.client = FallbackClient(recorded_calls)
+
+        namespace = self.creator_namespace(set(), calls)
+        namespace["MultiServerAPI"] = lambda: FallbackMultiServerAPI(calls)
+        create_reseller_user = compile_function(
+            Path("utils/reseller_handlers.py"),
+            "_create_reseller_user_with_note",
+            namespace,
+        )
+
+        username, result, _client = create_reseller_user(
+            None,
+            321,
+            5,
+            30,
+            "customer",
+            unlimited=True,
+        )
+
+        self.assertEqual(username, "r321")
+        self.assertEqual(result, {"created": True})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][3], {"unlimited": True, "note": "note"})
+        self.assertEqual(calls[1][3], {"unlimited": True})
+
     def test_sale_history_failure_stops_before_vpn_creation(self):
         calls = []
 

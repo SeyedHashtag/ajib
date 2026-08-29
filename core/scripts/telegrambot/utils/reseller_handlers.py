@@ -434,7 +434,12 @@ def _create_reseller_user_with_note(api_client, user_id, gb, days, chosen_userna
         )
         result = target_client.add_user(username, int(gb), int(days), unlimited=unlimited, note=note_payload)
         if result is None:
-            result = target_client.add_user(username, int(gb), int(days))
+            result = target_client.add_user(
+                username,
+                int(gb),
+                int(days),
+                unlimited=unlimited,
+            )
             if result is not None:
                 logging.getLogger("ajib.usernames").warning(
                     "Created reseller user without note fallback. reseller_id=%s username=%s",
