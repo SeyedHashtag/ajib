@@ -266,6 +266,22 @@ def test_direct_renewal_opens_customer_plan_picker_and_carries_target_plan():
     assert all(":20" not in callback for callback in callbacks if callback)
 
 
+def test_direct_renewal_duplicate_tap_is_acknowledged_without_second_lookup():
+    bot = DummyBot()
+    module = load_purchase_plan(bot, [])
+    lookups = []
+    module._resolve_customer_renewal_offer_for_call = (
+        lambda *_args, **_kwargs: lookups.append(True)
+    )
+    module.RENEWAL_CALLBACK_INFLIGHT.add(("1988", "renew-token"))
+
+    module.handle_customer_renewal_start(make_call("renew_plan:renew-token"))
+
+    assert lookups == []
+    assert len(bot.callback_answers) == 1
+    assert bot.callback_answers[0][1].get("text")
+
+
 def test_direct_renewal_crypto_quote_and_copy_show_both_discount_components():
     module = load_purchase_plan(DummyBot(), [])
     messages = {

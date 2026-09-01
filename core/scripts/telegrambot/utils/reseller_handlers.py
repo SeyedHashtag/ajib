@@ -1902,6 +1902,8 @@ def _format_reseller_customer_entry(index, cfg, category, language):
     status_label = _customer_category_label(language, status_category)
     if cfg.get("_status_note") == "status_unavailable":
         status_label = get_message_text(language, "reseller_customer_status_unavailable")
+    elif cfg.get("_status_note") == "identity_conflict":
+        status_label = get_message_text(language, "config_identity_conflict")
 
     identifier_lines = [f"{index}. {RESELLER_CUSTOMER_CATEGORY_ICONS.get(status_category, '✅')} `{customer_name or username}`"]
     if customer_name:
@@ -1980,13 +1982,25 @@ def _traffic_usage_percent(user_config):
     return (used_bytes / max_download_bytes) * 100
 
 
-def _days_usage_percent(cfg, user_config):
-    cycle = resolve_service_cycle(
+def _reseller_config_cycle(cfg):
+    try:
+        from utils.renewal import resolve_record_history_cycle
+    except ImportError:  # Rolling-upgrade/test compatibility.
+        return resolve_service_cycle(
+            cfg,
+            username=cfg.get('username'),
+            server_id=cfg.get('server_id'),
+            source='reseller_customer',
+        )
+    return resolve_record_history_cycle(
         cfg,
-        username=cfg.get('username'),
-        server_id=cfg.get('server_id'),
-        source='reseller_customer',
+        cfg.get('username'),
+        'reseller_customer',
     )
+
+
+def _days_usage_percent(cfg, user_config):
+    cycle = _reseller_config_cycle(cfg)
     snapshot = inspect_account(user_config, cycle=cycle)
     if not snapshot.service_duration_days or snapshot.service_days_remaining is None:
         return 0
@@ -1995,12 +2009,7 @@ def _days_usage_percent(cfg, user_config):
 
 
 def _is_customer_expired(user_config, cfg=None):
-    cycle = resolve_service_cycle(
-        cfg,
-        username=(cfg or {}).get('username'),
-        server_id=(cfg or {}).get('server_id'),
-        source='reseller_customer',
-    ) if isinstance(cfg, dict) else None
+    cycle = _reseller_config_cycle(cfg) if isinstance(cfg, dict) else None
     return inspect_account(
         user_config,
         cycle=cycle,
@@ -2012,14 +2021,38 @@ def _categorize_reseller_customers(configs, force_refresh=False, live_snapshot=N
         live_users, unavailable_server_ids = _load_reseller_live_users(force_refresh=force_refresh)
     else:
         live_users, unavailable_server_ids = live_snapshot
+    users_by_username = {}
+    for (live_server_id, live_username), live_user in (live_users or {}).items():
+        users_by_username.setdefault(str(live_username).casefold(), []).append(
+            (live_server_id, live_user)
+        )
+    unavailable_keys = {str(server_id).casefold() for server_id in unavailable_server_ids}
     categorized = {category: [] for category in RESELLER_CUSTOMER_CATEGORY_ORDER}
 
     for cfg in configs:
         username = cfg.get("username")
         server_id = cfg.get("server_id")
-        user_config = live_users.get(
-            (str(server_id or "primary").casefold(), str(username or "").casefold())
-        ) if username else None
+        username_key = str(username or "").casefold()
+        matches = users_by_username.get(username_key, []) if username else []
+        exact_match = next(
+            (
+                live_user
+                for live_server_id, live_user in matches
+                if str(live_server_id).casefold() == str(server_id or 'primary').casefold()
+            ),
+            None,
+        )
+        identity_conflict = len(matches) > 1
+        if identity_conflict:
+            user_config = None
+        elif len(matches) == 1 and unavailable_keys and exact_match is None:
+            user_config = None
+        elif exact_match is not None:
+            user_config = exact_match
+        elif len(matches) == 1:
+            user_config = matches[0][1]
+        else:
+            user_config = None
         enriched = {**cfg, "_user_config": user_config}
 
         if _is_removed_config(cfg):
@@ -2028,7 +2061,12 @@ def _categorize_reseller_customers(configs, force_refresh=False, live_snapshot=N
             continue
 
         if not user_config:
-            if server_id and server_id in unavailable_server_ids:
+            if identity_conflict:
+                enriched["_status_category"] = "unknown"
+                enriched["_status_note"] = "identity_conflict"
+                enriched["_identity_conflict"] = True
+                categorized["unknown"].append(enriched)
+            elif unavailable_keys:
                 enriched["_status_category"] = "unknown"
                 enriched["_status_note"] = "status_unavailable"
                 categorized["unknown"].append(enriched)
@@ -2037,12 +2075,7 @@ def _categorize_reseller_customers(configs, force_refresh=False, live_snapshot=N
                 categorized["deleted"].append(enriched)
             continue
 
-        cycle = resolve_service_cycle(
-            cfg,
-            username=username,
-            server_id=server_id,
-            source='reseller_customer',
-        )
+        cycle = _reseller_config_cycle(cfg)
         snapshot = inspect_account(user_config, cycle=cycle)
         enriched['_account_state'] = snapshot.to_dict()
 
@@ -2177,6 +2210,8 @@ def _render_reseller_customer_category(call, language, categorized, category, pa
     row_buttons = []
     for i, cfg in enumerate(page_configs, start=start + 1):
         config_index = cfg.get("_config_index")
+        if cfg.get("_identity_conflict"):
+            continue
         row_buttons.append(types.InlineKeyboardButton(
             f"{i}",
             callback_data=f"reseller:cfg_index:{config_index}:{category}:{page}",
@@ -2511,11 +2546,43 @@ def _render_reseller_customer_config_job(
     username = str(matched_config.get('username') or '').strip()
     preferred_server_id = matched_config.get('server_id')
 
-    # Fetch live config data from the server that owns this config.
+    # Historical affinity identifies the callback/config record. The live
+    # account may have been moved manually, so resolve it across every server.
     multi_api = MultiServerAPI()
-    api_client, user_config = multi_api.find_user(username, preferred_server_id=preferred_server_id)
+    resolver = getattr(multi_api, 'resolve_unique_user', None)
+    if callable(resolver):
+        resolved = resolver(
+            username,
+            preferred_server_id=preferred_server_id,
+            allow_exact_on_partial=True,
+            force_refresh=True,
+        )
+    else:
+        resolved = None
+    if isinstance(resolved, tuple) and len(resolved) == 3:
+        api_client, user_config, lookup_result = resolved
+    else:
+        api_client, user_config = multi_api.find_user(
+            username,
+            preferred_server_id=preferred_server_id,
+        )
+        lookup_result = {
+            'status': 'found' if user_config is not None else 'missing',
+            'actual_server_id': getattr(api_client, 'server_id', None) if api_client else None,
+            'uniqueness_verified': user_config is not None,
+        }
 
-    if not user_config:
+    if lookup_result.get('status') == 'duplicate':
+        safe_edit_message_text(
+            bot,
+            get_message_text(language, "config_identity_conflict"),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=back_markup,
+        )
+        return
+
+    if lookup_result.get('status') != 'found' or not user_config:
         safe_edit_message_text(
             bot,
             get_message_text(language, "reseller_config_data_unavailable").format(
@@ -2529,12 +2596,21 @@ def _render_reseller_customer_config_job(
         return
 
     # Extract stats
-    cycle = resolve_service_cycle(
-        matched_config,
-        username=username,
-        server_id=preferred_server_id,
-        source='reseller_customer',
-    )
+    try:
+        from utils.renewal import resolve_record_history_cycle
+    except ImportError:  # Rolling-upgrade/test compatibility.
+        cycle = resolve_service_cycle(
+            matched_config,
+            username=username,
+            server_id=preferred_server_id,
+            source='reseller_customer',
+        )
+    else:
+        cycle = resolve_record_history_cycle(
+            matched_config,
+            username=username,
+            source='reseller_customer',
+        )
     shared_state = inspect_account(user_config, cycle=cycle)
     is_blocked = shared_state.panel_state == PanelState.BLOCKED
     is_expired = shared_state.entitlement_state == EntitlementState.EXPIRED
@@ -2635,14 +2711,27 @@ def _render_reseller_customer_config_job(
             try:
                 from utils.renewal import find_reseller_renewal_offer, format_renewal_unavailable
 
-                offer = find_reseller_renewal_offer(
-                    user_id,
-                    matched_config_index,
-                    api_client,
-                    user_config,
-                    load_plans(),
-                    reseller_data=reseller_data,
-                )
+                try:
+                    offer = find_reseller_renewal_offer(
+                        user_id,
+                        matched_config_index,
+                        api_client,
+                        user_config,
+                        load_plans(),
+                        reseller_data=reseller_data,
+                        lookup_result=lookup_result,
+                    )
+                except TypeError as compatibility_error:
+                    if 'lookup_result' not in str(compatibility_error):
+                        raise
+                    offer = find_reseller_renewal_offer(
+                        user_id,
+                        matched_config_index,
+                        api_client,
+                        user_config,
+                        load_plans(),
+                        reseller_data=reseller_data,
+                    )
                 if offer.get("eligible"):
                     expired_markup = types.InlineKeyboardMarkup()
                     expired_markup.add(
@@ -2710,15 +2799,29 @@ def _render_reseller_customer_config_job(
         if not _is_reseller_suspended(reseller_data):
             from utils.renewal import find_reseller_renewal_offer
 
-            active_offer = find_reseller_renewal_offer(
-                user_id,
-                matched_config_index,
-                api_client,
-                user_config,
-                load_plans(),
-                reseller_data=reseller_data,
-                allow_reservation=True,
-            )
+            try:
+                active_offer = find_reseller_renewal_offer(
+                    user_id,
+                    matched_config_index,
+                    api_client,
+                    user_config,
+                    load_plans(),
+                    reseller_data=reseller_data,
+                    allow_reservation=True,
+                    lookup_result=lookup_result,
+                )
+            except TypeError as compatibility_error:
+                if 'lookup_result' not in str(compatibility_error):
+                    raise
+                active_offer = find_reseller_renewal_offer(
+                    user_id,
+                    matched_config_index,
+                    api_client,
+                    user_config,
+                    load_plans(),
+                    reseller_data=reseller_data,
+                    allow_reservation=True,
+                )
         if active_offer.get('eligible') and active_offer.get('renewal_mode') == 'reserved':
             reserve_markup = types.InlineKeyboardMarkup()
             reserve_markup.add(types.InlineKeyboardButton(
@@ -2784,6 +2887,22 @@ def _resolve_reseller_renewal_offer_for_call(call, token, target_plan_gb=None):
         reseller_data=reseller_data,
         target_plan_gb=target_plan_gb,
     ), reseller_data
+
+
+def _claim_reseller_renewal_view(user_id, token):
+    key = ('view', str(user_id), str(token))
+    with RESELLER_RENEWAL_LOCK:
+        if key in RESELLER_RENEWAL_INFLIGHT:
+            return None
+        RESELLER_RENEWAL_INFLIGHT.add(key)
+    return key
+
+
+def _release_reseller_renewal_view(key):
+    if key is None:
+        return
+    with RESELLER_RENEWAL_LOCK:
+        RESELLER_RENEWAL_INFLIGHT.discard(key)
 
 
 def _reseller_renewal_details_message(language, offer, current_debt, trust_limit):
@@ -2868,45 +2987,75 @@ def handle_reseller_renewal_start(call):
         return
 
     token = call.data.split(":", 2)[2]
-    offer, reseller_data = _resolve_reseller_renewal_offer_for_call(call, token)
-    if not offer.get("eligible"):
-        bot.answer_callback_query(
-            call.id,
-            get_message_text(language, "renewal_unavailable").format(reason=_renewal_reason_text(language, offer.get("reason"))),
-            show_alert=True,
+    claim_key = _claim_reseller_renewal_view(user_id, token)
+    if claim_key is None:
+        safe_answer_callback_query(
+            bot, call.id, get_message_text(language, 'renewal_check_in_progress')
         )
         return
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    from utils.renewal import eligible_renewal_plans
-    for plan_id, plan in eligible_renewal_plans(load_plans(), 'reseller_customer'):
-        wholesale_price = calculate_reseller_wholesale_price(
-            float(plan.get('price', 0) or 0), reseller_data
-        )
-        markup.add(types.InlineKeyboardButton(
-            get_message_text(language, 'renewal_plan_choice').format(
-                plan_gb=plan_id,
-                days=plan.get('days', 0),
-                price=format_usd_amount(wholesale_price),
+    try:
+        safe_answer_callback_query(bot, call.id, get_message_text(language, 'renewal_checking'))
+        offer, reseller_data = _resolve_reseller_renewal_offer_for_call(call, token)
+        if not offer.get("eligible"):
+            safe_edit_message_text(
+                bot,
+                get_message_text(language, "renewal_unavailable").format(reason=_renewal_reason_text(language, offer.get("reason"))),
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode='Markdown',
+            )
+            return
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        from utils.renewal import eligible_renewal_plans
+        for plan_id, plan in eligible_renewal_plans(load_plans(), 'reseller_customer'):
+            wholesale_price = calculate_reseller_wholesale_price(
+                float(plan.get('price', 0) or 0), reseller_data
+            )
+            markup.add(types.InlineKeyboardButton(
+                get_message_text(language, 'renewal_plan_choice').format(
+                    plan_gb=plan_id,
+                    days=plan.get('days', 0),
+                    price=format_usd_amount(wholesale_price),
+                ),
+                callback_data=f"reseller:renew_plan:{token}:{plan_id}",
+            ))
+        markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
+        bot.edit_message_text(
+            get_message_text(language, 'renewal_choose_plan').format(
+                username=escape_markdown_code(offer.get('username') or '—')
             ),
-            callback_data=f"reseller:renew_plan:{token}:{plan_id}",
-        ))
-    markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
-    bot.edit_message_text(
-        get_message_text(language, 'renewal_choose_plan').format(
-            username=escape_markdown_code(offer.get('username') or '—')
-        ),
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=markup,
-        parse_mode="Markdown",
-    )
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=markup,
+            parse_mode="Markdown",
+        )
+    except Exception as error:
+        logging.getLogger('ajib.renewal').exception(
+            'renewal_callback_failed stage=reseller_start user_id=%s error_type=%s',
+            user_id,
+            type(error).__name__,
+        )
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            get_message_text(language, 'error_occurred').format(error='Please try again.'),
+            show_alert=True,
+        )
+    finally:
+        _release_reseller_renewal_view(claim_key)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reseller:renew_plan:"))
 def handle_reseller_renewal_plan_choice(call):
     language = get_user_language(call.from_user.id)
+    _, _, token, plan_gb = call.data.split(":", 3)
+    claim_key = _claim_reseller_renewal_view(call.from_user.id, token)
+    if claim_key is None:
+        safe_answer_callback_query(
+            bot, call.id, get_message_text(language, 'renewal_check_in_progress')
+        )
+        return
     try:
-        _, _, token, plan_gb = call.data.split(":", 3)
         offer, reseller_data = _resolve_reseller_renewal_offer_for_call(
             call, token, plan_gb
         )
@@ -2924,11 +3073,18 @@ def handle_reseller_renewal_plan_choice(call):
             call, token, offer, reseller_data, language
         )
     except Exception as error:
-        bot.answer_callback_query(
-            call.id,
-            get_message_text(language, 'error_occurred').format(error=str(error)),
+        logging.getLogger('ajib.renewal').exception(
+            'renewal_callback_failed stage=reseller_plan_choice user_id=%s error_type=%s',
+            call.from_user.id,
+            type(error).__name__,
+        )
+        safe_answer_callback_query(
+            bot, call.id,
+            get_message_text(language, 'error_occurred').format(error='Please try again.'),
             show_alert=True,
         )
+    finally:
+        _release_reseller_renewal_view(claim_key)
 
 
 def _queue_reseller_renewal_confirm(call, user_id, language, token, target_plan_gb=None):
@@ -3064,7 +3220,7 @@ def _process_reseller_renewal_confirm_job(
                     offer.get('username'),
                     price,
                     reservation,
-                    server_id=offer.get('server_id'),
+                    server_id=offer.get('recorded_server_id') or offer.get('server_id'),
                 )
             except Exception:
                 release_wholesale_balance(user_id, wholesale_reservation_id)
@@ -3075,7 +3231,7 @@ def _process_reseller_renewal_confirm_job(
                 offer.get('username'),
                 price,
                 reservation,
-                server_id=offer.get('server_id'),
+                server_id=offer.get('recorded_server_id') or offer.get('server_id'),
                 funded=False,
                 enforce_credit=True,
             )
@@ -3148,7 +3304,7 @@ def _process_reseller_renewal_confirm_job(
                 offer.get('username'),
                 price,
                 renewal_record,
-                server_id=offer.get('server_id'),
+                server_id=offer.get('recorded_server_id') or offer.get('server_id'),
             )
         except Exception:
             debt_added = False
@@ -3158,7 +3314,7 @@ def _process_reseller_renewal_confirm_job(
             offer.get('username'),
             price,
             renewal_record,
-            server_id=offer.get('server_id'),
+            server_id=offer.get('recorded_server_id') or offer.get('server_id'),
         )
     if not debt_added:
         if funding_mode == 'prepaid':
@@ -3177,6 +3333,8 @@ def _process_reseller_renewal_confirm_job(
         return
 
     mark_cleanup_state_renewed(offer.get('username'), offer.get('server_id'))
+    if offer.get('recorded_server_id') and offer.get('recorded_server_id') != offer.get('server_id'):
+        mark_cleanup_state_renewed(offer.get('username'), offer.get('recorded_server_id'))
 
     api_client = result.get('api_client')
     user_uri_data = api_client.get_user_uri(offer.get('username')) if api_client else None

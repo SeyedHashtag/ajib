@@ -1687,6 +1687,37 @@ class ExpiredCleanupTests(unittest.TestCase):
         self.assertEqual(saved_test["server_id"], "s2")
         self.assertEqual(self.cleanup._test_bot.sent_messages, [])
 
+    def test_recorded_server_history_stays_unchanged_while_cleanup_follows_unique_move(self):
+        self.write_json(self.cleanup.TEST_CONFIGS_FILE, {
+            "101": {
+                "telegram_id": 101,
+                "username": "t101",
+                "server_id": "s1",
+                "used_at": "2026-05-01 08:00:00",
+            }
+        })
+        self.write_json(self.cleanup.PAYMENTS_FILE, {})
+        self.write_json(self.cleanup.RESELLERS_FILE, {})
+        old_server = FakeClient("s1", {})
+        live_server = FakeClient("s2", {"t101": self.expired_user()})
+        api = FakeMultiAPI({"s1": old_server, "s2": live_server})
+
+        self.cleanup.run_expired_user_cleanup(
+            grace_hours=0,
+            now=self.now,
+            multi_api=api,
+        )
+        self.cleanup.run_expired_user_cleanup(
+            grace_hours=0,
+            now=self.now + timedelta(hours=1),
+            multi_api=api,
+        )
+
+        saved_test = self.read_json(self.cleanup.TEST_CONFIGS_FILE)["101"]
+        self.assertEqual(saved_test["server_id"], "s1")
+        self.assertEqual(live_server.deleted, ["t101"])
+        self.assertEqual(old_server.deleted, [])
+
     def test_ambiguous_serverless_record_routes_expired_user_to_manual_review(self):
         self.write_json(self.cleanup.TEST_CONFIGS_FILE, {
             "101": {"telegram_id": 101, "username": "shared"}

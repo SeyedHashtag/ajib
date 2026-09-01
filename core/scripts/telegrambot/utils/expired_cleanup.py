@@ -1315,21 +1315,16 @@ def _lookup_user_from_context(context, username, preferred_server_id=None):
     if not username:
         return None, None, 'missing'
 
-    if preferred_server_id:
-        server_state = context.get('servers', {}).get(str(preferred_server_id).lower())
-        if not server_state:
-            return None, None, 'unavailable'
-        client = server_state.get('client')
-        if not server_state.get('available'):
-            return client, None, 'unavailable'
-        match = context.get('exact', {}).get(_state_key(preferred_server_id, username).lower())
-        if match:
-            return match[0], match[1], 'found'
-        return client, None, 'missing'
-
     matches = context.get('usernames', {}).get(username.lower()) or []
-    if matches:
-        _server_id, client, user_data = matches[0]
+    unique_matches = {}
+    for server_id, client, user_data in matches:
+        unique_matches.setdefault(str(server_id).lower(), (server_id, client, user_data))
+    if len(unique_matches) > 1:
+        return None, None, 'duplicate'
+    if len(unique_matches) == 1 and context.get('unavailable'):
+        return None, None, 'unavailable'
+    if unique_matches:
+        _server_key, (_server_id, client, user_data) = next(iter(unique_matches.items()))
         return client, user_data, 'found'
 
     if context.get('unavailable') or not context.get('checked_any'):
@@ -1731,10 +1726,7 @@ def _candidate_matches_server_candidates(candidate, usernames, exact_keys):
     username = str(candidate.get('username') or '').strip()
     if not username or username.lower() not in usernames:
         return False
-    server_id = candidate.get('server_id')
-    if not server_id:
-        return True
-    return _state_key(server_id, username).lower() in exact_keys
+    return True
 
 
 def discover_matching_cleanup_candidates(
@@ -1761,6 +1753,17 @@ def discover_matching_cleanup_candidates(
         server_candidate = None
         if server_id:
             server_candidate = exact_candidates.get(_state_key(server_id, username).lower())
+            if server_candidate is None and lookup_context is not None:
+                api_client, _user_data, lookup_status = _lookup_user_from_context(
+                    lookup_context,
+                    username,
+                    preferred_server_id=server_id,
+                )
+                if lookup_status == 'found':
+                    actual_server_id = getattr(api_client, 'server_id', None)
+                    server_candidate = exact_candidates.get(
+                        _state_key(actual_server_id, username).lower()
+                    )
         elif lookup_context is not None:
             if lookup_context.get('unavailable'):
                 continue
@@ -2332,6 +2335,23 @@ def _update_candidate_record(candidate, fields, stores=None):
 
 
 def _get_user_lookup(multi_api, username, preferred_server_id=None):
+    resolver = getattr(multi_api, 'resolve_unique_user', None)
+    if callable(resolver):
+        try:
+            client, user_data, outcome = resolver(
+                username,
+                preferred_server_id=preferred_server_id,
+                allow_exact_on_partial=False,
+                force_refresh=True,
+            )
+        except Exception:
+            return None, None, 'unavailable'
+        outcome = outcome if isinstance(outcome, dict) else {}
+        status = outcome.get('status') or 'unavailable'
+        if status != 'found' or not outcome.get('uniqueness_verified'):
+            return client, None, status
+        return client, user_data, 'found'
+
     checked_any = False
     unavailable = False
 
@@ -2846,22 +2866,17 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
             if entry and entry.get('source') == 'server_user' and entry.get('cleanup_status') == 'notified':
                 _convert_server_user_to_manual_review(entry, now_value)
 
-            if candidate.get('_lookup_status') == 'found':
-                api_client = candidate.get('_api_client')
-                user_data = candidate.get('_user_data')
-                lookup_status = 'found'
-            else:
-                api_client, user_data, lookup_status = _lookup_user_from_context(
-                    lookup_context,
+            api_client, user_data, lookup_status = _lookup_user_from_context(
+                lookup_context,
+                username,
+                preferred_server_id=candidate.get('server_id'),
+            )
+            if lookup_status is None:
+                api_client, user_data, lookup_status = _get_user_lookup(
+                    multi_api,
                     username,
                     preferred_server_id=candidate.get('server_id'),
                 )
-                if lookup_status is None:
-                    api_client, user_data, lookup_status = _get_user_lookup(
-                        multi_api,
-                        username,
-                        preferred_server_id=candidate.get('server_id'),
-                    )
 
             live_cleanup_reason = None
             if (
@@ -2910,15 +2925,45 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
             if user_expired and candidate.get('_record_was_deleted'):
                 _clear_candidate_delete_metadata(candidate, stores=record_stores)
 
-            if lookup_status == 'unavailable':
+            if lookup_status in {'unavailable', 'duplicate'}:
+                CLEANUP_LOGGER.warning(
+                    'cleanup_identity_rejected username=%s requested_server_id=%s status=%s',
+                    username,
+                    candidate.get('server_id'),
+                    lookup_status,
+                )
+                if not entry and candidate.get('source') == 'server_user':
+                    observed_user = candidate.get('_user_data')
+                    last_state = (
+                        _capture_candidate_state(candidate, observed_user, now=now)
+                        if isinstance(observed_user, dict)
+                        else None
+                    )
+                    state[key] = _manual_review_entry(
+                        candidate,
+                        now_value,
+                        last_state=last_state,
+                    )
+                    if lookup_status == 'duplicate':
+                        state[key]['manual_review_reason'] = 'identity_duplicate'
+                    state[key]['cleanup_error'] = (
+                        'identity_duplicate'
+                        if lookup_status == 'duplicate'
+                        else 'server_unavailable'
+                    )
+                    continue
                 if entry:
                     if entry.get('cleanup_status') == 'already_missing':
-                        entry['cleanup_error'] = 'server_unavailable'
+                        entry['cleanup_error'] = (
+                            'identity_duplicate' if lookup_status == 'duplicate' else 'server_unavailable'
+                        )
                         entry['last_checked_at'] = now_value
                         continue
                     if entry.get('cleanup_status') != 'manual_review':
                         entry['cleanup_status'] = 'server_unavailable'
-                    entry['cleanup_error'] = 'server_unavailable'
+                    entry['cleanup_error'] = (
+                        'identity_duplicate' if lookup_status == 'duplicate' else 'server_unavailable'
+                    )
                     entry['last_checked_at'] = now_value
                 continue
 
@@ -3516,11 +3561,17 @@ def _handle_manual_review_delete(record_id):
             preferred_server_id=candidate.get('server_id'),
         )
 
-        if lookup_status == 'unavailable':
-            entry['cleanup_error'] = 'server_unavailable'
+        if lookup_status in {'unavailable', 'duplicate'}:
+            entry['cleanup_error'] = (
+                'identity_duplicate' if lookup_status == 'duplicate' else 'server_unavailable'
+            )
             entry['last_checked_at'] = now_value
             _save_json_file(STATE_FILE, state)
-            return "Server unavailable. Try again later."
+            return (
+                "Username exists on multiple servers. Nothing was deleted."
+                if lookup_status == 'duplicate'
+                else "Server unavailable. Try again later."
+            )
 
         if lookup_status == 'missing':
             _mark_deleted(

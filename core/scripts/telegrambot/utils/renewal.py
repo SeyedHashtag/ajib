@@ -286,7 +286,28 @@ def _record_server_id(record):
 
 
 def lookup_renewal_user(multi_api, username, server_id=None):
-    """Resolve a renewal target without falling through to another server."""
+    """Resolve a renewal target only when it is globally unique.
+
+    ``server_id`` is historical affinity, not an instruction to mutate that
+    server. Old callback tokens therefore remain valid after a manual move,
+    while duplicates and incomplete server scans fail closed.
+    """
+    resolver = getattr(multi_api, 'resolve_unique_user', None)
+    if callable(resolver):
+        resolved = resolver(
+            username,
+            preferred_server_id=server_id,
+            allow_exact_on_partial=False,
+            force_refresh=True,
+        )
+        if isinstance(resolved, tuple) and len(resolved) == 3:
+            api_client, user_data, result = resolved
+            result = result if isinstance(result, dict) else {}
+            if result.get('status') != 'found' or not bool(result.get('uniqueness_verified')):
+                return api_client, None, result
+            return api_client, user_data, result
+
+    # Compatibility for injected clients used by older integrations/tests.
     if server_id:
         strict_lookup = getattr(multi_api, 'find_user_on_server', None)
         if callable(strict_lookup):
@@ -298,6 +319,10 @@ def lookup_renewal_user(multi_api, username, server_id=None):
                     'status': result.get('status') or ('found' if user_data is not None else 'unavailable'),
                     'http_status': result.get('http_status'),
                     'error': result.get('error'),
+                    'requested_server_id': server_id,
+                    'actual_server_id': getattr(api_client, 'server_id', None) if api_client else None,
+                    'relocated': False,
+                    'uniqueness_verified': user_data is not None,
                 }
 
         # Compatibility for injected clients used by older integrations. A
@@ -305,7 +330,11 @@ def lookup_renewal_user(multi_api, username, server_id=None):
         api_client, user_data = multi_api.find_user(username, preferred_server_id=server_id)
         returned_server_id = getattr(api_client, 'server_id', None) if api_client else None
         if api_client and str(returned_server_id) == str(server_id) and user_data is not None:
-            return api_client, user_data, {'status': 'found', 'http_status': None, 'error': None}
+            return api_client, user_data, {
+                'status': 'found', 'http_status': None, 'error': None,
+                'requested_server_id': server_id, 'actual_server_id': returned_server_id,
+                'relocated': False, 'uniqueness_verified': True,
+            }
         return api_client, None, {
             'status': 'unavailable' if api_client is None else 'missing',
             'http_status': None,
@@ -317,13 +346,67 @@ def lookup_renewal_user(multi_api, username, server_id=None):
         'status': 'found' if user_data is not None else 'missing',
         'http_status': None,
         'error': None if user_data is not None else 'not_found',
+        'requested_server_id': None,
+        'actual_server_id': getattr(api_client, 'server_id', None) if api_client else None,
+        'relocated': False,
+        'uniqueness_verified': user_data is not None,
     }
 
 
 def _lookup_failure_reason(lookup_result):
-    if isinstance(lookup_result, dict) and lookup_result.get('status') == 'unavailable':
-        return 'server_unavailable'
+    if isinstance(lookup_result, dict):
+        if lookup_result.get('status') == 'duplicate':
+            return 'renewal_ineligible_duplicate'
+        if lookup_result.get('status') == 'unavailable':
+            return 'server_unavailable'
     return 'renewal_ineligible_missing'
+
+
+def resolve_record_history_cycle(records, username, source):
+    """Return the newest valid cycle across a stable account's server history.
+
+    Each candidate is resolved against the server stored by its issuing
+    record, preserving its historical fingerprint after a manual move.
+    """
+    server_ids = set()
+
+    def collect(record, inherited_server_id=None):
+        if not isinstance(record, dict):
+            return
+        record_username = _record_username(record)
+        if record_username and record_username.lower() != str(username or '').strip().lower():
+            return
+        record_server_id = _record_server_id(record) or inherited_server_id or 'primary'
+        server_ids.add(str(record_server_id))
+        renewals = record.get('renewals')
+        if isinstance(renewals, list):
+            for renewal in renewals:
+                collect(renewal, record_server_id)
+
+    if isinstance(records, dict):
+        if any(key in records for key in ('username', 'renewal_username', 'days', 'renewal_plan_snapshot')):
+            collect(records)
+        else:
+            for record in records.values():
+                collect(record)
+    elif isinstance(records, (list, tuple)):
+        for record in records:
+            collect(record)
+
+    candidates = []
+    for candidate_server_id in server_ids:
+        cycle = resolve_service_cycle(
+            records,
+            username=username,
+            server_id=candidate_server_id,
+            source=source,
+        )
+        if cycle is not None:
+            candidates.append(cycle)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda cycle: (cycle.issued_at, cycle.record_id), reverse=True)
+    return candidates[0]
 
 
 def _lookup_failure_fields(lookup_result):
@@ -496,7 +579,17 @@ def _build_offer(
     cycle_records=None,
     target_plan_gb=None,
 ):
-    if not api_client or not user_data:
+    if (
+        not api_client
+        or not user_data
+        or (
+            isinstance(lookup_result, dict)
+            and (
+                lookup_result.get('status') != 'found'
+                or not bool(lookup_result.get('uniqueness_verified', True))
+            )
+        )
+    ):
         return {
             'eligible': False,
             'reason': _lookup_failure_reason(lookup_result),
@@ -505,10 +598,16 @@ def _build_offer(
             'server_id': server_id,
         }
 
-    cycle = resolve_service_cycle(
+    recorded_server_id = server_id
+    actual_server_id = (
+        (lookup_result or {}).get('actual_server_id')
+        or getattr(api_client, 'server_id', None)
+        or recorded_server_id
+        or 'primary'
+    )
+    cycle = resolve_record_history_cycle(
         cycle_records if cycle_records is not None else record,
         username=username,
-        server_id=server_id or getattr(api_client, 'server_id', None),
         source=source,
     )
     shared_state = inspect_account(user_data, cycle=cycle)
@@ -586,7 +685,10 @@ def _build_offer(
         'eligible': True,
         'source': source,
         'username': username,
-        'server_id': server_id or getattr(api_client, 'server_id', None) or 'primary',
+        'server_id': actual_server_id,
+        'recorded_server_id': recorded_server_id,
+        'relocated': str(actual_server_id) != str(recorded_server_id) if recorded_server_id else False,
+        'uniqueness_verified': True,
         'api_client': api_client,
         'plan_gb': plan_gb,
         'days': _safe_int(plan.get('days'), 0),
@@ -683,11 +785,22 @@ def find_customer_renewal_offer(
     server_id=None,
     allow_reservation=False,
     target_plan_gb=None,
+    lookup_result=None,
 ):
+    if isinstance(lookup_result, dict) and (
+        lookup_result.get('status') != 'found'
+        or not bool(lookup_result.get('uniqueness_verified', True))
+    ):
+        return {
+            'eligible': False,
+            'reason': _lookup_failure_reason(lookup_result),
+            'source': 'customer',
+            'username': username,
+            'server_id': lookup_result.get('actual_server_id') or server_id,
+        }
     existing_reservation = find_customer_reservation(
         user_id,
         username,
-        server_id=server_id or getattr(api_client, 'server_id', None),
         payments=payments,
     )
     if existing_reservation:
@@ -702,14 +815,12 @@ def find_customer_renewal_offer(
     matching_records = _matching_customer_records(
         user_id,
         username=username,
-        server_id=server_id,
         payments=payments,
     )
     cycle_records = {record_id: record for record_id, record in matching_records}
-    current_cycle = resolve_service_cycle(
+    current_cycle = resolve_record_history_cycle(
         cycle_records,
         username=username,
-        server_id=server_id or getattr(api_client, 'server_id', None),
         source='customer',
     )
     if current_cycle is not None:
@@ -738,6 +849,7 @@ def find_customer_renewal_offer(
                 'base_record': record,
             },
             allow_reservation=allow_reservation,
+            lookup_result=lookup_result,
             cycle_records=cycle_records,
             target_plan_gb=target_plan_gb,
         )
@@ -780,13 +892,10 @@ def resolve_customer_renewal_token(
             candidate_id: candidate
             for candidate_id, candidate in matching_records
             if _record_username(candidate).lower() == username.lower()
-            and str(_record_server_id(candidate) or 'primary').lower()
-            == str(server_id or 'primary').lower()
         }
-        current_cycle = resolve_service_cycle(
+        current_cycle = resolve_record_history_cycle(
             exact_records,
             username=username,
-            server_id=server_id,
             source='customer',
         )
         if current_cycle is not None and current_cycle.record_id != record_id:
@@ -933,6 +1042,7 @@ def customer_payment_metadata(offer):
         'renewal_source': 'customer',
         'renewal_username': offer.get('username'),
         'renewal_server_id': offer.get('server_id'),
+        'renewal_recorded_server_id': offer.get('recorded_server_id'),
         'renewal_base_record_id': offer.get('base_record_id'),
         'renewal_before_state': offer.get('before_state'),
         'renewal_mode': offer.get('renewal_mode', 'immediate'),
@@ -970,6 +1080,8 @@ def reseller_renewal_record(offer, before_state, after_state):
         'before_state': before_state,
         'after_state': after_state,
         'renewal_mode': offer.get('renewal_mode', 'immediate'),
+        'renewal_server_id': offer.get('server_id'),
+        'renewal_recorded_server_id': offer.get('recorded_server_id'),
         'renewal_business_expired': bool(offer.get('business_expired')),
         'renewal_cycle_fingerprint': offer.get('cycle_fingerprint'),
         'renewal_entitlement_deadline': offer.get('entitlement_deadline'),
@@ -1036,7 +1148,7 @@ def mark_payment_renewal_reserved(payment_id, payments_file=None, fields=None, n
                 continue
             if str(other.get('user_id')) != str(user_id):
                 continue
-            if _reservation_matches(other, username, server_id=server_id):
+            if _reservation_matches(other, username):
                 return False
         previous_status = record.get('status', 'unknown')
         record.update(dict(fields or {}))
@@ -1671,6 +1783,7 @@ def process_payment_renewal_reservation(
             'renewal_after_state': result.get('after_state'),
             'username': result.get('username'),
             'server_id': result.get('server_id'),
+            'renewal_server_id': result.get('server_id'),
         }
         persisted = finish_payment_renewal(
             payment_id,
@@ -1683,6 +1796,9 @@ def process_payment_renewal_reservation(
         if not persisted:
             raise RuntimeError('Could not persist applied renewal state')
         mark_cleanup_state_renewed(result.get('username'), result.get('server_id'))
+        historical_server_id = record.get('renewal_recorded_server_id')
+        if historical_server_id and historical_server_id != result.get('server_id'):
+            mark_cleanup_state_renewed(result.get('username'), historical_server_id)
         _log_renewal_transition('payment', payment_id, record, 'applied')
         return {
             'payment_id': str(payment_id),
@@ -1931,6 +2047,7 @@ def process_reseller_renewal_reservation(
         applied_fields = {
             'before_state': result.get('before_state'),
             'after_state': result.get('after_state'),
+            'renewal_server_id': result.get('server_id'),
         }
         persisted = finish_reseller_renewal_reservation(
             reseller_id,
@@ -1943,6 +2060,9 @@ def process_reseller_renewal_reservation(
         if not persisted:
             raise RuntimeError('Could not persist applied reseller renewal state')
         mark_cleanup_state_renewed(result.get('username'), result.get('server_id'))
+        historical_server_id = record.get('renewal_recorded_server_id')
+        if historical_server_id and historical_server_id != result.get('server_id'):
+            mark_cleanup_state_renewed(result.get('username'), historical_server_id)
         _log_renewal_transition('reseller', reservation_id, record, 'applied')
         return {
             'reservation_id': str(reservation_id),
@@ -2056,6 +2176,12 @@ def _execute_reset(
             'lookup_result': lookup_result,
         }
 
+    actual_server_id = (
+        (lookup_result or {}).get('actual_server_id')
+        or getattr(api_client, 'server_id', None)
+        or server_id
+    )
+
     before_state = capture_user_state(user_data)
     if require_expired and not (is_user_expired(user_data) or business_expired):
         return {'success': False, 'reason': 'renewal_ineligible_not_expired', 'before_state': before_state}
@@ -2133,12 +2259,23 @@ def _execute_reset(
 
     after_state = capture_user_state(after_user)
     if clear_cleanup:
-        mark_cleanup_state_renewed(username, server_id or getattr(api_client, 'server_id', None))
+        cleanup_server_ids = {
+            str(value)
+            for value in (
+                actual_server_id,
+                server_id,
+                plan_record.get('renewal_recorded_server_id'),
+            )
+            if value
+        }
+        for cleanup_server_id in cleanup_server_ids:
+            mark_cleanup_state_renewed(username, cleanup_server_id)
 
     return {
         'success': True,
         'username': username,
-        'server_id': server_id or getattr(api_client, 'server_id', None),
+        'server_id': actual_server_id,
+        'recorded_server_id': server_id,
         'api_client': api_client,
         'before_state': before_state,
         'after_state': after_state,
@@ -2228,6 +2365,7 @@ def execute_reserved_renewal(record, multi_api=None, force=False):
         {
             **snapshot,
             'renewal_source_plan_snapshot': record.get('renewal_source_plan_snapshot'),
+            'renewal_recorded_server_id': record.get('renewal_recorded_server_id'),
             'renewal_api_stage': record.get('renewal_api_stage'),
         },
         record.get('renewal_source') or 'reserved',

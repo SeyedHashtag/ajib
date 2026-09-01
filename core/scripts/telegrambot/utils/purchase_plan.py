@@ -107,6 +107,8 @@ TELEGRAM_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'
 CRYPTO_PAYMENT_DISCOUNT_PERCENT = 5
 PAYMENT_JOB_INFLIGHT = set()
 PAYMENT_JOB_LOCK = threading.Lock()
+RENEWAL_CALLBACK_INFLIGHT = set()
+RENEWAL_CALLBACK_LOCK = threading.Lock()
 PURCHASE_DISCLOSURES_FILE = os.getenv(
     "AJIB_PURCHASE_DISCLOSURES_FILE",
     "/etc/ajib/core/scripts/telegrambot/purchase_disclosures.json",
@@ -1239,6 +1241,7 @@ def _process_customer_renewal_payment(payment_id, payment_record, notify_chat_id
     completion_fields = {
         "username": username,
         "server_id": result.get('server_id') or getattr(api_client, 'server_id', None),
+        "renewal_server_id": result.get('server_id') or getattr(api_client, 'server_id', None),
         "renewal_after_state": result.get('after_state'),
         "renewal_before_state": result.get('before_state', payment_record.get('renewal_before_state')),
     }
@@ -2099,6 +2102,38 @@ def _resolve_customer_renewal_offer_for_call(call, token, target_plan_gb=None):
     )
 
 
+def _claim_renewal_callback(user_id, token):
+    key = (str(user_id), str(token))
+    with RENEWAL_CALLBACK_LOCK:
+        if key in RENEWAL_CALLBACK_INFLIGHT:
+            return None
+        RENEWAL_CALLBACK_INFLIGHT.add(key)
+    return key
+
+
+def _release_renewal_callback(key):
+    if key is None:
+        return
+    with RENEWAL_CALLBACK_LOCK:
+        RENEWAL_CALLBACK_INFLIGHT.discard(key)
+
+
+def _renewal_callback_error(call, stage, error):
+    logging.getLogger('ajib.renewal').exception(
+        'renewal_callback_failed stage=%s user_id=%s error_type=%s',
+        stage,
+        getattr(call.from_user, 'id', None),
+        type(error).__name__,
+    )
+    language = get_user_language(call.from_user.id)
+    safe_answer_callback_query(
+        bot,
+        call.id,
+        text=get_message_text(language, "error_occurred").format(error="Please try again."),
+        show_alert=True,
+    )
+
+
 def _show_customer_renewal_plan_picker(call, token, offer, language):
     from utils.renewal import eligible_renewal_plans
 
@@ -2197,11 +2232,23 @@ def _show_customer_renewal_payment_options(call, token, offer, language):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('renew_plan:'))
 def handle_customer_renewal_start(call):
+    user_id = call.from_user.id
+    language = get_user_language(user_id)
+    token = call.data.split(':', 1)[1]
+    claim_key = _claim_renewal_callback(user_id, token)
+    if claim_key is None:
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            text=get_message_text(language, "renewal_check_in_progress"),
+        )
+        return
     try:
-        bot.answer_callback_query(call.id)
-        user_id = call.from_user.id
-        language = get_user_language(user_id)
-        token = call.data.split(':', 1)[1]
+        safe_answer_callback_query(
+            bot,
+            call.id,
+            text=get_message_text(language, "renewal_checking"),
+        )
         offer = _resolve_customer_renewal_offer_for_call(call, token)
         if not offer.get('eligible'):
             bot.edit_message_text(
@@ -2215,15 +2262,22 @@ def handle_customer_renewal_start(call):
             return
         _show_customer_renewal_plan_picker(call, token, offer, language)
     except Exception as e:
-        language = get_user_language(call.from_user.id)
-        bot.answer_callback_query(call.id, text=get_message_text(language, "error_occurred").format(error=str(e)))
+        _renewal_callback_error(call, 'start', e)
+    finally:
+        _release_renewal_callback(claim_key)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('renew_plan_choice:'))
 def handle_customer_renewal_plan_choice(call):
+    _, token, plan_gb = call.data.split(':', 2)
+    language = get_user_language(call.from_user.id)
+    claim_key = _claim_renewal_callback(call.from_user.id, token)
+    if claim_key is None:
+        safe_answer_callback_query(
+            bot, call.id, text=get_message_text(language, "renewal_check_in_progress")
+        )
+        return
     try:
-        _, token, plan_gb = call.data.split(':', 2)
-        language = get_user_language(call.from_user.id)
         offer = _resolve_customer_renewal_offer_for_call(call, token, plan_gb)
         if not offer.get('eligible'):
             bot.answer_callback_query(
@@ -2237,21 +2291,25 @@ def handle_customer_renewal_plan_choice(call):
         bot.answer_callback_query(call.id)
         _show_customer_renewal_payment_options(call, token, offer, language)
     except Exception as e:
-        language = get_user_language(call.from_user.id)
-        bot.answer_callback_query(
-            call.id,
-            text=get_message_text(language, "error_occurred").format(error=str(e)),
-        )
+        _renewal_callback_error(call, 'plan_choice', e)
+    finally:
+        _release_renewal_callback(claim_key)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('renew_payment_method:'))
 def handle_customer_renewal_payment_method(call):
+    user_id = call.from_user.id
+    language = get_user_language(user_id)
+    parts = call.data.split(':', 3)
+    _, method, token = parts[:3]
+    target_plan_gb = parts[3] if len(parts) == 4 else None
+    claim_key = _claim_renewal_callback(user_id, token)
+    if claim_key is None:
+        safe_answer_callback_query(
+            bot, call.id, text=get_message_text(language, "renewal_check_in_progress")
+        )
+        return
     try:
-        user_id = call.from_user.id
-        language = get_user_language(user_id)
-        parts = call.data.split(':', 3)
-        _, method, token = parts[:3]
-        target_plan_gb = parts[3] if len(parts) == 4 else None
         if method == 'card_to_card' and not _customer_card_pricing_enabled(language):
             bot.answer_callback_query(
                 call.id,
@@ -2276,8 +2334,9 @@ def handle_customer_renewal_payment_method(call):
         else:
             bot.answer_callback_query(call.id, text=get_message_text(language, "invalid_payment_method"))
     except Exception as e:
-        language = get_user_language(call.from_user.id)
-        bot.answer_callback_query(call.id, text=get_message_text(language, "error_occurred").format(error=str(e)))
+        _renewal_callback_error(call, 'payment_method', e)
+    finally:
+        _release_renewal_callback(claim_key)
 
 
 def _handle_customer_renewal_crypto(call, offer):
@@ -3873,7 +3932,7 @@ def _reserved_renewal_review_markup(kind, event):
             types.InlineKeyboardButton('Keep for next expiry', callback_data=f"{prefix}:wait:{identity}"),
             types.InlineKeyboardButton('Apply now', callback_data=f"{prefix}:apply:{identity}"),
         )
-    elif reason == 'server_unavailable':
+    elif reason in {'server_unavailable', 'renewal_ineligible_duplicate'}:
         markup.add(
             types.InlineKeyboardButton('Retry now', callback_data=f"{prefix}:retry:{identity}"),
         )
@@ -3897,6 +3956,9 @@ def _human_renewal_reason(reason, record=None):
         ),
         'renewal_ineligible_missing': (
             'The assigned account could not be found. The reservation was not applied.'
+        ),
+        'renewal_ineligible_duplicate': (
+            'The username exists on multiple VPN servers. The reservation was not applied.'
         ),
         'renewal_reset_failed': (
             'The server did not confirm the renewal. The reservation remains unapplied for a safe retry.'
@@ -4218,7 +4280,14 @@ def handle_reserved_renewal_review(call):
                         'record': get_payment_record(payment_id) or record,
                     }
                 else:
-                    reason = 'server_unavailable' if (lookup_result or {}).get('status') == 'unavailable' else 'renewal_ineligible_missing'
+                    lookup_status = (lookup_result or {}).get('status')
+                    reason = (
+                        'renewal_ineligible_duplicate'
+                        if lookup_status == 'duplicate'
+                        else 'server_unavailable'
+                        if lookup_status == 'unavailable'
+                        else 'renewal_ineligible_missing'
+                    )
                     event = {'payment_id': payment_id, 'status': 'attention', 'reason': reason, 'record': record}
             else:
                 event = process_payment_renewal_reservation(
@@ -4273,7 +4342,14 @@ def handle_reserved_renewal_review(call):
                         },
                     }
                 else:
-                    reason = 'server_unavailable' if (lookup_result or {}).get('status') == 'unavailable' else 'renewal_ineligible_missing'
+                    lookup_status = (lookup_result or {}).get('status')
+                    reason = (
+                        'renewal_ineligible_duplicate'
+                        if lookup_status == 'duplicate'
+                        else 'server_unavailable'
+                        if lookup_status == 'unavailable'
+                        else 'renewal_ineligible_missing'
+                    )
                     event = {
                         'reseller_id': reseller_id,
                         'reservation_id': reservation_id,

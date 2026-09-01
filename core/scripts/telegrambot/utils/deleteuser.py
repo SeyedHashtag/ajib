@@ -38,7 +38,33 @@ def process_delete_user(message):
         return
 
     multi_api = MultiServerAPI()
-    api_client, _ = multi_api.find_user(username)
+    api_client, _user_data, lookup = multi_api.resolve_unique_user(
+        username,
+        allow_exact_on_partial=False,
+        force_refresh=True,
+    )
+
+    if lookup.get('status') == 'duplicate':
+        bot.reply_to(
+            message,
+            f"Error: '{username}' exists on multiple servers. Nothing was deleted; select an exact server in the admin tools.",
+            reply_markup=create_main_markup(is_admin=True),
+        )
+        return
+    if lookup.get('status') == 'unavailable':
+        bot.reply_to(
+            message,
+            f"Error: Could not verify '{username}' across every server. Nothing was deleted.",
+            reply_markup=create_main_markup(is_admin=True),
+        )
+        return
+    if lookup.get('status') == 'missing':
+        bot.reply_to(
+            message,
+            f"User '{username}' does not exist on any configured server.",
+            reply_markup=create_main_markup(is_admin=True),
+        )
+        return
 
     bot.send_chat_action(message.chat.id, 'typing')
     result = api_client.delete_user(username) if api_client else None

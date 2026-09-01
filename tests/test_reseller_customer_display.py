@@ -1150,6 +1150,28 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
         self.assertEqual([item["username"] for item in categorized["hold"]], ["r1988h"])
         self.assertEqual([item["username"] for item in categorized["unknown"]], ["r1988u"])
         self.assertEqual(categorized["active"], [])
+
+    def test_reseller_duplicate_live_username_is_conflicted_not_deleted(self):
+        config = {
+            "_config_index": 0,
+            "username": "r1988a",
+            "server_id": "s1",
+            "days": 30,
+        }
+        categorized = reseller_handlers._categorize_reseller_customers(
+            [config],
+            live_snapshot=(
+                {
+                    ("s1", "r1988a"): {"status": "Offline", "blocked": False},
+                    ("s2", "r1988a"): {"status": "Offline", "blocked": False},
+                },
+                set(),
+            ),
+        )
+
+        self.assertEqual(categorized["deleted"], [])
+        self.assertEqual(len(categorized["unknown"]), 1)
+        self.assertTrue(categorized["unknown"][0]["_identity_conflict"])
         self.assertEqual(categorized["expired"], [])
 
     def test_reseller_categories_expired_unused_and_manual_block_separately(self):

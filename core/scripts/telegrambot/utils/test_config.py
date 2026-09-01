@@ -151,10 +151,43 @@ def _strict_nonnegative_int(value):
     return parsed if parsed >= 0 else None
 
 
-def _exact_test_lookup(multi_api, username, server_id):
-    """Resolve one recorded test account without cross-server fallback."""
+def _exact_test_lookup(multi_api, username, server_id, snapshot_entries=None):
+    """Resolve a recorded test account only when globally unique."""
     if not multi_api or not username or not server_id:
         return None, 'unavailable'
+    classifier = getattr(multi_api, 'classify_unique_user_snapshot', None)
+    if snapshot_entries is not None and callable(classifier):
+        _client, user_data, outcome = classifier(
+            username,
+            snapshot_entries,
+            preferred_server_id=server_id,
+            allow_exact_on_partial=False,
+        )
+        outcome = outcome if isinstance(outcome, dict) else {}
+        status = outcome.get('status') or 'unavailable'
+        if status != 'found' or not outcome.get('uniqueness_verified'):
+            return None, status
+        return user_data, 'found'
+    resolver = getattr(multi_api, 'resolve_unique_user', None)
+    if callable(resolver):
+        try:
+            resolved = resolver(
+                username,
+                preferred_server_id=server_id,
+                allow_exact_on_partial=False,
+                force_refresh=True,
+            )
+        except Exception:
+            return None, 'unavailable'
+        if isinstance(resolved, tuple) and len(resolved) == 3:
+            _client, user_data, outcome = resolved
+            outcome = outcome if isinstance(outcome, dict) else {}
+            status = outcome.get('status') or 'unavailable'
+            if status != 'found' or not outcome.get('uniqueness_verified'):
+                return None, status
+            return user_data, 'found'
+
+    # Rolling-upgrade/test compatibility.
     strict_lookup = getattr(multi_api, 'find_user_on_server', None)
     if callable(strict_lookup):
         try:
@@ -554,6 +587,15 @@ def reset_test_users(mode='expired', now=None, multi_api=None):
         return 0
 
     snapshot = load_test_configs()
+    snapshot_entries = None
+    snapshot_getter = getattr(multi_api, 'get_user_snapshot_entries', None)
+    classifier = getattr(multi_api, 'classify_unique_user_snapshot', None)
+    if callable(snapshot_getter) and callable(classifier):
+        try:
+            loaded_entries = snapshot_getter(include_disabled=True, force_refresh=True)
+            snapshot_entries = loaded_entries if isinstance(loaded_entries, (list, tuple)) else None
+        except Exception:
+            snapshot_entries = None
     verified = {}
     for key, entry in snapshot.items() if isinstance(snapshot, dict) else []:
         if not isinstance(entry, dict) or _creation_claim_is_active(entry, now=now):
@@ -571,7 +613,12 @@ def reset_test_users(mode='expired', now=None, multi_api=None):
             or now >= used_at + datetime.timedelta(days=TEST_STALE_CLEANUP_DAYS)
         ):
             continue
-        user_data, lookup_status = _exact_test_lookup(multi_api, username, server_id)
+        user_data, lookup_status = _exact_test_lookup(
+            multi_api,
+            username,
+            server_id,
+            snapshot_entries=snapshot_entries,
+        )
         if lookup_status != 'found':
             continue
         if mode == 'expired' and not _verified_unused_hold(entry, user_data):

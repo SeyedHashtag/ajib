@@ -877,8 +877,32 @@ def _find_customer_configs(user_id):
     ]
 
 
+def _resolve_hosted_user(username, preferred_server_id=None, *, allow_read=False):
+    """Resolve hosted implicit identity with the shared relocation contract."""
+    multi_api = MultiServerAPI()
+    resolver = getattr(multi_api, "resolve_unique_user", None)
+    if callable(resolver):
+        resolved = resolver(
+            username,
+            preferred_server_id=preferred_server_id,
+            allow_exact_on_partial=allow_read,
+            force_refresh=True,
+        )
+        if isinstance(resolved, tuple) and len(resolved) == 3:
+            return resolved
+    client, live = multi_api.find_user(
+        username,
+        preferred_server_id=preferred_server_id,
+    )
+    return client, live, {
+        "status": "found" if live is not None else "missing",
+        "actual_server_id": getattr(client, "server_id", None) if client else None,
+        "uniqueness_verified": live is not None,
+    }
+
+
 def _hosted_service_cycle(config, *, payments=None):
-    """Resolve the exact successful tenant/reseller issuance cycle."""
+    """Resolve the newest stable-account cycle across recorded server history."""
     if not isinstance(config, dict):
         return None
     username = config.get("username")
@@ -889,19 +913,20 @@ def _hosted_service_cycle(config, *, payments=None):
         if not isinstance(record, dict):
             continue
         record_username = record.get("renew_username") or record.get("username")
-        record_server = record.get("renewal_server_id") or record.get("server_id")
         if str(record_username or "").strip().lower() != str(username or "").strip().lower():
-            continue
-        if str(record_server or "primary").strip().lower() != str(server_id or "primary").strip().lower():
             continue
         matching_records.append(record)
     records = matching_records if matching_records else config
-    return resolve_service_cycle(
-        records,
-        username=username,
-        server_id=server_id,
-        source="hosted_customer",
-    )
+    try:
+        from utils.renewal import resolve_record_history_cycle
+    except ImportError:  # Rolling-upgrade/test compatibility.
+        return resolve_service_cycle(
+            records,
+            username=username,
+            server_id=server_id,
+            source="hosted_customer",
+        )
+    return resolve_record_history_cycle(records, username, "hosted_customer")
 
 
 def _resolve_hosted_renewal_checkout(user_id, plan_id, renewal):
@@ -942,6 +967,7 @@ def _resolve_hosted_renewal_checkout(user_id, plan_id, renewal):
     return {
         "username": offer.get("username"),
         "server_id": offer.get("server_id"),
+        "recorded_server_id": offer.get("recorded_server_id") or config.get("server_id"),
         "config_index": config_index,
         "renewal_mode": offer.get("renewal_mode", "immediate"),
         "renewal_business_expired": bool(offer.get("business_expired")),
@@ -1427,6 +1453,7 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
     customer_id = int(record["user_id"])
     username = record.get("renew_username")
     server_id = record.get("server_id")
+    recorded_server_id = record.get("renewal_recorded_server_id") or server_id
     if not username:
         return False, "Renewal target is missing"
     common = {
@@ -1434,6 +1461,8 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
         "customer_telegram_id": customer_id,
         "customer_telegram_username": record.get("telegram_username"),
         "server_id": server_id,
+        "renewal_server_id": server_id,
+        "renewal_recorded_server_id": recorded_server_id,
         "reseller_id": str(OWNER_ID),
         "origin_bot_id": os.getenv("AJIB_HOSTED_BOT_ID"),
         "retail_order_id": payment_id,
@@ -1476,7 +1505,7 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
                 username,
                 record["wholesale_price"],
                 common,
-                server_id=server_id,
+                server_id=recorded_server_id,
             )
         except Exception as error:
             reserved, detail = False, {"reason": str(error)}
@@ -1486,7 +1515,7 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
             username,
             record["wholesale_price"],
             common,
-            server_id=server_id,
+            server_id=recorded_server_id,
             funded=effective_funded,
             enforce_credit=False,
         )
@@ -1508,6 +1537,8 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
         fields={
             "username": username,
             "server_id": server_id,
+            "renewal_server_id": server_id,
+            "renewal_recorded_server_id": recorded_server_id,
             "reservation_id": payment_id,
         },
     ):
@@ -1560,8 +1591,14 @@ def _provision_payment(payment_id, record, funded):
             break
     if existing_config:
         username = existing_config.get("username")
-        client, _ = MultiServerAPI().find_user(username, preferred_server_id=existing_config.get("server_id"))
-        metadata = {"username": username, "server_id": existing_config.get("server_id"),
+        client, live, lookup = _resolve_hosted_user(
+            username,
+            existing_config.get("server_id"),
+        )
+        if lookup.get("status") != "found" or not lookup.get("uniqueness_verified") or not live:
+            return False, f"VPN identity check failed ({lookup.get('status') or 'unknown'})"
+        actual_server_id = lookup.get("actual_server_id") or getattr(client, "server_id", None)
+        metadata = {"username": username, "server_id": actual_server_id,
                     "retail_order_id": payment_id, "customer_telegram_id": customer_id}
         if prepaid:
             consumed = consume_wholesale_balance(
@@ -1582,7 +1619,7 @@ def _provision_payment(payment_id, record, funded):
             margin=settlement["margin"],
         )
         _save_payment(payment_id, {"status": "completed", "username": username,
-                                   "server_id": existing_config.get("server_id")})
+                                   "server_id": actual_server_id})
         _record_completed_growth(payment_id, record, renewed=renewed)
         if funded:
             _record_hosted_prepaid_good(payment_id)
@@ -1613,9 +1650,13 @@ def _provision_payment(payment_id, record, funded):
     else:
         provisioned_username = record.get("provisioned_username")
         if provisioned_username:
-            client, live = MultiServerAPI().find_user(provisioned_username,
-                                                       preferred_server_id=record.get("provisioned_server_id"))
-            username = provisioned_username if client and live else None
+            client, live, lookup = _resolve_hosted_user(
+                provisioned_username,
+                record.get("provisioned_server_id"),
+            )
+            if lookup.get("status") in {"duplicate", "unavailable"}:
+                return False, f"VPN identity check failed ({lookup.get('status')})"
+            username = provisioned_username if lookup.get("status") == "found" and client and live else None
         if not username:
             plan = {"gb": record["plan_gb"], "days": record["days"], "unlimited": record.get("unlimited", False)}
 
@@ -1642,6 +1683,7 @@ def _provision_payment(payment_id, record, funded):
             _save_payment(payment_id, {"provisioned_username": username,
                                        "provisioned_server_id": getattr(client, "server_id", None)})
     server_id = getattr(client, "server_id", None)
+    recorded_server_id = record.get("renewal_recorded_server_id") or record.get("server_id") or server_id
     common = {
         "username": username, "customer_telegram_id": customer_id,
         "customer_telegram_username": record.get("telegram_username"),
@@ -1655,6 +1697,8 @@ def _provision_payment(payment_id, record, funded):
         "unlimited": record.get("unlimited", False),
     }
     if renewed:
+        common["renewal_server_id"] = server_id
+        common["renewal_recorded_server_id"] = recorded_server_id
         common["renewal_source_plan_snapshot"] = (
             record.get("renewal_source_plan_snapshot") or {}
         )
@@ -1671,7 +1715,7 @@ def _provision_payment(payment_id, record, funded):
         try:
             accounted = (
                 finalize_prepaid_renewal(
-                    OWNER_ID, payment_id, username, record["wholesale_price"], common, server_id
+                    OWNER_ID, payment_id, username, record["wholesale_price"], common, recorded_server_id
                 )
                 if renewed else finalize_prepaid_config(
                     OWNER_ID, payment_id, record["wholesale_price"], common
@@ -1680,10 +1724,10 @@ def _provision_payment(payment_id, record, funded):
         except Exception:
             accounted = False
     elif funded:
-        accounted = (record_funded_reseller_renewal(OWNER_ID, username, record["wholesale_price"], common, server_id)
+        accounted = (record_funded_reseller_renewal(OWNER_ID, username, record["wholesale_price"], common, recorded_server_id)
                      if renewed else record_funded_reseller_config(OWNER_ID, record["wholesale_price"], common))
     else:
-        accounted = (consume_renewal_credit(OWNER_ID, payment_id, username, common, server_id)
+        accounted = (consume_renewal_credit(OWNER_ID, payment_id, username, common, recorded_server_id)
                      if renewed else consume_credit(OWNER_ID, payment_id, common))
     if not accounted:
         if not renewed and client:
@@ -1916,15 +1960,37 @@ def _test_record(user_id):
 
 
 def _customer_onboarding_state(user_id):
+    multi_api = MultiServerAPI()
+    snapshot_getter = getattr(multi_api, "get_user_snapshot_entries", None)
+    classifier = getattr(multi_api, "classify_unique_user_snapshot", None)
+    snapshot_entries = (
+        snapshot_getter(include_disabled=True, force_refresh=True)
+        if callable(snapshot_getter) and callable(classifier)
+        else None
+    )
+    entries = snapshot_entries if isinstance(snapshot_entries, (list, tuple)) else None
+
+    def resolve_for_read(username, server_id):
+        if entries is not None:
+            resolved = classifier(
+                username,
+                entries,
+                preferred_server_id=server_id,
+                allow_exact_on_partial=True,
+            )
+            if isinstance(resolved, tuple) and len(resolved) == 3:
+                return resolved
+        return _resolve_hosted_user(username, server_id, allow_read=True)
+
     configs = _find_customer_configs(user_id)
     if configs:
         states = set()
         for config in configs:
-            client, live = MultiServerAPI().find_user(
+            client, live, lookup = resolve_for_read(
                 config.get("username"),
-                preferred_server_id=config.get("server_id"),
+                config.get("server_id"),
             )
-            if not client or not live:
+            if lookup.get("status") != "found" or not client or not live:
                 states.add("unknown")
                 continue
             cycle = _hosted_service_cycle(config)
@@ -1950,11 +2016,11 @@ def _customer_onboarding_state(user_id):
         return "unknown", configs
     test = _test_record(user_id)
     if test.get("used_at"):
-        client, live = MultiServerAPI().find_user(
+        client, live, lookup = resolve_for_read(
             test.get("username"),
-            preferred_server_id=test.get("server_id"),
+            test.get("server_id"),
         )
-        if not client or not live:
+        if lookup.get("status") != "found" or not client or not live:
             return "unknown", test
         account = inspect_account(live, source="hosted_test_onboarding")
         if account.panel_state == PanelState.HOLD:
@@ -1993,11 +2059,12 @@ def _send_onboarding(chat_id, user_id, reply_to=None):
                 deadline=format_utc_display(cycle.deadline),
             )
     if state == "trial_active" and isinstance(detail, dict) and detail.get("username"):
-        _client, live = MultiServerAPI().find_user(
+        _client, live, lookup = _resolve_hosted_user(
             detail.get("username"),
-            preferred_server_id=detail.get("server_id"),
+            detail.get("server_id"),
+            allow_read=True,
         )
-        if live:
+        if lookup.get("status") == "found" and live:
             account = inspect_account(live, source="hosted_test_onboarding")
             maximum = float(live.get("max_download_bytes", 0) or 0)
             used = float(live.get("upload_bytes", 0) or 0) + float(live.get("download_bytes", 0) or 0)
@@ -2234,6 +2301,7 @@ def payment_method(call):
         "payment_method": method,
         "checkout_source": f"{call.message.chat.id}:{call.message.message_id}:{method}:{plan_id}",
         "renew_username": renewal and renewal["username"], "server_id": renewal and renewal.get("server_id"),
+        "renewal_recorded_server_id": renewal and renewal.get("recorded_server_id"),
         "renewal_source": renewal and "hosted_customer",
         "renewal_mode": renewal and renewal.get("renewal_mode", "immediate"),
         "renewal_business_expired": renewal and bool(renewal.get("renewal_business_expired")),
@@ -2613,16 +2681,41 @@ def _show_customer_configs(chat_id, user_id, reply_to=None):
             bot.send_message(chat_id, _hosted_message(user_id, "no_configs"))
         return
     markup = types.InlineKeyboardMarkup(row_width=1)
+    duplicate_found = False
+    multi_api = MultiServerAPI()
+    snapshot_getter = getattr(multi_api, "get_user_snapshot_entries", None)
+    classifier = getattr(multi_api, "classify_unique_user_snapshot", None)
+    snapshot_entries = (
+        snapshot_getter(include_disabled=True, force_refresh=True)
+        if callable(snapshot_getter) and callable(classifier)
+        else None
+    )
+    entries = snapshot_entries if isinstance(snapshot_entries, (list, tuple)) else None
     for index, config in enumerate(configs):
+        if entries is not None:
+            resolved = classifier(
+                config.get("username"),
+                entries,
+                preferred_server_id=config.get("server_id"),
+                allow_exact_on_partial=True,
+            )
+            if isinstance(resolved, tuple) and len(resolved) == 3:
+                _client, _live, lookup = resolved
+                if lookup.get("status") == "duplicate":
+                    duplicate_found = True
+                    continue
         fallback = _hosted_message(user_id, "config_fallback", number=index + 1)
         markup.add(types.InlineKeyboardButton(
             config.get("username", fallback),
             callback_data=f"hb:cfg:{index}",
         ))
+    title = _hosted_message(user_id, "configs_title")
+    if duplicate_found:
+        title += "\n\n" + _message(user_id, "config_identity_conflict")
     if reply_to is not None:
-        bot.reply_to(reply_to, _hosted_message(user_id, "configs_title"), reply_markup=markup)
+        bot.reply_to(reply_to, title, reply_markup=markup)
     else:
-        bot.send_message(chat_id, _hosted_message(user_id, "configs_title"), reply_markup=markup)
+        bot.send_message(chat_id, title, reply_markup=markup)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "hb:configs")
@@ -2643,14 +2736,21 @@ def config_detail(call):
             show_alert=True,
         )
         return
-    from utils.renewal import find_reseller_renewal_offer, find_reseller_reservation, lookup_renewal_user
+    from utils.renewal import find_reseller_renewal_offer, find_reseller_reservation
 
-    client, live, lookup_result = lookup_renewal_user(
-        MultiServerAPI(),
+    client, live, lookup_result = _resolve_hosted_user(
         config.get("username"),
-        server_id=config.get("server_id"),
+        config.get("server_id"),
+        allow_read=True,
     )
-    if not client or not live:
+    if lookup_result.get("status") == "duplicate":
+        bot.answer_callback_query(
+            call.id,
+            _message(call.from_user.id, "config_identity_conflict"),
+            show_alert=True,
+        )
+        return
+    if lookup_result.get("status") != "found" or not client or not live:
         bot.answer_callback_query(
             call.id,
             _hosted_message(call.from_user.id, "config_unavailable"),
@@ -2877,13 +2977,15 @@ def free_test(message, customer=None):
         }
     plan = {"gb": 1, "days": 30, "unlimited": False}
     username = pending_username
-    client, live = (
-        MultiServerAPI().find_user(username, preferred_server_id=pending_server_id)
-        if username
-        else (None, None)
-    )
+    if username:
+        client, live, lookup = _resolve_hosted_user(username, pending_server_id)
+    else:
+        client, live, lookup = None, None, {"status": "missing", "uniqueness_verified": True}
     result = live if recovering_pending_test else None
-    if not client or not live:
+    may_create = not username or (
+        lookup.get("status") == "missing" and lookup.get("uniqueness_verified")
+    )
+    if (not client or not live) and may_create:
         def persist_test_allocation(allocated_username, allocated_client):
             with locked_json(GLOBAL_TEST_FILE, {}) as tests:
                 current = tests.get(str(customer.id))
@@ -2900,6 +3002,14 @@ def free_test(message, customer=None):
             on_username_allocated=persist_test_allocation,
             preferred_username=pending_username,
         )
+    elif lookup.get("status") in {"duplicate", "unavailable"}:
+        logging.getLogger("ajib.api.identity").warning(
+            "hosted_test_recovery_rejected username=%s status=%s requested_server_id=%s",
+            username,
+            lookup.get("status"),
+            pending_server_id,
+        )
+        result = None
     if result is None:
         with locked_json(GLOBAL_TEST_FILE, {}) as tests:
             current = tests.get(str(customer.id))
@@ -4367,7 +4477,7 @@ def _hosted_renewal_review_markup(payment_id, reason):
             types.InlineKeyboardButton("Keep for next expiry", callback_data=f"hb:rr:wait:{payment_id}"),
             types.InlineKeyboardButton("Apply now", callback_data=f"hb:rr:apply:{payment_id}"),
         )
-    elif reason == "server_unavailable":
+    elif reason in {"server_unavailable", "renewal_ineligible_duplicate"}:
         markup.add(
             types.InlineKeyboardButton("Retry now", callback_data=f"hb:rr:retry:{payment_id}"),
         )
@@ -4389,6 +4499,7 @@ def _hosted_human_renewal_reason(reason, record=None):
         'external_renewal': 'The account appears to have entered a different service cycle. Choose whether to keep or apply the reservation.',
         'server_unavailable': 'The assigned server could not be read. Nothing was applied and the reservation remains safe.',
         'renewal_ineligible_missing': 'The assigned account could not be found. Nothing was applied.',
+        'renewal_ineligible_duplicate': 'The username exists on multiple VPN servers. Nothing was applied.',
         'renewal_reset_failed': 'The server did not confirm the renewal. Nothing was applied and the reservation remains safe.',
         'deadline_normalized': 'The difference was only legacy Tehran-midnight to UTC-midnight normalization; the account was not changed.',
     }.get(reason, f"This reservation needs review ({str(reason or 'unknown').replace('_', ' ')}). Nothing was applied.")
@@ -4610,7 +4721,14 @@ def hosted_renewal_review(call):
                     'record': _tenant_payments().get(payment_id, record),
                 }
             else:
-                reason = 'server_unavailable' if (lookup_result or {}).get('status') == 'unavailable' else 'renewal_ineligible_missing'
+                lookup_status = (lookup_result or {}).get('status')
+                reason = (
+                    'renewal_ineligible_duplicate'
+                    if lookup_status == 'duplicate'
+                    else 'server_unavailable'
+                    if lookup_status == 'unavailable'
+                    else 'renewal_ineligible_missing'
+                )
                 event = {
                     'payment_id': payment_id,
                     'status': 'attention',

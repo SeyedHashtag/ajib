@@ -300,9 +300,6 @@ def _matching_customer_payment(payments, user_id, username, server_id=None):
         record_username = str(record.get('renewal_username') or record.get('username') or '')
         if record_username.casefold() != str(username).casefold():
             continue
-        record_server_id = record.get('renewal_server_id') or record.get('server_id')
-        if server_id and record_server_id and str(record_server_id) != str(server_id):
-            continue
         total_days = _safe_int(record.get('days'))
         if total_days is None or total_days <= 0:
             continue
@@ -323,6 +320,7 @@ def _customer_renewal_offer(
     user_data,
     plans,
     payments,
+    lookup_result=None,
 ):
     try:
         from utils.renewal import find_customer_renewal_offer
@@ -334,8 +332,8 @@ def _customer_renewal_offer(
             user_data,
             plans,
             payments=payments,
-            server_id=getattr(api_client, 'server_id', None),
             allow_reservation=True,
+            lookup_result=lookup_result,
         )
     except (ImportError, OSError, TypeError, ValueError):
         return {'eligible': False}
@@ -348,6 +346,7 @@ def _reseller_renewal_offer(
     user_data,
     plans,
     reseller_data,
+    lookup_result=None,
 ):
     try:
         from utils.renewal import find_reseller_renewal_offer
@@ -371,6 +370,7 @@ def _reseller_renewal_offer(
             plans,
             reseller_data=reseller_data,
             allow_reservation=True,
+            lookup_result=lookup_result,
         )
     except (ImportError, OSError, TypeError, ValueError):
         return {'eligible': False}
@@ -507,7 +507,66 @@ def monitor_user_traffic():
     alert_updates = {}
     updated_at = format_utc_timestamp()
 
-    for api_client, username, user_data in multi_api.iter_all_users(include_disabled=False):
+    snapshot_getter = getattr(multi_api, 'get_user_snapshot_entries', None)
+    if callable(snapshot_getter):
+        entries = snapshot_getter(include_disabled=True, force_refresh=True)
+        candidates = {}
+        for entry in entries:
+            users = entry.get('users') if isinstance(entry, dict) else None
+            if isinstance(users, dict):
+                iterable = users.items()
+            elif isinstance(users, list):
+                iterable = (
+                    (item.get('username'), item)
+                    for item in users
+                    if isinstance(item, dict)
+                )
+            else:
+                iterable = ()
+            for candidate_username, _candidate_data in iterable:
+                if candidate_username:
+                    candidates.setdefault(str(candidate_username).casefold(), str(candidate_username))
+        live_users = []
+        classifier = getattr(multi_api, 'classify_unique_user_snapshot', None)
+        for candidate_username in candidates.values():
+            if not callable(classifier):
+                continue
+            candidate_client, candidate_data, lookup_result = classifier(
+                candidate_username,
+                entries,
+                allow_exact_on_partial=False,
+            )
+            if (
+                lookup_result.get('status') == 'found'
+                and lookup_result.get('uniqueness_verified')
+                and candidate_client
+                and candidate_data
+            ):
+                live_users.append((candidate_client, candidate_username, candidate_data, lookup_result))
+            elif lookup_result.get('status') in {'duplicate', 'unavailable'}:
+                logger.info(
+                    'traffic_identity_rejected username=%s status=%s duplicate_server_ids=%s unavailable_server_ids=%s',
+                    candidate_username,
+                    lookup_result.get('status'),
+                    ','.join(lookup_result.get('duplicate_server_ids') or []),
+                    ','.join(lookup_result.get('unavailable_server_ids') or []),
+                )
+    else:  # Rolling-upgrade/test compatibility.
+        live_users = [
+            (
+                api_client,
+                username,
+                user_data,
+                {
+                    'status': 'found',
+                    'actual_server_id': getattr(api_client, 'server_id', None),
+                    'uniqueness_verified': True,
+                },
+            )
+            for api_client, username, user_data in multi_api.iter_all_users(include_disabled=False)
+        ]
+
+    for api_client, username, user_data, lookup_result in live_users:
         stats['scanned'] += 1
         if not username or not user_data:
             continue
@@ -531,14 +590,17 @@ def monitor_user_traffic():
                 payments,
                 telegram_id,
                 username,
-                server_id=getattr(api_client, 'server_id', None),
             )
-            cycle = resolve_service_cycle(
-                payments,
-                username=username,
-                server_id=getattr(api_client, 'server_id', None),
-                source='customer',
-            )
+            try:
+                from utils.renewal import resolve_record_history_cycle
+                cycle = resolve_record_history_cycle(payments, username, 'customer')
+            except ImportError:
+                cycle = resolve_service_cycle(
+                    payments,
+                    username=username,
+                    server_id=getattr(api_client, 'server_id', None),
+                    source='customer',
+                )
             account = inspect_account(user_data, cycle=cycle, source='traffic_monitor')
             if account.entitlement_state != EntitlementState.CURRENT:
                 continue
@@ -610,6 +672,7 @@ def monitor_user_traffic():
                             user_data,
                             plans,
                             payments,
+                            lookup_result=lookup_result,
                         )
                         markup = _renewal_markup(language, offer, 'renew_plan:')
                         try:
@@ -700,12 +763,20 @@ def monitor_user_traffic():
         upload_bytes = user_data.get('upload_bytes', 0) or 0
         download_bytes = user_data.get('download_bytes', 0) or 0
         total_usage_bytes = upload_bytes + download_bytes
-        cycle = resolve_service_cycle(
-            reseller_config,
-            username=username,
-            server_id=getattr(api_client, 'server_id', None),
-            source='reseller_customer',
-        )
+        try:
+            from utils.renewal import resolve_record_history_cycle
+            cycle = resolve_record_history_cycle(
+                reseller_config,
+                username,
+                'reseller_customer',
+            )
+        except ImportError:
+            cycle = resolve_service_cycle(
+                reseller_config,
+                username=username,
+                server_id=getattr(api_client, 'server_id', None),
+                source='reseller_customer',
+            )
         account = inspect_account(user_data, cycle=cycle, source='traffic_monitor')
         if account.entitlement_state != EntitlementState.CURRENT:
             continue
@@ -781,6 +852,7 @@ def monitor_user_traffic():
                         user_data,
                         plans,
                         reseller_data,
+                        lookup_result=lookup_result,
                     )
                     markup = _renewal_markup(language, offer, 'reseller:renew:')
                     try:

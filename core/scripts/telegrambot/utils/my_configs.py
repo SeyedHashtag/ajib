@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from telebot import types
 from utils.command import bot
 from utils.api_client import MultiServerAPI
-from utils.account_state import EntitlementState, PanelState, inspect_account, resolve_service_cycle
+from utils.account_state import EntitlementState, PanelState, inspect_account
 from utils.edit_plans import load_plans
 from utils.translations import BUTTON_TRANSLATIONS, get_message_text, get_button_text
 from utils.language import get_user_language
@@ -69,6 +69,7 @@ def _log_renewal_unavailable(source, username, api_client, offer):
 def _customer_cycle(user_id, username, server_id):
     try:
         from utils.payment_records import load_payments
+        from utils.renewal import resolve_record_history_cycle
 
         payments = load_payments()
     except Exception:
@@ -78,10 +79,9 @@ def _customer_cycle(user_id, username, server_id):
         for record_id, record in (payments or {}).items()
         if isinstance(record, dict) and str(record.get('user_id')) == str(user_id)
     }
-    return resolve_service_cycle(
+    return resolve_record_history_cycle(
         owned,
         username=username,
-        server_id=server_id,
         source='customer',
     )
 
@@ -184,7 +184,21 @@ def _find_cached_user(multi_api, username, preferred_server_id=None):
     return None, None
 
 
-def _reply_config_selection(message, user_configs, language):
+def _identity_conflict_text(language):
+    text = get_message_text(language, "config_identity_conflict")
+    if text == "config_identity_conflict":
+        return "⚠️ A username exists on more than one VPN server. Its config and renewal controls are hidden; please contact support."
+    return text
+
+
+def _identity_unavailable_text(language):
+    text = get_message_text(language, "config_identity_unavailable")
+    if text == "config_identity_unavailable":
+        return "⚠️ We could not verify this username across all VPN servers. Please try again later."
+    return text
+
+
+def _reply_config_selection(message, user_configs, language, duplicate_usernames=None):
     markup = types.InlineKeyboardMarkup()
 
     for username, user_data, api_client in user_configs:
@@ -192,9 +206,12 @@ def _reply_config_selection(message, user_configs, language):
         button_text = f"{username} - {max_traffic_gb:.2f} GB"
         markup.add(types.InlineKeyboardButton(button_text, callback_data=f"show_config:{api_client.server_id}:{username}"))
 
+    selection_text = "📱 Select a configuration to view:"
+    if duplicate_usernames:
+        selection_text += f"\n\n{_identity_conflict_text(language)}"
     bot.reply_to(
         message,
-        _append_my_configs_cache_notice("📱 Select a configuration to view:", language),
+        _append_my_configs_cache_notice(selection_text, language),
         reply_markup=markup
     )
 
@@ -236,14 +253,43 @@ def _my_configs_job(message, user_id):
 
         paid_configs = []
         test_configs = []
-        entries = _get_my_configs_snapshot_entries(multi_api, include_disabled=False)
-        for api_client, username, config_data in _iter_users_from_snapshot_entries(entries):
+        all_entries = _get_my_configs_snapshot_entries(multi_api, include_disabled=True)
+        all_matches = {}
+        for api_client, username, config_data in _iter_users_from_snapshot_entries(all_entries):
+            if username and _username_belongs_to_user(username, user_id):
+                all_matches.setdefault(str(username).casefold(), []).append(
+                    (username, config_data, api_client)
+                )
+        for api_client, username, config_data in _iter_users_from_snapshot_entries(all_entries):
             if username and any(pattern.match(username) for pattern in paid_patterns):
                 paid_configs.append((username, config_data, api_client))
             elif username and any(pattern.match(username) for pattern in test_patterns):
                 test_configs.append((username, config_data, api_client))
 
-        user_configs = paid_configs or test_configs
+        all_candidate_configs = paid_configs + test_configs
+        duplicate_usernames = {
+            str(username).casefold()
+            for username, _data, _client in all_candidate_configs
+            if len(all_matches.get(str(username).casefold(), [])) > 1
+        }
+        for duplicate_username in sorted(duplicate_usernames):
+            logging.getLogger("ajib.api.identity").warning(
+                "config_list_identity_duplicate user_id=%s username=%s",
+                user_id,
+                duplicate_username,
+            )
+        def unique_configs(configs):
+            seen_usernames = set()
+            result = []
+            for config in configs:
+                normalized = str(config[0]).casefold()
+                if normalized in duplicate_usernames or normalized in seen_usernames:
+                    continue
+                seen_usernames.add(normalized)
+                result.append(config)
+            return result
+
+        user_configs = unique_configs(paid_configs) or unique_configs(test_configs)
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
         cache_hit = getattr(multi_api, "last_user_snapshot_cache_hit", None)
         cache_state = "hit" if cache_hit is True else "miss" if cache_hit is False else "unknown"
@@ -252,14 +298,26 @@ def _my_configs_job(message, user_id):
             f"servers={len(multi_api.servers)} cache={cache_state} elapsed_ms={elapsed_ms}"
         )
 
-        if not user_configs:
+        if not user_configs and not duplicate_usernames:
             bot.reply_to(
                 message,
                 _append_my_configs_cache_notice(get_message_text(language, "no_active_configs"), language)
             )
             return
 
-        _reply_config_selection(message, user_configs, language)
+        if not user_configs:
+            bot.reply_to(
+                message,
+                _append_my_configs_cache_notice(_identity_conflict_text(language), language),
+            )
+            return
+
+        _reply_config_selection(
+            message,
+            user_configs,
+            language,
+            duplicate_usernames=duplicate_usernames,
+        )
     except Exception as e:
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
         print(f"[MyConfigs] user_id={user_id} error={type(e).__name__} elapsed_ms={elapsed_ms}")
@@ -312,9 +370,45 @@ def _show_config_job(call, key):
             return
 
         multi_api = MultiServerAPI()
-        api_client, user_data = _find_cached_user(multi_api, username, preferred_server_id=server_id)
-        if user_data is None:
-            api_client, user_data = multi_api.find_user(username, preferred_server_id=server_id)
+        resolver = getattr(multi_api, 'resolve_unique_user', None)
+        if callable(resolver):
+            resolved = resolver(
+                username,
+                preferred_server_id=server_id,
+                allow_exact_on_partial=True,
+                force_refresh=True,
+            )
+        else:
+            resolved = None
+        if isinstance(resolved, tuple) and len(resolved) == 3:
+            api_client, user_data, lookup_result = resolved
+        else:
+            api_client, user_data = _find_cached_user(multi_api, username, preferred_server_id=server_id)
+            if user_data is None:
+                api_client, user_data = multi_api.find_user(username, preferred_server_id=server_id)
+            lookup_result = {
+                'status': 'found' if user_data is not None else 'missing',
+                'actual_server_id': getattr(api_client, 'server_id', None) if api_client else None,
+                'uniqueness_verified': user_data is not None,
+            }
+
+        language = get_user_language(call.from_user.id)
+        if lookup_result.get('status') == 'duplicate':
+            safe_edit_message_text(
+                bot,
+                _identity_conflict_text(language),
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+            )
+            return
+        if lookup_result.get('status') != 'found' or user_data is None:
+            safe_edit_message_text(
+                bot,
+                _identity_unavailable_text(language),
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+            )
+            return
         
         if user_data:
             # Show the config
@@ -328,13 +422,7 @@ def _show_config_job(call, key):
                 user_id=call.from_user.id,
                 show_cache_notice=True,
                 observation_stale=bool(getattr(multi_api, 'last_user_snapshot_cache_stale', False)),
-            )
-        else:
-            safe_edit_message_text(
-                bot,
-                f"⚠️ Error: User '{username}' not found or API error.",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
+                lookup_result=lookup_result,
             )
     except Exception as e:
         print(f"Error in handle_show_config: {str(e)}")
@@ -358,6 +446,7 @@ def display_config(
     user_id=None,
     show_cache_notice=False,
     observation_stale=False,
+    lookup_result=None,
 ):
     """Display user configuration details and QR code"""
     
@@ -508,6 +597,7 @@ def display_config(
                     api_client,
                     user_data,
                     load_plans(),
+                    lookup_result=lookup_result,
                 )
                 if offer.get('eligible'):
                     message = (
@@ -566,6 +656,7 @@ def display_config(
                 user_data,
                 load_plans(),
                 allow_reservation=True,
+                lookup_result=lookup_result,
             )
             if active_offer.get('eligible') and active_offer.get('renewal_mode') == 'reserved':
                 renewal_markup = types.InlineKeyboardMarkup()

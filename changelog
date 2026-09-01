@@ -1,3 +1,10 @@
+## v2.7.9
+✨ Resolve customer and reseller accounts across all VPN servers, including disabled servers, and safely follow uniquely verified manual relocations
+🛡️ Reject duplicate usernames and incomplete cross-server scans before renewal, deletion, cleanup, traffic, or debt actions can target the wrong account
+🛠️ Preserve historical server attribution while applying renewals and service actions to the verified live server and reconciling cleanup state across account moves
+🐛 Serialize repeated renewal callbacks, surface identity conflicts clearly, and keep configuration and reseller views safe during server outages
+✅ Expand regression coverage for relocation, duplicate identity, partial outage, cleanup, reseller debt, configuration display, and callback handling
+
 ## v2.7.8
 🛡️ Share Telegram recipient reachability across broadcasts, traffic alerts, and recovered-test cleanup, with inbound activity restoring delivery eligibility
 🐛 Suppress repeated permanent-recipient sends without marking notices delivered, while preserving recovered-test retry, grace-period, renewal, and deletion safeguards

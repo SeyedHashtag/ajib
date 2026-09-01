@@ -11,6 +11,7 @@ whether the target was missing or its assigned server was unavailable.
 """
 
 import json
+import logging
 import math
 import os
 import re
@@ -43,6 +44,7 @@ MILLISECONDS_PER_DAY = 86_400_000
 THREE_X_UI_PANEL = "3x-ui"
 BLITZ_PANEL = "blitz"
 _thread_local = threading.local()
+LOGGER = logging.getLogger("ajib.api.identity")
 
 
 def _destination_transfer_password(
@@ -2466,19 +2468,169 @@ class MultiServerAPI:
             return list(cached.get("entries", []))
 
     def find_user(self, username: str, preferred_server_id: str | None = None):
-        if preferred_server_id:
-            client = self.get_client(preferred_server_id)
-            if client:
-                user = client.get_user(username)
-                if user is not None:
-                    return client, user
-        for _, client in self.iter_clients(include_disabled=True):
-            if preferred_server_id and client.server_id == preferred_server_id:
+        """Compatibility wrapper for fail-closed, globally unique lookup."""
+        client, user, result = self.resolve_unique_user(
+            username,
+            preferred_server_id=preferred_server_id,
+            allow_exact_on_partial=False,
+            force_refresh=True,
+        )
+        if result.get("status") != "found":
+            return None, None
+        return client, user
+
+    @staticmethod
+    def _matching_users_in_snapshot(users, username: str) -> list[tuple[str, dict]]:
+        target = str(username or "").strip().casefold()
+        if not target:
+            return []
+        if isinstance(users, dict):
+            return [
+                (str(name), value)
+                for name, value in users.items()
+                if str(name).casefold() == target and isinstance(value, dict)
+            ]
+        if isinstance(users, list):
+            return [
+                (str(value.get("username") or username), value)
+                for value in users
+                if isinstance(value, dict)
+                and str(value.get("username") or "").casefold() == target
+            ]
+        return []
+
+    @classmethod
+    def classify_unique_user_snapshot(
+        cls,
+        username: str,
+        entries: list[dict],
+        preferred_server_id: str | None = None,
+        *,
+        allow_exact_on_partial: bool = False,
+    ):
+        """Classify one username from a shared all-server snapshot.
+
+        The returned tuple is ``(client, user, result)``.  ``result.status`` is
+        one of ``found``, ``missing``, ``duplicate``, or ``unavailable``.
+        """
+        requested = str(preferred_server_id or "").strip() or None
+        found_by_server = {}
+        unavailable_server_ids = set()
+        for entry in entries or []:
+            server = entry.get("server") or {}
+            client = entry.get("client")
+            server_id = str(server.get("id") or getattr(client, "server_id", "") or "").strip()
+            if not server_id:
                 continue
-            user = client.get_user(username)
-            if user is not None:
-                return client, user
-        return None, None
+            users = entry.get("users")
+            if users is None:
+                unavailable_server_ids.add(server_id)
+                continue
+            matches = cls._matching_users_in_snapshot(users, username)
+            if matches:
+                actual_username, user = matches[0]
+                found_by_server.setdefault(server_id, (client, user, actual_username))
+
+        duplicate_server_ids = sorted(found_by_server, key=str.casefold)
+        unavailable = sorted(unavailable_server_ids, key=str.casefold)
+        base = {
+            "requested_server_id": requested,
+            "actual_server_id": None,
+            "relocated": False,
+            "uniqueness_verified": False,
+            "duplicate_server_ids": [],
+            "unavailable_server_ids": unavailable,
+            "http_status": None,
+        }
+        if len(found_by_server) > 1:
+            return None, None, {
+                **base,
+                "status": "duplicate",
+                "error": "duplicate_username",
+                "duplicate_server_ids": duplicate_server_ids,
+            }
+
+        if len(found_by_server) == 1:
+            actual_server_id, (client, user, actual_username) = next(iter(found_by_server.items()))
+            relocated = bool(requested and requested.casefold() != actual_server_id.casefold())
+            exact_partial = bool(
+                unavailable
+                and allow_exact_on_partial
+                and requested
+                and requested.casefold() == actual_server_id.casefold()
+            )
+            if unavailable and not exact_partial:
+                return None, None, {
+                    **base,
+                    "status": "unavailable",
+                    "error": "uniqueness_unconfirmed",
+                    "actual_server_id": actual_server_id,
+                    "relocated": relocated,
+                }
+            return client, user, {
+                **base,
+                "status": "found",
+                "error": None,
+                "actual_server_id": actual_server_id,
+                "actual_username": actual_username,
+                "relocated": relocated,
+                "uniqueness_verified": not unavailable,
+            }
+
+        if unavailable:
+            return None, None, {
+                **base,
+                "status": "unavailable",
+                "error": "server_unavailable",
+            }
+        return None, None, {
+            **base,
+            "status": "missing",
+            "error": "not_found",
+            "uniqueness_verified": True,
+        }
+
+    def resolve_unique_user(
+        self,
+        username: str,
+        preferred_server_id: str | None = None,
+        *,
+        allow_exact_on_partial: bool = False,
+        force_refresh: bool = True,
+    ):
+        """Resolve a username only when its current server identity is safe."""
+        entries = self.get_user_snapshot_entries(
+            include_disabled=True,
+            force_refresh=force_refresh,
+        )
+        client, user, result = self.classify_unique_user_snapshot(
+            username,
+            entries,
+            preferred_server_id=preferred_server_id,
+            allow_exact_on_partial=allow_exact_on_partial,
+        )
+        if result.get("status") == "duplicate":
+            LOGGER.warning(
+                "user_identity_duplicate username=%s requested_server_id=%s server_ids=%s",
+                username,
+                result.get("requested_server_id"),
+                ",".join(result.get("duplicate_server_ids") or []),
+            )
+        elif result.get("status") == "found" and result.get("relocated"):
+            LOGGER.info(
+                "user_identity_relocated username=%s requested_server_id=%s actual_server_id=%s",
+                username,
+                result.get("requested_server_id"),
+                result.get("actual_server_id"),
+            )
+        elif result.get("status") == "unavailable":
+            LOGGER.info(
+                "user_identity_unavailable username=%s requested_server_id=%s unavailable_server_ids=%s",
+                username,
+                result.get("requested_server_id"),
+                ",".join(result.get("unavailable_server_ids") or []),
+            )
+        return client, user, result
 
     def find_user_matches(self, username: str, force_refresh: bool = True) -> list[dict]:
         """Return every exact ``(server, username)`` identity that matches."""
@@ -2494,18 +2646,7 @@ class MultiServerAPI:
             users = entry.get("users")
             if client is None or users is None:
                 continue
-            candidates = []
-            if isinstance(users, dict):
-                candidates = [
-                    (str(name), value) for name, value in users.items()
-                    if str(name).casefold() == target and isinstance(value, dict)
-                ]
-            elif isinstance(users, list):
-                candidates = [
-                    (str(value.get("username") or ""), value) for value in users
-                    if isinstance(value, dict)
-                    and str(value.get("username") or "").casefold() == target
-                ]
+            candidates = self._matching_users_in_snapshot(users, username)
             for actual_username, user in candidates:
                 matches.append({
                     "ref": UserRef(

@@ -1121,6 +1121,68 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.assertEqual(saved["debt"], 4.0)
         self.assertFalse(saved["configs"][0].get("removed_from_vpn", False))
 
+    def test_debt_hold_follows_unique_relocation_without_rewriting_history(self):
+        class LiveClient:
+            server_id = "s2"
+
+            def __init__(self):
+                self.updated = []
+
+            def update_user(self, username, payload):
+                self.updated.append((username, payload))
+                return {"ok": True}
+
+        class RelocatedMultiAPI:
+            def __init__(self):
+                self.client = LiveClient()
+
+            def resolve_unique_user(self, username, preferred_server_id=None, **kwargs):
+                return self.client, {
+                    "blocked": False,
+                    "status": "Offline",
+                    "upload_bytes": 0,
+                    "download_bytes": 0,
+                    "max_download_bytes": 5 * 1024 ** 3,
+                }, {
+                    "status": "found",
+                    "requested_server_id": preferred_server_id,
+                    "actual_server_id": "s2",
+                    "relocated": True,
+                    "uniqueness_verified": True,
+                }
+
+        self.write_resellers({
+            "1988": {
+                "status": "suspended",
+                "suspended_reason": "debt",
+                "debt": 4.0,
+                "debt_charges": [{
+                    "id": "charge-1",
+                    "original_amount": 4.0,
+                    "outstanding_amount": 4.0,
+                }],
+                "configs": [{
+                    "username": "moved",
+                    "server_id": "s1",
+                    "debt_charge_id": "charge-1",
+                    "timestamp": self.hours_ago(24),
+                    "days": 30,
+                    "gb": 5,
+                }],
+            }
+        })
+        api = RelocatedMultiAPI()
+
+        success, result = self.reseller.process_reseller_debt_service_action(
+            "1988", api, "hold"
+        )
+
+        saved = self.read_resellers()["1988"]
+        self.assertTrue(success)
+        self.assertEqual(result["completed"], 1)
+        self.assertEqual(api.client.updated, [("moved", {"blocked": True})])
+        self.assertEqual(saved["configs"][0]["server_id"], "s1")
+
     def test_payment_and_deletion_are_serialized_without_overwriting_each_other(self):
         delete_started = threading.Event()
         allow_delete = threading.Event()

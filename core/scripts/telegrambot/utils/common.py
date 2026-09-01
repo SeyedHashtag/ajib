@@ -315,11 +315,24 @@ def _payment_entitlement_state(record, now=None, multi_api=None):
     )
     try:
         api = multi_api or MultiServerAPI()
-        finder = getattr(api, "find_user_on_server_cached", None)
-        if callable(finder):
-            _client, live, lookup = finder(username, server_id)
+        resolver = getattr(api, "resolve_unique_user", None)
+        if callable(resolver):
+            resolved = resolver(
+                username,
+                preferred_server_id=server_id,
+                allow_exact_on_partial=True,
+                force_refresh=True,
+            )
         else:
-            _client, live, lookup = api.find_user_on_server(username, server_id)
+            resolved = None
+        if isinstance(resolved, tuple) and len(resolved) == 3:
+            _client, live, lookup = resolved
+        else:
+            finder = getattr(api, "find_user_on_server_cached", None)
+            if callable(finder):
+                _client, live, lookup = finder(username, server_id)
+            else:
+                _client, live, lookup = api.find_user_on_server(username, server_id)
     except Exception:
         return "unknown"
     if not isinstance(lookup, dict) or lookup.get("status") != "found" or not isinstance(live, dict):

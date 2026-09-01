@@ -266,7 +266,7 @@ class MyConfigsTests(unittest.TestCase):
 
     def test_my_configs_scans_once_and_prefers_paid_configs_over_test_configs(self):
         enabled_client = FakeClient("enabled")
-        FakeMultiServerAPI.users_by_include_disabled[False] = [
+        FakeMultiServerAPI.users_by_include_disabled[True] = [
             (enabled_client, "t123a", {"max_download_bytes": 10}),
             (enabled_client, "s123a", {"max_download_bytes": 20}),
         ]
@@ -276,8 +276,8 @@ class MyConfigsTests(unittest.TestCase):
         self.assertEqual(
             FakeMultiServerAPI.iter_calls,
             [
-                {"method": "cached", "include_disabled": False, "cache_ttl_seconds": 300, "allow_expired": True},
-                {"method": "snapshot", "include_disabled": False, "force_refresh": False, "cache_ttl_seconds": 300},
+                {"method": "cached", "include_disabled": True, "cache_ttl_seconds": 300, "allow_expired": True},
+                {"method": "snapshot", "include_disabled": True, "force_refresh": False, "cache_ttl_seconds": 300},
             ],
         )
         self.assertEqual(self.displayed_configs, [])
@@ -291,7 +291,7 @@ class MyConfigsTests(unittest.TestCase):
         executor = HoldingExecutor()
         my_configs_module.MY_CONFIGS_EXECUTOR = executor
         enabled_client = FakeClient("enabled")
-        FakeMultiServerAPI.users_by_include_disabled[False] = [
+        FakeMultiServerAPI.users_by_include_disabled[True] = [
             (enabled_client, "s123a", {"max_download_bytes": 20}),
         ]
         message = self.make_message()
@@ -307,7 +307,7 @@ class MyConfigsTests(unittest.TestCase):
         self.assertEqual(len(my_configs_module.bot.replies), 1)
         self.assertEqual(my_configs_module.MY_CONFIGS_INFLIGHT, set())
 
-    def test_my_configs_excludes_disabled_servers_for_customer_lookup(self):
+    def test_my_configs_includes_existing_users_on_disabled_servers(self):
         disabled_client = FakeClient("disabled")
         FakeMultiServerAPI.users_by_include_disabled[True] = [
             (disabled_client, "s123a", {"max_download_bytes": 20}),
@@ -318,19 +318,23 @@ class MyConfigsTests(unittest.TestCase):
         self.assertEqual(
             FakeMultiServerAPI.iter_calls,
             [
-                {"method": "cached", "include_disabled": False, "cache_ttl_seconds": 300, "allow_expired": True},
-                {"method": "snapshot", "include_disabled": False, "force_refresh": False, "cache_ttl_seconds": 300},
+                {"method": "cached", "include_disabled": True, "cache_ttl_seconds": 300, "allow_expired": True},
+                {"method": "snapshot", "include_disabled": True, "force_refresh": False, "cache_ttl_seconds": 300},
             ],
         )
         self.assertEqual(self.displayed_configs, [])
         self.assertEqual(
             my_configs_module.bot.replies[0][0][1],
-            "No active configs\n\nThis list may take a few minutes to update.",
+            "📱 Select a configuration to view:\n\nThis list may take a few minutes to update.",
+        )
+        self.assertEqual(
+            my_configs_module.bot.replies[0][1]["reply_markup"].buttons[0].callback_data,
+            "show_config:disabled:s123a",
         )
 
     def test_my_configs_selection_menu_includes_cache_notice(self):
         enabled_client = FakeClient("enabled")
-        FakeMultiServerAPI.users_by_include_disabled[False] = [
+        FakeMultiServerAPI.users_by_include_disabled[True] = [
             (enabled_client, "s123a", {"max_download_bytes": 20}),
             (enabled_client, "s123b", {"max_download_bytes": 30}),
         ]
@@ -342,6 +346,85 @@ class MyConfigsTests(unittest.TestCase):
             "📱 Select a configuration to view:\n\nThis list may take a few minutes to update.",
         )
         self.assertEqual(len(my_configs_module.bot.replies[0][1]["reply_markup"].buttons), 2)
+
+    def test_my_configs_hides_case_insensitive_duplicates_across_disabled_servers(self):
+        FakeMultiServerAPI.users_by_include_disabled[True] = [
+            (FakeClient("enabled"), "s123a", {"max_download_bytes": 20}),
+            (FakeClient("disabled"), "S123A", {"max_download_bytes": 20}),
+        ]
+
+        my_configs_module.my_configs(self.make_message())
+
+        text = my_configs_module.bot.replies[0][0][1]
+        self.assertIn("more than one VPN server", text)
+        self.assertNotIn("reply_markup", my_configs_module.bot.replies[0][1])
+
+    def test_old_config_callback_follows_unique_relocation(self):
+        original_executor = my_configs_module.SHOW_CONFIG_EXECUTOR
+        original_resolver = getattr(FakeMultiServerAPI, "resolve_unique_user", None)
+        primary = FakeClient("primary")
+
+        def resolve_unique_user(self, username, preferred_server_id=None, **kwargs):
+            return primary, {"max_download_bytes": 20, "blocked": False}, {
+                "status": "found",
+                "requested_server_id": preferred_server_id,
+                "actual_server_id": "primary",
+                "relocated": True,
+                "uniqueness_verified": True,
+            }
+
+        FakeMultiServerAPI.resolve_unique_user = resolve_unique_user
+        my_configs_module.SHOW_CONFIG_EXECUTOR = ImmediateExecutor()
+        call = types.SimpleNamespace(
+            id="callback-moved",
+            data="show_config:server2:s123a",
+            from_user=types.SimpleNamespace(id=123),
+            message=types.SimpleNamespace(chat=types.SimpleNamespace(id=456), message_id=789),
+        )
+        try:
+            my_configs_module.handle_show_config(call)
+        finally:
+            my_configs_module.SHOW_CONFIG_EXECUTOR = original_executor
+            if original_resolver is None:
+                delattr(FakeMultiServerAPI, "resolve_unique_user")
+            else:
+                FakeMultiServerAPI.resolve_unique_user = original_resolver
+
+        self.assertEqual(len(self.displayed_configs), 1)
+        self.assertIs(self.displayed_configs[0][0][3], primary)
+        self.assertTrue(self.displayed_configs[0][1]["lookup_result"]["relocated"])
+
+    def test_duplicate_config_callback_exposes_no_config(self):
+        original_executor = my_configs_module.SHOW_CONFIG_EXECUTOR
+        original_resolver = getattr(FakeMultiServerAPI, "resolve_unique_user", None)
+
+        def resolve_unique_user(self, username, preferred_server_id=None, **kwargs):
+            return None, None, {
+                "status": "duplicate",
+                "requested_server_id": preferred_server_id,
+                "actual_server_id": None,
+                "uniqueness_verified": False,
+            }
+
+        FakeMultiServerAPI.resolve_unique_user = resolve_unique_user
+        my_configs_module.SHOW_CONFIG_EXECUTOR = ImmediateExecutor()
+        call = types.SimpleNamespace(
+            id="callback-duplicate",
+            data="show_config:server2:s123a",
+            from_user=types.SimpleNamespace(id=123),
+            message=types.SimpleNamespace(chat=types.SimpleNamespace(id=456), message_id=789),
+        )
+        try:
+            my_configs_module.handle_show_config(call)
+        finally:
+            my_configs_module.SHOW_CONFIG_EXECUTOR = original_executor
+            if original_resolver is None:
+                delattr(FakeMultiServerAPI, "resolve_unique_user")
+            else:
+                FakeMultiServerAPI.resolve_unique_user = original_resolver
+
+        self.assertEqual(self.displayed_configs, [])
+        self.assertIn("more than one VPN server", my_configs_module.bot.edited_messages[-1][0][0])
 
     def test_show_config_callback_queues_display_job_and_releases_inflight(self):
         original_executor = my_configs_module.SHOW_CONFIG_EXECUTOR
@@ -867,10 +950,10 @@ class MyConfigsTests(unittest.TestCase):
 
             my_configs_module.my_configs(self.make_message())
 
-            self.assertEqual(refresh_calls, [False])
+            self.assertEqual(refresh_calls, [True])
             self.assertEqual(
                 StaleFakeMultiServerAPI.iter_calls,
-                [{"method": "cached", "include_disabled": False, "cache_ttl_seconds": 300, "allow_expired": True}],
+                [{"method": "cached", "include_disabled": True, "cache_ttl_seconds": 300, "allow_expired": True}],
             )
             self.assertEqual(len(my_configs_module.bot.replies[0][1]["reply_markup"].buttons), 1)
         finally:

@@ -123,6 +123,65 @@ class FakeMultiAPI:
         return client, result.get("data"), result
 
 
+class ResolverFakeMultiAPI(FakeMultiAPI):
+    def resolve_unique_user(
+        self,
+        username,
+        preferred_server_id=None,
+        *,
+        allow_exact_on_partial=False,
+        force_refresh=True,
+    ):
+        matches = []
+        unavailable = []
+        for server_id, client in self.clients.items():
+            if not client.available:
+                unavailable.append(server_id)
+                continue
+            for actual_username, user in client.users.items():
+                if str(actual_username).casefold() == str(username).casefold():
+                    matches.append((server_id, client, user))
+        base = {
+            "requested_server_id": preferred_server_id,
+            "actual_server_id": matches[0][0] if len(matches) == 1 else None,
+            "relocated": bool(
+                len(matches) == 1
+                and preferred_server_id
+                and str(matches[0][0]) != str(preferred_server_id)
+            ),
+            "unavailable_server_ids": unavailable,
+            "duplicate_server_ids": [item[0] for item in matches] if len(matches) > 1 else [],
+            "uniqueness_verified": not unavailable and len(matches) <= 1,
+            "http_status": None,
+        }
+        if len(matches) > 1:
+            return None, None, {**base, "status": "duplicate", "error": "duplicate_username"}
+        if len(matches) == 1:
+            server_id, client, user = matches[0]
+            exact_partial = (
+                unavailable
+                and allow_exact_on_partial
+                and str(server_id) == str(preferred_server_id)
+            )
+            if unavailable and not exact_partial:
+                return None, None, {**base, "status": "unavailable", "error": "uniqueness_unconfirmed"}
+            return client, user, {
+                **base,
+                "status": "found",
+                "error": None,
+                "actual_server_id": server_id,
+                "uniqueness_verified": not unavailable,
+            }
+        if unavailable:
+            return None, None, {**base, "status": "unavailable", "error": "server_unavailable"}
+        return None, None, {
+            **base,
+            "status": "missing",
+            "error": "not_found",
+            "uniqueness_verified": True,
+        }
+
+
 def load_renewal_module():
     for name in list(sys.modules):
         if name == "utils" or name.startswith("utils."):
@@ -820,6 +879,80 @@ class RenewalTests(unittest.TestCase):
             "renewal-completed:customer:2026-08-05 12:00:00",
             events[0][1]["deduplication_key"],
         )
+
+    def test_historical_customer_token_follows_unique_relocation_and_records_live_server(self):
+        historical = self.base_payment(server_id="server2")
+        token = self.renewal.customer_renewal_token(
+            123, "base-1", "alice", "server2"
+        )
+        primary = FakeClient("primary", {"alice": self.expired_user()})
+        server2 = FakeClient("server2")
+        multi_api = ResolverFakeMultiAPI({"primary": primary, "server2": server2})
+
+        offer = self.renewal.resolve_customer_renewal_token(
+            123,
+            token,
+            self.plans,
+            multi_api=multi_api,
+            payments={"base-1": historical},
+        )
+
+        self.assertTrue(offer["eligible"])
+        self.assertEqual(offer["server_id"], "primary")
+        self.assertEqual(offer["recorded_server_id"], "server2")
+        self.assertTrue(offer["relocated"])
+        metadata = self.renewal.customer_payment_metadata(offer)
+        self.assertEqual(metadata["renewal_server_id"], "primary")
+        self.assertEqual(metadata["renewal_recorded_server_id"], "server2")
+
+        self.write_json(self.renewal.PAYMENTS_FILE, {"base-1": historical})
+        self.write_json(self.renewal.STATE_FILE, {
+            "server2:alice": {"cleanup_status": "notified"},
+            "primary:alice": {"cleanup_status": "notified"},
+        })
+        result = self.renewal.execute_customer_renewal(
+            {
+                **metadata,
+                "plan_gb": "5",
+                "days": 30,
+                "unlimited": False,
+            },
+            multi_api=multi_api,
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["server_id"], "primary")
+        self.assertEqual(primary.reset_calls, ["alice"])
+        self.assertEqual(server2.reset_calls, [])
+        self.assertEqual(self.read_json(self.renewal.STATE_FILE), {})
+
+    def test_duplicate_or_incomplete_identity_never_executes_renewal(self):
+        payment = {
+            "type": "renewal",
+            "renewal_username": "alice",
+            "renewal_server_id": "server2",
+            "plan_gb": "5",
+            "days": 30,
+            "unlimited": False,
+        }
+        primary = FakeClient("primary", {"alice": self.expired_user()})
+        server2 = FakeClient("server2", {"ALICE": self.expired_user()})
+        duplicate_result = self.renewal.execute_customer_renewal(
+            payment,
+            multi_api=ResolverFakeMultiAPI({"primary": primary, "server2": server2}),
+        )
+        self.assertEqual(duplicate_result["reason"], "renewal_ineligible_duplicate")
+        self.assertEqual(primary.reset_calls, [])
+        self.assertEqual(server2.reset_calls, [])
+
+        server2.users.clear()
+        server2.available = False
+        outage_result = self.renewal.execute_customer_renewal(
+            payment,
+            multi_api=ResolverFakeMultiAPI({"primary": primary, "server2": server2}),
+        )
+        self.assertEqual(outage_result["reason"], "server_unavailable")
+        self.assertEqual(primary.reset_calls, [])
 
     def test_customer_renewal_rechecks_expiry_at_execution_time(self):
         active_user = dict(self.expired_user(), blocked=False, expiration_days=30)

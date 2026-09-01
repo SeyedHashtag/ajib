@@ -126,6 +126,92 @@ class MultiServerCreationCacheTests(unittest.TestCase):
         self.assertEqual(clients["s1"].get_users_calls, 1)
         self.assertEqual(clients["s2"].get_users_calls, 1)
 
+    def test_unique_user_resolver_follows_one_verified_relocation(self):
+        clients = {
+            "primary": FakeClient("primary", {"Alice": {"username": "Alice"}}),
+            "server2": FakeClient("server2", {}),
+            "disabled": FakeClient("disabled", {}),
+        }
+        multi_api = self.make_multi_api(clients)
+        multi_api.servers[2]["enabled"] = False
+
+        client, user, result = multi_api.resolve_unique_user(
+            "alice", preferred_server_id="server2"
+        )
+
+        self.assertEqual(client.server_id, "primary")
+        self.assertEqual(user["username"], "Alice")
+        self.assertEqual(result["status"], "found")
+        self.assertEqual(result["requested_server_id"], "server2")
+        self.assertEqual(result["actual_server_id"], "primary")
+        self.assertTrue(result["relocated"])
+        self.assertTrue(result["uniqueness_verified"])
+        self.assertEqual(clients["disabled"].get_users_calls, 1)
+
+    def test_unique_user_resolver_rejects_duplicates_including_disabled_servers(self):
+        clients = {
+            "s1": FakeClient("s1", {"alice": {"server": "s1"}}),
+            "s2": FakeClient("s2", {}),
+            "disabled": FakeClient("disabled", {"ALICE": {"server": "disabled"}}),
+        }
+        multi_api = self.make_multi_api(clients)
+        multi_api.servers[2]["enabled"] = False
+
+        client, user, result = multi_api.resolve_unique_user(
+            "Alice", preferred_server_id="s1"
+        )
+
+        self.assertIsNone(client)
+        self.assertIsNone(user)
+        self.assertEqual(result["status"], "duplicate")
+        self.assertEqual(result["duplicate_server_ids"], ["disabled", "s1"])
+        self.assertEqual(multi_api.find_user("alice", preferred_server_id="s1"), (None, None))
+
+    def test_unique_user_resolver_mixed_outage_policy_only_allows_exact_read(self):
+        clients = {
+            "s1": FakeClient("s1", {"alice": {"server": "s1"}}),
+            "s2": FakeClient("s2", None),
+        }
+        multi_api = self.make_multi_api(clients)
+
+        strict_client, strict_user, strict = multi_api.resolve_unique_user(
+            "alice", preferred_server_id="s1", allow_exact_on_partial=False
+        )
+        read_client, read_user, readable = multi_api.resolve_unique_user(
+            "alice", preferred_server_id="s1", allow_exact_on_partial=True
+        )
+        moved_client, moved_user, moved = multi_api.resolve_unique_user(
+            "alice", preferred_server_id="old", allow_exact_on_partial=True
+        )
+
+        self.assertIsNone(strict_client)
+        self.assertIsNone(strict_user)
+        self.assertEqual(strict["status"], "unavailable")
+        self.assertEqual(read_client.server_id, "s1")
+        self.assertEqual(read_user["server"], "s1")
+        self.assertEqual(readable["status"], "found")
+        self.assertFalse(readable["uniqueness_verified"])
+        self.assertIsNone(moved_client)
+        self.assertIsNone(moved_user)
+        self.assertEqual(moved["status"], "unavailable")
+
+    def test_unique_user_resolver_distinguishes_global_missing_and_unavailable(self):
+        available = self.make_multi_api({
+            "s1": FakeClient("s1", {}),
+            "s2": FakeClient("s2", {}),
+        })
+        _client, _user, missing = available.resolve_unique_user("missing")
+        self.assertEqual(missing["status"], "missing")
+        self.assertTrue(missing["uniqueness_verified"])
+
+        unavailable = self.make_multi_api({
+            "s1": FakeClient("s1", {}),
+            "s2": FakeClient("s2", None),
+        })
+        _client, _user, failed = unavailable.resolve_unique_user("missing")
+        self.assertEqual(failed["status"], "unavailable")
+        self.assertEqual(failed["unavailable_server_ids"], ["s2"])
+
     def test_zero_weight_server_is_scanned_but_not_selected(self):
         clients = {
             "s1": FakeClient("s1", {"reserved": {"blocked": False}}),

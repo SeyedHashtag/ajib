@@ -2030,10 +2030,38 @@ def cleanup_banned_reseller_users(user_id, multi_api):
 
         for candidate in candidates:
             username = candidate['username']
-            api_client, live_user = multi_api.find_user(username, preferred_server_id=candidate.get('server_id'))
-            if api_client is None or live_user is None:
+            resolver = getattr(multi_api, 'resolve_unique_user', None)
+            if callable(resolver):
+                resolved = resolver(
+                    username,
+                    preferred_server_id=candidate.get('server_id'),
+                    allow_exact_on_partial=False,
+                    force_refresh=True,
+                )
+            else:
+                resolved = None
+            if isinstance(resolved, tuple) and len(resolved) == 3:
+                api_client, live_user, lookup = resolved
+            else:  # Rolling-upgrade/test compatibility.
+                api_client, live_user = multi_api.find_user(
+                    username,
+                    preferred_server_id=candidate.get('server_id'),
+                )
+                lookup = {
+                    'status': 'found' if live_user is not None else 'missing',
+                    'uniqueness_verified': True,
+                }
+            if lookup.get('status') == 'missing' and lookup.get('uniqueness_verified', True):
                 already_missing.append(candidate)
                 tagged_status_by_index[candidate['config_index']] = REMOVAL_STATUS_ALREADY_MISSING
+                continue
+            if (
+                lookup.get('status') != 'found'
+                or not lookup.get('uniqueness_verified', True)
+                or api_client is None
+                or live_user is None
+            ):
+                failed.append({**candidate, 'lookup_status': lookup.get('status') or 'unavailable'})
                 continue
 
             result = api_client.delete_user(username)
@@ -2178,6 +2206,20 @@ def _live_usage_snapshot(live, held_at):
 def _exact_debt_service_lookup(multi_api, username, server_id):
     if not username or not server_id:
         return None, None, {'status': 'unavailable', 'error': 'mapping_incomplete'}
+    resolver = getattr(multi_api, 'resolve_unique_user', None)
+    if callable(resolver):
+        resolved = resolver(
+            username,
+            preferred_server_id=server_id,
+            allow_exact_on_partial=False,
+            force_refresh=True,
+        )
+        if isinstance(resolved, tuple) and len(resolved) == 3:
+            client, live, outcome = resolved
+            outcome = outcome if isinstance(outcome, dict) else {}
+            if outcome.get('status') != 'found' or not outcome.get('uniqueness_verified'):
+                return client, None, outcome
+            return client, live, outcome
     finder = getattr(multi_api, 'find_user_on_server', None)
     if callable(finder):
         return finder(username, str(server_id))
@@ -2298,10 +2340,13 @@ def _process_reseller_debt_service_action(user_id, multi_api, action):
         server_id = candidate.get('server_id')
         client, live, lookup = _exact_debt_service_lookup(multi_api, username, server_id)
         lookup_status = str((lookup or {}).get('status') or 'unavailable')
-        if lookup_status == 'unavailable':
-            results['failed'].append({**candidate, 'reason': (lookup or {}).get('error')})
+        if lookup_status in {'unavailable', 'duplicate'}:
+            results['failed'].append({
+                **candidate,
+                'reason': (lookup or {}).get('error') or lookup_status,
+            })
             continue
-        if lookup_status == 'missing' or client is None or live is None:
+        if lookup_status == 'missing' and (lookup or {}).get('uniqueness_verified', True):
             details = {
                 'snapshot': {
                     'held_at': _now_str(),
@@ -2318,6 +2363,9 @@ def _process_reseller_debt_service_action(user_id, multi_api, action):
             }
             external.append((candidate, 'already_missing', details))
             results['already_missing'].append(candidate)
+            continue
+        if lookup_status != 'found' or client is None or live is None:
+            results['failed'].append({**candidate, 'reason': 'identity_unverified'})
             continue
         held_at = _now_str()
         snapshot = _live_usage_snapshot(live, held_at)
