@@ -60,6 +60,7 @@ def test_hosted_onboarding_ignores_old_issuance_after_connection():
             {"username": "r1", "server_id": "s1"}
         ],
         "MultiServerAPI": FakeMultiServerAPI,
+        "_resolve_hosted_user": lambda *args, **kwargs: (object(), live, {"status": "found"}),
         "_hosted_service_cycle": lambda _config: cycle,
         "inspect_account": account_state.inspect_account,
         "PanelState": account_state.PanelState,

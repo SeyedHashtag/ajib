@@ -99,6 +99,7 @@ MONEY_QUANTUM = Decimal('0.01')
 DEBT_CHARGE_EPSILON = 0.005
 CREDIT_OUTCOME_LIMIT = 3
 CREDIT_OUTCOME_WEIGHTS = {'good': 0, 'late': 1, 'default': 2}
+RESELLER_ACTIVITY_DAYS = 90
 EXTERNAL_BULK_PROVISIONING_SOURCE = 'external_bulk'
 EXTERNAL_BULK_USERNAME_RE = re.compile(r'^r([1-9]\d*)c(\d+)$', re.IGNORECASE)
 GIB = 1024 ** 3
@@ -406,11 +407,108 @@ def get_reseller_trust_limit(total_paid):
     return min(RESELLER_TRUST_MAX_LIMIT, limit)
 
 
-def get_reseller_level_summary(record):
+def _paid_activity_from_history(record):
+    """Recover only dated, paid wholesale activity; never estimate from totals."""
+    events = {}
+    for index, config in enumerate(record.get('configs', [])):
+        if not isinstance(config, dict):
+            continue
+        items = [('config', config)] + [
+            ('renewal', renewal) for renewal in config.get('renewals', [])
+            if isinstance(renewal, dict)
+        ]
+        for sequence, (kind, item) in enumerate(items):
+            if not item.get('funded_at_checkout'):
+                continue
+            reference = item.get('retail_order_id') or item.get('reservation_id')
+            reference = reference or f"legacy:{index}:{sequence}:{config.get('username')}:{item.get('timestamp')}"
+            events[f'funded:{reference}'] = {
+                'id': f'funded:{reference}', 'kind': kind,
+                'amount': _money_value(item.get('price', 0)),
+                'paid_at': item.get('timestamp'),
+            }
+    for item in record.get('debt_allocations', []):
+        if not isinstance(item, dict) or item.get('kind') not in {'settlement', 'manual_admin', 'earnings_transfer'}:
+            continue
+        reference = f"settlement:{item.get('id')}"
+        events[reference] = {
+            'id': reference, 'kind': 'settlement',
+            'amount': _money_value(item.get('amount', 0)), 'paid_at': item.get('created_at'),
+        }
+    for item in record.get('processed_debt_payments', []):
+        if not isinstance(item, dict) or not item.get('payment_id'):
+            continue
+        reference = f"settlement:{item['payment_id']}"
+        events.setdefault(reference, {
+            'id': reference, 'kind': 'settlement',
+            'amount': _money_value(item.get('credited_to_debt', 0)),
+            'paid_at': item.get('processed_at'),
+        })
+    return [event for event in events.values()
+            if event['amount'] > 0 and _parse_time(event.get('paid_at')) is not None]
+
+
+def _ensure_paid_activity(record):
+    if record.get('paid_activity_version') != 1:
+        existing = {str(item.get('id')): dict(item) for item in record.get('paid_activity', [])
+                    if isinstance(item, dict) and item.get('id')}
+        for event in _paid_activity_from_history(record):
+            existing.setdefault(event['id'], event)
+        record['paid_activity'] = list(existing.values())
+        record['paid_activity_version'] = 1
+    return record
+
+
+def _record_paid_activity(record, amount, reference, kind, paid_at=None):
+    _ensure_paid_activity(record)
+    event_id = str(reference)
+    if any(item.get('id') == event_id for item in record['paid_activity']):
+        return
+    amount = _money_value(amount)
+    if amount > 0:
+        record['paid_activity'].append({
+            'id': event_id, 'kind': kind, 'amount': amount,
+            'paid_at': paid_at or _now_str(),
+        })
+
+
+def get_reseller_recent_paid(record, now=None):
+    current = _renewal_current_time(now)
+    cutoff = current - timedelta(days=RESELLER_ACTIVITY_DAYS)
+    data = record or {}
+    events = (data.get('paid_activity', []) if data.get('paid_activity_version') == 1
+              else _paid_activity_from_history(data))
+    seen = set()
+    amount = Decimal('0')
+    for event in events:
+        if not isinstance(event, dict) or not event.get('id') or event['id'] in seen:
+            continue
+        seen.add(event['id'])
+        paid_at = _parse_time(event.get('paid_at'))
+        if paid_at is not None and cutoff <= paid_at <= current:
+            amount += Decimal(str(_money_value(event.get('amount', 0))))
+    return float(amount.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP))
+
+
+def backfill_reseller_paid_activity():
+    """Persist the additive history migration before transaction workers start."""
+    with reseller_lock, _resellers_file_lock():
+        records = _read_resellers_file()
+        changed = False
+        for record in records.values():
+            if isinstance(record, dict) and record.get('paid_activity_version') != 1:
+                _ensure_paid_activity(record)
+                changed = True
+        if changed:
+            _write_resellers_file(records)
+
+
+def get_reseller_level_summary(record, now=None, *, paid_amount=None):
     total_paid = get_reseller_total_paid(record)
-    level = get_reseller_level(total_paid)
-    discount_percent = get_reseller_discount_percent(total_paid)
-    trust_limit = get_reseller_trust_limit(total_paid)
+    recent_paid = get_reseller_recent_paid(record, now=now) if paid_amount is None else paid_amount
+    level = get_reseller_level(recent_paid)
+    discount_percent = get_reseller_discount_percent(recent_paid)
+    trust_limit = get_reseller_trust_limit(recent_paid)
     current_threshold = (level - 1) * RESELLER_TRUST_PAID_STEP
     next_threshold = (
         level * RESELLER_TRUST_PAID_STEP
@@ -424,9 +522,9 @@ def get_reseller_level_summary(record):
     else:
         progress_amount = min(
             RESELLER_TRUST_PAID_STEP,
-            max(0.0, total_paid - current_threshold),
+            max(0.0, recent_paid - current_threshold),
         )
-        amount_to_next = max(0.0, next_threshold - total_paid)
+        amount_to_next = max(0.0, next_threshold - recent_paid)
         progress_fraction = progress_amount / RESELLER_TRUST_PAID_STEP
     progress_segments = min(10, max(0, int(progress_fraction * 10)))
     return {
@@ -436,6 +534,7 @@ def get_reseller_level_summary(record):
         'discount_percent': discount_percent,
         'trust_limit': trust_limit,
         'total_paid': total_paid,
+        'recent_paid': recent_paid,
         'current_threshold': current_threshold,
         'next_level': level + 1 if next_threshold is not None else None,
         'next_threshold': next_threshold,
@@ -466,7 +565,7 @@ def get_reseller_available_credit(record):
     return max(0.0, trust_limit - debt)
 
 
-def get_reseller_credit_policy(record):
+def get_reseller_credit_policy(record, now=None):
     data = record or {}
     outcomes = data.get('credit_outcomes', [])
     if not isinstance(outcomes, list):
@@ -476,7 +575,7 @@ def get_reseller_credit_policy(record):
         CREDIT_OUTCOME_WEIGHTS.get(str(item.get('outcome') or ''), 0)
         for item in outcomes
     )
-    base_limit = get_reseller_trust_limit(get_reseller_total_paid(data))
+    base_limit = get_reseller_level_summary(data, now=now)['trust_limit']
     if adverse_weight >= 2:
         mode = 'prepaid_only'
         effective_limit = 0.0
@@ -700,7 +799,8 @@ def _ensure_reseller_defaults(record):
         data['debt_allocations'] = []
     total_paid = get_reseller_total_paid(data)
     data['total_paid'] = total_paid
-    data['trust_limit'] = get_reseller_trust_limit(total_paid)
+    _ensure_paid_activity(data)
+    data['trust_limit'] = get_reseller_level_summary(data)['trust_limit']
     data.setdefault('created_at', _now_str())
     data.setdefault('last_payment_at', None)
     data.setdefault('debt_since', None)
@@ -1007,7 +1107,7 @@ def claim_reseller_level_presentation(user_id, lease_seconds=None):
                 current = _ensure_reseller_defaults(resellers[user_id])
                 summary = get_reseller_level_summary(current)
                 presented_level = current.get('last_presented_reseller_level', 0)
-                if presented_level >= summary['level']:
+                if presented_level == summary['level']:
                     return None
 
                 existing_claim = current.get('reseller_level_presentation_claim')
@@ -1021,14 +1121,15 @@ def claim_reseller_level_presentation(user_id, lease_seconds=None):
                         existing_level = int(existing_claim.get('level', 0) or 0)
                     except (TypeError, ValueError):
                         existing_level = 0
-                    if claim_age < lease and existing_level >= summary['level']:
+                    if claim_age < lease and existing_level == summary['level']:
                         return None
 
                 claim = {
                     'id': uuid.uuid4().hex,
                     'level': summary['level'],
                     'from_level': presented_level,
-                    'kind': 'introduction' if presented_level == 0 else 'level_up',
+                    'kind': ('introduction' if presented_level == 0 else
+                             'level_up' if presented_level < summary['level'] else 'level_down'),
                     'claimed_at': _now_str(),
                 }
                 current['reseller_level_presentation_claim'] = claim
@@ -1060,12 +1161,8 @@ def _finish_reseller_level_presentation(user_id, claim_id, completed):
                 if not isinstance(claim, dict) or claim.get('id') != str(claim_id):
                     return False
                 if completed:
-                    current['last_presented_reseller_level'] = max(
-                        current.get('last_presented_reseller_level', 0),
-                        min(
-                            RESELLER_LEVEL_COUNT,
-                            int(claim.get('level', 0) or 0),
-                        ),
+                    current['last_presented_reseller_level'] = min(
+                        RESELLER_LEVEL_COUNT, int(claim.get('level', 0) or 0),
                     )
                 current['reseller_level_presentation_claim'] = None
                 resellers[user_id] = current
@@ -1184,6 +1281,7 @@ def record_funded_reseller_config(user_id, wholesale_amount, config_data):
                 record.setdefault('price', _safe_float(wholesale_amount, 0.0))
                 record.setdefault('timestamp', _now_str())
                 record['funded_at_checkout'] = True
+                _record_paid_activity(current, wholesale_amount, f"funded:{order_id or uuid.uuid4().hex}", 'config')
                 current.setdefault('configs', []).append(record)
                 current['total_paid'] = get_reseller_total_paid(current) + _safe_float(wholesale_amount, 0.0)
                 current['last_payment_at'] = _now_str()
@@ -1222,6 +1320,7 @@ def record_funded_reseller_renewal(user_id, username, wholesale_amount, renewal_
                 record.setdefault('price', _safe_float(wholesale_amount, 0.0))
                 record.setdefault('timestamp', _now_str())
                 record['funded_at_checkout'] = True
+                _record_paid_activity(current, wholesale_amount, f"funded:{order_id or uuid.uuid4().hex}", 'renewal')
                 target.setdefault('renewals', []).append(record)
                 target['cleanup_status'] = 'renewed'
                 current['total_paid'] = get_reseller_total_paid(current) + _safe_float(wholesale_amount, 0.0)
@@ -1415,6 +1514,7 @@ def reserve_reseller_renewal(
 
                 if funded:
                     record['funded_at_checkout'] = True
+                    _record_paid_activity(current, amount_value, f'funded:{reservation_id}', 'renewal')
                     current['total_paid'] = get_reseller_total_paid(current) + amount_value
                     current['last_payment_at'] = _now_str()
                 else:
@@ -2371,11 +2471,15 @@ def _process_reseller_debt_service_action(user_id, multi_api, action):
         snapshot = _live_usage_snapshot(live, held_at)
         if action == 'hold':
             changed_by_policy = not snapshot['blocked_before_policy']
-            api_result = client.update_user(username, {'blocked': True}) if changed_by_policy else {'unchanged': True}
+            from utils.reseller_blocks import set_owned_block_reason
+            api_result = set_owned_block_reason(user_id, candidate['config_index'], client, live,
+                                                reason='debt_policy_blocked', blocked=True)
         elif action == 'restore':
             config = initial.get('configs', [])[candidate['config_index']]
             changed_by_policy = bool(config.get('debt_policy_changed_blocked'))
-            api_result = client.update_user(username, {'blocked': False}) if changed_by_policy else {'unchanged': True}
+            from utils.reseller_blocks import set_owned_block_reason
+            api_result = set_owned_block_reason(user_id, candidate['config_index'], client, live,
+                                                reason='debt_policy_blocked', blocked=False)
         else:
             changed_by_policy = True
             api_result = client.delete_user(username)
@@ -2575,6 +2679,7 @@ def apply_reseller_payment(user_id, amount, payment_id=None, allocation_kind='se
                     current['debt'] = new_debt
 
                     if credited_amount > 0:
+                        _record_paid_activity(current, credited_amount, f"settlement:{payment_key or uuid.uuid4().hex}", 'settlement')
                         current['total_paid'] = round(
                             get_reseller_total_paid(current) + credited_amount,
                             2,

@@ -160,6 +160,8 @@ def _validate_setting(key, value):
                 normalized[language_code] = text
         return normalized
     if key == "recommended_plan_id":
+        if value is None:
+            return None
         plan_id = str(value or "").strip()
         if plan_id and (not plan_id.isdigit() or len(plan_id) > 12):
             raise ValueError("Invalid recommended plan")
@@ -230,6 +232,10 @@ def update_settings(reseller_id, updates):
     with locked_json(tenant_file(reseller_id, "settings.json"), default_settings()) as settings:
         normalized = _normalized_settings(settings)
         normalized.update(validated)
+        if (normalized.get("plan_selection_configured")
+                and normalized.get("recommended_plan_id")
+                and normalized["recommended_plan_id"] not in normalized["enabled_plan_ids"]):
+            normalized["recommended_plan_id"] = None
         settings.clear()
         settings.update(normalized)
         settings["updated_at"] = _now()
@@ -737,3 +743,21 @@ def list_pending_earnings_withdrawals():
             if request.get("status") == "pending":
                 pending.append({"reseller_id": reseller_id, **request})
     return pending
+
+
+def update_catalog_plan_reference(old_id, new_id=None):
+    """Preserve tenant selections on rename, or clear an unavailable plan."""
+    old_id = str(old_id)
+    for owner_id in list_bots():
+        settings = get_settings(owner_id)
+        updates = {}
+        if settings.get("recommended_plan_id") == old_id:
+            updates["recommended_plan_id"] = str(new_id) if new_id is not None else None
+        enabled = settings.get("enabled_plan_ids", [])
+        if old_id in enabled:
+            updates["enabled_plan_ids"] = sorted({
+                str(new_id) if value == old_id else value for value in enabled
+                if value != old_id or new_id is not None
+            }, key=int)
+        if updates:
+            update_settings(owner_id, updates)

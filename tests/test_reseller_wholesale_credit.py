@@ -73,13 +73,22 @@ class ResellerWholesaleCreditTests(unittest.TestCase):
     def test_purchase_credit_transfer_is_one_to_one_and_idempotent(self):
         self.account_credit.credit_account("7", 8, "purchase-refund")
 
-        first = self.wholesale.transfer_purchase_credit_to_wholesale("7", 5, "move-1")
-        duplicate = self.wholesale.transfer_purchase_credit_to_wholesale("7", 5, "move-1")
+        first = self.wholesale.transfer_purchase_credit_to_wholesale("7", 3, "move-1")
+        duplicate = self.wholesale.transfer_purchase_credit_to_wholesale("7", 3, "move-1")
 
-        self.assertEqual(first["available"], 5.0)
-        self.assertEqual(duplicate["available"], 5.0)
-        self.assertEqual(self.account_credit.get_account_credit("7")["available"], 3.0)
-        self.assertEqual(self.wholesale.get_wholesale_balance("7")["available"], 5.0)
+        self.assertEqual(first["available"], 3.0)
+        self.assertEqual(duplicate["available"], 3.0)
+        self.assertEqual(self.account_credit.get_account_credit("7")["available"], 5.0)
+        self.assertEqual(self.wholesale.get_wholesale_balance("7")["available"], 3.0)
+
+
+    def test_three_dollar_card_and_crypto_callbacks_credit_face_value_once(self):
+        for method in ('card', 'crypto'):
+            with self.subTest(method=method):
+                owner = '7' if method == 'card' else '8'
+                self.wholesale.credit_wholesale_balance(owner, 3, 'three-dollar', source=method)
+                self.wholesale.credit_wholesale_balance(owner, 3, 'three-dollar', source=method)
+                self.assertEqual(self.wholesale.get_wholesale_balance(owner)['available'], 3)
 
 
 if __name__ == "__main__":

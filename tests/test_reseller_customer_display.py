@@ -253,6 +253,7 @@ def install_stubs():
     )
     reseller_stub.get_reseller_trust_limit = lambda total_paid: min(30.0, 5.0 + int(float(total_paid or 0.0) // 10.0) * 5.0)
     reseller_stub.get_reseller_level_summary = lambda data: {
+        "trust_limit": reseller_stub.get_reseller_trust_limit(reseller_stub.get_reseller_total_paid(data)),
         "level": min(6, 1 + int(reseller_stub.get_reseller_total_paid(data) // 10)),
         "discount_percent": min(25, 20 + int(reseller_stub.get_reseller_total_paid(data) // 10)),
     }
@@ -283,6 +284,15 @@ def install_stubs():
     reseller_stub.validate_reseller_manual_payment_amount = validate_reseller_manual_payment_amount
     reseller_stub.DEBT_WARNING_THRESHOLD = 20.0
     reseller_stub.SUSPENDED_REASON_UNBAN_GRACE = "unban_grace"
+    reseller_stub.get_reseller_credit_policy = lambda data, now=None: {
+        'base_limit': reseller_stub.get_reseller_level_summary(data)['trust_limit'],
+        'effective_limit': reseller_stub.get_reseller_level_summary(data)['trust_limit'],
+        'mode': 'credit', 'outcomes': [],
+    }
+    reseller_stub.DEBT_SUSPEND_DEADLINE_HOURS = 48
+    reseller_stub.DEBT_HOLD_DEADLINE_HOURS = 72
+    reseller_stub.DEBT_FINAL_WARNING_HOURS = 144
+    reseller_stub.DEBT_REMOVAL_DEADLINE_HOURS = 168
     sys.modules["utils.reseller"] = reseller_stub
 
     level_ui_stub = types.ModuleType("utils.reseller_level_ui")
@@ -292,6 +302,10 @@ def install_stubs():
     level_ui_stub.build_reseller_program_preview = lambda *args, **kwargs: "Preview"
     level_ui_stub.present_pending_reseller_level = lambda *args, **kwargs: False
     sys.modules["utils.reseller_level_ui"] = level_ui_stub
+
+    blocks_stub = types.ModuleType('utils.reseller_blocks')
+    blocks_stub.customer_block_token = lambda owner, index: f'test{owner}{index}'
+    sys.modules['utils.reseller_blocks'] = blocks_stub
 
     edit_plans_stub = types.ModuleType("utils.edit_plans")
     edit_plans_stub.load_plans = lambda: {}
@@ -367,15 +381,32 @@ def install_stubs():
     sys.modules["qrcode"] = types.SimpleNamespace(make=lambda *args, **kwargs: None)
 
 
+COLLECTION_MODULES = {key: value for key, value in sys.modules.items()
+                      if key == 'utils' or key.startswith('utils.') or key in {'telebot', 'qrcode', 'dotenv'}}
 install_stubs()
 spec = importlib.util.spec_from_file_location("reseller_handlers_under_test", MODULE_PATH)
 reseller_handlers = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = reseller_handlers
 spec.loader.exec_module(reseller_handlers)
+DISPLAY_MODULES = {key: value for key, value in sys.modules.items() if key == 'utils' or key.startswith('utils.') or key in {'telebot', 'qrcode', 'dotenv'}}
+
+for key in DISPLAY_MODULES:
+    sys.modules.pop(key, None)
+sys.modules.update(COLLECTION_MODULES)
 
 
 class ResellerCustomerDisplayTests(unittest.TestCase):
     def setUp(self):
+        previous = {key: value for key, value in sys.modules.items() if key == 'utils' or key.startswith('utils.') or key in {'telebot', 'qrcode', 'dotenv'}}
+        def restore():
+            for key in list(sys.modules):
+                if key == 'utils' or key.startswith('utils.') or key in {'telebot', 'qrcode', 'dotenv'}:
+                    sys.modules.pop(key)
+            sys.modules.update(previous)
+        self.addCleanup(restore)
+        for key in previous:
+            sys.modules.pop(key)
+        sys.modules.update(DISPLAY_MODULES)
         reseller_handlers.bot.edits.clear()
         reseller_handlers.bot.answers.clear()
         reseller_handlers.bot.sent_messages.clear()
@@ -434,7 +465,7 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
             {"status": "approved", "debt": 0, "configs": []},
         )
 
-        self.assertIn("prepaid\\_only", detail)
+        self.assertIn("Prepaid only", detail)
         self.assertIn("half\\_credit", detail)
 
     def test_wholesale_balance_screen_escapes_restricted_credit_modes(self):
@@ -471,6 +502,7 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
             reseller_handlers.bot.answers.clear()
             reseller_handlers.get_reseller_credit_policy = (
                 lambda data, resolved_mode=mode: {
+                    "base_limit": 5,
                     "effective_limit": 5,
                     "mode": resolved_mode,
                     "outcomes": [],
@@ -481,7 +513,7 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
             self.assertEqual(len(reseller_handlers.bot.edits), 1)
             args, kwargs = reseller_handlers.bot.edits[0]
             self.assertEqual(kwargs["parse_mode"], "Markdown")
-            self.assertIn(mode.replace("_", "\\_"), args[0])
+            self.assertIn({"prepaid_only": "Prepaid only", "half_credit": "Half credit"}[mode], args[0])
             self.assertEqual(kwargs["chat_id"], 8)
             self.assertEqual(kwargs["message_id"], 9)
             callback_data = [
@@ -1115,6 +1147,12 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
             reseller_handlers.RESELLER_CUSTOMERS_EXECUTOR = original_executor
 
     def test_reseller_categories_separate_hold_and_unknown_from_active(self):
+        from unittest.mock import patch
+        from datetime import datetime, timezone
+        import utils.account_state as account_state
+        clock_patch = patch.dict(reseller_handlers.inspect_account.__globals__, {'utc_now': lambda: datetime(2026, 8, 2, tzinfo=timezone.utc)})
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
         original_loader = reseller_handlers._load_reseller_live_users
         try:
             reseller_handlers._load_reseller_live_users = lambda force_refresh=False: ({

@@ -29,6 +29,7 @@ if __name__ == "__main__":
 
     bootstrap_storage(BOT_DIR)
 
+from utils.reseller_experience import access_limit_text, build_credit_summary, build_credit_help, experience_text
 from utils.api_client import MultiServerAPI
 from utils.bulk_transfer import deliver_notifications, recover_stale_notification_claims
 from utils.account_state import (
@@ -76,7 +77,7 @@ try:
     from utils.reseller import get_reseller_credit_policy, record_reseller_credit_outcome
 except ImportError:
     def get_reseller_credit_policy(data):
-        limit = get_reseller_trust_limit(get_reseller_total_paid(data or {}))
+        limit = get_reseller_level_summary(data or {})['trust_limit']
         return {"base_limit": limit, "effective_limit": limit, "mode": "credit", "outcomes": []}
 
     def record_reseller_credit_outcome(*_args, **_kwargs):
@@ -1400,13 +1401,20 @@ def _create_user(
 def _deliver_config(chat_id, username, client, renewed=False, include_downloads=True):
     uri = client.get_user_uri(username) if client else None
     action = _hosted_message(chat_id, "renewed" if renewed else "created")
+    configs = (get_reseller_data(OWNER_ID) or {}).get('configs', [])
+    saved = next((item for item in reversed(configs) if isinstance(item, dict)
+                  and item.get('username') == username
+                  and str(item.get('server_id')) == str(getattr(client, 'server_id', None))), {})
+    live = client.get_user(username) if client and hasattr(client, 'get_user') else None
+    limit_note = access_limit_text(_language(chat_id), saved, live)
+
     if not uri or not uri.get("normal_sub"):
         bot.send_message(chat_id, _hosted_message(
             chat_id,
             "config_no_url",
             action=action,
             username=escape_markdown_code(username),
-        ),
+        ) + "\n" + limit_note,
                          parse_mode="Markdown")
         return
     url = uri.get("ipv4") or uri["normal_sub"]
@@ -1420,7 +1428,7 @@ def _deliver_config(chat_id, username, client, renewed=False, include_downloads=
                        action=action,
                        username=escape_markdown_code(username),
                        subscription=escape_markdown_code(uri["normal_sub"]),
-                   ),
+                   ) + "\n" + limit_note,
                    parse_mode="Markdown")
     if include_downloads:
         send_download_prompt_safely(
@@ -1790,7 +1798,7 @@ def _plan_button_text(user_id, plan_id, plan, quote, label_key=None, exchange_ra
             gb=plan.get("gb", plan_id),
             days=plan.get("days", 30),
             usd=format_usd_amount(quote["retail"]),
-        )
+        ) + ' · ' + access_limit_text(_language(user_id), plan, short=True, plan=True)
     exchange_rate = exchange_rate if exchange_rate is not None else get_exchange_rate()
     return hosted_text(
         language,
@@ -1800,7 +1808,7 @@ def _plan_button_text(user_id, plan_id, plan, quote, label_key=None, exchange_ra
         days=plan.get("days", 30),
         usd=format_usd_amount(quote["retail"]),
         toman=format_toman_amount(quote["retail"] * exchange_rate),
-    )
+    ) + ' · ' + access_limit_text(_language(user_id), plan, short=True, plan=True)
 
 
 def _show_plans(chat_id, user_id, message_id=None, event_key=None):
@@ -1908,6 +1916,7 @@ def _purchase_options(chat_id, user_id, plan_id, renewal=None, message_id=None):
         gb=plan.get("gb", plan_id),
         days=plan.get("days", 30),
     )
+    text += '\n' + access_limit_text(language, plan, plan=True)
     if crypto_available:
         text += "\n" + _hosted_message(
             user_id,
@@ -3879,7 +3888,7 @@ def _owner_plans_markup(settings=None):
                 callback_data=f"hb:plantoggle:{plan_id}",
             ),
             types.InlineKeyboardButton(
-                f"{'⭐' if plan_id == recommended else '☆'} {_hosted_message(OWNER_ID, 'recommend_plan')}",
+                experience_text(_language(OWNER_ID), 'remove_recommendation') if plan_id == recommended else f"☆ {_hosted_message(OWNER_ID, 'recommend_plan')}",
                 callback_data=f"hb:planrecommend:{plan_id}",
             ),
         )
@@ -3966,7 +3975,7 @@ def _handle_owner_action(chat_id, action, feedback):
                     days=plan.get("days", 30),
                     price=f"{pricing['wholesale_price']:.2f}",
                     discount=f"{pricing['discount_percent']:.0f}",
-                ),
+                ) + " · " + access_limit_text(_language(OWNER_ID), plan, short=True, plan=True),
                 callback_data=f"hb:ogen:{plan_id}",
             ))
         bot.send_message(
@@ -3976,37 +3985,14 @@ def _handle_owner_action(chat_id, action, feedback):
         )
         return
     if action == "customers":
-        reseller = get_reseller_data(OWNER_ID) or {}
-        configs = [item for item in reseller.get("configs", []) if isinstance(item, dict) and not item.get("removed_from_vpn")]
-        lines = [_hosted_message(OWNER_ID, "owner_customers_header"), ""]
-        for item in configs[-30:]:
-            label = (
-                item.get("customer_name") or item.get("customer_telegram_username")
-                or item.get("customer_telegram_id") or _hosted_message(OWNER_ID, "owner_manual_customer")
-            )
-            lines.append(f"• {item.get('username', '?')} · {label} · {item.get('plan_gb', item.get('gb', '?'))} GB")
-        bot.send_message(
-            chat_id,
-            "\n".join(lines) if configs else _hosted_message(OWNER_ID, "owner_no_customers"),
-        )
+        _show_owner_block_customers(chat_id, 0)
         return
     if action == "debt":
         reseller = get_reseller_data(OWNER_ID) or {}
-        total_paid = get_reseller_total_paid(reseller)
-        limit = get_reseller_trust_limit(total_paid)
-        _, _, available = can_reseller_add_debt(reseller, 0)
-        bot.send_message(
-            chat_id,
-            f"{build_reseller_level_compact(_language(OWNER_ID), reseller)}\n"
-            + _hosted_message(
-                OWNER_ID,
-                "owner_debt_summary",
-                debt=f"{float(reseller.get('debt', 0)):.2f}",
-                limit=f"{limit:.2f}",
-                available=f"{available:.2f}",
-            ),
-            parse_mode="Markdown",
-        )
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(experience_text(_language(OWNER_ID), 'help_button'), callback_data='hb:credithelp'))
+        bot.send_message(chat_id, build_reseller_level_compact(_language(OWNER_ID), reseller) + '\n\n'
+                         + build_credit_summary(_language(OWNER_ID), reseller, OWNER_ID), reply_markup=markup)
         return
     if action == "payment_methods":
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -4230,7 +4216,12 @@ def owner_generate_plan(call):
         bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "plan_unavailable"), show_alert=True)
         return
     _set_input_state(OWNER_ID, {"kind": "owner_generate", "plan_id": plan_id})
-    bot.send_message(call.message.chat.id, _hosted_message(OWNER_ID, "owner_generate_label"))
+    bot.send_message(
+        call.message.chat.id,
+        _hosted_message(OWNER_ID, "owner_generate_label") + "\n\n"
+        + access_limit_text(_language(OWNER_ID), _sellable_plans()[plan_id], plan=True)
+        + "\n\n" + build_credit_summary(_language(OWNER_ID), get_reseller_data(OWNER_ID) or {}, OWNER_ID),
+    )
     bot.answer_callback_query(call.id)
 
 
@@ -4287,7 +4278,7 @@ def owner_generate_input(message):
         return
     config = {"username": username, "customer_name": label, "server_id": getattr(client, "server_id", None),
               "reseller_id": str(OWNER_ID), "origin_bot_id": os.getenv("AJIB_HOSTED_BOT_ID"),
-              "plan_gb": plan_id, "days": plan.get("days", 30),
+              "plan_gb": plan_id, "days": plan.get("days", 30), "unlimited": plan.get("unlimited", False),
               "price": pricing["wholesale_price"], "list_price": pricing["list_price"],
               "reseller_level": pricing["reseller_level"],
               "discount_percent": pricing["discount_percent"],
@@ -4350,7 +4341,8 @@ def plan_recommend(call):
             show_alert=True,
         )
         return
-    update_settings(OWNER_ID, {"recommended_plan_id": plan_id})
+    current = str(get_settings(OWNER_ID).get("recommended_plan_id") or "")
+    update_settings(OWNER_ID, {"recommended_plan_id": None if current == plan_id else plan_id})
     bot.answer_callback_query(
         call.id,
         _hosted_message(OWNER_ID, "recommended_plan_updated"),
@@ -5172,6 +5164,16 @@ def _customer_notification_monitor():
         time.sleep(CUSTOMER_NOTIFICATION_INTERVAL_SECONDS)
 
 
+def _reseller_block_monitor():
+    from utils.reseller_blocks import process_due_blocks
+    while True:
+        try:
+            process_due_blocks(owner_id=OWNER_ID)
+        except Exception:
+            logging.getLogger('ajib.reseller_blocks').exception('Hosted block reconciliation failed')
+        time.sleep(60)
+
+
 def _owner_stats_monitor():
     while True:
         try:
@@ -5202,7 +5204,59 @@ def _migration_notification_monitor():
         time.sleep(30)
 
 
+def _show_owner_block_customers(chat_id, page):
+    from utils.reseller_blocks import customer_block_token
+    from utils.reseller_block_ui import block_status_text
+    reseller = get_reseller_data(OWNER_ID) or {}
+    configs = [(index, item) for index, item in enumerate(reseller.get('configs', []))
+               if isinstance(item, dict) and not item.get('removed_from_vpn')]
+    page = min(max(0, page), max(0, (len(configs)-1)//10))
+    lines = [_hosted_message(OWNER_ID, 'owner_customers_header')]
+    markup = types.InlineKeyboardMarkup()
+    for index, config in configs[page*10:(page+1)*10]:
+        name = str(config.get('username') or '?')
+        label = (config.get('customer_name') or config.get('customer_telegram_username')
+                 or config.get('customer_telegram_id') or _hosted_message(OWNER_ID, 'owner_manual_customer'))
+        lines.append(f"{name} · {label} · {config.get('plan_gb', config.get('gb', '?'))} GB · "
+                     + access_limit_text(_language(OWNER_ID), config, short=True))
+        status = block_status_text(_language(OWNER_ID), config)
+        if status:
+            lines.append(status)
+        try:
+            token = customer_block_token(OWNER_ID, index)
+        except ValueError:
+            continue
+        markup.add(types.InlineKeyboardButton(name, callback_data=f'rb:{token}:view'))
+    if page > 0:
+        markup.add(types.InlineKeyboardButton('◀', callback_data=f'hb:ownercustomers:{page-1}'))
+    if (page+1)*10 < len(configs):
+        markup.add(types.InlineKeyboardButton('▶', callback_data=f'hb:ownercustomers:{page+1}'))
+    bot.send_message(chat_id, '\n'.join(lines) if configs else _hosted_message(OWNER_ID, 'owner_no_customers'),
+                     reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('hb:ownercustomers:') or call.data == 'hb:credithelp')
+def owner_credit_customer_controls(call):
+    if call.from_user.id != OWNER_ID:
+        bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, 'owner_only'))
+        return
+    bot.answer_callback_query(call.id)
+    if call.data == 'hb:credithelp':
+        bot.send_message(call.message.chat.id, build_credit_help(_language(OWNER_ID)))
+    else:
+        try:
+            _show_owner_block_customers(call.message.chat.id, int(call.data.rsplit(':', 1)[1]))
+        except ValueError:
+            bot.send_message(call.message.chat.id, experience_text(_language(OWNER_ID), 'denied'))
+
+
+from utils.reseller_block_ui import register_block_handlers
+register_block_handlers(bot, _language, MultiServerAPI, owner_id=OWNER_ID)
+
+
 def run():
+    from utils.reseller import backfill_reseller_paid_activity
+    backfill_reseller_paid_activity()
     def auth_retry(error, wait_seconds):
         set_bot_runtime_status(
             OWNER_ID,
@@ -5228,6 +5282,7 @@ def run():
     _reconcile_credit_reservations()
     _reconcile_invite_discount_reservations()
     recover_stale_notification_claims()
+    threading.Thread(target=_reseller_block_monitor, daemon=True, name="hosted-blocks").start()
     threading.Thread(target=_crypto_monitor, daemon=True, name="hosted-crypto").start()
     threading.Thread(target=_customer_notification_monitor, daemon=True, name="hosted-notifications").start()
     threading.Thread(target=_owner_stats_monitor, daemon=True, name="hosted-owner-stats").start()

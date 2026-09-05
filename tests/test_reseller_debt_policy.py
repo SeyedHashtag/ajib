@@ -17,10 +17,26 @@ if str(RESELLER_PATH.parent) not in sys.path:
 
 
 def load_reseller_module():
-    spec = importlib.util.spec_from_file_location("reseller_policy_under_test", RESELLER_PATH)
+    for name in list(sys.modules):
+        if name == 'utils' or name.startswith('utils.'):
+            sys.modules.pop(name)
+    package = types.ModuleType('utils')
+    package.__path__ = [str(RESELLER_PATH.parent)]
+    sys.modules['utils'] = package
+    spec = importlib.util.spec_from_file_location('utils.reseller', RESELLER_PATH)
     module = importlib.util.module_from_spec(spec)
+    sys.modules['utils.reseller'] = module
     spec.loader.exec_module(module)
     return module
+
+
+def recent_paid_record(record):
+    """These benefit fixtures represent payments made within the level window."""
+    from datetime import datetime, timezone
+    return {**record, 'paid_activity_version': 1, 'paid_activity': [{
+        'id': 'fixture-payment', 'kind': 'settlement', 'amount': record['total_paid'],
+        'paid_at': datetime.now(timezone.utc).isoformat(),
+    }]}
 
 
 class ResellerDebtPolicyTests(unittest.TestCase):
@@ -28,6 +44,14 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)
         self.resellers_file = Path(self.tmpdir.name) / "resellers.json"
+        saved_modules = {name: value for name, value in sys.modules.items()
+                         if name == 'utils' or name.startswith('utils.')}
+        def restore_modules():
+            for name in list(sys.modules):
+                if name == 'utils' or name.startswith('utils.'):
+                    sys.modules.pop(name)
+            sys.modules.update(saved_modules)
+        self.addCleanup(restore_modules)
         self.reseller = load_reseller_module()
         self.reseller.RESELLERS_FILE = str(self.resellers_file)
 
@@ -92,12 +116,12 @@ class ResellerDebtPolicyTests(unittest.TestCase):
 
     def test_external_bulk_adoption_is_atomic_idempotent_and_financially_neutral(self):
         self.write_resellers({
-            "7784615720": {
+            "7784615720": recent_paid_record({
                 "status": "approved",
                 "debt": 4.0,
                 "total_paid": 20.0,
                 "configs": [],
-            },
+            }),
             "999": {
                 "status": "approved",
                 "configs": [
@@ -242,7 +266,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         for total_paid, level, discount, trust_limit, amount_to_next in cases:
             with self.subTest(total_paid=total_paid):
                 summary = self.reseller.get_reseller_level_summary(
-                    {"total_paid": total_paid}
+                    recent_paid_record({"total_paid": total_paid})
                 )
                 self.assertEqual(summary["level"], level)
                 self.assertEqual(summary["discount_percent"], discount)
@@ -251,9 +275,9 @@ class ResellerDebtPolicyTests(unittest.TestCase):
 
         for invalid_total in (-10, float("nan"), float("inf"), "invalid"):
             with self.subTest(invalid_total=invalid_total):
-                summary = self.reseller.get_reseller_level_summary({
+                summary = self.reseller.get_reseller_level_summary(recent_paid_record({
                     "total_paid": invalid_total,
-                })
+                }))
                 self.assertEqual(summary["level"], 1)
                 self.assertEqual(summary["discount_percent"], 20)
 
@@ -261,31 +285,31 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.assertEqual(
             self.reseller.calculate_reseller_wholesale_price(
                 1.25625,
-                {"total_paid": 0},
+                recent_paid_record({"total_paid": 0}),
             ),
             1.01,
         )
         self.assertEqual(
             self.reseller.calculate_reseller_wholesale_price(
                 100,
-                {"total_paid": 50},
+                recent_paid_record({"total_paid": 50}),
             ),
             75.0,
         )
         with self.assertRaises(ValueError):
             self.reseller.calculate_reseller_wholesale_price(
                 -1,
-                {"total_paid": 0},
+                recent_paid_record({"total_paid": 0}),
             )
 
     def test_level_presentation_claim_is_atomic_releasable_and_completable(self):
         self.write_resellers({
-            "1988": {
+            "1988": recent_paid_record({
                 "status": "approved",
                 "debt": 0,
                 "total_paid": 20,
                 "configs": [],
-            }
+            })
         })
 
         first = self.reseller.claim_reseller_level_presentation("1988")
@@ -315,6 +339,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
 
         saved = self.read_resellers()["1988"]
         saved["total_paid"] = 50
+        saved = recent_paid_record(saved)
         self.write_resellers({"1988": saved})
         level_up = self.reseller.claim_reseller_level_presentation("1988")
         self.assertEqual(level_up["kind"], "level_up")
@@ -336,7 +361,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         data = self.reseller.get_reseller_data("1988")
 
         self.assertEqual(data["total_paid"], 15.0)
-        self.assertEqual(data["trust_limit"], 10.0)
+        self.assertEqual(data["trust_limit"], 5.0)
 
     def test_missing_total_paid_ignores_removed_cleanup_history(self):
         self.write_resellers({
@@ -377,7 +402,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
 
         self.assertEqual(self.reseller.get_reseller_config_value(data["configs"][0]), 15.0)
         self.assertEqual(data["total_paid"], 11.0)
-        self.assertEqual(data["trust_limit"], 10.0)
+        self.assertEqual(data["trust_limit"], 5.0)
 
     def test_add_reseller_renewal_debt_appends_history_without_duplicating_config(self):
         self.write_resellers({
@@ -433,7 +458,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
 
     def test_successful_payment_increments_total_paid_by_debt_credit(self):
         self.write_resellers({
-            "1988": {
+            "1988": recent_paid_record({
                 "status": "approved",
                 "debt": 15.0,
                 "total_paid": 20.0,
@@ -441,7 +466,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
                     {"price": 20.0},
                     {"price": 15.0},
                 ],
-            }
+            })
         })
 
         success, new_debt = self.reseller.apply_reseller_payment("1988", 10.0)
@@ -455,12 +480,12 @@ class ResellerDebtPolicyTests(unittest.TestCase):
 
     def test_overpayment_only_increments_total_paid_by_debt_reduction(self):
         self.write_resellers({
-            "1988": {
+            "1988": recent_paid_record({
                 "status": "approved",
                 "debt": 8.0,
                 "total_paid": 0.0,
                 "configs": [{"price": 8.0}],
-            }
+            })
         })
 
         success, new_debt = self.reseller.apply_reseller_payment("1988", 20.0)
@@ -473,12 +498,12 @@ class ResellerDebtPolicyTests(unittest.TestCase):
 
     def test_fifo_settlement_pays_legacy_and_older_charges_before_reserved_renewal(self):
         self.write_resellers({
-            "1988": {
+            "1988": recent_paid_record({
                 "status": "approved",
                 "debt": 5.0,
                 "total_paid": 20.0,
                 "configs": [{"username": "customer1", "server_id": "s1", "price": 5.0}],
-            }
+            })
         })
         self.assertTrue(self.reseller.add_reseller_debt(
             "1988", 3.0, {"username": "customer2", "server_id": "s1"}
@@ -524,12 +549,12 @@ class ResellerDebtPolicyTests(unittest.TestCase):
 
     def test_reserved_renewal_credit_check_and_duplicate_are_atomic(self):
         self.write_resellers({
-            "1988": {
+            "1988": recent_paid_record({
                 "status": "approved",
                 "debt": 1.0,
                 "total_paid": 0.0,
                 "configs": [{"username": "customer1", "server_id": "s1", "price": 4.0}],
-            }
+            })
         })
         record = {
             "reservation_id": "reserved-atomic",
@@ -559,12 +584,12 @@ class ResellerDebtPolicyTests(unittest.TestCase):
 
     def test_admin_debt_adjustments_use_the_fifo_ledger(self):
         self.write_resellers({
-            "1988": {
+            "1988": recent_paid_record({
                 "status": "approved",
                 "debt": 2.0,
                 "total_paid": 0.0,
                 "configs": [],
-            }
+            })
         })
 
         self.assertTrue(self.reseller.set_reseller_debt("1988", 5.0))
@@ -597,11 +622,11 @@ class ResellerDebtPolicyTests(unittest.TestCase):
                 self.assertEqual(reason, "invalid")
 
     def test_can_reseller_add_debt_uses_current_trust_limit(self):
-        reseller_data = {
+        reseller_data = recent_paid_record({
             "debt": 4.0,
             "total_paid": 0.0,
             "configs": [],
-        }
+        })
 
         can_add, trust_limit, available_credit = self.reseller.can_reseller_add_debt(reseller_data, 1.0)
         self.assertTrue(can_add)
@@ -614,7 +639,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.assertEqual(available_credit, 1.0)
 
     def test_credit_outcome_weighting_and_three_good_recovery(self):
-        base = {"debt": 0.0, "total_paid": 30.0, "configs": []}
+        base = recent_paid_record({"debt": 0.0, "total_paid": 30.0, "configs": []})
 
         half_credit = self.reseller.get_reseller_credit_policy({
             **base,
@@ -771,12 +796,12 @@ class ResellerDebtPolicyTests(unittest.TestCase):
 
     def test_duplicate_payment_callback_does_not_double_apply_or_create_excess(self):
         self.write_resellers({
-            "1988": {
+            "1988": recent_paid_record({
                 "status": "approved",
                 "debt": 8.0,
                 "total_paid": 0.0,
                 "configs": [],
-            }
+            })
         })
 
         first = self.reseller.apply_reseller_payment("1988", 8.0, "payment-1")

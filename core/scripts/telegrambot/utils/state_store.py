@@ -22,6 +22,7 @@ from .time_utils import format_utc_timestamp
 
 STATIC_JSON_FILES = {"plans.json", "support_info.json"}
 TOP_LEVEL_STATE = {
+    "plan_preferences.json": ("kv_dict", "plan_preferences"),
     "payments.json": ("payments", "main"),
     "resellers.json": ("resellers", "main"),
     "hosted_bots.json": ("hosted_registry", "main"),

@@ -537,6 +537,13 @@ def display_config(
             f"{traffic_message}"
         )
 
+        from utils.reseller_experience import access_limit_text
+        saved_access = {}
+        if cycle and cycle.record_id:
+            from utils.payment_records import load_payments
+            saved_access = (load_payments() or {}).get(str(cycle.record_id), {})
+        formatted_details += '\n' + access_limit_text(get_user_language(user_id or chat_id), saved_access, user_data)
+
         if shared_state.panel_state == PanelState.UNKNOWN:
             language = get_user_language(user_id or chat_id)
             message = _append_my_configs_cache_notice(

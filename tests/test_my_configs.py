@@ -255,6 +255,13 @@ class MyConfigsTests(unittest.TestCase):
         renewal_stub.find_customer_renewal_offer = lambda *args, **kwargs: offer
         renewal_stub.format_renewal_offer = lambda *args, **kwargs: details
         renewal_stub.format_renewal_unavailable = lambda *args, **kwargs: unavailable
+        # Display fixtures still need a real dated service cycle while renewal
+        # eligibility and Telegram formatting are stubbed independently.
+        resolver = my_configs_module.inspect_account.__globals__['resolve_service_cycle']
+        renewal_stub.resolve_record_history_cycle = lambda records, username, source: resolver(
+            records, username=username, source=source,
+            server_id=next(iter(records.values()), {}).get('server_id'),
+        )
         sys.modules["utils.renewal"] = renewal_stub
         return original
 
@@ -693,6 +700,13 @@ class MyConfigsTests(unittest.TestCase):
         self.assertIn("select the configuration again", error_text)
 
     def test_paid_hold_shows_first_connection_timer_and_entitlement_deadline(self):
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+        clock = patch.dict(my_configs_module.inspect_account.__globals__, {
+            'utc_now': lambda: datetime(2026, 8, 2, tzinfo=timezone.utc),
+        })
+        clock.start()
+        self.addCleanup(clock.stop)
         class DummyQR:
             def save(self, target, image_format):
                 target.write(b"qr")

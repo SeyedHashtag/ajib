@@ -204,6 +204,7 @@ def load_renewal_module():
     sys.modules["utils.currency_format"] = currency_stub
 
     reseller_stub = types.ModuleType("utils.reseller")
+    reseller_stub._resellers_store_exists = lambda: False
     reseller_stub.get_reseller_level_summary = lambda data: {
         "level": min(6, 1 + int(float(data.get("total_paid", 0) or 0) // 10)),
         "discount_percent": min(
@@ -597,6 +598,12 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(offer["reason"], "renewal_ineligible_state_unknown")
 
     def test_latest_successful_cycle_prevents_offer_from_older_expired_cycle(self):
+        from unittest.mock import patch
+        clock = patch.dict(self.renewal.inspect_account.__globals__, {
+            'utc_now': lambda: datetime(2026, 8, 2, tzinfo=timezone.utc),
+        })
+        clock.start()
+        self.addCleanup(clock.stop)
         hold_user = {
             "blocked": False,
             "status": "On-hold",

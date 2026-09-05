@@ -379,7 +379,7 @@ MESSAGE_TRANSLATIONS = {
         "reseller_level_roadmap_row": "{marker} {icon} Level {level} · {discount_percent}% OFF · ${trust_limit} credit · ${threshold}+ paid",
         "reseller_level_introduction": "🎉 **Welcome to Reseller Levels!**\n\n{icon} You are **Level {level}/{level_count}**\n🏷 Wholesale Discount: **{discount_percent}%**\n🏦 Trust Limit: **${trust_limit}**",
         "reseller_level_up": "🎊 **LEVEL UP!**\n\nYou advanced from Level {from_level} to {icon} **Level {level}/{level_count}**\n🏷 New Wholesale Discount: **{discount_percent}%**\n🏦 New Trust Limit: **${trust_limit}**",
-        "reseller_level_next_reward": "Next: Level {next_level} at ${next_threshold} total paid unlocks {next_discount_percent}% OFF and a ${next_trust_limit} trust limit.",
+        "reseller_level_next_reward": "Next: Level {next_level} at ${next_threshold} paid in the last 90 days unlocks {next_discount_percent}% OFF and a ${next_trust_limit} trust limit.",
         "reseller_level_reward_max": "👑 You have unlocked the maximum reseller discount and trust limit.",
         "admin_resellers_list": "💼 **Resellers List**\nSelect a reseller to manage:",
         "admin_reseller_details": "👤 **Reseller Details**\n\nUser: {user_id}\nStatus: {status}\nDebt: ${debt}\nConfigs: {configs_count}",
@@ -452,7 +452,7 @@ MESSAGE_TRANSLATIONS = {
         "debt_state_warning": "Warning",
         "debt_state_suspended": "Suspended",
         "reseller_debt_status_line": "Debt Status: {debt_state}",
-        "reseller_suspended_intro_notice": "New config creation is temporarily disabled until debt is reduced.",
+        "reseller_suspended_intro_notice": "New config creation is temporarily disabled until debt is fully settled.",
         "reseller_suspended_due_debt": "Account suspended due to debt (${debt:.2f}). Pay ${unlock_amount:.2f} to unlock config generation.",
         "reseller_suspended_notification": "⏸️ Your reseller access has been suspended by an admin. You can still review your debt and contact support for details.",
         "reseller_banned_notification": "🚫 Your reseller access has been banned by an admin. Contact support/admin to resolve this.",
@@ -744,7 +744,7 @@ MESSAGE_TRANSLATIONS = {
         "reseller_level_roadmap_row": "{marker} {icon} Уровень {level} · скидка {discount_percent}% · кредит ${trust_limit} · оплачено ${threshold}+",
         "reseller_level_introduction": "🎉 **Добро пожаловать в систему уровней!**\n\n{icon} Ваш уровень: **{level}/{level_count}**\n🏷 Оптовая скидка: **{discount_percent}%**\n🏦 Лимит доверия: **${trust_limit}**",
         "reseller_level_up": "🎊 **НОВЫЙ УРОВЕНЬ!**\n\nВы перешли с уровня {from_level} на {icon} **уровень {level}/{level_count}**\n🏷 Новая оптовая скидка: **{discount_percent}%**\n🏦 Новый лимит доверия: **${trust_limit}**",
-        "reseller_level_next_reward": "Далее: уровень {next_level} при общей оплате ${next_threshold} откроет скидку {next_discount_percent}% и лимит доверия ${next_trust_limit}.",
+        "reseller_level_next_reward": "Далее: уровень {next_level} при оплате за последние 90 дней ${next_threshold} откроет скидку {next_discount_percent}% и лимит доверия ${next_trust_limit}.",
         "reseller_level_reward_max": "👑 Вы открыли максимальную скидку и лимит доверия.",
         "admin_resellers_list": "💼 **Список реселлеров**\nВыберите реселлера для управления:",
         "admin_reseller_details": "👤 **Детали реселлера**\n\nПользователь: {user_id}\nСтатус: {status}\nДолг: ${debt}\nКоличество конфигов: {configs_count}",
@@ -817,7 +817,7 @@ MESSAGE_TRANSLATIONS = {
         "debt_state_warning": "Предупреждение",
         "debt_state_suspended": "Приостановлен",
         "reseller_debt_status_line": "Статус долга: {debt_state}",
-        "reseller_suspended_intro_notice": "Создание новых конфигов временно отключено до снижения долга.",
+        "reseller_suspended_intro_notice": "Создание новых конфигов временно отключено до полного погашения долга.",
         "reseller_suspended_due_debt": "Аккаунт приостановлен из-за долга (${debt:.2f}). Оплатите ${unlock_amount:.2f}, чтобы разблокировать создание конфигов.",
         "reseller_suspended_notification": "⏸️ Ваш реселлерский доступ был приостановлен администратором. Вы можете проверить долг и обратиться в поддержку за деталями.",
         "reseller_banned_notification": "🚫 Ваш реселлерский доступ был заблокирован администратором. Обратитесь в поддержку/к администратору для решения.",
@@ -1109,7 +1109,7 @@ MESSAGE_TRANSLATIONS = {
         "reseller_level_roadmap_row": "{marker} {icon} سطح {level} · {discount_percent}٪ تخفیف · ${trust_limit} اعتبار · ${threshold}+ پرداخت",
         "reseller_level_introduction": "🎉 **به سیستم سطوح نمایندگی خوش آمدید!**\n\n{icon} شما در **سطح {level}/{level_count}** هستید\n🏷 تخفیف عمده: **{discount_percent}٪**\n🏦 سقف اعتبار: **${trust_limit}**",
         "reseller_level_up": "🎊 **ارتقای سطح!**\n\nاز سطح {from_level} به {icon} **سطح {level}/{level_count}** رسیدید\n🏷 تخفیف عمده جدید: **{discount_percent}٪**\n🏦 سقف اعتبار جدید: **${trust_limit}**",
-        "reseller_level_next_reward": "بعدی: سطح {next_level} با مجموع پرداخت ${next_threshold}، تخفیف {next_discount_percent}٪ و سقف اعتبار ${next_trust_limit} را فعال می‌کند.",
+        "reseller_level_next_reward": "بعدی: سطح {next_level} با پرداخت در ۹۰ روز اخیر به مبلغ ${next_threshold}، تخفیف {next_discount_percent}٪ و سقف اعتبار ${next_trust_limit} را فعال می‌کند.",
         "reseller_level_reward_max": "👑 بالاترین تخفیف و سقف اعتبار نمایندگی برای شما فعال شده است.",
         "admin_resellers_list": "💼 **لیست نمایندگان**\nیک نماینده را برای مدیریت انتخاب کنید:",
         "admin_reseller_details": "👤 **جزئیات نماینده**\n\nکاربر: {user_id}\nوضعیت: {status}\nبدهی: ${debt}\nتعداد کانفیگ: {configs_count}",
@@ -1182,7 +1182,7 @@ MESSAGE_TRANSLATIONS = {
         "debt_state_warning": "هشدار",
         "debt_state_suspended": "معلق",
         "reseller_debt_status_line": "وضعیت بدهی: {debt_state}",
-        "reseller_suspended_intro_notice": "ایجاد کانفیگ جدید تا زمان کاهش بدهی موقتاً غیرفعال است.",
+        "reseller_suspended_intro_notice": "ایجاد کانفیگ جدید تا زمان تسویه کامل بدهی موقتاً غیرفعال است.",
         "reseller_suspended_due_debt": "حساب شما به دلیل بدهی (${debt:.2f}) معلق است. برای باز شدن ایجاد کانفیگ، ${unlock_amount:.2f} پرداخت کنید.",
         "reseller_suspended_notification": "⏸️ دسترسی نمایندگی شما توسط ادمین معلق شد. می‌توانید بدهی خود را بررسی کنید و برای جزئیات با پشتیبانی تماس بگیرید.",
         "reseller_banned_notification": "🚫 دسترسی نمایندگی شما توسط ادمین مسدود شد. برای حل مشکل با پشتیبانی/ادمین تماس بگیرید.",
@@ -1474,7 +1474,7 @@ MESSAGE_TRANSLATIONS = {
         "reseller_level_roadmap_row": "{marker} {icon} Dereje {level} · {discount_percent}% arzan · ${trust_limit} kredit · ${threshold}+ töleg",
         "reseller_level_introduction": "🎉 **Satyjy derejelerine hoş geldiňiz!**\n\n{icon} Siz **{level}/{level_count}-nji derejede**\n🏷 Lomaý arzanladyş: **{discount_percent}%**\n🏦 Ynam çägi: **${trust_limit}**",
         "reseller_level_up": "🎊 **DEREJE ÝOKARLANDY!**\n\n{from_level}-nji derejeden {icon} **{level}/{level_count}-nji derejä** geçdiňiz\n🏷 Täze lomaý arzanladyş: **{discount_percent}%**\n🏦 Täze ynam çägi: **${trust_limit}**",
-        "reseller_level_next_reward": "Indiki: ${next_threshold} jemi tölegde {next_level}-nji dereje {next_discount_percent}% arzanladyşy we ${next_trust_limit} ynam çägini açýar.",
+        "reseller_level_next_reward": "Indiki: ${next_threshold} soňky 90 gündäki tölegde {next_level}-nji dereje {next_discount_percent}% arzanladyşy we ${next_trust_limit} ynam çägini açýar.",
         "reseller_level_reward_max": "👑 Iň ýokary satyjy arzanladyşyny we ynam çägini açdyňyz.",
         "admin_resellers_list": "💼 **Satyjylar Sanawy**\nDolandyrmak üçin satyjy saýlaň:",
         "admin_reseller_details": "👤 **Satyjy Maglumatlary**\n\nUlanyjy: {user_id}\nStatus: {status}\nBergi: ${debt}\nSazlamalar sany: {configs_count}",
@@ -1547,7 +1547,7 @@ MESSAGE_TRANSLATIONS = {
         "debt_state_warning": "Duýduryş",
         "debt_state_suspended": "Togtadylan",
         "reseller_debt_status_line": "Bergi ýagdaýy: {debt_state}",
-        "reseller_suspended_intro_notice": "Täze sazlama döretmek bergi azalýança wagtlaýyn togtadyldy.",
+        "reseller_suspended_intro_notice": "Täze sazlama döretmek bergi doly üzülýänçä wagtlaýyn togtadyldy.",
         "reseller_suspended_due_debt": "Hasabyňyz bergi sebäpli togtadylan (${debt:.2f}). Sazlama döretmegi açmak üçin ${unlock_amount:.2f} töläň.",
         "reseller_suspended_notification": "⏸️ Satyjy elýeterliligiňiz admin tarapyndan togtadyldy. Bergiňizi barlap, jikme-jiklik üçin goldaw bilen habarlaşyp bilersiňiz.",
         "reseller_banned_notification": "🚫 Satyjy elýeterliligiňiz admin tarapyndan blokirlendi. Bu meseläni çözmek üçin goldaw/admin bilen habarlaşyň.",
@@ -1863,6 +1863,15 @@ CUSTOMER_JOURNEY_TRANSLATIONS = {
 
 for _language_code, _messages in CUSTOMER_JOURNEY_TRANSLATIONS.items():
     MESSAGE_TRANSLATIONS[_language_code].update(_messages)
+
+for _language_code, _block_notice in {
+    'en': 'End the temporary block or resolve the admin/debt restriction before renewing this configuration.',
+    'fa': 'پیش از تمدید این کانفیگ، مسدودی موقت یا محدودیت مدیر/بدهی را برطرف کنید.',
+    'ru': 'Перед продлением снимите временную блокировку или устраните ограничение администратора/долга.',
+    'tk': 'Täzelemezden öň wagtlaýyn bloky ýa-da administrator/bergi çäklendirmesini aýryň.',
+}.items():
+    MESSAGE_TRANSLATIONS[_language_code]['renewal_ineligible_protected_block'] = _block_notice
+
 
 def get_button_text(language_code: str, button_key: str) -> str:
     """Get the translated text for a button key in the specified language.

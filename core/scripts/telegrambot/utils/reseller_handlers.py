@@ -11,6 +11,7 @@ from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
+from utils.reseller_experience import access_limit_text, build_credit_summary, build_credit_help, experience_text
 from utils.command import bot, ADMIN_USER_IDS, is_admin
 from utils.common import admin_action_text
 from utils.language import get_user_language
@@ -37,7 +38,7 @@ try:
     from utils.reseller import get_reseller_credit_policy
 except ImportError:  # Rolling-upgrade/test compatibility.
     def get_reseller_credit_policy(data):
-        limit = get_reseller_trust_limit(get_reseller_total_paid(data or {}))
+        limit = get_reseller_level_summary(data or {})['trust_limit']
         return {'base_limit': limit, 'effective_limit': limit, 'mode': 'credit', 'outcomes': []}
 try:
     from utils.reseller import (
@@ -468,11 +469,12 @@ def _build_reseller_purchase_details(
     quote,
     current_debt,
     trust_limit,
+    funding_mode='debt',
 ):
     price = quote['price']
     exchange_rate = get_exchange_rate()
     converted_price = price * exchange_rate
-    projected_debt = current_debt + price
+    projected_debt = current_debt + (0 if funding_mode == 'prepaid' else price)
     return get_message_text(language, "reseller_purchase_details").format(
         plan_gb=gb,
         days=days,
@@ -485,7 +487,7 @@ def _build_reseller_purchase_details(
         current_debt=format_usd_amount(current_debt),
         projected_debt=format_usd_amount(projected_debt),
         trust_limit=format_usd_amount(trust_limit),
-    ) + get_message_text(language, "purchase_connection_warning")
+    ) + '\n' + access_limit_text(language, load_plans().get(str(gb), {}), plan=True) + get_message_text(language, "purchase_connection_warning")
 
 
 def _reseller_username_prompt_markup(language):
@@ -494,13 +496,13 @@ def _reseller_username_prompt_markup(language):
     return markup
 
 
-def _show_reseller_purchase_details(call, language, gb, days, quote, current_debt, trust_limit):
+def _show_reseller_purchase_details(call, language, gb, days, quote, current_debt, trust_limit, funding_mode='debt'):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton(get_button_text(language, "confirm"), callback_data=f"reseller:confirm_buy:{gb}"))
     markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
 
     bot.edit_message_text(
-        _build_reseller_purchase_details(language, gb, days, quote, current_debt, trust_limit),
+        _build_reseller_purchase_details(language, gb, days, quote, current_debt, trust_limit, funding_mode) + '\n' + build_credit_summary(language, get_reseller_data(call.from_user.id) or {}, call.from_user.id),
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         reply_markup=markup
@@ -632,13 +634,15 @@ def reseller_panel(message):
         )
         debt = float(reseller_data.get('debt', 0.0))
         debt_state_text = get_message_text(language, _debt_state_label(reseller_data.get('debt_state', 'active')))
-        trust_limit = get_reseller_trust_limit(get_reseller_total_paid(reseller_data))
+        trust_limit = get_reseller_level_summary(reseller_data)['trust_limit']
         intro = get_message_text(language, "reseller_intro").replace("${debt}", f"${format_usd_amount(debt)}")
         intro += "\n" + build_reseller_level_compact(language, reseller_data)
         intro += "\n" + get_message_text(language, "reseller_trust_limit_line").format(trust_limit=trust_limit)
         intro += "\n" + get_message_text(language, "reseller_debt_status_line").format(debt_state=debt_state_text)
         if _is_reseller_suspended(reseller_data) or status == 'suspended':
             intro += "\n" + get_message_text(language, "reseller_suspended_intro_notice")
+        intro += '\n\n' + build_credit_summary(language, reseller_data, user_id, deadlines=False)
+        markup.add(types.InlineKeyboardButton(experience_text(language, 'help_button'), callback_data='reseller:credit_help'))
         intro += hosted_text(language, "main_reseller_guide").replace("*", "")
         bot.reply_to(message, intro, reply_markup=markup)
         
@@ -889,6 +893,7 @@ def handle_reseller_generate(call):
             discount_percent=quote['discount_percent'],
             days=details['days'],
         )
+        button_text += " · " + access_limit_text(language, details, short=True, plan=True)
         markup.add(types.InlineKeyboardButton(button_text, callback_data=f"reseller:buy:{gb}"))
         
     markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
@@ -940,7 +945,7 @@ def handle_reseller_buy(call):
         _show_reseller_trust_limit_block(call, language, current_debt, price, trust_limit, available_credit)
         return
 
-    if projected_debt >= DEBT_WARNING_THRESHOLD:
+    if funding_mode == 'debt' and projected_debt >= DEBT_WARNING_THRESHOLD:
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(types.InlineKeyboardButton(get_message_text(language, "continue_action"), callback_data=f"reseller:details:{gb}"))
         markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
@@ -957,7 +962,7 @@ def handle_reseller_buy(call):
         )
         return
     
-    _show_reseller_purchase_details(call, language, gb, days, quote, current_debt, trust_limit)
+    _show_reseller_purchase_details(call, language, gb, days, quote, current_debt, trust_limit, funding_mode)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reseller:details:"))
@@ -998,7 +1003,7 @@ def handle_reseller_purchase_details(call):
         _show_reseller_trust_limit_block(call, language, current_debt, price, trust_limit, available_credit)
         return
 
-    _show_reseller_purchase_details(call, language, gb, plan['days'], quote, current_debt, trust_limit)
+    _show_reseller_purchase_details(call, language, gb, plan['days'], quote, current_debt, trust_limit, funding_mode)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reseller:confirm_buy:"))
@@ -1187,6 +1192,7 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
             ipv4_info=ipv4_info
         )
 
+        msg += "\n" + access_limit_text(language, {"unlimited": unlimited})
         if sub_url:
             qr = qrcode.make(ipv4_url or sub_url)
             bio = io.BytesIO()
@@ -1255,16 +1261,7 @@ def handle_reseller_debt(call):
         bot.answer_callback_query(call.id, get_message_text(language, "reseller_access_required"))
         return
     debt = float(reseller_data.get('debt', 0.0))
-    debt_state = reseller_data.get('debt_state', 'active')
-    debt_state_text = get_message_text(language, _debt_state_label(debt_state))
-    unavailable = get_message_text(language, "value_not_available")
-    debt_since = reseller_data.get('debt_since') or unavailable
-    last_payment_at = reseller_data.get('last_payment_at') or unavailable
-    trust_limit = get_reseller_trust_limit(get_reseller_total_paid(reseller_data))
-    credit_policy = get_reseller_credit_policy(reseller_data)
-    wholesale_balance = get_wholesale_balance(user_id)
-    unlock_amount = get_reseller_unlock_amount(debt) if _is_reseller_suspended(reseller_data) else 0.0
-    
+
     markup = types.InlineKeyboardMarkup()
     if debt > 0:
         markup.add(types.InlineKeyboardButton(get_button_text(language, "settle_debt"), callback_data=f"reseller:settle:{debt:.2f}"))
@@ -1274,17 +1271,9 @@ def handle_reseller_debt(call):
     ))
     markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
     
+    markup.add(types.InlineKeyboardButton(experience_text(language, 'help_button'), callback_data='reseller:credit_help'))
     bot.edit_message_text(
-        (
-            f"{get_message_text(language, 'current_debt').replace('${debt}', f'${format_usd_amount(debt)}')}\n"
-            f"{get_message_text(language, 'reseller_trust_limit_line').format(trust_limit=trust_limit)}\n"
-            f"{get_message_text(language, 'reseller_effective_credit_line').format(effective_limit=credit_policy['effective_limit'], credit_mode=credit_policy['mode'])}\n"
-            f"{get_message_text(language, 'reseller_wholesale_balance_line').format(balance=wholesale_balance['available'])}\n"
-            f"{get_message_text(language, 'reseller_debt_status_line').format(debt_state=debt_state_text)}\n"
-            f"{get_message_text(language, 'reseller_oldest_unpaid_date_line').format(debt_since=debt_since)}\n"
-            f"{get_message_text(language, 'reseller_last_payment_date_line').format(last_payment_at=last_payment_at)}\n"
-            f"{get_message_text(language, 'reseller_amount_due_to_unlock_line').format(unlock_amount=unlock_amount)}"
-        ),
+        build_credit_summary(language, reseller_data, user_id),
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         reply_markup=markup
@@ -1305,10 +1294,10 @@ def handle_reseller_wholesale_balance(call):
     markup = types.InlineKeyboardMarkup(row_width=3)
     has_outstanding_debt = float(reseller_data.get('debt', 0.0) or 0.0) > 0.005
     if not has_outstanding_debt:
-        markup.row(*[
+        markup.add(*[
             types.InlineKeyboardButton(
                 f"${amount}", callback_data=f"reseller:wholesale_fund:{amount:.2f}"
-            ) for amount in (5, 10, 20)
+            ) for amount in (3, 5, 10, 20)
         ])
     if not has_outstanding_debt and float(credit or 0) > 0:
         amount = round(float(credit), 2)
@@ -1323,13 +1312,9 @@ def handle_reseller_wholesale_balance(call):
             callback_data=f"reseller:settle:{debt:.2f}",
         ))
     markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
+    markup.add(types.InlineKeyboardButton(experience_text(language, 'help_button'), callback_data='reseller:credit_help'))
     bot.edit_message_text(
-        get_message_text(language, "reseller_wholesale_balance_screen").format(
-            available=balance['available'],
-            reserved=balance['reserved'],
-            credit_mode=_escape_markdown(policy['mode']),
-            effective_limit=policy['effective_limit'],
-        ),
+        build_credit_summary(language, reseller_data, user_id, balance=balance, policy=policy),
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         reply_markup=markup,
@@ -1373,7 +1358,8 @@ def handle_reseller_wholesale_fund(call):
         ))
     markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
     bot.edit_message_text(
-        get_message_text(language, "reseller_wholesale_fund_prompt").format(amount=amount),
+        get_message_text(language, "reseller_wholesale_fund_prompt").format(amount=amount)
+        + "\n\n" + build_credit_summary(language, reseller_data, user_id),
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         reply_markup=markup,
@@ -1629,7 +1615,7 @@ def handle_reseller_payment(call):
             get_message_text(language, "settlement_payment_approved").format(
                 amount=format_usd_amount(reserved),
                 remaining_debt=format_usd_amount(remaining_debt or 0),
-            ),
+            ) + '\n\n' + build_credit_summary(language, get_reseller_data(user_id) or {}, user_id),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             parse_mode="Markdown",
@@ -1908,6 +1894,7 @@ def _format_reseller_customer_entry(index, cfg, category, language):
     identifier_lines = [f"{index}. {RESELLER_CUSTOMER_CATEGORY_ICONS.get(status_category, '✅')} `{customer_name or username}`"]
     if customer_name:
         identifier_lines.append(f"   🆔 `{username}`")
+    status_label += ' · ' + access_limit_text(language, cfg, short=True)
     removal_reason = _removed_config_reason_line(cfg, language)
     price_display = (
         unavailable
@@ -2543,6 +2530,9 @@ def _render_reseller_customer_config_job(
         )
         return
 
+    from utils.reseller_block_ui import add_block_button
+    add_block_button(back_markup, user_id, matched_config_index, language)
+
     username = str(matched_config.get('username') or '').strip()
     preferred_server_id = matched_config.get('server_id')
 
@@ -2676,6 +2666,12 @@ def _render_reseller_customer_config_job(
         traffic_message=traffic_message,
     )
 
+    formatted_details += '\n' + access_limit_text(language, matched_config, user_config)
+    from utils.reseller_block_ui import block_status_text
+    temporary_status = block_status_text(language, matched_config)
+    if temporary_status:
+        formatted_details += '\n' + temporary_status
+
     if shared_state.panel_state == PanelState.UNKNOWN:
         safe_edit_message_text(
             bot,
@@ -2757,6 +2753,8 @@ def _render_reseller_customer_config_job(
                     )
             except Exception as renewal_error:
                 print(f"Error building reseller renewal offer for {username}: {renewal_error}")
+        from utils.reseller_block_ui import add_block_button
+        add_block_button(expired_markup, user_id, matched_config_index, language)
         message_text = get_message_text(language, "reseller_config_expired").format(
             details=formatted_details,
             renewal_message=(
@@ -2838,6 +2836,9 @@ def _render_reseller_customer_config_job(
     except Exception as renewal_error:
         print(f"Error building reseller renewal reservation for {username}: {renewal_error}")
 
+    from utils.reseller_block_ui import add_block_button
+    add_block_button(back_markup, user_id, matched_config_index, language)
+
     caption = get_message_text(language, "reseller_config_subscription_caption").format(
         details=formatted_details,
         ipv4_info=(
@@ -2905,10 +2906,10 @@ def _release_reseller_renewal_view(key):
         RESELLER_RENEWAL_INFLIGHT.discard(key)
 
 
-def _reseller_renewal_details_message(language, offer, current_debt, trust_limit):
+def _reseller_renewal_details_message(language, offer, current_debt, trust_limit, funding_mode='debt'):
     from utils.renewal import format_renewal_offer
 
-    projected_debt = current_debt + float(offer.get('price', 0.0))
+    projected_debt = current_debt + (0 if funding_mode == 'prepaid' else float(offer.get('price', 0.0)))
     message = format_renewal_offer(language, offer, include_payment_prompt=False)
     message += "\n\n" + get_message_text(language, "reseller_renewal_debt_details").format(
         list_price=format_usd_amount(offer.get('full_price', offer.get('price', 0.0))),
@@ -2919,7 +2920,7 @@ def _reseller_renewal_details_message(language, offer, current_debt, trust_limit
         projected_debt=format_usd_amount(projected_debt),
         trust_limit=format_usd_amount(trust_limit),
     )
-    if projected_debt >= DEBT_WARNING_THRESHOLD:
+    if funding_mode == 'debt' and projected_debt >= DEBT_WARNING_THRESHOLD:
         message += "\n\n" + get_message_text(language, "reseller_debt_warning_message").format(
             current_debt=current_debt,
             purchase_adds=float(offer.get('price', 0.0)),
@@ -2959,8 +2960,9 @@ def _show_reseller_renewal_confirmation(call, token, offer, reseller_data, langu
     markup.add(types.InlineKeyboardButton(
         get_button_text(language, "cancel"), callback_data="reseller:cancel"
     ))
+    credit_summary = build_credit_summary(language, reseller_data, call.from_user.id)
     bot.edit_message_text(
-        _reseller_renewal_details_message(language, offer, current_debt, trust_limit),
+        _reseller_renewal_details_message(language, offer, current_debt, trust_limit, funding_mode) + "\n\n" + credit_summary,
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         reply_markup=markup,
@@ -3016,7 +3018,7 @@ def handle_reseller_renewal_start(call):
                     plan_gb=plan_id,
                     days=plan.get('days', 0),
                     price=format_usd_amount(wholesale_price),
-                ),
+                ) + ' · ' + access_limit_text(language, plan, short=True, plan=True),
                 callback_data=f"reseller:renew_plan:{token}:{plan_id}",
             ))
         markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
@@ -3540,7 +3542,7 @@ def _reseller_financial_stats(reseller_data):
     total_turnover = sum(_reseller_config_value(config) for config in value_configs)
     current_debt = _safe_float((reseller_data or {}).get("debt", 0.0))
     total_paid = get_reseller_total_paid(reseller_data)
-    trust_limit = get_reseller_trust_limit(total_paid)
+    trust_limit = get_reseller_level_summary(reseller_data)['trust_limit']
     financially_active_configs = [
         config for config in value_configs
         if _reseller_config_value(config) > 0
@@ -3755,7 +3757,7 @@ def _build_admin_reseller_detail_text(language, reseller_id, reseller_data):
         "\n"
         + get_message_text(language, "reseller_effective_credit_line").format(
             effective_limit=credit_policy["effective_limit"],
-            credit_mode=_escape_markdown(credit_policy["mode"]),
+            credit_mode=_escape_markdown(experience_text(language, credit_policy["mode"])),
         )
         + "\n"
         + get_message_text(language, "reseller_wholesale_balance_line").format(
@@ -4887,3 +4889,17 @@ def handle_admin_reseller_ui(call):
         return
 
     bot.answer_callback_query(call.id, get_message_text(language, "admin_invalid_action"), show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'reseller:credit_help')
+def handle_reseller_credit_help(call):
+    language = get_user_language(call.from_user.id)
+    if not _get_active_reseller_data(call.from_user.id):
+        safe_answer_callback_query(bot, call.id, get_message_text(language, 'reseller_access_required'))
+        return
+    safe_answer_callback_query(bot, call.id)
+    bot.send_message(call.message.chat.id, build_credit_help(language))
+
+
+from utils.reseller_block_ui import register_block_handlers
+register_block_handlers(bot, get_user_language, MultiServerAPI)

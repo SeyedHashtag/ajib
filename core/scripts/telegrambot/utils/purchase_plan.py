@@ -10,6 +10,7 @@ except ImportError:
     def record_main_growth_event(*args, **kwargs):
         return False
 from utils.edit_plans import load_plans
+from utils.reseller_experience import access_limit_text
 from utils.payments import CryptoPayment
 from utils.payment_records import (
     add_payment_record,
@@ -477,19 +478,8 @@ def select_recommended_plan_id(plans, configured_plan_id=None):
     if not items:
         return None
 
-    stored = next(
-        (plan_id for plan_id, details in items if details.get("recommended") is True),
-        None,
-    )
-    if stored is not None:
-        return stored
-
-    fallback = str(
-        configured_plan_id
-        if configured_plan_id is not None
-        else os.getenv("AJIB_RECOMMENDED_PLAN_ID") or ""
-    ).strip()
-    return fallback if fallback in dict(items) else None
+    from utils.plan_recommendation import get_recommendation
+    return get_recommendation(dict(items), configured_plan_id)
 
 
 def _customer_card_pricing_enabled(language):
@@ -504,14 +494,14 @@ def _plan_price_pair(language, price, exchange_rate=None):
     return get_message_text(language, "plan_price_pair_usd_first").format(usd=usd, toman=toman)
 
 
-def _plan_button_text(language, gb, details, exchange_rate, label_key=None):
+def _plan_button_text(language, gb, details, exchange_rate=None, label_key=None):
     label = f"{get_message_text(language, label_key)} · " if label_key else ""
     return get_message_text(language, "customer_plan_button").format(
         label=label,
         plan_gb=gb,
-        price_pair=_plan_price_pair(language, details['price'], exchange_rate),
+        price_pair=get_message_text(language, 'plan_price_usd_only').format(usd=format_usd_amount(details['price'])),
         days=details['days'],
-    )
+    ) + ' · ' + access_limit_text(language, details, short=True, plan=True)
 
 
 def build_plan_payment_totals(
@@ -685,6 +675,11 @@ def _deliver_payment_config(
     parse_mode='Markdown',
     delivery_failure_code=None,
 ):
+    record = get_payment_record(payment_id) or {}
+    language = get_user_language(recipient_id)
+    notice = access_limit_text(language, record)
+    if notice not in message:
+        message += '\n' + notice
     _record_config_delivery(payment_id, 'attempting')
     try:
         if photo is not None:
@@ -1081,10 +1076,12 @@ def _remaining_reseller_debt(user_id, fallback=None):
 
 
 def _settlement_approved_message(language, user_id, credited_amount, remaining_debt):
+    from utils.reseller_experience import build_credit_summary
+    from utils.reseller import get_reseller_data
     return get_message_text(language, "settlement_payment_approved").format(
         amount=format_usd_amount(credited_amount),
         remaining_debt=format_usd_amount(_remaining_reseller_debt(user_id, remaining_debt)),
-    )
+    ) + '\n\n' + build_credit_summary(language, get_reseller_data(user_id) or {}, user_id)
 
 
 def _send_reseller_settlement_admin_notification(
@@ -1890,7 +1887,6 @@ def show_plans(chat_id, user_id, message_id=None):
         catalog="all",
     )
     plans = load_plans()
-    exchange_rate = get_exchange_rate() if _customer_card_pricing_enabled(language) else None
     customer_plans = _customer_plan_items(plans)
     markup = types.InlineKeyboardMarkup(row_width=1)
     recommended_plan_id = select_recommended_plan_id(plans)
@@ -1899,7 +1895,7 @@ def show_plans(chat_id, user_id, message_id=None):
             language,
             gb,
             details,
-            exchange_rate,
+            None,
             label_key="quick_pick_recommended" if gb == recommended_plan_id else None,
         )
         markup.add(types.InlineKeyboardButton(button_text, callback_data=f"purchase:{gb}"))
@@ -1993,6 +1989,7 @@ def handle_purchase_selection(call):
             message += get_message_text(language, "data").format(plan_gb=plan_gb)
             message += get_message_text(language, "duration").format(days=plan['days'])
             message += get_message_text(language, "unlimited").format(unlimited_text=unlimited_text)
+            message += access_limit_text(language, plan, plan=True) + '\n'
             message += build_plan_payment_totals(
                 language,
                 plan_gb,
@@ -2144,7 +2141,7 @@ def _show_customer_renewal_plan_picker(call, token, offer, language):
                 plan_gb=plan_id,
                 days=plan.get('days', 0),
                 price=format_usd_amount(plan.get('price', 0)),
-            ),
+            ) + ' · ' + access_limit_text(language, plan, short=True, plan=True),
             callback_data=f"renew_plan_choice:{token}:{plan_id}",
         ))
     markup.add(types.InlineKeyboardButton(
@@ -3340,7 +3337,7 @@ def _process_admin_approval_job(call, action, payment_id, payment_record, review
                 unlimited,
             )
             if result:
-                if not _complete_sale_payment_or_notify(payment_id, user_to_notify, username, api_client):
+                if not _complete_sale_payment_or_notify(payment_id, user_to_notify, username, api_client, fields={"unlimited": unlimited}):
                     safe_answer_callback_query(
                         bot,
                         call.id,
@@ -3624,7 +3621,7 @@ def _process_check_payment_job(call):
             unlimited,
         )
         if result:
-            if not _complete_sale_payment_or_notify(payment_id, user_id, username, api_client):
+            if not _complete_sale_payment_or_notify(payment_id, user_id, username, api_client, fields={"unlimited": unlimited}):
                 bot.send_message(
                     user_id,
                     get_message_text(user_language, "payment_completed_user_error"),
@@ -3846,7 +3843,7 @@ def process_payment_webhook(request_data):
                     unlimited,
                 )
                 if result:
-                    if not _complete_sale_payment_or_notify(record_key, user_id, username, api_client):
+                    if not _complete_sale_payment_or_notify(record_key, user_id, username, api_client, fields={"unlimited": unlimited}):
                         return False
                     payment_method = "Crypto" if "order_id" in payment_record else "Card to Card"
                     telegram_username = None
@@ -4548,7 +4545,7 @@ def check_pending_payments():
                         )
                         
                         if add_result:
-                            if not _complete_sale_payment_or_notify(payment_id, user_id, username, api_client):
+                            if not _complete_sale_payment_or_notify(payment_id, user_id, username, api_client, fields={"unlimited": unlimited}):
                                 continue
                             telegram_username = None
                             try:

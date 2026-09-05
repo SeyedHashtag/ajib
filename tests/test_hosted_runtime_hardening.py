@@ -99,6 +99,8 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
                     "status": "approved",
                     "debt": 0,
                     "total_paid": 50,
+                    "paid_activity_version": 1,
+                    "paid_activity": [{"id": "paid", "amount": 50, "paid_at": self.reseller._now_str()}],
                     "configs": [],
                 }
             }),

@@ -2151,6 +2151,21 @@ def _mark_payment_record_renewed(record_id, after_state):
 
 
 def _execute_reset(
+    username, server_id, plan_record, source, multi_api=None, require_expired=True,
+    validate_plan=True, business_expired=False, clear_cleanup=True,
+):
+    from utils.reseller_blocks import renewal_block_guard
+    with renewal_block_guard(username, server_id) as allowed:
+        if not allowed:
+            return {'success': False, 'reason': 'renewal_ineligible_protected_block'}
+        return _execute_reset_unlocked(
+            username, server_id, plan_record, source, multi_api=multi_api,
+            require_expired=require_expired, validate_plan=validate_plan,
+            business_expired=business_expired, clear_cleanup=clear_cleanup,
+        )
+
+
+def _execute_reset_unlocked(
     username,
     server_id,
     plan_record,
@@ -2280,6 +2295,7 @@ def _execute_reset(
         'before_state': before_state,
         'after_state': after_state,
         'raw_result': result,
+        'unlimited': bool(target_snapshot.get('unlimited', False)),
     }
 
 
@@ -2418,6 +2434,7 @@ def format_state_summary(state, language='en'):
 
 def format_renewal_offer(language, offer, include_payment_prompt=True):
     from utils.currency_format import format_usd_amount
+    from utils.reseller_experience import access_limit_text
     from utils.translations import get_message_text
 
     before = format_state_summary(offer.get('before_state'), language)
@@ -2450,7 +2467,7 @@ def format_renewal_offer(language, offer, include_payment_prompt=True):
         before=before,
         after=after,
         payment_prompt=payment_prompt,
-    )
+    ) + '\n' + access_limit_text(language, offer, plan=True)
 
 
 def format_renewal_unavailable(language, offer):
@@ -2464,6 +2481,7 @@ def format_renewal_unavailable(language, offer):
 
 
 def format_renewal_success(language, result, plan_gb, days, sub_url=None, ipv4_url=None):
+    from utils.reseller_experience import access_limit_text
     from utils.translations import get_message_text
 
     ipv4_info = (
@@ -2483,4 +2501,4 @@ def format_renewal_success(language, result, plan_gb, days, sub_url=None, ipv4_u
             sub_url or get_message_text(language, 'value_not_available')
         ),
         ipv4_info=ipv4_info,
-    )
+    ) + '\n' + access_limit_text(language, result.get('record') or result, result.get('user_data'))

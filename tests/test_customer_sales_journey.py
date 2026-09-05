@@ -1,9 +1,23 @@
+import sys
+import pytest
 import datetime
 import os
 import types
 from unittest.mock import patch
+from pathlib import Path
 
 from test_crypto_payment_discount import DummyBot, load_purchase_plan, make_call
+
+
+@pytest.fixture(autouse=True)
+def isolate_purchase_modules():
+    saved = {key: value for key, value in sys.modules.items()
+             if key == 'utils' or key.startswith('utils.') or key in {'telebot', 'qrcode', 'dotenv'}}
+    yield
+    for key in list(sys.modules):
+        if key == 'utils' or key.startswith('utils.') or key in {'telebot', 'qrcode', 'dotenv'}:
+            sys.modules.pop(key)
+    sys.modules.update(saved)
 
 
 def test_recommendation_prefers_stored_customer_plan_and_deduplicates_legacy_flags():
@@ -52,6 +66,7 @@ def test_plan_selector_lists_every_customer_plan_once_on_one_page():
         "all_plans_title": "All available plans",
         "customer_plan_button": "{label}{plan_gb} GB · {price_pair} · {days} days",
         "plan_price_pair_usd_first": "${usd} / {toman}",
+        "plan_price_usd_only": "${usd}",
         "quick_pick_recommended": "Recommended",
     }
     module.get_message_text = lambda _language, key: messages[key]
@@ -525,3 +540,75 @@ def test_fully_credit_funded_card_purchase_completes_without_receipt_checkout():
     assert 1988 not in module.user_data
     assert module._CARD_CHECKOUT_FALLBACK == {}
     assert len(bot.sent_photos) == 1
+
+
+@pytest.mark.parametrize('language', ['en', 'fa', 'ru', 'tk'])
+def test_main_selectors_use_usd_and_access_labels_without_exchange_lookup(language):
+    module = load_purchase_plan(DummyBot(), [])
+    from utils.reseller_experience import TEXT
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('selector_translations',
+        Path(module.__file__).with_name('translations.py'))
+    translations = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(translations)
+    module.get_message_text = translations.get_message_text
+    module.get_user_language = lambda _: language
+    module.load_plans = lambda: {'5': {'price': 3, 'days': 30},
+                                '10': {'price': 5, 'days': 30, 'unlimited': True}}
+    module.get_exchange_rate = lambda: (_ for _ in ()).throw(AssertionError('selector fetched currency'))
+    module.show_plans(555, 1988)
+    buttons = module.bot.sent_messages[-1][1]['reply_markup'].buttons
+    assert '$3' in buttons[0].args[0] and '$5' in buttons[1].args[0]
+    assert TEXT[language]['single'] in buttons[0].args[0]
+    assert TEXT[language]['many'] in buttons[1].args[0]
+    assert not any(word in button.args[0] for button in buttons for word in ('Toman', 'تومان', 'томан'))
+
+
+@pytest.mark.parametrize('method', ['card', 'crypto', 'credit'])
+def test_three_dollar_wholesale_checkout_uses_existing_payment_routes(method, monkeypatch):
+    from test_crypto_payment_discount import load_reseller_handlers, FakeCryptoPayment
+    bot, records = DummyBot(), []
+    purchase = load_purchase_plan(bot, records)
+    handlers = load_reseller_handlers(purchase)
+    handlers.get_reseller_data = lambda _: {'status': 'approved', 'debt': 0}
+    handlers.get_account_credit = lambda _: {'available': 3}
+    handlers.get_wholesale_balance = lambda _: {'available': 0, 'reserved': 0}
+    handlers.get_card_number_for_receipt_type = lambda _: '1234'
+    handlers.get_exchange_rate = lambda: 100000
+    monkeypatch.setenv('CRYPTO_MERCHANT_ID', 'test')
+    monkeypatch.setenv('CRYPTO_API_KEY', 'test')
+    handlers.handle_reseller_wholesale_balance(make_call('reseller:wholesale'))
+    buttons = bot.edited_messages[-1][1]['reply_markup'].buttons
+    assert any(b.kwargs.get('callback_data') == 'reseller:wholesale_fund:3.00' for b in buttons)
+    handlers.handle_reseller_wholesale_fund(make_call('reseller:wholesale_fund:3.00'))
+    buttons = bot.edited_messages[-1][1]['reply_markup'].buttons
+    assert all(any(b.kwargs.get('callback_data') == f'reseller:wholesale_pay:{m}:3.00' for b in buttons)
+               for m in ('card', 'crypto', 'credit'))
+    transfers = []
+    handlers.transfer_purchase_credit_to_wholesale = lambda *args: transfers.append(args)
+    handlers.handle_reseller_wholesale_payment(make_call(f'reseller:wholesale_pay:{method}:3.00'))
+    if method == 'card':
+        assert handlers.user_data[1988]['wholesale_topup_amount'] == 3
+        assert handlers.user_data[1988]['converted_amount'] == 300000
+    elif method == 'crypto':
+        assert FakeCryptoPayment.calls[-1]['amount'] == 2.85
+        assert records[-1][1]['wholesale_topup_amount'] == 3
+        assert records[-1][1]['price'] == 2.85
+    else:
+        assert transfers[-1][0:2] == (1988, 3)
+    # An outstanding debt still prevents every funding route.
+    handlers.get_reseller_data = lambda _: {'status': 'approved', 'debt': 1}
+    before = (len(transfers), len(FakeCryptoPayment.calls), len(bot.edited_messages))
+    handlers.handle_reseller_wholesale_payment(make_call(f'reseller:wholesale_pay:{method}:3.00'))
+    assert before == (len(transfers), len(FakeCryptoPayment.calls), len(bot.edited_messages))
+
+
+
+def test_prepaid_checkout_does_not_project_an_increase_in_debt():
+    from test_crypto_payment_discount import load_reseller_handlers
+    handlers = load_reseller_handlers(load_purchase_plan(DummyBot(), []))
+    handlers.get_message_text = lambda language, key: (
+        '{current_debt}/{projected_debt}' if key == 'reseller_purchase_details' else '')
+    quote = {'price': 3, 'list_price': 4, 'level': 1, 'discount_percent': 20}
+    details = handlers._build_reseller_purchase_details('en', '5', 30, quote, 2, 5, funding_mode='prepaid')
+    assert details.startswith('2.00/2.00')

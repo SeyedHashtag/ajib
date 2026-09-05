@@ -1,6 +1,7 @@
 """Formatting and reliable delivery for reseller level presentations."""
 
 from utils.currency_format import format_usd_amount
+from utils.reseller_experience import experience_text
 from utils.reseller import (
     RESELLER_LEVEL_COUNT,
     RESELLER_TRUST_PAID_STEP,
@@ -32,7 +33,7 @@ def build_reseller_level_compact(language, reseller_data):
         discount_percent=summary["discount_percent"],
         next_level=summary["next_level"],
         amount_to_next=format_usd_amount(summary["amount_to_next"]),
-    )
+    ) + "\n" + experience_text(language, "recent", amount=format_usd_amount(summary["recent_paid"]))
 
 
 def build_reseller_level_profile(
@@ -74,7 +75,7 @@ def build_reseller_level_profile(
         total_value=format_usd_amount(total_value),
         total_paid=format_usd_amount(summary["total_paid"]),
         current_debt=format_usd_amount(current_debt),
-    )
+    ) + '\n' + experience_text(language, 'recent', amount=format_usd_amount(summary['recent_paid']))
 
 
 def build_reseller_level_roadmap(language, reseller_data):
@@ -82,7 +83,7 @@ def build_reseller_level_roadmap(language, reseller_data):
     lines = [get_message_text(language, "reseller_level_roadmap_title")]
     for level in range(1, RESELLER_LEVEL_COUNT + 1):
         threshold = (level - 1) * RESELLER_TRUST_PAID_STEP
-        level_summary = get_reseller_level_summary({"total_paid": threshold})
+        level_summary = get_reseller_level_summary({}, paid_amount=threshold)
         lines.append(
             get_message_text(language, "reseller_level_roadmap_row").format(
                 marker="➤" if level == current else "•",
@@ -93,7 +94,8 @@ def build_reseller_level_roadmap(language, reseller_data):
                 threshold=format_usd_amount(threshold),
             )
         )
-    return "\n".join(lines)
+    return "\n".join(lines) + '\n' + experience_text(language, 'recent', amount=format_usd_amount(
+        get_reseller_level_summary(reseller_data)['recent_paid']))
 
 
 def build_reseller_program_preview(
@@ -126,6 +128,9 @@ def build_reseller_program_preview(
 
 def build_reseller_level_presentation(language, claim):
     summary = claim["summary"]
+    if claim.get('kind') == 'level_down':
+        return experience_text(language, 'level_down', level=summary['level'], count=summary['level_count'],
+            discount=summary['discount_percent'], limit=format_usd_amount(summary['trust_limit']))
     key = (
         "reseller_level_introduction"
         if claim.get("kind") == "introduction"
@@ -147,9 +152,7 @@ def build_reseller_level_presentation(language, claim):
     next_summary = (
         summary
         if summary["is_max_level"]
-        else get_reseller_level_summary({
-            "total_paid": summary["next_threshold"],
-        })
+        else get_reseller_level_summary({}, paid_amount=summary['next_threshold'])
     )
     return message + "\n\n" + get_message_text(language, reward_key).format(
         next_level=summary["next_level"],

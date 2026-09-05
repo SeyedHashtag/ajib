@@ -135,6 +135,7 @@ def install_common_stubs(bot, payment_records):
     # Otherwise a privileged test process can create production-shaped state
     # under /etc/ajib and leak checkout/disclosure data between tests.
     atomic_store_stub = types.ModuleType("utils.atomic_store")
+    atomic_store_stub.read_json = lambda _path, default=None: default or {}
     atomic_store_stub.locked_json = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         ImportError("repository storage is unavailable in this isolated test")
     )
@@ -299,6 +300,7 @@ def install_common_stubs(bot, payment_records):
     )
     reseller_stub.get_reseller_trust_limit = lambda total_paid: min(30.0, 5.0 + int(float(total_paid or 0.0) // 10.0) * 5.0)
     reseller_stub.get_reseller_level_summary = lambda data: {
+        "trust_limit": reseller_stub.get_reseller_trust_limit(reseller_stub.get_reseller_total_paid(data)),
         "level": min(6, 1 + int(reseller_stub.get_reseller_total_paid(data) // 10)),
         "discount_percent": min(25, 20 + int(reseller_stub.get_reseller_total_paid(data) // 10)),
     }
@@ -334,6 +336,15 @@ def install_common_stubs(bot, payment_records):
     reseller_stub.validate_reseller_manual_payment_amount = validate_reseller_manual_payment_amount
     reseller_stub.get_banned_reseller_cleanup_candidates = lambda reseller_data: []
     reseller_stub.cleanup_banned_reseller_users = lambda user_id, multi_api: (True, {})
+    reseller_stub.get_reseller_credit_policy = lambda data, now=None: {
+        'base_limit': reseller_stub.get_reseller_level_summary(data)['trust_limit'],
+        'effective_limit': reseller_stub.get_reseller_level_summary(data)['trust_limit'],
+        'mode': 'credit', 'outcomes': [],
+    }
+    reseller_stub.DEBT_SUSPEND_DEADLINE_HOURS = 48
+    reseller_stub.DEBT_HOLD_DEADLINE_HOURS = 72
+    reseller_stub.DEBT_FINAL_WARNING_HOURS = 144
+    reseller_stub.DEBT_REMOVAL_DEADLINE_HOURS = 168
     sys.modules["utils.reseller"] = reseller_stub
 
     level_ui_stub = types.ModuleType("utils.reseller_level_ui")
@@ -559,6 +570,16 @@ def install_payment_store(purchase_plan, store):
 
 
 class CryptoPaymentDiscountTests(unittest.TestCase):
+    def setUp(self):
+        self.saved_modules = {key: value for key, value in sys.modules.items()
+                              if key == 'utils' or key.startswith('utils.') or key in {'telebot', 'qrcode', 'dotenv'}}
+
+    def tearDown(self):
+        for key in list(sys.modules):
+            if key == 'utils' or key.startswith('utils.') or key in {'telebot', 'qrcode', 'dotenv'}:
+                sys.modules.pop(key)
+        sys.modules.update(self.saved_modules)
+
     def test_config_delivery_formats_incident_url_and_records_success(self):
         bot = DummyBot()
         purchase_plan = load_purchase_plan(bot, [])
@@ -926,7 +947,9 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         self.assertEqual(statuses, [("settlement-payment", "completed")])
         self.assertEqual(len(admin_notifications), 1)
         self.assertEqual(admin_notifications[0][0][0:6], (1988, "Settlement", "Settlement", 95.0, "settlement-payment", "Crypto"))
-        self.assertEqual(bot.sent_messages[-1][0], (1988, "Settlement approved amount $100.00; remaining $0.00"))
+        self.assertEqual(bot.sent_messages[-1][0][0], 1988)
+        self.assertTrue(bot.sent_messages[-1][0][1].startswith("Settlement approved amount $100.00; remaining $0.00\n\n"))
+        self.assertIn("Credit status", bot.sent_messages[-1][0][1])
 
     def test_rejected_settlement_payment_does_not_apply_reseller_credit(self):
         bot = DummyBot()
@@ -990,7 +1013,7 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         self.assertEqual(renewal_calls, [("execute", "old-user")])
         self.assertIn(("settlement-payment", "completed"), statuses)
         self.assertTrue(any(fields.get("renewal_after_state") == {"status": "active"} for _pid, fields in field_updates))
-        self.assertEqual(bot.sent_photos[-1][1]["caption"], "renewal success")
+        self.assertTrue(bot.sent_photos[-1][1]["caption"].startswith("renewal success\n"))
         self.assertEqual(admin_notifications[0][1]["server_name"], "Germany")
         self.assertEqual(admin_notifications[0][1]["server_id"], "s1")
 
@@ -1415,7 +1438,7 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         self.assertEqual(store["crypto-payment"]["username"], "s1988a")
         self.assertEqual(store["crypto-payment"]["server_id"], "s1")
         self.assertEqual(store["crypto-payment"]["updates"][-1]["previous_status"], "processing")
-        self.assertEqual(bot.sent_photos[-1][1]["caption"], "completed s1988a https://sub.example/s1988a")
+        self.assertEqual(bot.sent_photos[-1][1]["caption"], "completed s1988a https://sub.example/s1988a\n👤 Single-user configuration: for one user only.")
         self.assertEqual(admin_notifications[0][1]["server_name"], "Germany")
         self.assertEqual(admin_notifications[0][1]["server_id"], "s1")
 
@@ -1534,7 +1557,9 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
             (1988, "Settlement", "Settlement", 95.0, "settle-payment", "Crypto"),
         )
         approved_messages = [args[1] for args, _kwargs in bot.sent_messages if "Settlement approved" in args[1]]
-        self.assertEqual(approved_messages, ["Settlement approved amount $100.00; remaining $0.00"])
+        self.assertEqual(len(approved_messages), 1)
+        self.assertTrue(approved_messages[0].startswith("Settlement approved amount $100.00; remaining $0.00\n\n"))
+        self.assertIn("Credit status", approved_messages[0])
         self.assertEqual(store["settle-payment"]["status"], "completed")
 
     def test_crypto_webhook_claim_processes_settlement_once(self):
@@ -1843,7 +1868,7 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         reseller_handlers.handle_reseller_debt(make_call("reseller:debt"))
 
         message = bot.edited_messages[-1][0][0]
-        self.assertIn("Unlock amount: $0.50", message)
+        self.assertIn("Full settlement required: $0.50", message)
         self.assertNotIn("Unlock amount: $0.00", message)
 
     def test_rapid_second_reseller_customer_name_does_not_create_duplicate_config(self):

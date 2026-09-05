@@ -29,19 +29,15 @@ def _customer_plan_eligible(plan):
     return isinstance(plan, dict) and plan.get("target", "both") != "reseller"
 
 
-def get_recommended_customer_plan_id(plans):
-    eligible = sorted(
-        (
-            (str(plan_id), details)
-            for plan_id, details in (plans or {}).items()
-            if str(plan_id).isdigit() and _customer_plan_eligible(details)
-        ),
-        key=lambda item: int(item[0]),
-    )
-    return next(
-        (plan_id for plan_id, details in eligible if details.get("recommended") is True),
-        None,
-    )
+def set_customer_recommendation(plan_id):
+    from utils.plan_recommendation import set_recommendation
+    set_recommendation(plan_id, plans_file=PLANS_FILE)
+
+
+def get_recommended_customer_plan_id(plans, configured_plan_id=None):
+    from utils.plan_recommendation import get_recommendation
+    return get_recommendation(plans, configured_plan_id, plans_file=PLANS_FILE)
+
 
 def create_plans_markup():
     markup = types.InlineKeyboardMarkup(row_width=3)
@@ -122,8 +118,10 @@ def handle_plan_select(call):
                 types.InlineKeyboardButton("✏️ Edit", callback_data=f"edit_plan:{gb}"),
             ]
             if _customer_plan_eligible(plan):
+                from utils.language import get_user_language
+                from utils.reseller_experience import experience_text
                 recommendation_label = (
-                    "⭐ Recommended"
+                    "☆ " + experience_text(get_user_language(call.from_user.id), "remove_recommendation")
                     if gb == get_recommended_customer_plan_id(plans)
                     else "☆ Recommend"
                 )
@@ -166,12 +164,13 @@ def handle_recommend_customer_plan(call):
         if not _customer_plan_eligible(plan):
             bot.answer_callback_query(call.id, text="Plan is not available to customers.", show_alert=True)
             return
+        removing = gb == get_recommended_customer_plan_id(plans)
         for details in plans.values():
             if isinstance(details, dict):
                 details.pop("recommended", None)
-        plan["recommended"] = True
+        set_customer_recommendation(None if removing else gb)
         save_plans(plans)
-        bot.answer_callback_query(call.id, text="Recommended plan updated.")
+        bot.answer_callback_query(call.id, text="Recommendation removed." if removing else "Recommended plan updated.")
         markup, plans_text, _ = create_plans_markup()
         plans_text += "\nSelect a plan number to edit:"
         bot.edit_message_text(
@@ -288,9 +287,14 @@ def process_update_gb(message, old_gb):
                 bot.reply_to(message, f"❌ Plan with {new_gb}GB already exists.")
                 return
 
+            from utils.hosted_bots import update_catalog_plan_reference
             # Update key
+            recommended = get_recommended_customer_plan_id(plans)
             plans[str(new_gb)] = plans.pop(str(old_gb))
             save_plans(plans)
+            if recommended == str(old_gb):
+                set_customer_recommendation(str(new_gb))
+            update_catalog_plan_reference(old_gb, new_gb)
             bot.reply_to(message, f"✅ Size updated to {new_gb}GB")
             
             # Return to plan view (with new gb)
@@ -333,6 +337,11 @@ def handle_update_target(call):
         
         plans = load_plans()
         if str(gb) in plans:
+            if target == 'reseller' and get_recommended_customer_plan_id(plans) == str(gb):
+                set_customer_recommendation(None)
+            if target == 'customer':
+                from utils.hosted_bots import update_catalog_plan_reference
+                update_catalog_plan_reference(gb)
             plans[str(gb)]['target'] = target
             if target == "reseller":
                 plans[str(gb)].pop("recommended", None)
@@ -388,6 +397,10 @@ def handle_plan_delete(call):
         plans = load_plans()
         
         if gb in plans:
+            if get_recommended_customer_plan_id(plans) == gb:
+                set_customer_recommendation(None)
+            from utils.hosted_bots import update_catalog_plan_reference
+            update_catalog_plan_reference(gb)
             del plans[gb]
             save_plans(plans)
             

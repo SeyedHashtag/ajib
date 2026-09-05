@@ -336,12 +336,13 @@ def handle_block_confirmation(call):
     if ref is None:
         bot.send_message(call.message.chat.id, "This account selection expired. Open Show User again.")
         return
-    api_client, _, lookup = multi_api.find_user_on_server(ref.username, ref.server_id)
+    api_client, live, lookup = multi_api.find_user_on_server(ref.username, ref.server_id)
     if lookup.get("status") != "found":
         bot.send_message(call.message.chat.id, "The selected account is unavailable.")
         return
     is_blocked = block_status == "true"
-    result = api_client.update_user(ref.username, {"blocked": is_blocked})
+    from utils.reseller_blocks import set_admin_block
+    result = set_admin_block(api_client, ref.username, is_blocked, live)
     _report_update(call.message.chat.id, result, f"User '{ref.username}' {'blocked' if is_blocked else 'unblocked'} successfully.", "Failed to update block status.")
 
 

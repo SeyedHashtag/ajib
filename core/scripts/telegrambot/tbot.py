@@ -197,6 +197,16 @@ def monitoring_thread():
         monitor_system_resources()
         time.sleep(60)
 
+
+def reseller_block_monitoring_thread():
+    from utils.reseller_blocks import process_due_blocks
+    while True:
+        try:
+            process_due_blocks()
+        except Exception:
+            logging.getLogger('ajib.reseller_blocks').exception('block_monitor_failed')
+        time.sleep(60)
+
 def payment_monitoring_thread():
     """Background thread to check pending payments periodically"""
     while True:
@@ -327,7 +337,10 @@ def write_readiness_marker():
             pass
 
 if __name__ == '__main__':
+    from utils.reseller import backfill_reseller_paid_activity
+    backfill_reseller_paid_activity()
     write_readiness_marker()
+    threading.Thread(target=reseller_block_monitoring_thread, daemon=True, name='reseller-blocks').start()
     start_server_info_cache_monitor()
     monitor_thread = threading.Thread(target=monitoring_thread, daemon=True)
     monitor_thread.start()

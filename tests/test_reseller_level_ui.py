@@ -12,6 +12,15 @@ BOT_DIR = ROOT / "core" / "scripts" / "telegrambot"
 UTILS_DIR = BOT_DIR / "utils"
 
 
+def recent_paid_record(record):
+    """These benefit fixtures represent payments made within the level window."""
+    from datetime import datetime, timezone
+    return {**record, 'paid_activity_version': 1, 'paid_activity': [{
+        'id': 'fixture-payment', 'kind': 'settlement', 'amount': record['total_paid'],
+        'paid_at': datetime.now(timezone.utc).isoformat(),
+    }]}
+
+
 class DummyBot:
     def __init__(self, fail=False):
         self.fail = fail
@@ -65,12 +74,12 @@ class ResellerLevelPresentationTests(unittest.TestCase):
         )["7"]
 
     def test_failed_delivery_releases_claim_and_success_is_presented_once(self):
-        self.write_reseller({
+        self.write_reseller(recent_paid_record({
             "status": "approved",
             "debt": 0,
             "total_paid": 20,
             "configs": [],
-        })
+        }))
 
         self.assertFalse(
             self.level_ui.present_pending_reseller_level(
@@ -98,15 +107,16 @@ class ResellerLevelPresentationTests(unittest.TestCase):
         )
 
     def test_multi_level_jump_presents_only_the_final_level(self):
-        self.write_reseller({
+        self.write_reseller(recent_paid_record({
             "status": "approved",
             "debt": 0,
             "total_paid": 20,
             "last_presented_reseller_level": 3,
             "configs": [],
-        })
+        }))
         saved = self.read_reseller()
         saved["total_paid"] = 50
+        saved = recent_paid_record(saved)
         self.write_reseller(saved)
 
         bot = DummyBot()
@@ -124,12 +134,12 @@ class ResellerLevelPresentationTests(unittest.TestCase):
         self.assertEqual(len(bot.messages), 1)
 
     def test_profile_and_roadmap_render_in_every_supported_language(self):
-        record = {
+        record = recent_paid_record({
             "status": "approved",
             "debt": 2,
             "total_paid": 50,
             "configs": [],
-        }
+        })
         for language in ("en", "fa", "ru", "tk"):
             with self.subTest(language=language):
                 profile = self.level_ui.build_reseller_level_profile(
@@ -172,7 +182,7 @@ class ResellerLevelPresentationTests(unittest.TestCase):
 
         preview = self.level_ui.build_reseller_program_preview(
             "en",
-            {"total_paid": 0, "debt": 0, "configs": []},
+            recent_paid_record({"total_paid": 0, "debt": 0, "configs": []}),
             "10",
             {"price": 10, "days": 30},
         )
