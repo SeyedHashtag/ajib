@@ -1,3 +1,10 @@
+## v2.7.10
+✨ Add temporary customer blocking controls for resellers in main and hosted bots, with automatic expiry and retryable reconciliation
+🛡️ Preserve overlapping administrator, debt-policy, and external blocks when reseller blocks expire or are released
+🛠️ Base reseller levels, discounts, and trust limits on the last 90 days of paid activity, with dated-history migration and duplicate-payment protection
+✨ Clarify access limits and reseller credit summaries across purchase, renewal, configuration, and hosted flows, and allow recommended plans to be deselected
+✅ Expand regression coverage for reseller blocking, recent paid activity, credit policies, plan recommendations, and customer displays
+
 ## v2.7.9
 ✨ Resolve customer and reseller accounts across all VPN servers, including disabled servers, and safely follow uniquely verified manual relocations
 🛡️ Reject duplicate usernames and incomplete cross-server scans before renewal, deletion, cleanup, traffic, or debt actions can target the wrong account
