@@ -4894,11 +4894,12 @@ def handle_admin_reseller_ui(call):
 @bot.callback_query_handler(func=lambda call: call.data == 'reseller:credit_help')
 def handle_reseller_credit_help(call):
     language = get_user_language(call.from_user.id)
-    if not _get_active_reseller_data(call.from_user.id):
+    record = _get_active_reseller_data(call.from_user.id)
+    if not record:
         safe_answer_callback_query(bot, call.id, get_message_text(language, 'reseller_access_required'))
         return
     safe_answer_callback_query(bot, call.id)
-    bot.send_message(call.message.chat.id, build_credit_help(language))
+    bot.send_message(call.message.chat.id, build_credit_help(language, record))
 
 
 from utils.reseller_block_ui import register_block_handlers

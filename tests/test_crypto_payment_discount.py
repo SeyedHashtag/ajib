@@ -299,9 +299,10 @@ def install_common_stubs(bot, payment_records):
         float(data.get("total_paid", sum(float(config.get("price", 0.0)) for config in data.get("configs", [])) - float(data.get("debt", 0.0))) or 0.0),
     )
     reseller_stub.get_reseller_trust_limit = lambda total_paid: min(30.0, 5.0 + int(float(total_paid or 0.0) // 10.0) * 5.0)
-    reseller_stub.get_reseller_level_summary = lambda data: {
+    reseller_stub.get_reseller_level_summary = lambda data, now=None: {
         "trust_limit": reseller_stub.get_reseller_trust_limit(reseller_stub.get_reseller_total_paid(data)),
         "level": min(6, 1 + int(reseller_stub.get_reseller_total_paid(data) // 10)),
+        "settlement_hours": 48 + min(5, int(reseller_stub.get_reseller_total_paid(data) // 10)) * 24,
         "discount_percent": min(25, 20 + int(reseller_stub.get_reseller_total_paid(data) // 10)),
     }
     reseller_stub.calculate_reseller_wholesale_price = lambda price, data: round(
@@ -345,6 +346,14 @@ def install_common_stubs(bot, payment_records):
     reseller_stub.DEBT_HOLD_DEADLINE_HOURS = 72
     reseller_stub.DEBT_FINAL_WARNING_HOURS = 144
     reseller_stub.DEBT_REMOVAL_DEADLINE_HOURS = 168
+    reseller_stub._is_debt_fully_settled = lambda debt: float(debt or 0) < 1
+    reseller_stub.get_reseller_debt_deadlines = lambda data, now=None: {
+        'level': reseller_stub.get_reseller_level_summary(data)['level'],
+        'suspend_hours': reseller_stub.get_reseller_level_summary(data)['settlement_hours'],
+        'hold_hours': reseller_stub.get_reseller_level_summary(data)['settlement_hours'] + 24,
+        'warning_hours': reseller_stub.get_reseller_level_summary(data)['settlement_hours'] + 96,
+        'removal_hours': reseller_stub.get_reseller_level_summary(data)['settlement_hours'] + 120,
+    }
     sys.modules["utils.reseller"] = reseller_stub
 
     level_ui_stub = types.ModuleType("utils.reseller_level_ui")

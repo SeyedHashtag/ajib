@@ -504,6 +504,63 @@ def backfill_reseller_paid_activity():
             _write_resellers_file(records)
 
 
+def _level_debt_deadlines(level):
+    extra_hours = (level - 1) * 24.0
+    return {
+        'level': level,
+        'suspend_hours': DEBT_SUSPEND_DEADLINE_HOURS + extra_hours,
+        'hold_hours': DEBT_HOLD_DEADLINE_HOURS + extra_hours,
+        'warning_hours': DEBT_FINAL_WARNING_HOURS + extra_hours,
+        'removal_hours': DEBT_REMOVAL_DEADLINE_HOURS + extra_hours,
+    }
+
+
+def get_reseller_debt_deadlines(record, now=None):
+    """Resolve the saved open-cycle terms, or the current level's next terms."""
+    data = record or {}
+    saved = data.get('debt_cycle_deadlines')
+    if not _is_debt_fully_settled(data.get('debt', 0)) and isinstance(saved, dict):
+        return dict(saved)
+    return _level_debt_deadlines(get_reseller_level(get_reseller_recent_paid(data, now=now)))
+
+
+def _ensure_debt_cycle_deadlines(record, now=None):
+    """Freeze new/legacy cycle terms; callers persist under the store lock."""
+    if _is_debt_fully_settled(record.get('debt', 0)):
+        record['debt_cycle_deadlines'] = None
+        return
+    if not isinstance(record.get('debt_cycle_deadlines'), dict):
+        record['debt_cycle_deadlines'] = get_reseller_debt_deadlines(record, now=now)
+    current = parse_utc_timestamp(now) if now is not None else utc_now()
+    started = _parse_time(record.get('debt_since'))
+    age_hours = max(0, (current - started).total_seconds() / 3600) if started else 0
+    deadlines = record['debt_cycle_deadlines']
+    # A queued action from the former schedule must not run early. Completed
+    # restrictions, notification receipts and credit outcomes remain intact.
+    if age_hours < deadlines['hold_hours']:
+        record['debt_service_hold_due'] = False
+    if age_hours < deadlines['removal_hours']:
+        record['debt_service_remove_due'] = False
+
+
+def _backfill_debt_cycle_deadlines(records):
+    changed = False
+    for user_id, record in records.items():
+        if (isinstance(record, dict)
+                and not _is_debt_fully_settled(record.get('debt', 0))
+                and not isinstance(record.get('debt_cycle_deadlines'), dict)):
+            records[user_id] = _ensure_reseller_defaults(record)
+            changed = True
+    if changed:
+        _write_resellers_file(records)
+
+
+def backfill_reseller_debt_deadlines():
+    """Persist existing cycle terms before workers begin enforcing policy."""
+    with reseller_lock, _resellers_file_lock():
+        _backfill_debt_cycle_deadlines(_read_resellers_file())
+
+
 def get_reseller_level_summary(record, now=None, *, paid_amount=None):
     total_paid = get_reseller_total_paid(record)
     recent_paid = get_reseller_recent_paid(record, now=now) if paid_amount is None else paid_amount
@@ -534,6 +591,7 @@ def get_reseller_level_summary(record, now=None, *, paid_amount=None):
         'icon': RESELLER_LEVEL_ICONS[level - 1],
         'discount_percent': discount_percent,
         'trust_limit': trust_limit,
+        'settlement_hours': _level_debt_deadlines(level)['suspend_hours'],
         'total_paid': total_paid,
         'recent_paid': recent_paid,
         'current_threshold': current_threshold,
@@ -750,7 +808,7 @@ def _mark_config_removed(config, cleanup_status):
     return tagged
 
 
-def _compute_debt_state(debt, debt_since=None, now=None):
+def _compute_debt_state(debt, debt_since=None, now=None, *, deadlines=None):
     debt_amount = _safe_float(debt, 0.0)
     if _is_debt_fully_settled(debt_amount):
         return 'active'
@@ -760,7 +818,7 @@ def _compute_debt_state(debt, debt_since=None, now=None):
         max(0.0, (current - started_at).total_seconds() / 3600)
         if started_at else 0.0
     )
-    if age_hours >= DEBT_SUSPEND_DEADLINE_HOURS:
+    if age_hours >= (deadlines or _level_debt_deadlines(1))['suspend_hours']:
         return 'suspended'
     if age_hours >= 24.0:
         return 'warning'
@@ -863,8 +921,12 @@ def _ensure_reseller_defaults(record):
     debt_fully_settled = _is_debt_fully_settled(debt)
     if not debt_fully_settled and not data.get('debt_since'):
         data['debt_since'] = _now_str()
-    if not debt_fully_settled and not data.get('debt_cycle_id'):
+    needs_cycle_id = not debt_fully_settled and not data.get('debt_cycle_id')
+    if needs_cycle_id:
         data['debt_cycle_id'] = uuid.uuid4().hex
+    # Records predating saved deadlines can already have applied restrictions.
+    # Only a new cycle on an initialized record resets previous cycle state.
+    if needs_cycle_id and 'debt_cycle_deadlines' in data:
         data['debt_cycle_late_recorded'] = False
         data['debt_cycle_default_recorded'] = False
         data['debt_services_held_at'] = None
@@ -880,7 +942,10 @@ def _ensure_reseller_defaults(record):
         data['debt_last_reminded_at'] = None
         data['debt_last_admin_alert_level'] = 'none'
 
-    data['debt_state'] = _compute_debt_state(debt, data.get('debt_since'))
+    _ensure_debt_cycle_deadlines(data)
+    data['debt_state'] = _compute_debt_state(
+        debt, data.get('debt_since'), deadlines=get_reseller_debt_deadlines(data)
+    )
     return data
 
 
@@ -916,6 +981,7 @@ def _mark_policy_restore_due_if_needed(data):
 
 def _finish_debt_cycle(data):
     data['debt_cycle_id'] = None
+    data['debt_cycle_deadlines'] = None
     data['debt_cycle_late_recorded'] = False
     data['debt_cycle_default_recorded'] = False
     data['debt_service_hold_due'] = False
@@ -929,7 +995,9 @@ def load_resellers():
     with reseller_lock:
         try:
             with _resellers_file_lock():
-                return _read_resellers_file()
+                records = _read_resellers_file()
+                _backfill_debt_cycle_deadlines(records)
+                return records
         except Exception:
             pass
         return {}
@@ -2396,6 +2464,14 @@ def _process_reseller_debt_service_action(user_id, multi_api, action):
         return False, {'reason': 'reseller_missing'}
     if action != 'restore' and _is_debt_fully_settled(initial.get('debt', 0.0)):
         return False, {'reason': 'debt_settled'}
+    if action != 'restore':
+        if initial.get('status') == 'banned':
+            return False, {'reason': 'reseller_banned'}
+        deadlines = get_reseller_debt_deadlines(initial)
+        started = _parse_time(initial.get('debt_since'))
+        hours = deadlines['hold_hours' if action == 'hold' else 'removal_hours']
+        if started is None or (utc_now() - started).total_seconds() < hours * 3600:
+            return False, {'reason': 'deadline_not_due'}
     candidates, manual_review = get_reseller_debt_service_candidates(initial)
     results = {'changed': [], 'already_missing': [], 'failed': [], 'manual_review': manual_review}
 
@@ -2670,6 +2746,7 @@ def apply_reseller_payment(user_id, amount, payment_id=None, allocation_kind='se
                     cycle_id = str(current.get('debt_cycle_id') or '')
                     cycle_started = _parse_time(current.get('debt_since'))
                     cycle_was_late = bool(current.get('debt_cycle_late_recorded'))
+                    cycle_deadlines = get_reseller_debt_deadlines(current)
                     credited_amount = max(0.0, min(paid_amount, current_debt))
                     excess_amount = round(max(0.0, paid_amount - current_debt), 2)
                     new_debt = round(max(0.0, current_debt - paid_amount), 2)
@@ -2696,7 +2773,7 @@ def apply_reseller_payment(user_id, amount, payment_id=None, allocation_kind='se
                             and not cycle_was_late
                             and cycle_started is not None
                             and (utc_now() - cycle_started).total_seconds()
-                                < DEBT_SUSPEND_DEADLINE_HOURS * 3600
+                                < cycle_deadlines['suspend_hours'] * 3600
                         ):
                             _record_credit_outcome(
                                 current,
@@ -2797,7 +2874,7 @@ def flush_reseller_pending_wholesale_credits(user_id=None):
     return len(completed_ids)
 
 
-def _compute_debt_state_with_deadline(debt, debt_since, now):
+def _compute_debt_state_with_deadline(debt, debt_since, now, *, deadlines=None):
     """Return the time-based debt state without ever banning a reseller."""
     debt_amount = _safe_float(debt, 0.0)
 
@@ -2809,8 +2886,9 @@ def _compute_debt_state_with_deadline(debt, debt_since, now):
     if debt_since_dt:
         hours_in_debt = max(0.0, (now - debt_since_dt).total_seconds() / 3600)
 
-    suspend_deadline_passed = hours_in_debt >= DEBT_SUSPEND_DEADLINE_HOURS
-    removal_deadline_passed = hours_in_debt >= DEBT_REMOVAL_DEADLINE_HOURS
+    deadlines = deadlines or _level_debt_deadlines(1)
+    suspend_deadline_passed = hours_in_debt >= deadlines['suspend_hours']
+    removal_deadline_passed = hours_in_debt >= deadlines['removal_hours']
 
     if suspend_deadline_passed:
         return 'suspended', True, removal_deadline_passed
@@ -3005,8 +3083,9 @@ def evaluate_reseller_debt_policies():
                         current['debt_cycle_id'] = uuid.uuid4().hex
 
                     debt_since = current.get('debt_since')
+                    deadlines = get_reseller_debt_deadlines(current, now=now)
                     debt_state, suspend_deadline_passed, removal_deadline_passed = _compute_debt_state_with_deadline(
-                        debt, debt_since, now
+                        debt, debt_since, now, deadlines=deadlines
                     )
                     current['debt_state'] = debt_state
                     auto_suspended = False
@@ -3039,7 +3118,7 @@ def evaluate_reseller_debt_policies():
                             current['debt_cycle_late_recorded'] = True
                         changed = True
 
-                    if not debt_fully_settled and debt_age_hours >= DEBT_HOLD_DEADLINE_HOURS:
+                    if not debt_fully_settled and debt_age_hours >= deadlines['hold_hours']:
                         current['debt_service_hold_due'] = not bool(current.get('debt_services_held_at'))
                         if not current.get('debt_cycle_default_recorded'):
                             _record_credit_outcome(
@@ -3059,7 +3138,7 @@ def evaluate_reseller_debt_policies():
                         event_kind = 'recovered'
                     elif not debt_fully_settled and current.get('debt_service_remove_due'):
                         event_kind = 'remove_due'
-                    elif not debt_fully_settled and debt_age_hours >= DEBT_FINAL_WARNING_HOURS and not current.get('debt_services_removed_at'):
+                    elif not debt_fully_settled and debt_age_hours >= deadlines['warning_hours'] and not current.get('debt_services_removed_at'):
                         event_kind = 'deletion_warning'
                     elif not debt_fully_settled and current.get('debt_service_hold_due'):
                         event_kind = 'hold_due'
@@ -3077,7 +3156,7 @@ def evaluate_reseller_debt_policies():
                         )
                     elif current.get('status') == 'suspended':
                         event_kind = None
-                    elif not debt_fully_settled and debt_age_hours >= max(24.0, DEBT_SUSPEND_DEADLINE_HOURS - 6.0):
+                    elif not debt_fully_settled and debt_age_hours >= max(24.0, deadlines['suspend_hours'] - 6.0):
                         event_kind = 'deadline_final'
                     elif not debt_fully_settled and debt_age_hours >= 24.0:
                         event_kind = 'reminder_24h'
@@ -3129,9 +3208,9 @@ def evaluate_reseller_debt_policies():
                             'auto_suspended': auto_suspended,
                             'auto_banned': False,
                             'service_action': service_action,
-                            'hours_until_suspend': max(0, DEBT_SUSPEND_DEADLINE_HOURS - debt_age_hours),
-                            'hours_until_hold': max(0, DEBT_HOLD_DEADLINE_HOURS - debt_age_hours),
-                            'hours_until_removal': max(0, DEBT_REMOVAL_DEADLINE_HOURS - debt_age_hours),
+                            'hours_until_suspend': max(0, deadlines['suspend_hours'] - debt_age_hours),
+                            'hours_until_hold': max(0, deadlines['hold_hours'] - debt_age_hours),
+                            'hours_until_removal': max(0, deadlines['removal_hours'] - debt_age_hours),
                             'hours_until_ban': 0.0,
                             'suspend_deadline_passed': suspend_deadline_passed,
                             'ban_deadline_passed': False,

@@ -5242,7 +5242,7 @@ def owner_credit_customer_controls(call):
         return
     bot.answer_callback_query(call.id)
     if call.data == 'hb:credithelp':
-        bot.send_message(call.message.chat.id, build_credit_help(_language(OWNER_ID)))
+        bot.send_message(call.message.chat.id, build_credit_help(_language(OWNER_ID), get_reseller_data(OWNER_ID)))
     else:
         try:
             _show_owner_block_customers(call.message.chat.id, int(call.data.rsplit(':', 1)[1]))
@@ -5255,8 +5255,9 @@ register_block_handlers(bot, _language, MultiServerAPI, owner_id=OWNER_ID)
 
 
 def run():
-    from utils.reseller import backfill_reseller_paid_activity
+    from utils.reseller import backfill_reseller_paid_activity, backfill_reseller_debt_deadlines
     backfill_reseller_paid_activity()
+    backfill_reseller_debt_deadlines()
     def auth_retry(error, wait_seconds):
         set_bot_runtime_status(
             OWNER_ID,

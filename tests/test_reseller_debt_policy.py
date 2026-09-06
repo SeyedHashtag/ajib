@@ -1038,7 +1038,9 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         api = FakeMultiAPI()
 
         held, hold_result = self.reseller.process_reseller_debt_service_action("1988", api, "hold")
-        removed, remove_result = self.reseller.process_reseller_debt_service_action("1988", api, "remove")
+        # Removal happens at its deadline, using the original hold snapshot.
+        with patch.object(self.reseller, "utc_now", return_value=datetime.now(timezone.utc) + timedelta(hours=97)):
+            removed, remove_result = self.reseller.process_reseller_debt_service_action("1988", api, "remove")
         saved = self.read_resellers()["1988"]
         calculation = saved["configs"][0]["debt_proration"][0]
 
@@ -1222,6 +1224,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
                 "status": "suspended",
                 "suspended_reason": "debt",
                 "debt": 4.0,
+                "debt_since": self.hours_ago(169),
                 "debt_charges": [{
                     "id": "legacy",
                     "original_amount": 4.0,
@@ -1256,6 +1259,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
                 "status": "suspended",
                 "suspended_reason": "debt",
                 "debt": 4.0,
+                "debt_since": self.hours_ago(169),
                 "debt_charges": [{
                     "id": "charge-1",
                     "original_amount": 4.0,
@@ -1322,6 +1326,7 @@ class ResellerDebtPolicyTests(unittest.TestCase):
                 "status": "suspended",
                 "suspended_reason": "debt",
                 "debt": 4.0,
+                "debt_since": self.hours_ago(73),
                 "debt_charges": [{
                     "id": "charge-1",
                     "original_amount": 4.0,
@@ -1474,7 +1479,9 @@ class ResellerDebtPolicyTests(unittest.TestCase):
 
         self.assertTrue(self.reseller.process_reseller_debt_service_action("1988", api, "hold")[0])
         api.client.user = None
-        success, result = self.reseller.process_reseller_debt_service_action("1988", api, "remove")
+        # Removal happens at its deadline, using the original hold snapshot.
+        with patch.object(self.reseller, "utc_now", return_value=datetime.now(timezone.utc) + timedelta(hours=97)):
+            success, result = self.reseller.process_reseller_debt_service_action("1988", api, "remove")
         saved = self.read_resellers()["1988"]
         calculation = saved["configs"][0]["debt_proration"][0]
 

@@ -1,7 +1,7 @@
 """Formatting and reliable delivery for reseller level presentations."""
 
 from utils.currency_format import format_usd_amount
-from utils.reseller_experience import experience_text
+from utils.reseller_experience import experience_text, build_settlement_terms, settlement_window_text
 from utils.reseller import (
     RESELLER_LEVEL_COUNT,
     RESELLER_TRUST_PAID_STEP,
@@ -75,7 +75,8 @@ def build_reseller_level_profile(
         total_value=format_usd_amount(total_value),
         total_paid=format_usd_amount(summary["total_paid"]),
         current_debt=format_usd_amount(current_debt),
-    ) + '\n' + experience_text(language, 'recent', amount=format_usd_amount(summary['recent_paid']))
+    ) + '\n' + experience_text(language, 'recent', amount=format_usd_amount(summary['recent_paid'])) + (
+        '\n' + build_settlement_terms(language, reseller_data))
 
 
 def build_reseller_level_roadmap(language, reseller_data):
@@ -92,7 +93,7 @@ def build_reseller_level_roadmap(language, reseller_data):
                 discount_percent=level_summary["discount_percent"],
                 trust_limit=format_usd_amount(level_summary["trust_limit"]),
                 threshold=format_usd_amount(threshold),
-            )
+            ) + ' · ' + settlement_window_text(language, level_summary['settlement_hours'])
         )
     return "\n".join(lines) + '\n' + experience_text(language, 'recent', amount=format_usd_amount(
         get_reseller_level_summary(reseller_data)['recent_paid']))
@@ -130,7 +131,9 @@ def build_reseller_level_presentation(language, claim):
     summary = claim["summary"]
     if claim.get('kind') == 'level_down':
         return experience_text(language, 'level_down', level=summary['level'], count=summary['level_count'],
-            discount=summary['discount_percent'], limit=format_usd_amount(summary['trust_limit']))
+            discount=summary['discount_percent'], limit=format_usd_amount(summary['trust_limit'])) + '\n' + (
+                experience_text(language, 'settlement_next', level=summary['level'],
+                    window=settlement_window_text(language, summary['settlement_hours'])))
     key = (
         "reseller_level_introduction"
         if claim.get("kind") == "introduction"
@@ -154,12 +157,14 @@ def build_reseller_level_presentation(language, claim):
         if summary["is_max_level"]
         else get_reseller_level_summary({}, paid_amount=summary['next_threshold'])
     )
+    message += '\n' + experience_text(language, 'settlement_next', level=summary['level'],
+        window=settlement_window_text(language, summary['settlement_hours']))
     return message + "\n\n" + get_message_text(language, reward_key).format(
         next_level=summary["next_level"],
         next_threshold=format_usd_amount(summary["next_threshold"] or 0),
         next_discount_percent=next_summary["discount_percent"],
         next_trust_limit=format_usd_amount(next_summary["trust_limit"]),
-    )
+    ) + ' ' + settlement_window_text(language, next_summary['settlement_hours'])
 
 
 def present_pending_reseller_level(

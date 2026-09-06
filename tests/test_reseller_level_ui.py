@@ -164,6 +164,22 @@ class ResellerLevelPresentationTests(unittest.TestCase):
                     if line.startswith(("•", "➤"))
                 ]
                 self.assertEqual(len(rows), 6)
+                window = self.level_ui.settlement_window_text(language, 168)
+                self.assertIn(window, profile)
+                for level, row in enumerate(rows, 1):
+                    self.assertIn(self.level_ui.settlement_window_text(language, (level + 1) * 24), row)
+
+    def test_level_presentations_include_next_cycle_settlement_terms(self):
+        for language in ('en', 'fa', 'ru', 'tk'):
+            for kind in ('introduction', 'level_up', 'level_down'):
+                with self.subTest(language=language, kind=kind):
+                    summary = self.reseller.get_reseller_level_summary({}, paid_amount=20)
+                    text = self.level_ui.build_reseller_level_presentation(language, {
+                        'kind': kind, 'from_level': 2 if kind != 'level_down' else 4,
+                        'summary': summary,
+                    })
+                    self.assertIn(self.level_ui.settlement_window_text(language, 96), text)
+                    self.assertNotIn('{', text)
 
     def test_program_preview_uses_real_catalog_and_wholesale_prices(self):
         template = (

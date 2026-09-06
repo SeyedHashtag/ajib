@@ -337,8 +337,9 @@ def write_readiness_marker():
             pass
 
 if __name__ == '__main__':
-    from utils.reseller import backfill_reseller_paid_activity
+    from utils.reseller import backfill_reseller_paid_activity, backfill_reseller_debt_deadlines
     backfill_reseller_paid_activity()
+    backfill_reseller_debt_deadlines()
     write_readiness_marker()
     threading.Thread(target=reseller_block_monitoring_thread, daemon=True, name='reseller-blocks').start()
     start_server_info_cache_monitor()

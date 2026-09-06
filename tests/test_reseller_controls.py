@@ -1,3 +1,4 @@
+import ast
 import importlib
 import json
 import sys
@@ -48,6 +49,209 @@ def save(store, **extra):
 
 def event(key, amount, days=0):
     return {'id': key, 'kind': 'settlement', 'amount': amount, 'paid_at': (NOW-timedelta(days=days)).isoformat()}
+
+
+@pytest.mark.parametrize('level', range(1, 7))
+@pytest.mark.parametrize('stage,base_hours,expected_kind', [
+    ('suspend', 48, 'suspended'), ('hold', 72, 'hold_due'),
+    ('warning', 144, 'deletion_warning'), ('removal', 168, 'remove_due'),
+])
+@pytest.mark.parametrize('seconds_before', [1, 0])
+def test_level_deadline_boundaries(modules, level, stage, base_hours, expected_kind, seconds_before):
+    store, _, _ = modules
+    hours = base_hours + (level - 1) * 24
+    started = NOW - timedelta(hours=hours) + timedelta(seconds=seconds_before)
+    record = save(store, debt=4, debt_since=started.isoformat(), debt_cycle_id='boundary',
+        paid_activity_version=1, paid_activity=[event('paid', (level - 1) * 10, days=30)])
+    if stage != 'suspend':
+        record.update(status='suspended', suspended_reason='debt', debt_cycle_late_recorded=True)
+    if stage in {'warning', 'removal'}:
+        record.update(debt_services_held_at=(NOW-timedelta(hours=1)).isoformat(),
+            debt_cycle_default_recorded=True)
+    store.save_resellers({'7': record})
+    events = store.evaluate_reseller_debt_policies()
+    saved = store.get_reseller_data(7)
+    assert saved['debt_cycle_deadlines'][stage + '_hours'] == hours
+    if seconds_before:
+        assert expected_kind not in [item['kind'] for item in events]
+        if stage == 'suspend':
+            assert saved['status'] == 'approved'
+        if stage in {'hold', 'removal'}:
+            assert not saved['debt_service_' + ('remove' if stage == 'removal' else stage) + '_due']
+    else:
+        assert events[0]['kind'] == expected_kind
+        assert events[0]['hours_until_suspend'] == max(0, (level + 1) * 24 - hours)
+        assert events[0]['hours_until_hold'] == max(0, (level + 2) * 24 - hours)
+        assert events[0]['hours_until_removal'] == max(0, (level + 6) * 24 - hours)
+        assert saved['status'] == 'suspended'
+
+
+@pytest.mark.parametrize('sqlite', [False, True])
+@pytest.mark.parametrize('entrypoint', ['backfill_reseller_debt_deadlines', 'evaluate_reseller_debt_policies'])
+def test_deadline_migration_persists_once_and_preserves_applied_restrictions(modules, monkeypatch, sqlite, entrypoint):
+    store, _, _ = modules
+    started = (NOW-timedelta(hours=170)).isoformat()
+    record = save(store, debt=4, debt_since=started, status='suspended', suspended_reason='debt',
+        debt_services_held_at=(NOW-timedelta(hours=90)).isoformat(),
+        debt_cycle_late_recorded=True, debt_cycle_default_recorded=True,
+        credit_outcomes=[{'outcome': 'late'}, {'outcome': 'default'}],
+        debt_notification_state={'suspended:user': {'delivered_at': NOW.isoformat()}},
+        debt_service_remove_due=True,
+        paid_activity_version=1, paid_activity=[event('paid', 50, days=30)])
+    monkeypatch.setenv('AJIB_SQLITE_ACTIVE', '1' if sqlite else '0')
+    store.save_resellers({'7': record})
+    getattr(store, entrypoint)()
+    migrated = store._read_resellers_file()['7']
+    assert migrated['debt_cycle_deadlines'] == {
+        'level': 6, 'suspend_hours': 168, 'hold_hours': 192,
+        'warning_hours': 264, 'removal_hours': 288,
+    }
+    assert migrated['debt_cycle_id']
+    assert not migrated['debt_service_remove_due']
+    for key in ('debt_since', 'status', 'suspended_reason', 'debt_services_held_at',
+                'debt_cycle_late_recorded', 'debt_cycle_default_recorded', 'credit_outcomes',
+                'debt_notification_state'):
+        assert migrated[key] == record[key]
+    store.backfill_reseller_debt_deadlines()
+    assert store._read_resellers_file()['7'] == migrated
+    importlib.import_module('utils.database').close_connections()
+    # A later read with a lower level still uses the persisted cycle terms.
+    monkeypatch.setattr(store, 'utc_now', lambda: NOW+timedelta(days=100))
+    assert store.get_reseller_data(7)['debt_cycle_deadlines'] == migrated['debt_cycle_deadlines']
+
+
+@pytest.mark.parametrize('action,age_hours', [('hold', 80), ('remove', 175)])
+def test_legacy_queued_service_action_waits_for_extended_deadline(modules, action, age_hours):
+    store, _, _ = modules
+    save(store, debt=4, debt_since=(NOW-timedelta(hours=age_hours)).isoformat(),
+        debt_cycle_id='legacy', debt_service_hold_due=True, debt_service_remove_due=True,
+        paid_activity_version=1, paid_activity=[event('paid', 50, days=30)])
+    # An object with no panel methods makes any attempted external action fail.
+    assert store.process_reseller_debt_service_action(7, object(), action) == (
+        False, {'reason': 'deadline_not_due'})
+    saved = store._read_resellers_file()['7']
+    assert not saved['debt_service_hold_due']
+    assert not saved['debt_service_remove_due']
+    assert all(item['service_action'] is None for item in store.evaluate_reseller_debt_policies())
+
+
+def test_cycle_deadlines_survive_upgrade_downgrade_partial_payment_and_new_charges(modules):
+    store, _, _ = modules
+    save(store, debt=0, paid_activity_version=1, paid_activity=[event('paid', 10)])
+    assert store.set_reseller_debt(7, 5)
+    original = store.get_reseller_data(7)
+    assert original['debt_cycle_deadlines']['suspend_hours'] == 72
+    assert store.apply_reseller_payment(7, 2, 'partial')[0]
+    assert store.add_reseller_debt(7, 1, {'username': 'bob', 'server_id': 's1', 'price': 1})
+    for paid_amount in (50, 0):
+        records = store.load_resellers()
+        records['7']['paid_activity'] = [event('change-level', paid_amount)]
+        store.save_resellers(records)
+        store.evaluate_reseller_debt_policies()
+        current = store.get_reseller_data(7)
+        assert current['debt_cycle_deadlines'] == original['debt_cycle_deadlines']
+        assert current['debt_since'] == original['debt_since']
+        assert current['debt_cycle_id'] == original['debt_cycle_id']
+    assert store.apply_reseller_payment(7, 4, 'finish')[0]
+    assert store.get_reseller_data(7)['debt_cycle_deadlines'] is None
+    assert store.set_reseller_debt(7, 2)
+    new_cycle = store.get_reseller_data(7)
+    assert new_cycle['debt_cycle_deadlines']['suspend_hours'] == 48
+    assert new_cycle['debt_cycle_id'] != original['debt_cycle_id']
+
+
+@pytest.mark.parametrize('age_hours,on_time', [(60, True), (72, False)])
+def test_payment_classification_uses_saved_terms_before_payment_level_increase(modules, age_hours, on_time):
+    store, _, _ = modules
+    save(store, debt=10, debt_since=(NOW-timedelta(hours=age_hours)).isoformat(),
+        paid_activity_version=1, paid_activity=[event('paid', 10, days=10)])
+    assert store.apply_reseller_payment(7, 10, 'full')[0]
+    saved = store.get_reseller_data(7)
+    assert ('good' in [item['outcome'] for item in saved['credit_outcomes']]) is on_time
+    assert store.get_reseller_level_summary(saved)['level'] == 3
+    assert saved['debt_cycle_deadlines'] is None
+
+
+def test_environment_baselines_and_saved_terms_survive_config_changes(modules, monkeypatch, tmp_path):
+    store, _, _ = modules
+    for setting, hours in [('SUSPEND_DEADLINE', 60), ('HOLD_DEADLINE', 90),
+                           ('FINAL_WARNING', 180), ('REMOVAL_DEADLINE', 210)]:
+        monkeypatch.setenv('RESELLER_DEBT_' + setting + '_HOURS', str(hours))
+    store = importlib.reload(store)
+    monkeypatch.setattr(store, 'utc_now', lambda: NOW)
+    monkeypatch.setattr(store, '_now_str', lambda: NOW.isoformat())
+    store.RESELLERS_FILE = str(tmp_path / 'resellers.json')
+    save(store, debt=4, debt_since=NOW.isoformat(),
+        paid_activity_version=1, paid_activity=[event('paid', 20)])
+    saved = store.get_reseller_data(7)
+    assert saved['debt_cycle_deadlines'] == {
+        'level': 3, 'suspend_hours': 108, 'hold_hours': 138,
+        'warning_hours': 228, 'removal_hours': 258,
+    }
+    monkeypatch.setattr(store, 'DEBT_SUSPEND_DEADLINE_HOURS', 120)
+    assert store.get_reseller_data(7)['debt_cycle_deadlines']['suspend_hours'] == 108
+    assert store.get_reseller_level_summary(saved)['settlement_hours'] == 168
+
+
+@pytest.mark.parametrize('language', ['en', 'fa', 'ru', 'tk'])
+def test_credit_displays_distinguish_locked_and_next_cycle_terms(modules, language):
+    store, _, experience = modules
+    save(store, debt=4, debt_since=(NOW-timedelta(hours=60)).isoformat(),
+        paid_activity_version=1, paid_activity=[event('paid', 10, days=30)])
+    records = store.load_resellers()
+    records['7']['paid_activity'] = [event('level-up', 50)]
+    store.save_resellers(records)
+    record = store.get_reseller_data(7)
+    summary = experience.build_credit_summary(language, record, 7,
+        balance={'available': 0, 'reserved': 0}, now=NOW)
+    help_text = experience.build_credit_help(language, record)
+    for text in (summary, help_text):
+        assert experience.settlement_window_text(language, 72) in text
+        assert experience.settlement_window_text(language, 168) in text
+        assert '{' not in text
+    assert experience.experience_text(language, 'selling') in summary
+    assert '12.0' in summary
+    assert experience.experience_text(language, 'settlement_rules') in help_text
+
+
+@pytest.mark.parametrize('source,function_name,callback', [
+    ('utils/reseller_handlers.py', 'handle_reseller_credit_help', 'reseller:credit_help'),
+    ('hosted_worker.py', 'owner_credit_customer_controls', 'hb:credithelp'),
+])
+def test_both_bot_help_callbacks_use_reseller_cycle_terms(modules, source, function_name, callback):
+    store, _, experience = modules
+    save(store, debt=4, debt_since=NOW.isoformat(),
+        paid_activity_version=1, paid_activity=[event('paid', 50)])
+    record = store.get_reseller_data(7)
+    messages = []
+    bot = types.SimpleNamespace(send_message=lambda chat, text: messages.append(text),
+        answer_callback_query=lambda *_args: None)
+    namespace = {
+        'OWNER_ID': 7, 'bot': bot, 'get_reseller_data': lambda _id: record,
+        '_get_active_reseller_data': lambda _id: record,
+        'get_user_language': lambda _id: 'en', '_language': lambda _id: 'en',
+        'safe_answer_callback_query': lambda *_args: None,
+        'build_credit_help': experience.build_credit_help,
+    }
+    tree = ast.parse((UTILS.parent / source).read_text(encoding='utf-8'))
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == function_name)
+    function.decorator_list = []
+    exec(compile(ast.Module(body=[function], type_ignores=[]), source, 'exec'), namespace)
+    namespace[function_name](types.SimpleNamespace(id='callback', data=callback,
+        from_user=types.SimpleNamespace(id=7), message=types.SimpleNamespace(chat=types.SimpleNamespace(id=7))))
+    assert messages == [experience.build_credit_help('en', record)]
+    assert '168' in messages[0] and '288' in messages[0]
+
+
+@pytest.mark.parametrize('level', range(1, 7))
+def test_final_payment_reminder_moves_with_settlement_window(modules, level):
+    store, _, _ = modules
+    save(store, debt=4, debt_since=(NOW-timedelta(hours=(level + 1) * 24 - 6)).isoformat(),
+        paid_activity_version=1, paid_activity=[event('paid', (level - 1) * 10, days=30)])
+    events = store.evaluate_reseller_debt_policies()
+    assert events[0]['kind'] == 'deadline_final'
+    assert events[0]['hours_until_suspend'] == 6
+    assert store.get_reseller_data(7)['status'] == 'approved'
 
 
 class Panel:

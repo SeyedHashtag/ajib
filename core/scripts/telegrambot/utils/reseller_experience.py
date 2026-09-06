@@ -8,6 +8,10 @@ TEXT = {
         'single_note': '👤 Single-user configuration: for one user only.',
         'many_note': '👥 Unlimited-user configuration (traffic and validity limits still apply).',
         'recent': 'Paid in the last 90 days: ${amount}',
+        'settlement_window': '{days} days ({hours} hours) to settle',
+        'settlement_next': 'Next debt cycle at level {level}: {window}.',
+        'settlement_current': 'Current debt cycle, locked at level {level}: {window}.',
+        'settlement_rules': 'All deadlines run from the original debt start. The level and deadlines are locked for each debt cycle; level changes apply to the next cycle. Daily reminders still begin after 24 hours.',
         'level_down': 'Your level is now {level}/{count} because older payments left the 90-day window. Current discount: {discount}%. Base credit limit: ${limit}.',
         'credit': 'Full credit', 'half_credit': 'Half credit', 'prepaid_only': 'Prepaid only',
         'selling': 'Selling available', 'paused': 'Selling suspended', 'banned': 'Access banned by an administrator',
@@ -35,6 +39,10 @@ TEXT = {
         'single_note': '👤 کانفیگ تک‌کاربر: فقط برای استفاده یک کاربر.',
         'many_note': '👥 تعداد کاربران نامحدود است؛ محدودیت حجم و اعتبار زمانی همچنان برقرار است.',
         'recent': 'پرداخت در ۹۰ روز اخیر: ${amount}',
+        'settlement_window': '{days} روز ({hours} ساعت) مهلت تسویه',
+        'settlement_next': 'دوره بدهی بعدی در سطح {level}: {window}.',
+        'settlement_current': 'دوره بدهی فعلی با سطح ثابت {level}: {window}.',
+        'settlement_rules': 'همه مهلت‌ها از زمان شروع اولیه بدهی محاسبه می‌شوند. سطح و مهلت‌ها برای هر دوره بدهی ثابت می‌مانند؛ تغییر سطح در دوره بعدی اعمال می‌شود. یادآوری روزانه همچنان پس از ۲۴ ساعت آغاز می‌شود.',
         'level_down': 'با خروج پرداخت‌های قدیمی از بازه ۹۰ روزه، سطح شما اکنون {level}/{count} است. تخفیف فعلی: {discount}٪. سقف پایه اعتبار: ${limit}.',
         'credit': 'اعتبار کامل', 'half_credit': 'نصف اعتبار', 'prepaid_only': 'فقط پیش‌پرداخت',
         'selling': 'فروش فعال است', 'paused': 'فروش تعلیق شده است', 'banned': 'دسترسی توسط مدیر مسدود شده است',
@@ -62,6 +70,10 @@ TEXT = {
         'single_note': '👤 Конфигурация только для одного пользователя.',
         'many_note': '👥 Число пользователей не ограничено; лимиты трафика и срока действуют.',
         'recent': 'Оплачено за последние 90 дней: ${amount}',
+        'settlement_window': '{days} дн. ({hours} ч.) на погашение',
+        'settlement_next': 'Следующий долговой цикл на уровне {level}: {window}.',
+        'settlement_current': 'Текущий долговой цикл, закреплённый уровень {level}: {window}.',
+        'settlement_rules': 'Все сроки отсчитываются от первоначального возникновения долга. Уровень и сроки фиксируются на весь долговой цикл; изменение уровня применяется к следующему циклу. Ежедневные напоминания по-прежнему начинаются через 24 часа.',
         'level_down': 'Старые платежи вышли из окна 90 дней. Ваш уровень: {level}/{count}. Скидка: {discount}%. Базовый кредит: ${limit}.',
         'credit': 'Полный кредит', 'half_credit': 'Половина кредита', 'prepaid_only': 'Только предоплата',
         'selling': 'Продажи доступны', 'paused': 'Продажи приостановлены', 'banned': 'Доступ заблокирован администратором',
@@ -89,6 +101,10 @@ TEXT = {
         'single_note': '👤 Bu sazlama diňe bir ulanyjy üçin.',
         'many_note': '👥 Ulanyjy sany çäksiz; trafik we möhlet çäkleri güýjünde galýar.',
         'recent': 'Soňky 90 günde tölenen: ${amount}',
+        'settlement_window': 'üzmek üçin {days} gün ({hours} sagat)',
+        'settlement_next': '{level}-nji derejede indiki bergi döwri: {window}.',
+        'settlement_current': 'Häzirki bergi döwri, berkidilen dereje {level}: {window}.',
+        'settlement_rules': 'Ähli möhletler berginiň ilkinji başlan wagtyndan hasaplanýar. Dereje we möhletler her bergi döwri üçin üýtgemeýär; dereje üýtgemegi indiki döwre degişli bolýar. Gündelik ýatlatmalar öňküsi ýaly 24 sagatdan başlanýar.',
         'level_down': 'Köne tölegler 90 günlük aralykdan çykdy. Derejäňiz: {level}/{count}. Arzanladyş: {discount}%. Esasy karz çägi: ${limit}.',
         'credit': 'Doly karz', 'half_credit': 'Ýarym karz', 'prepaid_only': 'Diňe öňünden töleg',
         'selling': 'Satuw elýeterli', 'paused': 'Satuw wagtlaýyn togtadyldy', 'banned': 'Administrator girişi gadagan etdi',
@@ -139,11 +155,29 @@ def access_limit_text(language, record=None, live=None, *, short=False, plan=Fal
     return experience_text(language, ('many' if unlimited else 'single') + ('' if short else '_note'))
 
 
-def build_credit_help(language):
+def settlement_window_text(language, hours):
+    return experience_text(language, 'settlement_window', days=f'{hours / 24:g}', hours=f'{hours:g}')
+
+
+def build_settlement_terms(language, record, *, now=None):
     from utils import reseller as store
+    summary = store.get_reseller_level_summary(record, now=now)
+    text = experience_text(language, 'settlement_next', level=summary['level'],
+        window=settlement_window_text(language, summary['settlement_hours']))
+    if not store._is_debt_fully_settled((record or {}).get('debt', 0)):
+        deadlines = store.get_reseller_debt_deadlines(record, now=now)
+        text += '\n' + experience_text(language, 'settlement_current', level=deadlines['level'],
+            window=settlement_window_text(language, deadlines['suspend_hours']))
+    return text
+
+
+def build_credit_help(language, record=None):
+    from utils import reseller as store
+    deadlines = store.get_reseller_debt_deadlines(record)
     return experience_text(language, 'help',
-        suspend=f'{store.DEBT_SUSPEND_DEADLINE_HOURS:g}', hold=f'{store.DEBT_HOLD_DEADLINE_HOURS:g}',
-        warning=f'{store.DEBT_FINAL_WARNING_HOURS:g}', remove=f'{store.DEBT_REMOVAL_DEADLINE_HOURS:g}')
+        suspend=f"{deadlines['suspend_hours']:g}", hold=f"{deadlines['hold_hours']:g}",
+        warning=f"{deadlines['warning_hours']:g}", remove=f"{deadlines['removal_hours']:g}") + '\n\n' + (
+            build_settlement_terms(language, record) + '\n' + experience_text(language, 'settlement_rules'))
 
 
 def build_credit_summary(language, record, reseller_id, *, balance=None, now=None, deadlines=True, policy=None):
@@ -155,9 +189,11 @@ def build_credit_summary(language, record, reseller_id, *, balance=None, now=Non
     policy = store.get_reseller_credit_policy(record, now=now) if policy is None else policy
     balance = get_wholesale_balance(reseller_id) if balance is None else balance
     debt = float(record.get('debt', 0) or 0)
+    cycle_deadlines = store.get_reseller_debt_deadlines(record, now=current)
+    has_collectible_debt = not store._is_debt_fully_settled(debt)
     started = parse_utc_timestamp(record.get('debt_since'))
-    overdue = bool(debt > 0.005 and started and
-                   (current - started).total_seconds() >= store.DEBT_SUSPEND_DEADLINE_HOURS * 3600)
+    overdue = bool(has_collectible_debt and started and
+                   (current - started).total_seconds() >= cycle_deadlines['suspend_hours'] * 3600)
     status = record.get('status', 'approved')
     selling = 'banned' if status == 'banned' else 'paused' if status != 'approved' or overdue else 'selling'
     values = {key: format_usd_amount(value) for key, value in {
@@ -168,11 +204,12 @@ def build_credit_summary(language, record, reseller_id, *, balance=None, now=Non
     text = experience_text(language, 'summary', **values,
                            mode=experience_text(language, policy['mode']), selling=experience_text(language, selling))
     text += '\n' + experience_text(language, 'score', score=policy.get('adverse_weight', 0))
+    text += '\n' + build_settlement_terms(language, record, now=current)
     if debt > 0.005:
         text += '\n' + experience_text(language, 'due', amount=format_usd_amount(debt))
-    if deadlines and debt > 0.005 and started:
-        for stage, hours in [('reminder', 24), ('suspend', store.DEBT_SUSPEND_DEADLINE_HOURS), ('hold', store.DEBT_HOLD_DEADLINE_HOURS),
-                             ('warning', store.DEBT_FINAL_WARNING_HOURS), ('remove', store.DEBT_REMOVAL_DEADLINE_HOURS)]:
+    if deadlines and has_collectible_debt and started:
+        for stage, hours in [('reminder', 24), ('suspend', cycle_deadlines['suspend_hours']), ('hold', cycle_deadlines['hold_hours']),
+                             ('warning', cycle_deadlines['warning_hours']), ('remove', cycle_deadlines['removal_hours'])]:
             due = started + timedelta(hours=hours)
             text += '\n' + experience_text(language, 'deadline', stage=experience_text(language, stage),
                 date=format_utc_display(due), hours=f'{max(0, (due-current).total_seconds()/3600):.1f}')
