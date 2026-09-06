@@ -37,6 +37,7 @@ except ImportError:  # pragma: no cover - Windows fallback
 
 RESELLERS_FILE = '/etc/ajib/core/scripts/telegrambot/resellers.json'
 reseller_lock = threading.RLock()
+DEBT_LOGGER = logging.getLogger('ajib.reseller_debt')
 RENEWAL_LOGGER = logging.getLogger('ajib.renewals')
 RENEWAL_INTERNAL_ERROR_FIELDS = (
     'renewal_internal_error_type',
@@ -872,6 +873,8 @@ def _ensure_reseller_defaults(record):
         data['debt_service_remove_due'] = False
         data['debt_service_action_claims'] = {}
         data['debt_notification_state'] = {}
+        data['debt_recovery_pending'] = False
+        data['debt_restore_services_due'] = False
     if debt_fully_settled:
         data['debt_since'] = None
         data['debt_last_reminded_at'] = None
@@ -917,7 +920,8 @@ def _finish_debt_cycle(data):
     data['debt_cycle_default_recorded'] = False
     data['debt_service_hold_due'] = False
     data['debt_service_remove_due'] = False
-    data['debt_notification_state'] = {}
+    # Recovery can span several scans or settlement calls. Keep delivery
+    # receipts and leases until _ensure_reseller_defaults opens a new cycle.
     return data
 
 
@@ -2872,6 +2876,11 @@ def complete_reseller_debt_notification(user_id, kind, audience, delivered=True)
             with _resellers_file_lock():
                 resellers = _read_resellers_file()
                 if user_id not in resellers:
+                    DEBT_LOGGER.warning(
+                        'notification_completion_failed reseller_id=%s event=%s audience=%s '
+                        'delivered=%s reason=reseller_missing',
+                        user_id, kind, audience, delivered,
+                    )
                     return False
                 current = _ensure_reseller_defaults(resellers[user_id])
                 state = current.setdefault('debt_notification_state', {})
@@ -2890,7 +2899,12 @@ def complete_reseller_debt_notification(user_id, kind, audience, delivered=True)
                 resellers[user_id] = current
                 _write_resellers_file(resellers)
                 return True
-        except Exception:
+        except Exception as error:
+            DEBT_LOGGER.error(
+                'notification_completion_failed reseller_id=%s event=%s audience=%s '
+                'delivered=%s error_type=%s',
+                user_id, kind, audience, delivered, type(error).__name__,
+            )
             return False
 
 
@@ -3087,7 +3101,9 @@ def evaluate_reseller_debt_policies():
                             if event_kind in {'suspended', 'recovered', 'hold_due', 'remove_due'}:
                                 notify_admin = _notification_claim_due(current, event_kind, 'admin', now)
 
-                    if current != record:
+                    # Claim helpers mutate nested dictionaries shared with record,
+                    # so equality alone cannot detect newly acquired leases.
+                    if current != record or notify_user or notify_admin or service_action:
                         changed = True
                         resellers[user_id] = current
 
@@ -3099,6 +3115,7 @@ def evaluate_reseller_debt_policies():
                             'kind': event_kind,
                             'cycle_id': current.get('debt_cycle_id'),
                             'debt': debt,
+                            'settlement_threshold': _money_value(DEBT_SETTLEMENT_THRESHOLD),
                             'debt_state': debt_state,
                             'status': current.get('status', 'pending'),
                             'suspended_reason': current.get('suspended_reason'),

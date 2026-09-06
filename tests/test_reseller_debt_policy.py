@@ -7,6 +7,7 @@ import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -711,6 +712,92 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         ))
         self.assertEqual(self.reseller.evaluate_reseller_debt_policies(), [])
 
+    def test_recovery_retries_only_failed_audience_across_scans_and_reload(self):
+        for debt in (0.0, 0.10):
+            for delivered_audience, failed_audience in (("admin", "user"), ("user", "admin")):
+                with self.subTest(debt=debt, delivered=delivered_audience):
+                    delivered_at = "2026-09-06T18:50:35.000000Z"
+                    self.write_resellers({"1988": {
+                        "status": "approved", "debt": debt, "configs": [],
+                        "debt_cycle_id": None, "debt_recovery_pending": True,
+                        "debt_notification_state": {
+                            f"recovered:{delivered_audience}": {"delivered_at": delivered_at},
+                            f"recovered:{failed_audience}": {},
+                        },
+                    }})
+                    for _ in range(3):
+                        # A fresh module must honor receipts already stored by another process.
+                        self.reseller = load_reseller_module()
+                        self.reseller.RESELLERS_FILE = str(self.resellers_file)
+                        events = self.reseller.evaluate_reseller_debt_policies()
+                        self.assertEqual(len(events), 1)
+                        self.assertEqual(events[0]["kind"], "recovered")
+                        self.assertFalse(events[0][f"notify_{delivered_audience}"])
+                        self.assertTrue(events[0][f"notify_{failed_audience}"])
+                        self.assertTrue(self.reseller.complete_reseller_debt_notification(
+                            "1988", "recovered", failed_audience, delivered=False,
+                        ))
+                    saved = self.read_resellers()["1988"]
+                    self.assertEqual(saved["debt"], debt)
+                    self.assertEqual(saved["debt_notification_state"][
+                        f"recovered:{delivered_audience}"
+                    ]["delivered_at"], delivered_at)
+                    self.assertTrue(self.reseller.complete_reseller_debt_notification(
+                        "1988", "recovered", failed_audience, delivered=True,
+                    ))
+                    self.assertFalse(self.read_resellers()["1988"]["debt_recovery_pending"])
+                    self.assertEqual(self.reseller.evaluate_reseller_debt_policies(), [])
+
+    def test_recovery_leases_survive_scans_and_expire_after_ten_minutes(self):
+        self.write_resellers({"1988": {
+            "status": "approved", "debt": 0.10, "configs": [],
+            "debt_recovery_pending": True,
+        }})
+        now = datetime(2026, 9, 6, 19, tzinfo=timezone.utc)
+        with patch.object(self.reseller, "utc_now", return_value=now):
+            first = self.reseller.evaluate_reseller_debt_policies()
+        self.assertTrue(first[0]["notify_user"])
+        self.assertTrue(first[0]["notify_admin"])
+        with patch.object(self.reseller, "utc_now", return_value=now + timedelta(minutes=5)):
+            self.assertEqual(self.reseller.evaluate_reseller_debt_policies(), [])
+        with patch.object(self.reseller, "utc_now", return_value=now + timedelta(minutes=10)):
+            retry = self.reseller.evaluate_reseller_debt_policies()
+        self.assertTrue(retry[0]["notify_user"])
+        self.assertTrue(retry[0]["notify_admin"])
+        for audience in ("user", "admin"):
+            self.assertTrue(self.reseller.complete_reseller_debt_notification(
+                "1988", "recovered", audience,
+            ))
+        self.assertEqual(self.reseller.evaluate_reseller_debt_policies(), [])
+
+    def test_settlement_calls_preserve_recovery_receipts_and_leases(self):
+        self.write_resellers({"1988": {
+            "status": "suspended", "suspended_reason": "debt",
+            "debt": 1.50, "configs": [], "debt_since": self.hours_ago(50),
+        }})
+        self.assertEqual(self.reseller.apply_reseller_payment("1988", 1.40, "partial"), (True, 0.10))
+        self.assertEqual(self.reseller.evaluate_reseller_debt_policies()[0]["kind"], "recovered")
+        self.assertTrue(self.reseller.complete_reseller_debt_notification("1988", "recovered", "admin"))
+        receipts = self.read_resellers()["1988"]["debt_notification_state"]
+        self.assertTrue(self.reseller.set_reseller_debt("1988", 0.10))
+        self.assertEqual(self.reseller.apply_reseller_payment("1988", 0.10, "final"), (True, 0.0))
+        self.assertTrue(self.reseller.clear_reseller_debt("1988"))
+        self.assertEqual(self.read_resellers()["1988"]["debt_notification_state"], receipts)
+        self.assertEqual(self.reseller.evaluate_reseller_debt_policies(), [])
+        self.assertTrue(self.reseller.complete_reseller_debt_notification("1988", "recovered", "user"))
+        self.assertFalse(self.read_resellers()["1988"]["debt_recovery_pending"])
+
+    def test_notification_completion_failure_is_logged_without_exception_contents(self):
+        self.write_resellers({"1988": {"status": "approved", "debt": 0.10, "configs": []}})
+        with patch.object(self.reseller, "_write_resellers_file", side_effect=OSError("secret-token")):
+            with self.assertLogs("ajib.reseller_debt", level="ERROR") as logs:
+                self.assertFalse(self.reseller.complete_reseller_debt_notification(
+                    "1988", "recovered", "admin",
+                ))
+        self.assertIn("notification_completion_failed reseller_id=1988 event=recovered audience=admin", logs.output[0])
+        self.assertIn("error_type=OSError", logs.output[0])
+        self.assertNotIn("secret-token", str(logs.output))
+
     def test_reminder_and_deletion_warning_deadlines(self):
         cases = (
             (1, {}, "opened"),
@@ -780,6 +867,9 @@ class ResellerDebtPolicyTests(unittest.TestCase):
                 "debt": 0.0,
                 "debt_services_held_at": self.hours_ago(20),
                 "debt_services_removed_at": self.hours_ago(10),
+                "debt_recovery_pending": True,
+                "debt_restore_services_due": True,
+                "debt_notification_state": {"recovered:admin": {"delivered_at": self.hours_ago(1)}},
                 "credit_outcomes": [{"outcome": "default", "reference_id": "old"}],
                 "configs": [{"username": "historical", "removed_from_vpn": True}],
             }
@@ -791,8 +881,19 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.assertIsNotNone(saved["debt_cycle_id"])
         self.assertIsNone(saved["debt_services_held_at"])
         self.assertIsNone(saved["debt_services_removed_at"])
+        self.assertFalse(saved["debt_recovery_pending"])
+        self.assertFalse(saved["debt_restore_services_due"])
+        self.assertEqual(saved["debt_notification_state"], {})
         self.assertEqual(saved["credit_outcomes"][0]["outcome"], "default")
         self.assertTrue(saved["configs"][0]["removed_from_vpn"])
+
+        self.assertEqual(self.reseller.evaluate_reseller_debt_policies()[0]["kind"], "opened")
+        self.assertTrue(self.reseller.update_reseller_status("1988", "suspended", suspended_reason="debt"))
+        self.assertEqual(self.reseller.apply_reseller_payment("1988", 2.0, "new-cycle"), (True, 0.0))
+        recovered = self.reseller.evaluate_reseller_debt_policies()[0]
+        self.assertEqual(recovered["kind"], "recovered")
+        self.assertTrue(recovered["notify_admin"])
+        self.assertTrue(recovered["notify_user"])
 
     def test_duplicate_payment_callback_does_not_double_apply_or_create_excess(self):
         self.write_resellers({
@@ -952,6 +1053,46 @@ class ResellerDebtPolicyTests(unittest.TestCase):
         self.assertEqual(saved["debt"], 5.0)
         self.assertTrue(saved["configs"][0]["removed_from_vpn"])
         self.assertEqual(saved["configs"][0]["removal_reason"], "reseller_debt_default")
+
+    def test_service_writeoff_recovers_below_threshold_without_recreating_deleted_config(self):
+        self.write_resellers({"1988": {
+            "status": "suspended", "suspended_reason": "debt",
+            "debt": 1.34, "total_paid": 12.28, "debt_since": self.hours_ago(169),
+            "credit_outcomes": [{"outcome": "default", "reference_id": "old"}],
+            "debt_charges": [{"id": "charge", "original_amount": 1.34, "outstanding_amount": 1.34}],
+            "configs": [{
+                "username": "customer", "server_id": "s1", "debt_charge_id": "charge",
+                "timestamp": "2026-08-30T18:30:00Z", "days": 40, "gb": 10, "price": 1.34,
+                "debt_policy_blocked": True,
+                "debt_policy_hold_snapshot": {
+                    "held_at": "2026-09-02T18:30:00Z", "used_bytes": 0, "quota_bytes": 10 * 1024 ** 3,
+                },
+            }],
+        }})
+        client = Mock(server_id="s1")
+        client.delete_user.return_value = {"ok": True}
+        api = Mock()
+        api.resolve_unique_user.return_value = (client, {"blocked": True}, {
+            "status": "found", "uniqueness_verified": True,
+        })
+        success, result = self.reseller.process_reseller_debt_service_action("1988", api, "remove")
+        self.assertTrue(success)
+        self.assertEqual(result["writeoff"], 1.24)
+        self.assertEqual(result["remaining_debt"], 0.10)
+        event = self.reseller.evaluate_reseller_debt_policies()[0]
+        self.assertEqual(event["kind"], "recovered")
+        self.assertIsNone(event["service_action"])
+        self.assertEqual(event["settlement_threshold"], 1.0)
+        for audience in ("user", "admin"):
+            self.assertTrue(self.reseller.complete_reseller_debt_notification("1988", "recovered", audience))
+        self.assertEqual(self.reseller.evaluate_reseller_debt_policies(), [])
+        client.delete_user.assert_called_once_with("customer")
+        client.update_user.assert_not_called()
+        saved = self.read_resellers()["1988"]
+        self.assertTrue(saved["configs"][0]["removed_from_vpn"])
+        self.assertEqual(saved["debt_charges"][0]["outstanding_amount"], 0.10)
+        self.assertEqual(saved["total_paid"], 12.28)
+        self.assertEqual(saved["credit_outcomes"], [{"outcome": "default", "reference_id": "old"}])
 
     def test_proration_subtracts_payments_already_allocated_to_charge(self):
         calculation = self.reseller._prorated_collectible(

@@ -29,6 +29,8 @@ PUBLIC_CUSTOMER_FUNCTIONS = {
 }
 
 REQUIRED_KEYS = {
+    "reseller_debt_recovered_below_threshold",
+    "admin_reseller_debt_recovered_below_threshold",
     "customer_reseller_only_plan",
     "payment_status_checking",
     "payment_status_check_in_progress",

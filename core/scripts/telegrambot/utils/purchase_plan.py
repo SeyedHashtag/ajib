@@ -103,6 +103,7 @@ def _configured_primary_api_client():
 
 # New: Global dictionary for user states
 user_data = {}
+DEBT_LOGGER = logging.getLogger('ajib.reseller_debt')
 
 TELEGRAM_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
 CRYPTO_PAYMENT_DISCOUNT_PERCENT = 5
@@ -4669,8 +4670,13 @@ def check_pending_payments():
                                         ),
                                         parse_mode='Markdown',
                                     )
-                                except Exception:
+                                except Exception as error:
                                     admin_delivered = False
+                                    DEBT_LOGGER.warning(
+                                        'notification_delivery_failed reseller_id=%s event=%s '
+                                        'audience=admin recipient_id=%s error_type=%s',
+                                        reseller_id, retry_kind, admin_id, type(error).__name__,
+                                    )
                             complete_reseller_debt_notification(
                                 reseller_id,
                                 retry_kind,
@@ -4704,7 +4710,10 @@ def check_pending_payments():
                             'deletion_warning': 'reseller_debt_deletion_warning',
                             'held': 'reseller_debt_services_held',
                             'removed': 'reseller_debt_services_removed',
-                            'recovered': 'reseller_debt_recovered',
+                            'recovered': (
+                                'reseller_debt_recovered_below_threshold'
+                                if round(debt, 2) > 0 else 'reseller_debt_recovered'
+                            ),
                         }.get(kind, 'reseller_debt_reminder_suspended')
                         user_message = get_message_text(user_language, message_key).format(
                             debt=debt,
@@ -4718,6 +4727,7 @@ def check_pending_payments():
                             changed=int(action_result.get('completed', 0) or 0),
                             writeoff=float(action_result.get('writeoff', 0.0) or 0.0),
                             remaining_debt=float(action_result.get('remaining_debt', debt) or 0.0),
+                            settlement_threshold=float(event.get('settlement_threshold', 1.0)),
                         )
 
                     markup = None
@@ -4732,8 +4742,12 @@ def check_pending_payments():
                         )
                     bot.send_message(reseller_id, user_message, reply_markup=markup, parse_mode="Markdown")
                     delivered = True
-                except Exception:
-                    pass
+                except Exception as error:
+                    DEBT_LOGGER.warning(
+                        'notification_delivery_failed reseller_id=%s event=%s '
+                        'audience=user recipient_id=%s error_type=%s',
+                        reseller_id, event.get('kind') or kind, reseller_id, type(error).__name__,
+                    )
                 complete_reseller_debt_notification(
                     reseller_id,
                     str(event.get('kind') or kind),
@@ -4762,7 +4776,10 @@ def check_pending_payments():
                             message_key = {
                                 'held': 'admin_reseller_debt_services_held',
                                 'removed': 'admin_reseller_debt_services_removed',
-                                'recovered': 'admin_reseller_debt_recovered',
+                                'recovered': (
+                                    'admin_reseller_debt_recovered_below_threshold'
+                                    if round(debt, 2) > 0 else 'admin_reseller_debt_recovered'
+                                ),
                             }.get(kind, 'reseller_debt_threshold_crossed_admin')
                             state_text = get_message_text(admin_language, _debt_state_label_key(event.get('debt_state', 'active')))
                             admin_message = get_message_text(admin_language, message_key).format(
@@ -4770,6 +4787,7 @@ def check_pending_payments():
                                 debt_state=state_text,
                                 debt=debt,
                                 remaining_debt=float(action_result.get('remaining_debt', debt) or 0.0),
+                                settlement_threshold=float(event.get('settlement_threshold', 1.0)),
                                 changed=int(action_result.get('completed', 0) or 0),
                                 writeoff=float(action_result.get('writeoff', 0.0) or 0.0),
                                 manual_review=len(action_result.get('manual_review', []) or []),
@@ -4778,8 +4796,13 @@ def check_pending_payments():
                                 suspend_threshold=DEBT_SUSPEND_THRESHOLD
                             )
                         bot.send_message(admin_id, admin_message, parse_mode="Markdown")
-                    except Exception:
+                    except Exception as error:
                         admin_delivered = False
+                        DEBT_LOGGER.warning(
+                            'notification_delivery_failed reseller_id=%s event=%s '
+                            'audience=admin recipient_id=%s error_type=%s',
+                            reseller_id, event.get('kind') or kind, admin_id, type(error).__name__,
+                        )
                 complete_reseller_debt_notification(
                     reseller_id,
                     str(event.get('kind') or kind),

@@ -3,7 +3,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -579,6 +579,103 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
             if key == 'utils' or key.startswith('utils.') or key in {'telebot', 'qrcode', 'dotenv'}:
                 sys.modules.pop(key)
         sys.modules.update(self.saved_modules)
+
+    def make_recovery_monitor(self):
+        bot = DummyBot()
+        monitor = load_purchase_plan(bot, [])
+        monitor.process_main_reserved_renewals = Mock()
+        monitor._reconcile_completed_checkout_incentives = Mock()
+        monitor.send_due_card_checkout_reminders = Mock()
+        monitor.flush_reseller_pending_wholesale_credits = Mock()
+        monitor.ADMIN_USER_IDS = [7]
+        monitor.complete_reseller_debt_notification = Mock(return_value=True)
+        monitor.complete_reseller_debt_service_action_claim = Mock(return_value=True)
+        monitor.claim_reseller_debt_notification = Mock(return_value=True)
+        event = {
+            "user_id": "1988", "kind": "recovered", "debt": 0.10,
+            "settlement_threshold": 1.0, "notify_user": True, "notify_admin": True,
+        }
+        monitor.evaluate_reseller_debt_policies = Mock(return_value=[event])
+        spec = importlib.util.spec_from_file_location(
+            "recovery_translations_under_test", PURCHASE_PLAN_PATH.parent / "translations.py",
+        )
+        translations = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(translations)
+        monitor.get_message_text = translations.get_message_text
+        return monitor, bot, event, translations
+
+    def test_recovery_messages_distinguish_remaining_debt_in_every_language(self):
+        monitor, bot, event, translations = self.make_recovery_monitor()
+        for language in ("en", "fa", "ru", "tk"):
+            for debt, threshold in ((0.0, 1.0), (0.10, 1.0), (0.99, 1.0), (0.10, 2.0), (0.0, 0.0)):
+                with self.subTest(language=language, debt=debt, threshold=threshold):
+                    bot.sent_messages.clear()
+                    event.update(debt=debt, settlement_threshold=threshold)
+                    monitor.get_user_language = lambda _uid: language
+                    monitor.check_pending_payments()
+                    self.assertEqual(len(bot.sent_messages), 2)
+                    suffix = "_below_threshold" if debt else ""
+                    for index, prefix in enumerate(("reseller", "admin_reseller")):
+                        expected = translations.get_message_text(
+                            language, f"{prefix}_debt_recovered{suffix}",
+                        ).format(reseller_id=1988, remaining_debt=debt, settlement_threshold=threshold)
+                        self.assertEqual(bot.sent_messages[index][0][1], expected)
+                        if debt:
+                            self.assertIn(f"${debt:.2f}", expected)
+                            self.assertIn(f"${threshold:.2f}", expected)
+                    if language == "en" and debt:
+                        self.assertIn("remains outstanding", bot.sent_messages[0][0][1])
+                        self.assertNotIn("fully settled", str(bot.sent_messages))
+
+    def test_recovery_delivery_failures_are_logged_and_only_requested_audience_is_sent(self):
+        for failed_audience, failed_recipient in (("user", 1988), ("admin", 7)):
+            with self.subTest(audience=failed_audience):
+                monitor, bot, event, _ = self.make_recovery_monitor()
+                send_message = bot.send_message
+
+                def send(recipient, *args, **kwargs):
+                    if recipient == failed_recipient:
+                        raise RuntimeError("secret-token")
+                    return send_message(recipient, *args, **kwargs)
+
+                bot.send_message = send
+                with self.assertLogs("ajib.reseller_debt", level="WARNING") as logs:
+                    monitor.check_pending_payments()
+                self.assertIn(f"audience={failed_audience} recipient_id={failed_recipient}", logs.output[0])
+                self.assertIn("event=recovered", logs.output[0])
+                self.assertIn("error_type=RuntimeError", logs.output[0])
+                self.assertNotIn("secret-token", str(logs.output))
+                monitor.complete_reseller_debt_notification.assert_any_call(
+                    1988, "recovered", failed_audience, delivered=False,
+                )
+                event["notify_user"] = failed_audience == "user"
+                event["notify_admin"] = failed_audience == "admin"
+                bot.send_message = send_message
+                bot.sent_messages.clear()
+                monitor.check_pending_payments()
+                self.assertEqual([args[0] for args, _kwargs in bot.sent_messages], [failed_recipient])
+
+    def test_recovery_notifications_wait_for_successful_service_restoration(self):
+        monitor, bot, event, _ = self.make_recovery_monitor()
+        event["service_action"] = "restore"
+        monitor.process_reseller_debt_service_action = Mock(return_value=(False, {"failed": [{}]}))
+        monitor.check_pending_payments()
+        # Only the action-failure alert is allowed before restoration succeeds.
+        self.assertEqual(len(bot.sent_messages), 1)
+        self.assertEqual(bot.sent_messages[0][0][0], 7)
+        self.assertNotIn("access restored", bot.sent_messages[0][0][1].lower())
+        for audience in ("user", "admin"):
+            monitor.complete_reseller_debt_notification.assert_any_call(
+                1988, "recovered", audience, delivered=False,
+            )
+        bot.sent_messages.clear()
+        monitor.process_reseller_debt_service_action.return_value = (True, {"completed": 1})
+        monitor.check_pending_payments()
+        self.assertEqual(len(bot.sent_messages), 2)
+        for audience in ("user", "admin"):
+            monitor.complete_reseller_debt_notification.assert_any_call(
+                1988, "recovered", audience, delivered=True,
+            )
 
     def test_config_delivery_formats_incident_url_and_records_success(self):
         bot = DummyBot()
