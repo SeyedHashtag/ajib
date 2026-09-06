@@ -1,3 +1,10 @@
+## v2.7.11
+✨ Add reseller credit settlement terms and deadlines, with localized guidance for settlement windows, current and next debt cycles, and settlement rules
+✨ Surface settlement terms in reseller credit help, profiles, and level presentations for accurate deadline awareness
+🛠️ Enhance debt-recovery notifications to distinguish user and admin audiences and tailor messages to the remaining debt
+🐛 Improve debt-recovery delivery logging without exposing sensitive information, and update recovery message translations
+✅ Expand regression coverage for settlement deadlines, credit help displays, recovery notification scenarios, and logging behavior
+
 ## v2.7.10
 ✨ Add temporary customer blocking controls for resellers in main and hosted bots, with automatic expiry and retryable reconciliation
 🛡️ Preserve overlapping administrator, debt-policy, and external blocks when reseller blocks expire or are released
