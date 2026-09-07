@@ -2,6 +2,8 @@ import importlib
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from pathlib import Path
 
 
@@ -136,6 +138,42 @@ class AccountCreditTests(unittest.TestCase):
         self.assertEqual(source["available"], 2.0)
         self.assertEqual(source["reserved"], 0.0)
         self.assertEqual(destination["available"], 0.0)
+
+    def test_concurrent_transfers_report_destination_creation_once(self):
+        self.credit.credit_account("7", 10, "seed", path=self.path)
+        barrier = Barrier(2)
+
+        def transfer():
+            try:
+                barrier.wait(timeout=10)
+                return self.credit.transfer_account_credit(
+                    "7", "reseller-wholesale:7", 6, "concurrent-transfer",
+                    path=self.path, return_created=True,
+                )
+            finally:
+                self.database.close_connections()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: transfer(), range(2)))
+
+        self.assertEqual(sorted(created for _, created in results), [False, True])
+        self.assertEqual([balance["available"] for balance, _ in results], [6.0, 6.0])
+        self.assertEqual(self.credit.get_account_credit("7", path=self.path)["available"], 4.0)
+
+    def test_recovered_transfer_reports_new_destination_credit_once(self):
+        self.credit.credit_account("7", 10, "seed", path=self.path)
+        self.credit.reserve_account_credit("7", "transfer:recovery", 6, path=self.path)
+        self.credit.consume_account_credit(
+            "7", "transfer:recovery", metadata={"destination_user_id": "reseller-wholesale:7"},
+            path=self.path,
+        )
+        for expected_created in (True, False):
+            balance, created = self.credit.transfer_account_credit(
+                "7", "reseller-wholesale:7", 6, "recovery", path=self.path, return_created=True,
+            )
+            self.assertEqual(created, expected_created)
+            self.assertEqual(balance["available"], 6.0)
+        self.assertEqual(self.credit.get_account_credit("7", path=self.path)["available"], 4.0)
 
 
 if __name__ == "__main__":

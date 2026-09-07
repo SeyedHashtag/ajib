@@ -1128,6 +1128,42 @@ def _send_reseller_settlement_admin_notification(
     return True
 
 
+def _send_reseller_wholesale_admin_notification(
+    user_id,
+    payment_id,
+    payment_record,
+    credited_amount,
+    payment_method="Crypto",
+    telegram_username=None,
+):
+    if telegram_username is None:
+        try:
+            telegram_username = bot.get_chat(user_id).username
+        except Exception:
+            telegram_username = None
+
+    price = payment_record.get('price')
+    try:
+        has_collected_price = float(price or 0.0) > 0
+    except (TypeError, ValueError):
+        has_collected_price = False
+    if not has_collected_price:
+        price = credited_amount
+
+    send_admin_payment_notification(
+        user_id,
+        'Wholesale',
+        'Wholesale',
+        price,
+        payment_id,
+        payment_method,
+        telegram_username=telegram_username,
+        converted_amount=payment_record.get('converted_amount'),
+        converted_currency=payment_record.get('converted_currency'),
+        exchange_rate=payment_record.get('exchange_rate'),
+    )
+
+
 def _apply_reseller_wholesale_topup(payment_id, payment_record):
     from utils.reseller_wholesale_credit import credit_wholesale_balance
 
@@ -3236,6 +3272,10 @@ def _process_admin_approval_job(call, action, payment_id, payment_record, review
                      return
                  update_payment_status(payment_id, 'completed')
                  user_to_notify = payment_record['user_id']
+                 _send_reseller_wholesale_admin_notification(
+                    user_to_notify, payment_id, payment_record, amount,
+                    payment_method=payment_record.get('payment_method', 'Card to Card'),
+                 )
                  bot.send_message(
                     user_to_notify,
                     get_message_text(get_user_language(user_to_notify), 'reseller_wholesale_funded').format(amount=amount),
@@ -3560,6 +3600,10 @@ def _process_check_payment_job(call):
                 _release_processing_for_retry(payment_id, 'pending', "wholesale top-up failed")
                 return
             update_payment_status(payment_id, 'completed')
+            _send_reseller_wholesale_admin_notification(
+                user_id, payment_id, payment_record, amount,
+                telegram_username=telegram_username,
+            )
             bot.send_message(
                 user_id,
                 get_message_text(user_language, 'reseller_wholesale_funded').format(amount=amount),
@@ -3783,6 +3827,9 @@ def process_payment_webhook(request_data):
                         _release_processing_for_retry(record_key, 'pending', "wholesale top-up failed")
                         return False
                     update_payment_status(record_key, 'completed')
+                    _send_reseller_wholesale_admin_notification(
+                        user_id, record_key, payment_record, amount,
+                    )
                     bot.send_message(
                         user_id,
                         get_message_text(user_language, 'reseller_wholesale_funded').format(amount=amount),
@@ -4476,6 +4523,9 @@ def check_pending_payments():
                                 _release_processing_for_retry(payment_id, 'pending', "wholesale top-up failed")
                                 continue
                             update_payment_status(payment_id, 'completed')
+                            _send_reseller_wholesale_admin_notification(
+                                user_id, payment_id, record, amount,
+                            )
                             try:
                                 bot.send_message(
                                     user_id,

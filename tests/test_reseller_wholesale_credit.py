@@ -90,6 +90,15 @@ class ResellerWholesaleCreditTests(unittest.TestCase):
                 self.wholesale.credit_wholesale_balance(owner, 3, 'three-dollar', source=method)
                 self.assertEqual(self.wholesale.get_wholesale_balance(owner)['available'], 3)
 
+    def test_transfer_can_report_whether_credit_was_created(self):
+        self.account_credit.credit_account("7", 8, "purchase-refund")
+        for expected_created in (True, False):
+            balance, created = self.wholesale.transfer_purchase_credit_to_wholesale(
+                "7", 3, "move-1", return_created=True,
+            )
+            self.assertEqual(created, expected_created)
+            self.assertEqual(balance["available"], 3.0)
+
 
 if __name__ == "__main__":
     unittest.main()

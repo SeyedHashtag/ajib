@@ -1620,6 +1620,144 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         self.assertEqual(len(admin_messages), 1)
         self.assertIn("Payment completion persistence failed.", admin_messages[0])
 
+    def wholesale_completion_scenario(self, route, *, funding_succeeds=True, failed_recipient=None):
+        bot = DummyBot()
+        purchase = load_purchase_plan(bot, [])
+        purchase.ADMIN_USER_IDS = [1, 2]
+        purchase.is_admin = lambda _: True
+        record = {
+            'status': 'pending_approval' if route == 'card' else 'pending',
+            'type': 'reseller_wholesale_topup', 'user_id': 1988,
+            'plan_gb': 'Wholesale', 'wholesale_topup_amount': 3.0,
+            'price': 3.0 if route == 'card' else 2.85,
+            'payment_method': 'Card to Card' if route == 'card' else 'Crypto',
+            'payment_id': 'wholesale-payment', 'order_id': 'wholesale-order',
+        }
+        if route == 'card':
+            record.update(converted_amount=300000, converted_currency='Tomans', exchange_rate=100000)
+        store = {'wholesale-payment': record}
+        statuses, _, _ = install_payment_store(purchase, store)
+        purchase._apply_reseller_wholesale_topup = Mock(return_value=(funding_succeeds, 3.0))
+        purchase.send_admin_payment_notification = Mock(wraps=purchase.send_admin_payment_notification)
+        FakeCryptoPayment.statuses = {'wholesale-payment': {'result': {'status': 'paid'}}}
+        original_send = bot.send_message
+
+        def send_message(chat_id, *args, **kwargs):
+            if chat_id == failed_recipient:
+                raise RuntimeError('Telegram delivery failed')
+            return original_send(chat_id, *args, **kwargs)
+
+        bot.send_message = send_message
+        actions = {
+            'card': lambda: purchase.handle_admin_approval(
+                make_receipt_approval_call('approve', 'wholesale-payment')),
+            'manual': lambda: purchase.handle_check_payment(make_call('check_payment:wholesale-payment')),
+            'webhook': lambda: purchase.process_payment_webhook({'order_id': 'wholesale-order', 'status': 'paid'}),
+            'poller': purchase.check_pending_payments,
+        }
+        actions[route]()
+        if funding_succeeds:
+            # Replays and competing completion routes must see the completed claim.
+            actions[route]()
+            if route != 'card':
+                actions['manual']()
+                actions['webhook']()
+                actions['poller']()
+        return purchase, bot, store, statuses
+
+    def test_all_wholesale_payment_routes_send_standard_admin_followup_once(self):
+        for route in ('card', 'manual', 'webhook', 'poller'):
+            with self.subTest(route=route):
+                purchase, bot, store, statuses = self.wholesale_completion_scenario(route)
+                purchase._apply_reseller_wholesale_topup.assert_called_once()
+                purchase.send_admin_payment_notification.assert_called_once()
+                args, kwargs = purchase.send_admin_payment_notification.call_args
+                self.assertEqual(args, (
+                    1988, 'Wholesale', 'Wholesale', 3.0 if route == 'card' else 2.85,
+                    'wholesale-payment', 'Card to Card' if route == 'card' else 'Crypto',
+                ))
+                self.assertEqual(kwargs['telegram_username'], 'buyer' if route == 'manual' else 'user1988')
+                if route == 'card':
+                    self.assertEqual(kwargs['converted_amount'], 300000)
+                    self.assertEqual(kwargs['converted_currency'], 'Tomans')
+                    self.assertEqual(kwargs['exchange_rate'], 100000)
+                for admin in (1, 2):
+                    messages = [args[1] for args, _ in bot.sent_messages
+                                if args[0] == admin and 'Wholesale' in args[1]]
+                    self.assertEqual(len(messages), 1)
+                    self.assertIn('wholesale-payment', messages[0])
+                self.assertEqual(statuses.count(('wholesale-payment', 'completed')), 1)
+                self.assertEqual(store['wholesale-payment']['status'], 'completed')
+
+    def test_failed_wholesale_funding_sends_no_admin_success(self):
+        for route in ('card', 'manual', 'webhook', 'poller'):
+            with self.subTest(route=route):
+                purchase, _, store, _ = self.wholesale_completion_scenario(route, funding_succeeds=False)
+                purchase.send_admin_payment_notification.assert_not_called()
+                self.assertEqual(store['wholesale-payment']['status'],
+                                 'pending_approval' if route == 'card' else 'pending')
+
+    def test_wholesale_delivery_failures_do_not_suppress_admins_or_repeat_funding(self):
+        for route in ('card', 'manual', 'webhook', 'poller'):
+            for recipient in (1988, 1):
+                with self.subTest(route=route, recipient=recipient):
+                    purchase, bot, store, _ = self.wholesale_completion_scenario(route, failed_recipient=recipient)
+                    purchase._apply_reseller_wholesale_topup.assert_called_once()
+                    purchase.send_admin_payment_notification.assert_called_once()
+                    self.assertEqual(store['wholesale-payment']['status'], 'completed')
+                    self.assertEqual(len([args for args, _ in bot.sent_messages
+                                          if args[0] == 2 and 'Wholesale' in args[1]]), 1)
+
+    def test_wholesale_credit_transfer_notifies_once_before_updating_reseller(self):
+        bot = DummyBot()
+        purchase = load_purchase_plan(bot, [])
+        handlers = load_reseller_handlers(purchase)
+        handlers.get_reseller_data = lambda _: {'status': 'approved', 'debt': 0}
+        handlers.transfer_purchase_credit_to_wholesale = Mock(side_effect=[
+            ({'available': 3}, True), ({'available': 3}, False), ValueError('Insufficient credit'),
+        ])
+        purchase.send_admin_payment_notification = Mock()
+        call = make_call('reseller:wholesale_pay:credit:3.00')
+        original_edit = bot.edit_message_text
+
+        def edit_message(*args, **kwargs):
+            purchase.send_admin_payment_notification.assert_called_once()
+            return original_edit(*args, **kwargs)
+
+        bot.edit_message_text = edit_message
+        for _ in range(3):
+            handlers.handle_reseller_wholesale_payment(call)
+        purchase.send_admin_payment_notification.assert_called_once()
+        args, kwargs = purchase.send_admin_payment_notification.call_args
+        self.assertEqual(args, (
+            1988, 'Wholesale', 'Wholesale', 3.0, 'wholesale-transfer:1988:555:777', 'Account Credit',
+        ))
+        self.assertEqual(kwargs['telegram_username'], 'buyer')
+        self.assertEqual(len(bot.edited_messages), 2)
+        handlers.transfer_purchase_credit_to_wholesale.assert_called_with(
+            1988, 3.0, 'wholesale-transfer:1988:555:777', return_created=True,
+        )
+
+    def test_wholesale_credit_admin_delivery_failure_keeps_transfer_successful(self):
+        bot = DummyBot()
+        purchase = load_purchase_plan(bot, [])
+        purchase.ADMIN_USER_IDS = [1, 2]
+        handlers = load_reseller_handlers(purchase)
+        handlers.get_reseller_data = lambda _: {'status': 'approved', 'debt': 0}
+        handlers.transfer_purchase_credit_to_wholesale = Mock(return_value=({'available': 3}, True))
+        original_send = bot.send_message
+
+        def send_message(chat_id, *args, **kwargs):
+            if chat_id == 1:
+                raise RuntimeError('Admin unavailable')
+            return original_send(chat_id, *args, **kwargs)
+
+        bot.send_message = send_message
+        handlers.handle_reseller_wholesale_payment(make_call('reseller:wholesale_pay:credit:3.00'))
+        handlers.transfer_purchase_credit_to_wholesale.assert_called_once()
+        self.assertEqual(len(bot.edited_messages), 1)
+        self.assertEqual(len([args for args, _ in bot.sent_messages if args[0] == 2]), 1)
+
     def test_crypto_settlement_completion_sends_admin_dm_once(self):
         bot = DummyBot()
         purchase_plan = load_purchase_plan(bot, [])

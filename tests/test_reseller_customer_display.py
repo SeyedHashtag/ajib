@@ -371,6 +371,7 @@ def install_stubs():
     purchase_plan_stub.get_crypto_discount_button_text = lambda language: "Crypto"
     purchase_plan_stub.get_exchange_rate = lambda: 1
     purchase_plan_stub.user_data = {}
+    purchase_plan_stub._send_reseller_wholesale_admin_notification = lambda *args, **kwargs: None
     sys.modules["utils.purchase_plan"] = purchase_plan_stub
 
     receipt_checker_stub = types.ModuleType("utils.receipt_checker")

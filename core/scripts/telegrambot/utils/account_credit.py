@@ -149,8 +149,9 @@ def transfer_account_credit(
     source=None,
     metadata=None,
     path=None,
+    return_created=False,
 ):
-    """Atomically move available credit between two ledger accounts."""
+    """Move credit atomically; optionally return (balance, destination_credit_created)."""
     requested_cents = _money_cents(amount)
     if requested_cents <= 0:
         raise ValueError("A positive transfer amount is required")
@@ -177,7 +178,8 @@ def transfer_account_credit(
                 existing_payload = {}
             if str(existing_payload.get("source_user_id") or "") != source_key:
                 raise ValueError("Account-credit transfer ID was reused with a different source")
-            return _account_from_connection(connection, destination_key)
+            balance = _account_from_connection(connection, destination_key)
+            return (balance, False) if return_created else balance
         outgoing = connection.execute(
             """
             SELECT amount_cents, payload_json FROM account_credit_transactions
@@ -195,7 +197,7 @@ def transfer_account_credit(
                 or str(outgoing_payload.get("destination_user_id") or "") != destination_key
             ):
                 raise ValueError("Account-credit transfer ID was reused with different data")
-            return credit_account(
+            balance = credit_account(
                 destination_key,
                 amount,
                 f"transfer-in:{transfer_id}",
@@ -203,6 +205,7 @@ def transfer_account_credit(
                 metadata={"source_user_id": source_key, **dict(metadata or {})},
                 path=path,
             )
+            return (balance, True) if return_created else balance
         reserved = reserve_account_credit(
             source_key,
             reservation_id,
@@ -222,7 +225,7 @@ def transfer_account_credit(
         )
         if _money_cents(consumed) != requested_cents:
             raise RuntimeError("Account-credit transfer could not be consumed")
-        return credit_account(
+        balance = credit_account(
             destination_user_id,
             amount,
             f"transfer-in:{transfer_id}",
@@ -233,6 +236,7 @@ def transfer_account_credit(
             },
             path=path,
         )
+        return (balance, True) if return_created else balance
 
 
 def reserve_account_credit(

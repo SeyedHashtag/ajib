@@ -40,7 +40,7 @@ def credit_wholesale_balance(reseller_id, amount, transaction_id, *, source=None
     )
 
 
-def transfer_purchase_credit_to_wholesale(reseller_id, amount, transaction_id):
+def transfer_purchase_credit_to_wholesale(reseller_id, amount, transaction_id, *, return_created=False):
     if transfer_account_credit is None:
         raise RuntimeError("Account-credit transfers are unavailable during this rolling update")
     return transfer_account_credit(
@@ -50,6 +50,7 @@ def transfer_purchase_credit_to_wholesale(reseller_id, amount, transaction_id):
         transaction_id,
         source="purchase_credit_transfer",
         metadata={"reseller_id": str(reseller_id)},
+        return_created=return_created,
     )
 
 

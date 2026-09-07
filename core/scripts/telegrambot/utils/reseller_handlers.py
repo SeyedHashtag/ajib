@@ -108,6 +108,7 @@ from utils.purchase_plan import (
     get_crypto_discount_button_text,
     get_exchange_rate,
     user_data,
+    _send_reseller_wholesale_admin_notification,
 )
 try:
     from utils.purchase_plan import _send_reseller_settlement_admin_notification
@@ -1386,10 +1387,18 @@ def handle_reseller_wholesale_payment(call):
     if method == 'credit':
         transaction_id = f"wholesale-transfer:{user_id}:{call.message.chat.id}:{call.message.message_id}"
         try:
-            transfer_purchase_credit_to_wholesale(user_id, amount, transaction_id)
+            _balance, created = transfer_purchase_credit_to_wholesale(
+                user_id, amount, transaction_id, return_created=True,
+            )
         except Exception:
             safe_answer_callback_query(bot, call.id, get_message_text(language, "account_credit_unavailable"), show_alert=True)
             return
+        if created:
+            _send_reseller_wholesale_admin_notification(
+                user_id, transaction_id, {'price': amount}, amount,
+                payment_method='Account Credit',
+                telegram_username=getattr(call.from_user, 'username', None),
+            )
         safe_answer_callback_query(bot, call.id)
         bot.edit_message_text(
             get_message_text(language, "reseller_wholesale_funded").format(amount=amount),

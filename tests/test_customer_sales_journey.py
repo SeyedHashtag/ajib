@@ -585,7 +585,9 @@ def test_three_dollar_wholesale_checkout_uses_existing_payment_routes(method, mo
     assert all(any(b.kwargs.get('callback_data') == f'reseller:wholesale_pay:{m}:3.00' for b in buttons)
                for m in ('card', 'crypto', 'credit'))
     transfers = []
-    handlers.transfer_purchase_credit_to_wholesale = lambda *args: transfers.append(args)
+    handlers.transfer_purchase_credit_to_wholesale = lambda *args, **kwargs: (
+        transfers.append(args) or ({'available': 3}, True)
+    )
     handlers.handle_reseller_wholesale_payment(make_call(f'reseller:wholesale_pay:{method}:3.00'))
     if method == 'card':
         assert handlers.user_data[1988]['wholesale_topup_amount'] == 3
