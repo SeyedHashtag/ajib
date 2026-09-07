@@ -597,6 +597,7 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
             mock.patch.object(self.worker, "record_funded_reseller_config", return_value=True),
             mock.patch.object(self.worker, "credit_crypto_sale", return_value=True),
             mock.patch.object(self.worker, "_deliver_config_safely", return_value=True),
+            mock.patch.object(self.worker.bot, "send_message"),
         ):
             success, username = self.worker._provision_payment("order", record, funded=True)
 

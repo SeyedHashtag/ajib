@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Isolated polling worker for one reseller-owned Telegram bot."""
 
+import html
 import io
 import logging
 import math
@@ -506,13 +507,17 @@ def _matching_reserved_checkout(payments, user_id, username, server_id=None):
     return None
 
 
-def _save_payment(payment_id, record):
+def _save_payment(payment_id, record, *, owner_followup=None):
     with locked_json(tenant_file(OWNER_ID, "payments.json"), {}) as payments:
         current = payments.get(payment_id, {})
         timestamp = _now()
         current.update(record)
         if record.get("status") == "completed":
             current.setdefault("completed_at", timestamp)
+            if owner_followup is not None:
+                current.setdefault("owner_payment_followup", {
+                    "snapshot": {**owner_followup, "completed_at": current["completed_at"]},
+                })
         if record.get("status") and record.get("status") != "processing":
             current.pop("processing_started_at", None)
             current.pop("processing_from_status", None)
@@ -520,6 +525,117 @@ def _save_payment(payment_id, record):
         current["updated_at"] = timestamp
         payments[payment_id] = current
         return dict(current)
+
+
+def _owner_payment_snapshot(payment_id, record, username, kind, settlement):
+    """Only owner-facing sale details may enter this persisted snapshot."""
+    return {
+        "user_id": record.get("user_id"),
+        "telegram_username": record.get("telegram_username"),
+        "username": username,
+        "kind": kind,
+        "plan_gb": record.get("plan_allowance_gb", record.get("plan_gb")),
+        "days": record.get("days"),
+        "unlimited": bool(record.get("unlimited")),
+        "collected_amount": settlement["collected_amount"],
+        "wholesale_price": settlement["wholesale_price"],
+        "referral_reward": settlement["referral_reward"],
+        "profit": str(Decimal(str(settlement["margin"])) - Decimal(str(settlement["referral_reward"]))),
+        "converted_amount": record.get("converted_amount") if record.get("payment_method") == "card" else None,
+        "payment_method": record.get("payment_method"),
+        "order_id": str(payment_id),
+    }
+
+
+def _format_owner_payment_followup(snapshot):
+    def escaped(value):
+        return html.escape(str(value if value is not None else "—"))
+
+    def line(key, value):
+        return f"{_hosted_message(OWNER_ID, 'payment_followup_' + key)}: {value}"
+
+    lines = [f"💰 <b>{_hosted_message(OWNER_ID, 'payment_followup_title')}</b>", ""]
+    lines.append(line("customer", f"<code>{escaped(snapshot['user_id'])}</code>"))
+    if snapshot.get("telegram_username"):
+        lines.append(line("telegram", "@" + escaped(str(snapshot["telegram_username"]).lstrip("@"))))
+    lines.append(line("username", f"<code>{escaped(snapshot['username'])}</code>"))
+    lines.append(line("type", _hosted_message(OWNER_ID, 'payment_followup_' + snapshot['kind'])))
+    allowance = (_hosted_message(OWNER_ID, "payment_followup_unlimited") if snapshot.get("unlimited")
+                 else _hosted_message(OWNER_ID, "payment_followup_allowance", gb=escaped(snapshot['plan_gb'])))
+    lines.append(line("plan", _hosted_message(
+        OWNER_ID, "payment_followup_plan_value", allowance=allowance, days=escaped(snapshot['days']),
+    )))
+    lines.append(line("paid", "$" + format_usd_amount(snapshot['collected_amount'])))
+    if snapshot.get("converted_amount") is not None:
+        lines.append(line("toman", format_toman_amount(snapshot['converted_amount'])))
+    lines.append(line("cost", "$" + format_usd_amount(snapshot['wholesale_price'])))
+    if Decimal(str(snapshot['referral_reward'])) > 0:
+        lines.append(line("referral", "$" + format_usd_amount(snapshot['referral_reward'])))
+    lines.append(line("profit", "$" + format_usd_amount(snapshot['profit'])))
+    method = snapshot.get("payment_method")
+    method_text = _hosted_message(OWNER_ID, "payment_followup_" + method) if method in {"card", "crypto"} else "—"
+    lines.append(line("method", method_text))
+    lines.append(line("order", f"<code>{escaped(snapshot['order_id'])}</code>"))
+    lines.append(line("time", escaped(format_utc_display(snapshot['completed_at']))))
+    return "\n".join(lines)
+
+
+def _claim_owner_payment_followup(payment_id):
+    with locked_json(tenant_file(OWNER_ID, "payments.json"), {}) as payments:
+        record = payments.get(payment_id)
+        state = record.get("owner_payment_followup") if isinstance(record, dict) else None
+        if not isinstance(state, dict) or record.get("status") != "completed" or state.get("delivered_at"):
+            return None
+        started = _parse_time(state.get("claimed_at"))
+        if started and (utc_now() - started).total_seconds() < PROCESSING_LEASE_SECONDS:
+            return None
+        claim_id = uuid.uuid4().hex
+        state.update(claim_id=claim_id, claimed_at=_now(), attempts=int(state.get("attempts", 0)) + 1)
+        return claim_id, dict(state["snapshot"])
+
+
+def _finish_owner_payment_followup(payment_id, claim_id, error=None):
+    with locked_json(tenant_file(OWNER_ID, "payments.json"), {}) as payments:
+        record = payments.get(payment_id)
+        state = record.get("owner_payment_followup") if isinstance(record, dict) else None
+        if not isinstance(state, dict) or state.get("claim_id") != claim_id:
+            return False
+        state.pop("claim_id", None)
+        state.pop("claimed_at", None)
+        if error is None:
+            state["delivered_at"] = _now()
+            state.pop("last_error", None)
+        else:
+            state["last_error"] = str(error)[:500]
+        return True
+
+
+def _notify_owner_payment(payment_id):
+    """Notification errors must never become provisioning failures."""
+    try:
+        claim = _claim_owner_payment_followup(payment_id)
+        if claim is None:
+            return False
+        claim_id, snapshot = claim
+        try:
+            bot.send_message(OWNER_ID, _format_owner_payment_followup(snapshot), parse_mode="HTML")
+        except Exception as error:
+            _finish_owner_payment_followup(payment_id, claim_id, type(error).__name__)
+            raise
+        return _finish_owner_payment_followup(payment_id, claim_id)
+    except Exception as error:
+        logging.getLogger("ajib.hosted").warning(
+            "Owner payment notification failed owner=%s payment=%s error=%s",
+            OWNER_ID, payment_id, type(error).__name__,
+        )
+        return False
+
+
+def _retry_owner_payment_followups():
+    for payment_id, record in _tenant_payments().items():
+        state = record.get("owner_payment_followup") if isinstance(record, dict) else None
+        if isinstance(state, dict) and not state.get("delivered_at"):
+            _notify_owner_payment(payment_id)
 
 
 def _claim_payment(payment_id, allowed):
@@ -1539,10 +1655,20 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
         funded=effective_funded,
         margin=settlement["margin"],
     )
+    saved_payment = _tenant_payments().get(payment_id) or record
+    completion_time = saved_payment.get("completed_at") or _now()
+    followup_fields = {} if saved_payment.get("owner_payment_followup") else {
+        "owner_payment_followup": {"snapshot": {
+            **_owner_payment_snapshot(payment_id, record, username, "reserved", settlement),
+            "completed_at": completion_time,
+        }},
+    }
     if not mark_payment_renewal_reserved(
         payment_id,
         payments_file=tenant_file(OWNER_ID, "payments.json"),
         fields={
+            **followup_fields,
+            "completed_at": completion_time,
             "username": username,
             "server_id": server_id,
             "renewal_server_id": server_id,
@@ -1551,6 +1677,7 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
         },
     ):
         return False, "Reservation persistence failed"
+    _notify_owner_payment(payment_id)
     _record_completed_growth(payment_id, record, renewed=True)
     if funded:
         _record_hosted_prepaid_good(payment_id)
@@ -1562,7 +1689,12 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
             allow_introduction=False,
         )
     reserved_text = _hosted_message(customer_id, "renewal_reserved_success")
-    bot.send_message(customer_id, reserved_text)
+    try:
+        bot.send_message(customer_id, reserved_text)
+    except Exception as error:
+        logging.getLogger("ajib.hosted").warning(
+            "Reserved renewal confirmation failed payment=%s error=%s", payment_id, type(error).__name__,
+        )
     return True, username
 
 
@@ -1626,8 +1758,13 @@ def _provision_payment(payment_id, record, funded):
             funded=effective_funded,
             margin=settlement["margin"],
         )
-        _save_payment(payment_id, {"status": "completed", "username": username,
-                                   "server_id": actual_server_id})
+        _save_payment(
+            payment_id, {"status": "completed", "username": username, "server_id": actual_server_id},
+            owner_followup=_owner_payment_snapshot(
+                payment_id, record, username, "renewal" if renewed else "new", settlement,
+            ),
+        )
+        _notify_owner_payment(payment_id)
         _record_completed_growth(payment_id, record, renewed=renewed)
         if funded:
             _record_hosted_prepaid_good(payment_id)
@@ -1756,7 +1893,13 @@ def _provision_payment(payment_id, record, funded):
         funded=effective_funded,
         margin=settlement["margin"],
     )
-    _save_payment(payment_id, {"status": "completed", "username": username, "server_id": server_id})
+    _save_payment(
+        payment_id, {"status": "completed", "username": username, "server_id": server_id},
+        owner_followup=_owner_payment_snapshot(
+            payment_id, record, username, "renewal" if renewed else "new", settlement,
+        ),
+    )
+    _notify_owner_payment(payment_id)
     _record_completed_growth(payment_id, record, renewed=renewed)
     if funded:
         _record_hosted_prepaid_good(payment_id)
@@ -2289,6 +2432,7 @@ def payment_method(call):
         "id": order_id, "user_id": call.from_user.id, "telegram_username": call.from_user.username,
         "reseller_id": str(OWNER_ID), "origin_bot_id": os.getenv("AJIB_HOSTED_BOT_ID"),
         "plan_gb": plan_id, "days": plan.get("days", 30), "unlimited": plan.get("unlimited", False),
+        "plan_allowance_gb": plan.get("gb", plan_id),
         "wholesale_price": quote["wholesale"], "retail_price": collected_amount,
         "original_price": quote["original_price"], "collected_amount": collected_amount,
         "margin": margin,
@@ -4782,6 +4926,7 @@ def hosted_renewal_review(call):
 def _crypto_monitor():
     while True:
         try:
+            _retry_owner_payment_followups()
             _recover_stale_payment_claims()
             _recover_saved_receipts()
             _reconcile_credit_reservations()

@@ -731,6 +731,53 @@ CUSTOMER_EXPERIENCE_TRANSLATIONS["tk"].update({
 })
 
 
+OWNER_PAYMENT_TRANSLATIONS = {
+    "en": {
+        "title": "Successful payment", "customer": "Customer ID", "telegram": "Telegram",
+        "username": "Config username", "type": "Purchase", "new": "New config",
+        "renewal": "Renewal", "reserved": "Renewal reserved", "plan": "Plan",
+        "allowance": "{gb} GB", "unlimited": "Unlimited traffic", "plan_value": "{allowance} / {days} days",
+        "paid": "Amount paid", "toman": "Amount paid (Tomans)", "cost": "Wholesale cost",
+        "referral": "Referral share", "profit": "Profit after referral share",
+        "method": "Payment method", "card": "Card to card", "crypto": "Crypto",
+        "order": "Order ID", "time": "Payment time",
+    },
+    "fa": {
+        "title": "پرداخت موفق", "customer": "شناسه مشتری", "telegram": "تلگرام",
+        "username": "نام کاربری پیکربندی", "type": "نوع خرید", "new": "پیکربندی جدید",
+        "renewal": "تمدید", "reserved": "تمدید رزروشده", "plan": "طرح",
+        "allowance": "{gb} گیگابایت", "unlimited": "ترافیک نامحدود", "plan_value": "{allowance} / {days} روز",
+        "paid": "مبلغ پرداخت‌شده", "toman": "مبلغ پرداخت‌شده (تومان)", "cost": "هزینه عمده",
+        "referral": "سهم معرف", "profit": "سود پس از کسر سهم معرف",
+        "method": "روش پرداخت", "card": "کارت به کارت", "crypto": "رمزارز",
+        "order": "شناسه سفارش", "time": "زمان پرداخت",
+    },
+    "ru": {
+        "title": "Успешный платёж", "customer": "ID клиента", "telegram": "Telegram",
+        "username": "Имя пользователя конфигурации", "type": "Покупка", "new": "Новая конфигурация",
+        "renewal": "Продление", "reserved": "Продление зарезервировано", "plan": "Тариф",
+        "allowance": "{gb} ГБ", "unlimited": "Безлимитный трафик", "plan_value": "{allowance} / {days} дней",
+        "paid": "Оплачено", "toman": "Оплачено (томаны)", "cost": "Оптовая стоимость",
+        "referral": "Реферальное вознаграждение", "profit": "Прибыль после реферального вознаграждения",
+        "method": "Способ оплаты", "card": "С карты на карту", "crypto": "Криптовалюта",
+        "order": "ID заказа", "time": "Время оплаты",
+    },
+    "tk": {
+        "title": "Üstünlikli töleg", "customer": "Müşderiniň ID-si", "telegram": "Telegram",
+        "username": "Sazlamanyň ulanyjy ady", "type": "Satyn alyş", "new": "Täze sazlama",
+        "renewal": "Uzaltma", "reserved": "Uzaltma ätiýaçlandyryldy", "plan": "Meýilnama",
+        "allowance": "{gb} GB", "unlimited": "Çäklendirilmedik trafik", "plan_value": "{allowance} / {days} gün",
+        "paid": "Tölenen möçber", "toman": "Tölenen möçber (Toman)", "cost": "Lomaý baha",
+        "referral": "Çakylyk paýy", "profit": "Çakylyk paýyndan soňky peýda",
+        "method": "Töleg usuly", "card": "Kartdan karta", "crypto": "Kripto",
+        "order": "Sargyt ID-si", "time": "Töleg wagty",
+    },
+}
+
+for _language_code, _catalog in OWNER_PAYMENT_TRANSLATIONS.items():
+    HOSTED_TRANSLATIONS[_language_code].update({
+        "payment_followup_" + key: value for key, value in _catalog.items()
+    })
 for _language_code, _catalog in OWNER_EXPERIENCE_TRANSLATIONS.items():
     HOSTED_TRANSLATIONS[_language_code].update(_catalog)
 for _language_code, _catalog in CUSTOMER_EXPERIENCE_TRANSLATIONS.items():
