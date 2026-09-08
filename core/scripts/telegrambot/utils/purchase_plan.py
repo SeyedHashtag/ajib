@@ -2168,6 +2168,25 @@ def _renewal_callback_error(call, stage, error):
     )
 
 
+def _show_customer_renewal_message(call, text, reply_markup=None):
+    # Active configs put the renewal button on a QR photo. Keep its connection
+    # details intact and continue checkout in a text message.
+    if getattr(call.message, 'photo', None) or getattr(call.message, 'caption', None):
+        return bot.send_message(
+            chat_id=call.message.chat.id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+    return bot.edit_message_text(
+        text,
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=reply_markup,
+        parse_mode="Markdown",
+    )
+
+
 def _show_customer_renewal_plan_picker(call, token, offer, language):
     from utils.renewal import eligible_renewal_plans
 
@@ -2184,14 +2203,12 @@ def _show_customer_renewal_plan_picker(call, token, offer, language):
     markup.add(types.InlineKeyboardButton(
         get_button_text(language, "cancel"), callback_data="cancel_purchase"
     ))
-    bot.edit_message_text(
+    _show_customer_renewal_message(
+        call,
         get_message_text(language, 'renewal_choose_plan').format(
             username=escape_markdown_code(offer.get('username') or '—')
         ),
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
         reply_markup=markup,
-        parse_mode="Markdown",
     )
 
 
@@ -2285,13 +2302,11 @@ def handle_customer_renewal_start(call):
         )
         offer = _resolve_customer_renewal_offer_for_call(call, token)
         if not offer.get('eligible'):
-            bot.edit_message_text(
+            _show_customer_renewal_message(
+                call,
                 get_message_text(language, "renewal_unavailable").format(
                     reason=_renewal_reason_text(language, offer.get('reason'))
                 ),
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                parse_mode="Markdown"
             )
             return
         _show_customer_renewal_plan_picker(call, token, offer, language)

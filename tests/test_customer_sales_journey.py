@@ -297,6 +297,49 @@ def test_direct_renewal_duplicate_tap_is_acknowledged_without_second_lookup():
     assert bot.callback_answers[0][1].get("text")
 
 
+@pytest.mark.parametrize("eligible", [True, False])
+def test_renewal_from_config_photo_sends_text_without_editing_connection_caption(eligible):
+    bot = DummyBot()
+    module = load_purchase_plan(bot, [])
+    call = make_call("renew_plan:renew-token")
+    call.message.photo = [types.SimpleNamespace(file_id="qr-photo")]
+    call.message.text = None
+    call.message.caption = "Connection details and subscription link"
+    module._resolve_customer_renewal_offer_for_call = lambda *_args, **_kwargs: {
+        "eligible": eligible, "username": "alice", "reason": "renewal_already_reserved",
+    }
+    original_message = module.get_message_text
+    module.get_message_text = lambda language, key: {
+        "renewal_choose_plan": "Choose for {username}",
+        "renewal_plan_choice": "{plan_gb}GB/{days}d/${price}",
+        "renewal_unavailable": "Unavailable: {reason}",
+    }.get(key, original_message(language, key))
+    renewal_stub = types.ModuleType("utils.renewal")
+    renewal_stub.eligible_renewal_plans = lambda *_args: [("100", {"days": 60, "price": 3})]
+
+    def reject_photo_text_edit(*_args, **_kwargs):
+        raise RuntimeError("Bad Request: there is no text in the message to edit")
+
+    bot.edit_message_text = reject_photo_text_edit
+    with patch.dict("sys.modules", {"utils.renewal": renewal_stub}):
+        module.handle_customer_renewal_start(call)
+
+    assert len(bot.sent_messages) == 1
+    _, kwargs = bot.sent_messages[0]
+    assert kwargs["chat_id"] == call.message.chat.id
+    if eligible:
+        assert kwargs["text"] == "Choose for alice"
+        assert kwargs["reply_markup"].buttons[0].kwargs["callback_data"] == (
+            "renew_plan_choice:renew-token:100"
+        )
+    else:
+        assert "Unavailable:" in kwargs["text"]
+    assert bot.edited_captions == []
+    assert bot.deleted_messages == []
+    assert call.message.caption == "Connection details and subscription link"
+    assert module.RENEWAL_CALLBACK_INFLIGHT == set()
+
+
 def test_direct_renewal_crypto_quote_and_copy_show_both_discount_components():
     module = load_purchase_plan(DummyBot(), [])
     messages = {
