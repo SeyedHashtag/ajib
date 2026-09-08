@@ -1,3 +1,10 @@
+## v2.7.12
+✨ Notify administrators about reseller wholesale top-ups across card, crypto, and account-credit payments, with duplicate-transfer notification protection
+✨ Add localized hosted-bot owner payment summaries for purchases, renewals, and reserved renewals, including collected amounts, wholesale costs, referral rewards, and profit
+🛠️ Persist and retry owner payment notifications without turning delivery errors into provisioning failures
+🐛 Fix customer renewal actions from QR-code photos by continuing checkout in a text message while preserving connection details
+✅ Expand regression coverage for wholesale credit transfers, payment notifications, hosted follow-up recovery, and photo-based renewal flows
+
 ## v2.7.11
 ✨ Add reseller credit settlement terms and deadlines, with localized guidance for settlement windows, current and next debt cycles, and settlement rules
 ✨ Surface settlement terms in reseller credit help, profiles, and level presentations for accurate deadline awareness
