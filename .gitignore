@@ -175,3 +175,7 @@ core/scripts/telegrambot/broadcast_logs/
 
 # Tool caches
 .ruff_cache/
+
+# AI agent instructions (local only)
+AGENTS.md
+agents.md
