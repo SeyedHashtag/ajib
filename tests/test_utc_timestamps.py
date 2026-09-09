@@ -207,7 +207,7 @@ class TimestampMigrationTests(unittest.TestCase):
         ).fetchone()
 
         expected = "2026-08-17T10:48:54.000000Z"
-        self.assertEqual(database.schema_version(self.db_path), 5)
+        self.assertEqual(database.schema_version(self.db_path), database.SCHEMA_VERSION)
         self.assertEqual(repaired["completed_at"], expected)
         self.assertEqual(repaired["renewal_reserved_at"], expected)
         self.assertEqual(repaired["updates"][0]["timestamp"], expected)
@@ -310,7 +310,7 @@ class TimestampMigrationTests(unittest.TestCase):
         reseller_after = json.loads(migrated.execute(
             "SELECT payload_json FROM reseller_renewals WHERE reseller_id='7'"
         ).fetchone()["payload_json"])
-        self.assertEqual(database.schema_version(self.db_path), 5)
+        self.assertEqual(database.schema_version(self.db_path), database.SCHEMA_VERSION)
         for record in (payment_after, reseller_after):
             self.assertEqual(record["renewal_status"], "attention")
             self.assertEqual(record["renewal_attention_reason"], "external_renewal")

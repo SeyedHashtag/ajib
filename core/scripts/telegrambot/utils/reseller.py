@@ -419,13 +419,15 @@ def _paid_activity_from_history(record):
             if isinstance(renewal, dict)
         ]
         for sequence, (kind, item) in enumerate(items):
-            if not item.get('funded_at_checkout'):
+            funding = item.get('funding') or {}
+            prepaid_cents = funding.get('prepaid_cents', 0) + funding.get('external_cents', 0)
+            if not item.get('funded_at_checkout') and not prepaid_cents:
                 continue
             reference = item.get('retail_order_id') or item.get('reservation_id')
             reference = reference or f"legacy:{index}:{sequence}:{config.get('username')}:{item.get('timestamp')}"
             events[f'funded:{reference}'] = {
                 'id': f'funded:{reference}', 'kind': kind,
-                'amount': _money_value(item.get('price', 0)),
+                'amount': prepaid_cents / 100 if funding else _money_value(item.get('price', 0)),
                 'paid_at': item.get('timestamp'),
             }
     for item in record.get('debt_allocations', []):
@@ -489,6 +491,19 @@ def get_reseller_recent_paid(record, now=None):
         if paid_at is not None and cutoff <= paid_at <= current:
             amount += Decimal(str(_money_value(event.get('amount', 0))))
     return float(amount.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP))
+
+
+def backfill_reseller_credit_recovery():
+    """Persist verified legacy recovery amounts once before either bot starts."""
+    with reseller_lock, _resellers_file_lock():
+        records = _read_resellers_file()
+        changed = False
+        for key, record in records.items():
+            if isinstance(record, dict) and (not isinstance(record.get('credit_recovery'), dict) or record['credit_recovery'].get('version') != 1):
+                records[key] = _ensure_reseller_defaults(record)
+                changed = True
+        if changed:
+            _write_resellers_file(records)
 
 
 def backfill_reseller_paid_activity():
@@ -630,10 +645,9 @@ def get_reseller_credit_policy(record, now=None):
     if not isinstance(outcomes, list):
         outcomes = []
     outcomes = [item for item in outcomes[-CREDIT_OUTCOME_LIMIT:] if isinstance(item, dict)]
-    adverse_weight = sum(
-        CREDIT_OUTCOME_WEIGHTS.get(str(item.get('outcome') or ''), 0)
-        for item in outcomes
-    )
+    from utils.reseller_credit import recovery_state
+    recovery = recovery_state(data)
+    adverse_weight = recovery['penalty']
     base_limit = get_reseller_level_summary(data, now=now)['trust_limit']
     if adverse_weight >= 2:
         mode = 'prepaid_only'
@@ -649,6 +663,7 @@ def get_reseller_credit_policy(record, now=None):
         'effective_limit': effective_limit,
         'mode': mode,
         'adverse_weight': adverse_weight,
+        'recovery': recovery,
         'outcomes': [dict(item) for item in outcomes],
     }
 
@@ -664,8 +679,15 @@ def _record_credit_outcome(record, outcome, source, reference_id=None):
     references = record.get('credit_outcome_references', [])
     if not isinstance(references, list):
         references = []
-    if reference in {str(item) for item in references}:
+    if reference in {str(item) for item in references} or any(item.get('reference_id') == reference for item in record.get('credit_policy_history', [])):
         return False
+    from utils.reseller_credit import recovery_state, record_penalty
+    record['credit_recovery'] = recovery_state(record)
+    if normalized in {'late', 'default'}:
+        record_penalty(record, normalized, reference, _now_str())
+        record['credit_policy_history'][-1]['source'] = str(source or 'unknown')
+    else:
+        record.setdefault('credit_policy_history', []).append({'kind': normalized, 'source': str(source or 'unknown'), 'reference_id': reference, 'recorded_at': _now_str()})
     history.append({
         'outcome': normalized,
         'source': str(source or 'unknown'),
@@ -845,6 +867,14 @@ def validate_reseller_manual_payment_amount(amount, current_debt):
 
 def _ensure_reseller_defaults(record):
     data = dict(record or {})
+    from utils.reseller_credit import recovery_state
+    data['credit_recovery'] = recovery_state(data)
+    if not isinstance(data.get('credit_policy_history'), list):
+        old_outcomes = data.get('credit_outcomes')
+        data['credit_policy_history'] = [dict(item, kind=item.get('outcome')) for item in (old_outcomes if isinstance(old_outcomes, list) else []) if isinstance(item, dict)]
+    data['credit_policy_history'] = [item for item in data['credit_policy_history'] if isinstance(item, dict)]
+    if not isinstance(data.get('credit_spending_references'), list):
+        data['credit_spending_references'] = []
     data['status'] = data.get('status', 'pending')
     data.setdefault('telegram_username', None)
     data.setdefault('suspended_reason', None)
@@ -1333,7 +1363,53 @@ def add_reseller_debt(user_id, amount, config_data):
             return False
 
 
-def record_funded_reseller_config(user_id, wholesale_amount, config_data):
+def _apply_funded_order(current, record, total, debt_amount, kind, reference):
+    from utils.reseller_credit import record_spending, cents
+    total, debt_amount = cents(total) / 100, cents(debt_amount) / 100
+    paid = _money_value(total - debt_amount)
+    if debt_amount < 0 or debt_amount > total:
+        raise ValueError('Invalid funded order split')
+    record['funded_at_checkout'] = debt_amount == 0
+    if debt_amount:
+        before = current.get('debt', 0)
+        charge_id = f'order:{reference}'
+        charge = _add_debt_charge(current, debt_amount, kind, reference_id=charge_id,
+            metadata={'username': record.get('username'), 'server_id': record.get('server_id'),
+                      'retail_order_id': reference})
+        if charge is None:
+            raise ValueError('Unable to record debt portion')
+        record['debt_charge_id'] = charge_id
+        if _is_debt_fully_settled(before) and not _is_debt_fully_settled(current['debt']):
+            current['debt_since'] = _now_str()
+    if paid:
+        current['last_payment_at'] = _now_str()
+    _record_paid_activity(current, paid, f'funded:{reference}', kind)
+    record_spending(current, paid, f'funded:{reference}', _now_str())
+
+
+def restore_reseller_credit(user_id, admin_id, reason, action_id):
+    """Reset active penalties, preserving debt, access restrictions and history."""
+    if not 1 <= len(str(reason or '').strip()) <= 500 or not str(action_id or '').strip() or not str(admin_id or '').strip():
+        return False
+    with reseller_lock, _resellers_file_lock():
+        records = _read_resellers_file()
+        if str(user_id) not in records:
+            return False
+        current = _ensure_reseller_defaults(records[str(user_id)])
+        history = current.setdefault('credit_policy_history', [])
+        if any(x.get('reference_id') == action_id for x in history):
+            return True
+        before = dict(current['credit_recovery'])
+        current['credit_recovery'] = {'version': 1, 'penalty': 0, 'spent_cents': 0, 'reason': 'admin_restore'}
+        history.append({'kind': 'admin_restore', 'reference_id': action_id,
+            'admin_id': str(admin_id), 'reason': str(reason).strip(), 'recorded_at': _now_str(),
+            'before': before, 'after': dict(current['credit_recovery'])})
+        records[str(user_id)] = current
+        _write_resellers_file(records)
+        return True
+
+
+def record_funded_reseller_config(user_id, wholesale_amount, config_data, *, debt_amount=0):
     """Record a reseller config whose wholesale cost was paid at checkout."""
     user_id = str(user_id)
     with reseller_lock:
@@ -1352,21 +1428,20 @@ def record_funded_reseller_config(user_id, wholesale_amount, config_data):
                     return True
                 record.setdefault('price', _safe_float(wholesale_amount, 0.0))
                 record.setdefault('timestamp', _now_str())
-                record['funded_at_checkout'] = True
-                _record_paid_activity(current, wholesale_amount, f"funded:{order_id or uuid.uuid4().hex}", 'config')
+                _apply_funded_order(current, record, wholesale_amount, debt_amount, 'config', order_id or uuid.uuid4().hex)
                 current.setdefault('configs', []).append(record)
-                current['total_paid'] = get_reseller_total_paid(current) + _safe_float(wholesale_amount, 0.0)
-                current['last_payment_at'] = _now_str()
+                current['total_paid'] = get_reseller_total_paid(current) + _money_value(_money_value(wholesale_amount) - _money_value(debt_amount))
                 current = _ensure_reseller_defaults(current)
                 resellers[user_id] = current
                 _write_resellers_file(resellers)
-                _update_recruitment_milestone(user_id, current)
+                if not record.get('funding'):
+                    _update_recruitment_milestone(user_id, current)
                 return True
         except Exception:
             return False
 
 
-def record_funded_reseller_renewal(user_id, username, wholesale_amount, renewal_data, server_id=None):
+def record_funded_reseller_renewal(user_id, username, wholesale_amount, renewal_data, server_id=None, *, debt_amount=0):
     """Record a renewal whose wholesale cost was paid at crypto checkout."""
     user_id = str(user_id)
     with reseller_lock:
@@ -1391,16 +1466,15 @@ def record_funded_reseller_renewal(user_id, username, wholesale_amount, renewal_
                     return True
                 record.setdefault('price', _safe_float(wholesale_amount, 0.0))
                 record.setdefault('timestamp', _now_str())
-                record['funded_at_checkout'] = True
-                _record_paid_activity(current, wholesale_amount, f"funded:{order_id or uuid.uuid4().hex}", 'renewal')
+                _apply_funded_order(current, record, wholesale_amount, debt_amount, 'renewal', order_id or uuid.uuid4().hex)
                 target.setdefault('renewals', []).append(record)
                 target['cleanup_status'] = 'renewed'
-                current['total_paid'] = get_reseller_total_paid(current) + _safe_float(wholesale_amount, 0.0)
-                current['last_payment_at'] = _now_str()
+                current['total_paid'] = get_reseller_total_paid(current) + _money_value(_money_value(wholesale_amount) - _money_value(debt_amount))
                 current = _ensure_reseller_defaults(current)
                 resellers[user_id] = current
                 _write_resellers_file(resellers)
-                _update_recruitment_milestone(user_id, current)
+                if not record.get('funding'):
+                    _update_recruitment_milestone(user_id, current)
                 return True
         except Exception:
             return False
@@ -1524,6 +1598,7 @@ def reserve_reseller_renewal(
     server_id=None,
     funded=False,
     enforce_credit=True,
+    debt_amount=0,
 ):
     """Atomically record one future renewal and its debt or funded charge."""
     user_id = str(user_id)
@@ -1585,10 +1660,8 @@ def reserve_reseller_renewal(
                 record.setdefault('renewal_attempts', 0)
 
                 if funded:
-                    record['funded_at_checkout'] = True
-                    _record_paid_activity(current, amount_value, f'funded:{reservation_id}', 'renewal')
-                    current['total_paid'] = get_reseller_total_paid(current) + amount_value
-                    current['last_payment_at'] = _now_str()
+                    _apply_funded_order(current, record, amount_value, debt_amount, 'reserved_renewal', reservation_id)
+                    current['total_paid'] = get_reseller_total_paid(current) + _money_value(amount_value - debt_amount)
                 else:
                     if enforce_credit:
                         can_add, trust_limit, available = can_reseller_add_debt(current, amount_value)

@@ -171,7 +171,7 @@ def create_pending_migration_notice(
 def test_schema_v5_has_transfer_tables(tmp_path):
     path = str(tmp_path / "state.db")
     connection = database.get_connection(path)
-    assert database.schema_version(path) == 5
+    assert database.schema_version(path) == database.SCHEMA_VERSION
     tables = {
         row[0] for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"

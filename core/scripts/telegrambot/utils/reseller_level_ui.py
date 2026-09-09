@@ -1,5 +1,6 @@
 """Formatting and reliable delivery for reseller level presentations."""
 
+from utils.reseller_journey import recovery_text
 from utils.currency_format import format_usd_amount
 from utils.reseller_experience import experience_text, build_settlement_terms, settlement_window_text
 from utils.reseller import (
@@ -9,6 +10,7 @@ from utils.reseller import (
     complete_reseller_level_presentation,
     calculate_reseller_wholesale_price,
     get_reseller_level_summary,
+    get_reseller_credit_policy,
     release_reseller_level_presentation,
 )
 from utils.translations import get_message_text
@@ -69,14 +71,17 @@ def build_reseller_level_profile(
         discount_percent=summary["discount_percent"],
         trust_limit=format_usd_amount(summary["trust_limit"]),
         progress_line=progress_line,
+        settlement_terms=build_settlement_terms(language, reseller_data),
+        credit_journey=get_message_text(language, 'reseller_effective_credit_line').format(
+            effective_limit=get_reseller_credit_policy(reseller_data)['effective_limit'],
+            credit_mode=experience_text(language, get_reseller_credit_policy(reseller_data)['mode'])) + '\n' + recovery_text(language, reseller_data),
         user_id=user_id,
         joined_date=joined_date,
         total_configs=total_configs,
         total_value=format_usd_amount(total_value),
         total_paid=format_usd_amount(summary["total_paid"]),
         current_debt=format_usd_amount(current_debt),
-    ) + '\n' + experience_text(language, 'recent', amount=format_usd_amount(summary['recent_paid'])) + (
-        '\n' + build_settlement_terms(language, reseller_data))
+    ) + '\n' + experience_text(language, 'recent', amount=format_usd_amount(summary['recent_paid']))
 
 
 def build_reseller_level_roadmap(language, reseller_data):

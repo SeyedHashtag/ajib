@@ -1840,7 +1840,7 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
 
         row_texts = [button.text for button in markup.buttons]
         self.assertIn(
-            "✅ 1988 (@buyer) - Debt: $35.50 | Paid: $64.50 | Limit: $30.00",
+            "Full credit · ✅ 1988 (@buyer) - Debt: $35.50 | Paid: $64.50 | Limit: $30.00",
             row_texts,
         )
 

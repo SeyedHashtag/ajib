@@ -200,9 +200,19 @@ def monitoring_thread():
 
 def reseller_block_monitoring_thread():
     from utils.reseller_blocks import process_due_blocks
+    from utils.reseller_funding import reconcile_funding
+    from utils.reseller_journey import journey_text, funding_text, recovery_text
     while True:
         try:
             process_due_blocks()
+            for recovered in reconcile_funding():
+                reseller_id = int(recovered['reseller_id'])
+                language = get_user_language(reseller_id)
+                fulfillment = recovered['fulfillment']
+                username = fulfillment.get('username') or fulfillment.get('data', {}).get('username', '')
+                safe_send_message(bot, reseller_id, journey_text(language, 'completed', username=username)
+                    + '\n' + funding_text(language, recovered)
+                    + '\n' + recovery_text(language, get_reseller_data(reseller_id) or {}))
         except Exception:
             logging.getLogger('ajib.reseller_blocks').exception('block_monitor_failed')
         time.sleep(60)
@@ -337,9 +347,10 @@ def write_readiness_marker():
             pass
 
 if __name__ == '__main__':
-    from utils.reseller import backfill_reseller_paid_activity, backfill_reseller_debt_deadlines
+    from utils.reseller import backfill_reseller_paid_activity, backfill_reseller_debt_deadlines, backfill_reseller_credit_recovery
     backfill_reseller_paid_activity()
     backfill_reseller_debt_deadlines()
+    backfill_reseller_credit_recovery()
     write_readiness_marker()
     threading.Thread(target=reseller_block_monitoring_thread, daemon=True, name='reseller-blocks').start()
     start_server_info_cache_monitor()

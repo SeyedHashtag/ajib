@@ -1,6 +1,7 @@
 """Shared reseller/customer wording, independent of either Telegram runtime."""
 
 from datetime import timedelta
+from utils.reseller_journey import journey_text, recovery_text
 
 TEXT = {
     'en': {
@@ -16,10 +17,9 @@ TEXT = {
         'credit': 'Full credit', 'half_credit': 'Half credit', 'prepaid_only': 'Prepaid only',
         'selling': 'Selling available', 'paused': 'Selling suspended', 'banned': 'Access banned by an administrator',
         'summary': '💳 Credit status\nPrepaid available: ${available} · Reserved: ${reserved}\nDebt: ${debt}\nBase credit limit: ${base} · Effective limit: ${effective}\nRemaining borrowing capacity: ${remaining}\nPayment standing: {mode}\n{selling}',
-        'score': 'Penalty score from the latest 3 outcomes: {score}',
         'reminder': 'Debt reminder',
         'help_button': 'How credit works',
-        'help': 'Wholesale balance is prepaid, non-withdrawable money for wholesale orders. Credit is permission to buy now and owe the wholesale cost. Funding a balance alone does not raise your level. Levels use paid wholesale activity in the rolling last 90 days and can fall.\n\nCredit penalties use your latest 3 payment outcomes, separately from the 90-day level. On-time settlement or a successful prepaid order scores 0; late payment scores 1; default scores 2. A total score of 1 halves your base limit; 2 or more requires prepayment. New successful outcomes replace older outcomes, gradually restoring credit.\n\nDebt reminders begin after 24 hours. Selling pauses after {suspend} hours; unpaid services are blocked after {hold} hours; the final deletion warning is after {warning} hours; unpaid services are removed after {remove} hours. New charges and partial payments do not reset the clock. Full settlement restores eligible selling and policy-held services, but does not erase payment penalties or recreate deleted configs.',
+        'help': 'Wholesale balance is prepaid, non-withdrawable money for wholesale orders. Credit is permission to buy now and owe the wholesale cost. Funding a balance alone does not raise your level. Levels use paid wholesale activity in the rolling last 90 days and can fall.\n\n{recovery_rules}\n\nDebt reminders begin after 24 hours. Selling pauses after {suspend} hours; unpaid services are blocked after {hold} hours; the final deletion warning is after {warning} hours; unpaid services are removed after {remove} hours. New charges and partial payments do not reset the clock. Full settlement restores eligible selling and policy-held services, but does not erase payment penalties or recreate deleted configs.',
         'deadline': '{stage}: {date} ({hours} hours remaining)',
         'suspend': 'Selling suspension', 'hold': 'Unpaid-service block', 'warning': 'Final deletion warning', 'remove': 'Unpaid-service removal',
         'due': 'Full settlement required: ${amount}',
@@ -47,10 +47,9 @@ TEXT = {
         'credit': 'اعتبار کامل', 'half_credit': 'نصف اعتبار', 'prepaid_only': 'فقط پیش‌پرداخت',
         'selling': 'فروش فعال است', 'paused': 'فروش تعلیق شده است', 'banned': 'دسترسی توسط مدیر مسدود شده است',
         'summary': '💳 وضعیت اعتبار\nموجودی پیش‌پرداخت: ${available} · رزروشده: ${reserved}\nبدهی: ${debt}\nسقف پایه اعتبار: ${base} · سقف مؤثر: ${effective}\nاعتبار باقی‌مانده برای خرید: ${remaining}\nوضعیت پرداخت: {mode}\n{selling}',
-        'score': 'امتیاز جریمه از ۳ نتیجه اخیر: {score}',
         'reminder': 'یادآوری بدهی',
         'help_button': 'اعتبار چگونه کار می‌کند؟',
-        'help': 'موجودی عمده‌فروشی پیش‌پرداختی غیرقابل‌برداشت برای سفارش‌های عمده است. اعتبار اجازه خرید اکنون و پرداخت هزینه عمده در آینده است. شارژ موجودی به‌تنهایی سطح را افزایش نمی‌دهد. سطح بر اساس پرداخت‌های عمده در ۹۰ روز اخیر است و ممکن است کاهش یابد.\n\nجریمه اعتباری بر اساس ۳ نتیجه پرداخت اخیر و جدا از سطح ۹۰ روزه است: تسویه به‌موقع یا سفارش پیش‌پرداخت موفق امتیاز ۰، تأخیر امتیاز ۱ و نکول امتیاز ۲ دارد. مجموع ۱ سقف پایه را نصف می‌کند و مجموع ۲ یا بیشتر فقط پیش‌پرداخت را مجاز می‌کند. نتایج موفق جدید جای نتایج قدیمی را می‌گیرند و اعتبار به‌تدریج بازمی‌گردد.\n\nیادآوری بدهی از ۲۴ ساعت آغاز می‌شود. فروش پس از {suspend} ساعت متوقف، سرویس‌های پرداخت‌نشده پس از {hold} ساعت مسدود، هشدار نهایی حذف پس از {warning} ساعت ارسال و سرویس‌های پرداخت‌نشده پس از {remove} ساعت حذف می‌شوند. خرید جدید و پرداخت جزئی زمان را از نو شروع نمی‌کنند. تسویه کامل فروش واجد شرایط و سرویس‌های مسدودشده بابت بدهی را بازمی‌گرداند؛ جریمه اعتباری پاک نمی‌شود و کانفیگ حذف‌شده بازسازی نمی‌شود.',
+        'help': 'موجودی عمده\u200cفروشی پیش\u200cپرداختی غیرقابل\u200cبرداشت برای سفارش\u200cهای عمده است. اعتبار اجازه خرید اکنون و پرداخت هزینه عمده در آینده است. شارژ موجودی به\u200cتنهایی سطح را افزایش نمی\u200cدهد. سطح بر اساس پرداخت\u200cهای عمده در ۹۰ روز اخیر است و ممکن است کاهش یابد.\n\n{recovery_rules}\n\nیادآوری بدهی از ۲۴ ساعت آغاز می\u200cشود. فروش پس از {suspend} ساعت متوقف، سرویس\u200cهای پرداخت\u200cنشده پس از {hold} ساعت مسدود، هشدار نهایی حذف پس از {warning} ساعت ارسال و سرویس\u200cهای پرداخت\u200cنشده پس از {remove} ساعت حذف می\u200cشوند. خرید جدید و پرداخت جزئی زمان را از نو شروع نمی\u200cکنند. تسویه کامل فروش واجد شرایط و سرویس\u200cهای مسدودشده بابت بدهی را بازمی\u200cگرداند؛ جریمه اعتباری پاک نمی\u200cشود و کانفیگ حذف\u200cشده بازسازی نمی\u200cشود.',
         'deadline': '{stage}: {date} ({hours} ساعت باقی‌مانده)',
         'suspend': 'توقف فروش', 'hold': 'مسدودسازی سرویس پرداخت‌نشده', 'warning': 'هشدار نهایی حذف', 'remove': 'حذف سرویس پرداخت‌نشده',
         'due': 'مبلغ لازم برای تسویه کامل: ${amount}',
@@ -78,10 +77,9 @@ TEXT = {
         'credit': 'Полный кредит', 'half_credit': 'Половина кредита', 'prepaid_only': 'Только предоплата',
         'selling': 'Продажи доступны', 'paused': 'Продажи приостановлены', 'banned': 'Доступ заблокирован администратором',
         'summary': '💳 Состояние кредита\nПредоплата: ${available} · Зарезервировано: ${reserved}\nДолг: ${debt}\nБазовый лимит: ${base} · Действующий лимит: ${effective}\nОстаток для покупок в долг: ${remaining}\nПлатёжный статус: {mode}\n{selling}',
-        'score': 'Штрафные баллы по последним 3 результатам: {score}',
         'reminder': 'Напоминание о долге',
         'help_button': 'Как работает кредит',
-        'help': 'Оптовый баланс — предоплата для оптовых заказов без возможности вывода. Кредит позволяет купить сейчас и оплатить оптовую стоимость позже. Само пополнение не повышает уровень. Уровень зависит от оплаченной оптовой активности за последние 90 дней и может снижаться.\n\nКредитные ограничения зависят от 3 последних платёжных результатов, отдельно от уровня за 90 дней: своевременное погашение или успешный заказ по предоплате — 0 баллов, просрочка — 1, дефолт — 2. Сумма 1 уменьшает базовый лимит вдвое; 2 и более разрешает только предоплату. Новые успешные результаты заменяют старые и постепенно восстанавливают кредит.\n\nНапоминания начинаются через 24 часа. Продажи приостанавливаются через {suspend} ч.; неоплаченные услуги блокируются через {hold} ч.; последнее предупреждение об удалении — через {warning} ч.; удаление — через {remove} ч. Новые покупки и частичная оплата не перезапускают срок. Полное погашение восстанавливает допустимые продажи и услуги, заблокированные из-за долга, но не отменяет кредитные ограничения и не воссоздаёт удалённые конфигурации.',
+        'help': 'Оптовый баланс — предоплата для оптовых заказов без возможности вывода. Кредит позволяет купить сейчас и оплатить оптовую стоимость позже. Само пополнение не повышает уровень. Уровень зависит от оплаченной оптовой активности за последние 90 дней и может снижаться.\n\n{recovery_rules}\n\nНапоминания начинаются через 24 часа. Продажи приостанавливаются через {suspend} ч.; неоплаченные услуги блокируются через {hold} ч.; последнее предупреждение об удалении — через {warning} ч.; удаление — через {remove} ч. Новые покупки и частичная оплата не перезапускают срок. Полное погашение восстанавливает допустимые продажи и услуги, заблокированные из-за долга, но не отменяет кредитные ограничения и не воссоздаёт удалённые конфигурации.',
         'deadline': '{stage}: {date} (осталось {hours} ч.)',
         'suspend': 'Приостановка продаж', 'hold': 'Блокировка неоплаченных услуг', 'warning': 'Последнее предупреждение', 'remove': 'Удаление неоплаченных услуг',
         'due': 'Для полного погашения: ${amount}',
@@ -109,10 +107,9 @@ TEXT = {
         'credit': 'Doly karz', 'half_credit': 'Ýarym karz', 'prepaid_only': 'Diňe öňünden töleg',
         'selling': 'Satuw elýeterli', 'paused': 'Satuw wagtlaýyn togtadyldy', 'banned': 'Administrator girişi gadagan etdi',
         'summary': '💳 Karz ýagdaýy\nÖňünden töleg: ${available} · Ätiýaçda: ${reserved}\nBergi: ${debt}\nEsasy çäk: ${base} · Häzirki çäk: ${effective}\nGalan karz mümkinçiligi: ${remaining}\nTöleg ýagdaýy: {mode}\n{selling}',
-        'score': 'Soňky 3 netijäniň jerime baly: {score}',
         'reminder': 'Bergi ýatlatmasy',
         'help_button': 'Karz nähili işleýär',
-        'help': 'Lomaý balans — diňe lomaý sargytlar üçin öňünden tölenen, çykaryp bolmaýan pul. Karz häzir satyn alyp, lomaý bahany soň tölemäge mümkinçilik berýär. Diňe balans doldurmak derejäni ýokarlandyrmaýar. Dereje soňky 90 gündäki tölenen lomaý işjeňlige bagly we peselip biler.\n\nKarz çäklendirmesi 90 günlük derejeden aýratynlykda soňky 3 töleg netijesine bagly: wagtynda üzmek ýa-da üstünlikli öňünden tölenen sargyt — 0 bal, gijikme — 1, tölemezlik — 2. Jemi 1 bal esasy çägi ýarym edýär; 2 ýa-da köp bal diňe öňünden tölegi talap edýär. Täze üstünlikli netijeler köneleri çalşyp, karzy kem-kemden dikeldýär.\n\nÝatlatmalar 24 sagatdan başlanýar. Satuw {suspend} sagatdan togtaýar; tölenmedik hyzmatlar {hold} sagatdan bloklanýar; soňky pozmak duýduryşy {warning} sagatdan; pozmak {remove} sagatdan bolýar. Täze sargyt we bölekleýin töleg wagty täzeden başlatmaýar. Doly töleg degişli satuwy we bergi sebäpli bloklanan hyzmatlary dikeldýär, emma karz çäklendirmesini aýyrmaýar we pozulan sazlamalary döretmeýär.',
+        'help': 'Lomaý balans — diňe lomaý sargytlar üçin öňünden tölenen, çykaryp bolmaýan pul. Karz häzir satyn alyp, lomaý bahany soň tölemäge mümkinçilik berýär. Diňe balans doldurmak derejäni ýokarlandyrmaýar. Dereje soňky 90 gündäki tölenen lomaý işjeňlige bagly we peselip biler.\n\n{recovery_rules}\n\nÝatlatmalar 24 sagatdan başlanýar. Satuw {suspend} sagatdan togtaýar; tölenmedik hyzmatlar {hold} sagatdan bloklanýar; soňky pozmak duýduryşy {warning} sagatdan; pozmak {remove} sagatdan bolýar. Täze sargyt we bölekleýin töleg wagty täzeden başlatmaýar. Doly töleg degişli satuwy we bergi sebäpli bloklanan hyzmatlary dikeldýär, emma karz çäklendirmesini aýyrmaýar we pozulan sazlamalary döretmeýär.',
         'deadline': '{stage}: {date} ({hours} sagat galdy)',
         'suspend': 'Satuwy togtatmak', 'hold': 'Tölenmedik hyzmaty bloklamak', 'warning': 'Soňky pozmak duýduryşy', 'remove': 'Tölenmedik hyzmaty pozmak',
         'due': 'Doly üzmek üçin: ${amount}',
@@ -174,7 +171,7 @@ def build_settlement_terms(language, record, *, now=None):
 def build_credit_help(language, record=None):
     from utils import reseller as store
     deadlines = store.get_reseller_debt_deadlines(record)
-    return experience_text(language, 'help',
+    return experience_text(language, 'help', recovery_rules=journey_text(language, 'rules'),
         suspend=f"{deadlines['suspend_hours']:g}", hold=f"{deadlines['hold_hours']:g}",
         warning=f"{deadlines['warning_hours']:g}", remove=f"{deadlines['removal_hours']:g}") + '\n\n' + (
             build_settlement_terms(language, record) + '\n' + experience_text(language, 'settlement_rules'))
@@ -201,9 +198,26 @@ def build_credit_summary(language, record, reseller_id, *, balance=None, now=Non
         'debt': debt, 'base': policy['base_limit'], 'effective': policy['effective_limit'],
         'remaining': max(0, policy['effective_limit'] - debt),
     }.items()}
-    text = experience_text(language, 'summary', **values,
-                           mode=experience_text(language, policy['mode']), selling=experience_text(language, selling))
-    text += '\n' + experience_text(language, 'score', score=policy.get('adverse_weight', 0))
+    from utils.reseller_funding import borrowing_reserved
+    reserved_credit = borrowing_reserved(reseller_id)
+    values['remaining'] = format_usd_amount(max(0, policy['effective_limit'] - debt - reserved_credit))
+    text = experience_text(language, 'summary', **values, mode=experience_text(language, policy['mode']), selling=experience_text(language, selling))
+    text += '\n' + journey_text(language, 'reserved', amount=format_usd_amount(reserved_credit))
+    next_stage = None
+    if has_collectible_debt and started:
+        for stage, hours in [('suspend', cycle_deadlines['suspend_hours']), ('hold', cycle_deadlines['hold_hours']),
+                             ('warning', cycle_deadlines['warning_hours']), ('remove', cycle_deadlines['removal_hours'])]:
+            due = started + timedelta(hours=hours)
+            if due > current:
+                next_stage = stage
+                text += '\n' + experience_text(language, 'deadline', stage=experience_text(language, stage),
+                    date=format_utc_display(due), hours=f'{(due-current).total_seconds()/3600:.1f}')
+                break
+    text += '\n' + recovery_text(language, record, policy)
+    if selling != 'selling':
+        text += '\n' + journey_text(language, 'settle' if overdue or record.get('suspended_reason') in {'debt', 'unban_grace'} else 'contact')
+    elif policy['mode'] != 'credit':
+        text += '\n' + journey_text(language, 'next')
     text += '\n' + build_settlement_terms(language, record, now=current)
     if debt > 0.005:
         text += '\n' + experience_text(language, 'due', amount=format_usd_amount(debt))
@@ -211,6 +225,11 @@ def build_credit_summary(language, record, reseller_id, *, balance=None, now=Non
         for stage, hours in [('reminder', 24), ('suspend', cycle_deadlines['suspend_hours']), ('hold', cycle_deadlines['hold_hours']),
                              ('warning', cycle_deadlines['warning_hours']), ('remove', cycle_deadlines['removal_hours'])]:
             due = started + timedelta(hours=hours)
-            text += '\n' + experience_text(language, 'deadline', stage=experience_text(language, stage),
-                date=format_utc_display(due), hours=f'{max(0, (due-current).total_seconds()/3600):.1f}')
+            if stage == next_stage:
+                continue
+            if due <= current:
+                text += '\n' + journey_text(language, 'overdue', stage=experience_text(language, stage), date=format_utc_display(due))
+            else:
+                text += '\n' + experience_text(language, 'deadline', stage=experience_text(language, stage),
+                    date=format_utc_display(due), hours=f'{(due-current).total_seconds()/3600:.1f}')
     return text

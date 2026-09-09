@@ -7,10 +7,13 @@ import os
 import re
 import logging
 import threading
+import time
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
+from utils.reseller_funding import quote_funding, reserve_funding, release_funding, finalize_funding, remember_fulfillment, pending_funding, FundingUnavailable, FundingChanged
+from utils.reseller_journey import funding_text, journey_text
 from utils.reseller_experience import access_limit_text, build_credit_summary, build_credit_help, experience_text
 from utils.command import bot, ADMIN_USER_IDS, is_admin
 from utils.common import admin_action_text
@@ -147,18 +150,13 @@ TELEGRAM_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'
 reseller_username_state_lock = threading.Lock()
 RESELLER_CREATE_LOCK = threading.Lock()
 RESELLER_CREATE_INFLIGHT = set()
+RESELLER_FUNDING_PREVIEWS = {}
 
 
 def _reseller_order_funding(user_id, reseller_data, amount):
-    can_add, trust_limit, available_credit = can_reseller_add_debt(reseller_data, amount)
     balance = get_wholesale_balance(user_id)
-    if can_add:
-        mode = 'debt'
-    elif float(balance.get('available', 0.0)) + 0.005 >= float(amount or 0.0):
-        mode = 'prepaid'
-    else:
-        mode = None
-    return mode, trust_limit, available_credit, balance
+    funding = quote_funding(user_id, amount, record=reseller_data, balance=balance)
+    return (funding if funding['allowed'] else None), funding['limit'], funding['remaining_credit_cents'] / 100, balance
 
 
 def _int_env(name, default, minimum=1):
@@ -475,7 +473,7 @@ def _build_reseller_purchase_details(
     price = quote['price']
     exchange_rate = get_exchange_rate()
     converted_price = price * exchange_rate
-    projected_debt = current_debt + (0 if funding_mode == 'prepaid' else price)
+    projected_debt = current_debt + (funding_mode['debt_cents'] / 100 if isinstance(funding_mode, dict) else 0 if funding_mode == 'prepaid' else price)
     return get_message_text(language, "reseller_purchase_details").format(
         plan_gb=gb,
         days=days,
@@ -498,12 +496,13 @@ def _reseller_username_prompt_markup(language):
 
 
 def _show_reseller_purchase_details(call, language, gb, days, quote, current_debt, trust_limit, funding_mode='debt'):
+    RESELLER_FUNDING_PREVIEWS[(call.from_user.id, str(gb))] = funding_mode
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton(get_button_text(language, "confirm"), callback_data=f"reseller:confirm_buy:{gb}"))
     markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
 
     bot.edit_message_text(
-        _build_reseller_purchase_details(language, gb, days, quote, current_debt, trust_limit, funding_mode) + '\n' + build_credit_summary(language, get_reseller_data(call.from_user.id) or {}, call.from_user.id),
+        _build_reseller_purchase_details(language, gb, days, quote, current_debt, trust_limit, funding_mode) + '\n' + (funding_text(language, funding_mode, current_debt) if isinstance(funding_mode, dict) else '') + '\n' + build_credit_summary(language, get_reseller_data(call.from_user.id) or {}, call.from_user.id),
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         reply_markup=markup
@@ -512,21 +511,15 @@ def _show_reseller_purchase_details(call, language, gb, days, quote, current_deb
 
 def _show_reseller_trust_limit_block(call, language, current_debt, purchase_adds, trust_limit, available_credit):
     markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton(get_message_text(language, 'reseller_wholesale_balance_button'), callback_data='reseller:wholesale'))
     if current_debt > 0:
-        markup.add(types.InlineKeyboardButton(get_button_text(language, "settle_debt"), callback_data=f"reseller:settle:{current_debt:.2f}"))
-    markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
-    bot.edit_message_text(
-        get_message_text(language, "reseller_trust_limit_exceeded").format(
-            current_debt=current_debt,
-            purchase_adds=purchase_adds,
-            projected_debt=current_debt + purchase_adds,
-            trust_limit=trust_limit,
-            available_credit=available_credit,
-        ),
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=markup
-    )
+        markup.add(types.InlineKeyboardButton(get_button_text(language, 'settle_debt'), callback_data=f'reseller:settle:{current_debt:.2f}'))
+    markup.add(types.InlineKeyboardButton(get_button_text(language, 'cancel'), callback_data='reseller:cancel'))
+    funding = quote_funding(call.from_user.id, purchase_adds)
+    bot.edit_message_text(get_message_text(language, 'reseller_prepaid_balance_insufficient') + '\n'
+        + funding_text(language, funding, current_debt) + '\n'
+        + build_credit_summary(language, get_reseller_data(call.from_user.id) or {}, call.from_user.id),
+        chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup)
 
 
 def _rollback_unaccounted_reseller_user(api_client, username):
@@ -946,7 +939,7 @@ def handle_reseller_buy(call):
         _show_reseller_trust_limit_block(call, language, current_debt, price, trust_limit, available_credit)
         return
 
-    if funding_mode == 'debt' and projected_debt >= DEBT_WARNING_THRESHOLD:
+    if (funding_mode.get('debt_cents', 0) if isinstance(funding_mode, dict) else funding_mode == 'debt') and projected_debt >= DEBT_WARNING_THRESHOLD:
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(types.InlineKeyboardButton(get_message_text(language, "continue_action"), callback_data=f"reseller:details:{gb}"))
         markup.add(types.InlineKeyboardButton(get_button_text(language, "cancel"), callback_data="reseller:cancel"))
@@ -1054,6 +1047,11 @@ def handle_reseller_confirm_buy(call):
         _show_reseller_trust_limit_block(call, language, current_debt, price, trust_limit, available_credit)
         return
 
+    previous = RESELLER_FUNDING_PREVIEWS.get((user_id, str(gb)))
+    if isinstance(funding_mode, dict) and previous != funding_mode:
+        _show_reseller_purchase_details(call, language, gb, days, quote, current_debt, trust_limit, funding_mode)
+        return
+
     user_data[user_id] = {
         'state': 'waiting_reseller_username',
         'gb': gb,
@@ -1066,7 +1064,7 @@ def handle_reseller_confirm_buy(call):
         'funding_mode': funding_mode,
         'wholesale_reservation_id': (
             f"reseller-config:{user_id}:{uuid.uuid4().hex}"
-            if funding_mode == 'prepaid' else None
+            if funding_mode == 'prepaid' or isinstance(funding_mode, dict) else None
         ),
     }
 
@@ -1108,7 +1106,18 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
     funding_mode = data.get('funding_mode', 'debt')
     wholesale_reservation_id = data.get('wholesale_reservation_id')
 
-    if funding_mode == 'prepaid':
+    if isinstance(funding_mode, dict):
+        try:
+            reserve_funding(user_id, wholesale_reservation_id, price, expected=funding_mode,
+                metadata={'kind': 'config', 'customer_name': chosen_username, 'origin': 'main'})
+        except FundingUnavailable:
+            latest = quote_funding(user_id, price)
+            RESELLER_FUNDING_PREVIEWS[(user_id, str(gb))] = latest
+            markup = _reseller_username_prompt_markup(language)
+            markup.add(types.InlineKeyboardButton(get_button_text(language, 'confirm'), callback_data=f'reseller:confirm_buy:{gb}'))
+            safe_reply_to(bot, message, journey_text(language, 'changed') + '\n' + funding_text(language, latest, (get_reseller_data(user_id) or {}).get('debt', 0)), reply_markup=markup)
+            return
+    elif funding_mode == 'prepaid':
         reserved = reserve_wholesale_balance(
             user_id,
             wholesale_reservation_id,
@@ -1125,15 +1134,23 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
             )
             return
 
-    api_client = _configured_primary_api_client()
-    username, result, api_client = _create_reseller_user_with_note(
-        api_client,
-        user_id,
-        gb,
-        days,
-        chosen_username,
-        unlimited=unlimited,
-    )
+    if isinstance(funding_mode, dict):
+        remember_fulfillment(user_id, wholesale_reservation_id)
+    try:
+        api_client = _configured_primary_api_client()
+        username, result, api_client = _create_reseller_user_with_note(
+            api_client,
+            user_id,
+            gb,
+            days,
+            chosen_username,
+            unlimited=unlimited,
+        )
+
+    except Exception:
+        if isinstance(funding_mode, dict):
+            release_funding(user_id, wholesale_reservation_id)
+        raise
 
     if result:
         config_data = {
@@ -1148,7 +1165,13 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
             "discount_percent": data.get("discount_percent"),
             "server_id": api_client.server_id,
         }
-        if funding_mode == 'prepaid':
+        if isinstance(funding_mode, dict):
+            remember_fulfillment(user_id, wholesale_reservation_id, config_data)
+            try:
+                debt_added = finalize_funding(user_id, wholesale_reservation_id, config_data)
+            except Exception:
+                debt_added = False
+        elif funding_mode == 'prepaid':
             try:
                 debt_added = finalize_prepaid_config(
                     user_id,
@@ -1161,6 +1184,10 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
         else:
             debt_added = add_reseller_debt(user_id, price, config_data)
         if not debt_added or not reseller_config_is_recorded(user_id, username, api_client.server_id):
+            if isinstance(funding_mode, dict):
+                _notify_reseller_accounting_failure(user_id, username, price, None)
+                safe_reply_to(bot, message, journey_text(language, 'accounting_pending'))
+                return
             if funding_mode == 'prepaid':
                 release_wholesale_balance(user_id, wholesale_reservation_id)
             rollback_result = _rollback_unaccounted_reseller_user(api_client, username)
@@ -1172,6 +1199,7 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
             )
             return
 
+        safe_send_message(bot, message.chat.id, (funding_text(language, funding_mode) + '\n' if isinstance(funding_mode, dict) else '') + build_credit_summary(language, get_reseller_data(user_id) or {}, user_id, deadlines=False))
         user_uri_data = api_client.get_user_uri(username)
         sub_url = user_uri_data.get('normal_sub') if user_uri_data else None
         ipv4_url = user_uri_data.get('ipv4', '') if user_uri_data else ''
@@ -1203,7 +1231,9 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
         else:
             safe_send_message(bot, message.chat.id, msg, parse_mode="Markdown")
     else:
-        if funding_mode == 'prepaid':
+        if isinstance(funding_mode, dict):
+            release_funding(user_id, wholesale_reservation_id)
+        elif funding_mode == 'prepaid':
             release_wholesale_balance(user_id, wholesale_reservation_id)
         safe_reply_to(
             bot,
@@ -2918,7 +2948,7 @@ def _release_reseller_renewal_view(key):
 def _reseller_renewal_details_message(language, offer, current_debt, trust_limit, funding_mode='debt'):
     from utils.renewal import format_renewal_offer
 
-    projected_debt = current_debt + (0 if funding_mode == 'prepaid' else float(offer.get('price', 0.0)))
+    projected_debt = current_debt + (funding_mode['debt_cents'] / 100 if isinstance(funding_mode, dict) else 0 if funding_mode == 'prepaid' else float(offer.get('price', 0.0)))
     message = format_renewal_offer(language, offer, include_payment_prompt=False)
     message += "\n\n" + get_message_text(language, "reseller_renewal_debt_details").format(
         list_price=format_usd_amount(offer.get('full_price', offer.get('price', 0.0))),
@@ -2929,12 +2959,14 @@ def _reseller_renewal_details_message(language, offer, current_debt, trust_limit
         projected_debt=format_usd_amount(projected_debt),
         trust_limit=format_usd_amount(trust_limit),
     )
-    if funding_mode == 'debt' and projected_debt >= DEBT_WARNING_THRESHOLD:
+    if (funding_mode.get('debt_cents', 0) if isinstance(funding_mode, dict) else funding_mode == 'debt') and projected_debt >= DEBT_WARNING_THRESHOLD:
         message += "\n\n" + get_message_text(language, "reseller_debt_warning_message").format(
             current_debt=current_debt,
             purchase_adds=float(offer.get('price', 0.0)),
             projected_debt=projected_debt,
         )
+    if isinstance(funding_mode, dict):
+        message += '\n' + funding_text(language, funding_mode, current_debt)
     return message
 
 
@@ -2969,6 +3001,7 @@ def _show_reseller_renewal_confirmation(call, token, offer, reseller_data, langu
     markup.add(types.InlineKeyboardButton(
         get_button_text(language, "cancel"), callback_data="reseller:cancel"
     ))
+    RESELLER_FUNDING_PREVIEWS[(user_id, 'renewal', token)] = funding_mode
     credit_summary = build_credit_summary(language, reseller_data, call.from_user.id)
     bot.edit_message_text(
         _reseller_renewal_details_message(language, offer, current_debt, trust_limit, funding_mode) + "\n\n" + credit_summary,
@@ -3194,7 +3227,18 @@ def _process_reseller_renewal_confirm_job(
         return
 
     wholesale_reservation_id = confirmation_id
-    if funding_mode == 'prepaid':
+    if isinstance(funding_mode, dict):
+        expected = RESELLER_FUNDING_PREVIEWS.get((user_id, 'renewal', token))
+        if expected != funding_mode:
+            _show_reseller_renewal_confirmation(call, token, offer, reseller_data, language)
+            return
+        try:
+            reserve_funding(user_id, wholesale_reservation_id, price, expected=expected,
+                metadata={'kind': 'renewal', 'username': offer.get('username'), 'origin': 'main'})
+        except FundingUnavailable:
+            _show_reseller_renewal_confirmation(call, token, offer, get_reseller_data(user_id) or {}, language)
+            return
+    elif funding_mode == 'prepaid':
         reserved_amount = reserve_wholesale_balance(
             user_id,
             wholesale_reservation_id,
@@ -3223,7 +3267,16 @@ def _process_reseller_renewal_confirm_job(
             'config_index': offer.get('config_index'),
             'renewal_confirmation_id': confirmation_id,
         })
-        if funding_mode == 'prepaid':
+        if isinstance(funding_mode, dict):
+            try:
+                reservation_result = finalize_funding(user_id, wholesale_reservation_id, reservation,
+                    kind='reserved_renewal', username=offer.get('username'),
+                    server_id=offer.get('recorded_server_id') or offer.get('server_id'))
+                reserved = True
+            except Exception:
+                release_funding(user_id, wholesale_reservation_id)
+                reserved, reservation_result = False, {'reason': 'renewal_accounting_failed'}
+        elif funding_mode == 'prepaid':
             try:
                 reserved, reservation_result = finalize_prepaid_reserved_renewal(
                     user_id,
@@ -3271,6 +3324,7 @@ def _process_reseller_renewal_confirm_job(
                 parse_mode='Markdown',
             )
             return
+        safe_send_message(bot, call.message.chat.id, (funding_text(language, funding_mode) + '\n' if isinstance(funding_mode, dict) else '') + build_credit_summary(language, get_reseller_data(user_id) or {}, user_id, deadlines=False))
         reserved_text = get_message_text(language, 'renewal_reserved_reseller_success')
         reserved_text = reserved_text.format(
             username=escape_markdown_code(offer.get('username')),
@@ -3293,9 +3347,13 @@ def _process_reseller_renewal_confirm_job(
     )
     from utils.reseller import add_reseller_renewal_debt
 
+    if isinstance(funding_mode, dict):
+        remember_fulfillment(user_id, wholesale_reservation_id)
     result = execute_reseller_renewal(offer)
     if not result.get('success'):
-        if funding_mode == 'prepaid':
+        if isinstance(funding_mode, dict):
+            release_funding(user_id, wholesale_reservation_id)
+        elif funding_mode == 'prepaid':
             release_wholesale_balance(user_id, wholesale_reservation_id)
         bot.edit_message_text(
             get_message_text(language, "renewal_failed").format(reason=_renewal_reason_text(language, result.get('reason'))),
@@ -3307,7 +3365,16 @@ def _process_reseller_renewal_confirm_job(
 
     renewal_record = reseller_renewal_record(offer, result.get('before_state'), result.get('after_state'))
     renewal_record['renewal_confirmation_id'] = confirmation_id
-    if funding_mode == 'prepaid':
+    if isinstance(funding_mode, dict):
+        remember_fulfillment(user_id, wholesale_reservation_id, renewal_record, kind='renewal',
+            username=offer.get('username'), server_id=offer.get('recorded_server_id') or offer.get('server_id'))
+        try:
+            debt_added = finalize_funding(user_id, wholesale_reservation_id, renewal_record,
+                kind='renewal', username=offer.get('username'),
+                server_id=offer.get('recorded_server_id') or offer.get('server_id'))
+        except Exception:
+            debt_added = False
+    elif funding_mode == 'prepaid':
         try:
             debt_added = finalize_prepaid_renewal(
                 user_id,
@@ -3328,7 +3395,10 @@ def _process_reseller_renewal_confirm_job(
             server_id=offer.get('recorded_server_id') or offer.get('server_id'),
         )
     if not debt_added:
-        if funding_mode == 'prepaid':
+        if isinstance(funding_mode, dict):
+            safe_edit_message_text(bot, journey_text(language, 'accounting_pending'), chat_id=call.message.chat.id, message_id=call.message.message_id)
+            return
+        elif funding_mode == 'prepaid':
             release_wholesale_balance(user_id, wholesale_reservation_id)
         for admin_id in ADMIN_USER_IDS:
             try:
@@ -3347,6 +3417,7 @@ def _process_reseller_renewal_confirm_job(
     if offer.get('recorded_server_id') and offer.get('recorded_server_id') != offer.get('server_id'):
         mark_cleanup_state_renewed(offer.get('username'), offer.get('recorded_server_id'))
 
+    safe_send_message(bot, call.message.chat.id, (funding_text(language, funding_mode) + '\n' if isinstance(funding_mode, dict) else '') + build_credit_summary(language, get_reseller_data(user_id) or {}, user_id, deadlines=False))
     api_client = result.get('api_client')
     user_uri_data = api_client.get_user_uri(offer.get('username')) if api_client else None
     sub_url = user_uri_data.get('normal_sub') if user_uri_data else None
@@ -3432,6 +3503,7 @@ ADMIN_RESELLER_PAGE_SIZE = 8
 ADMIN_RESELLER_MAX_DEBT = 100000.0
 ADMIN_RESELLER_DEFAULT_LIST_STATUS = "pending"
 ADMIN_RESELLER_DEBT_INPUT_STATE = {}
+ADMIN_CREDIT_RESTORE_STATE = {}
 ADMIN_RESELLER_VIEW_CONTEXT = {}
 ADMIN_RESELLER_CLEANUP_MAX_ITEMS = 45
 
@@ -3666,7 +3738,7 @@ def _build_admin_reseller_list_markup(language, grouped, active_status=ADMIN_RES
                 stats = _reseller_financial_stats(data)
                 markup.add(
                     types.InlineKeyboardButton(
-                        get_message_text(language, "admin_reseller_row_compact").format(
+                        ('⚠️ ' if get_reseller_credit_policy(data)['mode'] != 'credit' or data.get('debt_state') not in {None, 'active', 'none', 'settled'} else '') + experience_text(language, get_reseller_credit_policy(data)['mode']) + ' · ' + get_message_text(language, "admin_reseller_row_compact").format(
                             status_icon=_admin_status_icon(status),
                             user_id=rid,
                             username_display=_username_display(language, data),
@@ -3777,7 +3849,13 @@ def _build_admin_reseller_detail_text(language, reseller_id, reseller_data):
             outcomes=_escape_markdown(outcome_summary)
         )
     )
-    return details + policy_details + "\n\n" + build_reseller_level_compact(language, reseller_data)
+    history = (reseller_data or {}).get('credit_policy_history', [])[-5:]
+    pending = pending_funding(reseller_id)
+    pending_text = '\n' + journey_text(language, 'pending_orders', count=len(pending)) if pending else ''
+    audit = '\n'.join(_escape_markdown(f"{item.get('recorded_at', '')} · {item.get('kind', '')} · {item.get('admin_id', '')} {str(item.get('reason', ''))[:120]}") for item in history)
+    return (build_reseller_level_compact(language, reseller_data) + '\n\n'
+            + build_credit_summary(language, reseller_data, reseller_id) + '\n\n'
+            + details + policy_details + pending_text + ('\n' + audit if audit else ''))
 
 
 def _build_admin_reseller_detail_markup(language, reseller_id, reseller_data, return_status, return_page):
@@ -3832,6 +3910,9 @@ def _build_admin_reseller_detail_markup(language, reseller_id, reseller_data, re
                 callback_data=f"admin_reseller_ui:action:{reseller_id}:ban",
             )
         )
+
+    markup.add(types.InlineKeyboardButton(journey_text(language, 'restore'),
+        callback_data=f'admin_reseller_ui:restore:{reseller_id}'))
 
     # Add delete button for rejected resellers
     if status == "rejected":
@@ -4420,6 +4501,37 @@ def admin_manage_resellers(message):
     )
 
 
+@bot.message_handler(func=lambda message: message.from_user.id in ADMIN_CREDIT_RESTORE_STATE and ADMIN_CREDIT_RESTORE_STATE[message.from_user.id].get('state') == 'reason')
+def handle_admin_credit_restore_reason(message):
+    if not is_admin(message.from_user.id):
+        return
+    admin_id = message.from_user.id
+    language = get_user_language(admin_id)
+    state = ADMIN_CREDIT_RESTORE_STATE.get(admin_id) or {}
+    reason = (message.text or '').strip()
+    if reason.lower() == '/cancel':
+        ADMIN_CREDIT_RESTORE_STATE.pop(admin_id, None)
+        return
+    if not 1 <= len(reason) <= 500 or time.time() - state.get('created_at', 0) > 600:
+        bot.reply_to(message, journey_text(language, 'reason_prompt'))
+        return
+    record = get_reseller_data(state['reseller_id'])
+    if not record:
+        ADMIN_CREDIT_RESTORE_STATE.pop(admin_id, None)
+        return
+    state.update(reason=reason, state='confirm')
+    state['limit'] = get_reseller_credit_policy(record)['base_limit']
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for delivery in ('notify', 'silent'):
+        markup.add(types.InlineKeyboardButton(get_message_text(language, 'admin_reseller_action_confirm_' + delivery),
+            callback_data=f"admin_reseller_ui:restoreconfirm:{state['token']}:{delivery}"))
+    context = _admin_view_context(admin_id)
+    markup.add(types.InlineKeyboardButton(get_button_text(language, 'cancel'),
+        callback_data=f"admin_reseller_ui:detail:{state['reseller_id']}:{context['return_status']}:{context['return_page']}"))
+    bot.send_message(message.chat.id, journey_text(language, 'restore_preview', user_id=state['reseller_id'],
+        reason=reason, limit=format_usd_amount(state['limit'])), reply_markup=markup)
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_reseller_ui:"))
 def handle_admin_reseller_ui(call):
     if not is_admin(call.from_user.id):
@@ -4432,6 +4544,38 @@ def handle_admin_reseller_ui(call):
         return
 
     action = parts[1]
+
+    if action == 'restore' and len(parts) == 3:
+        if not get_reseller_data(parts[2]):
+            return
+        ADMIN_CREDIT_RESTORE_STATE[call.from_user.id] = {
+            'state': 'reason', 'reseller_id': parts[2], 'token': uuid.uuid4().hex[:12],
+            'created_at': time.time(), 'action_id': 'admin-restore:' + uuid.uuid4().hex,
+        }
+        bot.send_message(call.message.chat.id, journey_text(language, 'reason_prompt'))
+        bot.answer_callback_query(call.id)
+        return
+    if action == 'restoreconfirm' and len(parts) == 4:
+        from utils.reseller import restore_reseller_credit
+        state = ADMIN_CREDIT_RESTORE_STATE.get(call.from_user.id) or {}
+        if (state.get('state') != 'confirm' or state.get('token') != parts[2]
+                or parts[3] not in {'notify', 'silent'} or time.time() - state.get('created_at', 0) > 600):
+            bot.answer_callback_query(call.id, get_message_text(language, 'admin_invalid_action'), show_alert=True)
+            return
+        record = get_reseller_data(state['reseller_id'])
+        if not record or get_reseller_credit_policy(record)['base_limit'] != state['limit']:
+            ADMIN_CREDIT_RESTORE_STATE.pop(call.from_user.id, None)
+            bot.answer_callback_query(call.id, journey_text(language, 'changed'), show_alert=True)
+            return
+        if restore_reseller_credit(state['reseller_id'], call.from_user.id, state['reason'], state['action_id']):
+            ADMIN_CREDIT_RESTORE_STATE.pop(call.from_user.id, None)
+            if parts[3] == 'notify':
+                target_language = get_user_language(int(state['reseller_id']))
+                safe_send_message(bot, int(state['reseller_id']), journey_text(target_language, 'restored') + '\n'
+                    + build_credit_summary(target_language, get_reseller_data(state['reseller_id']) or {}, state['reseller_id']))
+            context = _admin_view_context(call.from_user.id)
+            _render_admin_reseller_detail(call, state['reseller_id'], context['return_status'], context['return_page'])
+        return
 
     if action == "noop":
         bot.answer_callback_query(call.id)
@@ -4455,6 +4599,7 @@ def handle_admin_reseller_ui(call):
         return
 
     if action == "detail":
+        ADMIN_CREDIT_RESTORE_STATE.pop(call.from_user.id, None)
         if len(parts) != 5:
             bot.answer_callback_query(call.id, get_message_text(language, "admin_invalid_action"), show_alert=True)
             return

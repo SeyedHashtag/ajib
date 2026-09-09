@@ -71,18 +71,6 @@ def consume_wholesale_balance(reseller_id, reservation_id, *, metadata=None):
         order_id=reservation_id,
         metadata={"reseller_id": str(reseller_id), **dict(metadata or {})},
     )
-    if consumed > 0:
-        try:
-            from utils.reseller import record_reseller_credit_outcome
-
-            record_reseller_credit_outcome(
-                reseller_id,
-                "good",
-                "prepaid_wholesale_order",
-                reference_id=f"prepaid:{reservation_id}",
-            )
-        except Exception:
-            pass
     return consumed
 
 
@@ -94,7 +82,7 @@ def finalize_prepaid_config(reseller_id, reservation_id, amount, config_data):
     from utils.reseller import record_funded_reseller_config
 
     with database.write_transaction(operation="reseller_prepaid_config_finalize"):
-        if not record_funded_reseller_config(reseller_id, amount, config_data):
+        if not record_funded_reseller_config(reseller_id, amount, dict(config_data, retail_order_id=reservation_id)):
             raise RuntimeError("Prepaid reseller config could not be recorded")
         consumed = consume_wholesale_balance(
             reseller_id,
@@ -114,7 +102,7 @@ def finalize_prepaid_renewal(reseller_id, reservation_id, username, amount, rene
             reseller_id,
             username,
             amount,
-            renewal_data,
+            dict(renewal_data, retail_order_id=reservation_id),
             server_id=server_id,
         ):
             raise RuntimeError("Prepaid reseller renewal could not be recorded")

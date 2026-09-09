@@ -86,15 +86,11 @@ except ImportError:
 
 
 def _record_hosted_prepaid_good(payment_id):
-    try:
-        return record_reseller_credit_outcome(
-            OWNER_ID,
-            "good",
-            "hosted_crypto_wholesale_order",
-            reference_id=f"hosted-prepaid:{payment_id}",
-        )
-    except Exception:
-        return False
+    # Recovery is recorded atomically with funded order accounting, not as a
+    # best-effort payment follow-up. Kept for old callback compatibility.
+    return False
+from utils.reseller_funding import quote_funding, reserve_funding, release_funding, finalize_funding, remember_fulfillment, reconcile_funding, get_funding, FundingUnavailable, FundingChanged
+from utils.reseller_journey import funding_text, recovery_text
 from utils.reseller_wholesale_credit import (
     consume_wholesale_balance,
     finalize_prepaid_config,
@@ -183,6 +179,8 @@ def _now():
 
 
 def _release_checkout_wholesale(payment_id, record, kind="credit_released"):
+    if (isinstance(record, dict) and record.get("funding")) or get_funding(OWNER_ID, payment_id):
+        return release_funding(OWNER_ID, payment_id)
     if isinstance(record, dict) and record.get("wholesale_prepaid"):
         return release_wholesale_balance(OWNER_ID, payment_id)
     return release_credit(OWNER_ID, payment_id, kind=kind)
@@ -544,6 +542,8 @@ def _owner_payment_snapshot(payment_id, record, username, kind, settlement):
         "converted_amount": record.get("converted_amount") if record.get("payment_method") == "card" else None,
         "payment_method": record.get("payment_method"),
         "order_id": str(payment_id),
+        "funding": record.get("funding"),
+        "credit_journey": recovery_text(_language(OWNER_ID), get_reseller_data(OWNER_ID) or {}),
     }
 
 
@@ -577,6 +577,10 @@ def _format_owner_payment_followup(snapshot):
     lines.append(line("method", method_text))
     lines.append(line("order", f"<code>{escaped(snapshot['order_id'])}</code>"))
     lines.append(line("time", escaped(format_utc_display(snapshot['completed_at']))))
+    if snapshot.get('funding'):
+        lines.append(escaped(funding_text(_language(OWNER_ID), snapshot['funding'])))
+    if snapshot.get('credit_journey'):
+        lines.append(escaped(snapshot['credit_journey']))
     return "\n".join(lines)
 
 
@@ -942,6 +946,11 @@ def _reconcile_credit_reservations():
             "creating", "waiting_receipt", "pending_approval", "processing"
         }
     }
+    for recovered in reconcile_funding(reseller_id=OWNER_ID, origin='hosted', active_ids=active):
+        try:
+            bot.send_message(OWNER_ID, funding_text(_language(OWNER_ID), recovered) + '\n' + recovery_text(_language(OWNER_ID), get_reseller_data(OWNER_ID) or {}))
+        except Exception:
+            logging.getLogger('ajib.reseller_funding').exception('recovery_notification_failed')
     return release_stale_credit_reservations(
         OWNER_ID,
         active,
@@ -1621,7 +1630,14 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
     }
     prepaid = bool(record.get("wholesale_prepaid"))
     effective_funded = funded or prepaid
-    if prepaid:
+    if record.get('funding'):
+        try:
+            detail = finalize_funding(OWNER_ID, payment_id, common, kind='reserved_renewal',
+                username=username, server_id=recorded_server_id)
+            reserved = True
+        except Exception as error:
+            reserved, detail = False, {'reason': str(error)}
+    elif prepaid:
         try:
             reserved, detail = finalize_prepaid_reserved_renewal(
                 OWNER_ID,
@@ -1645,7 +1661,7 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
         )
     if not reserved:
         return False, (detail or {}).get("reason", "Reseller accounting failed")
-    if not prepaid and not funded:
+    if not record.get("funding") and not prepaid and not funded:
         release_credit(OWNER_ID, payment_id, kind="renewal_credit_consumed")
     _credit_sale_and_referral(
         payment_id,
@@ -1740,7 +1756,11 @@ def _provision_payment(payment_id, record, funded):
         actual_server_id = lookup.get("actual_server_id") or getattr(client, "server_id", None)
         metadata = {"username": username, "server_id": actual_server_id,
                     "retail_order_id": payment_id, "customer_telegram_id": customer_id}
-        if prepaid:
+        if record.get('funding'):
+            saved_funding = get_funding(OWNER_ID, payment_id)
+            if not saved_funding or saved_funding['status'] != 'completed':
+                return False, 'Funding finalization is incomplete'
+        elif prepaid:
             consumed = consume_wholesale_balance(
                 OWNER_ID,
                 payment_id,
@@ -1856,7 +1876,13 @@ def _provision_payment(payment_id, record, funded):
             "reseller_level": record.get("reseller_level"),
             "discount_percent": record.get("discount_percent"),
         }
-    if prepaid:
+    if record.get('funding'):
+        try:
+            accounted = finalize_funding(OWNER_ID, payment_id, common,
+                kind='renewal' if renewed else 'config', username=username, server_id=recorded_server_id)
+        except Exception:
+            accounted = False
+    elif prepaid:
         try:
             accounted = (
                 finalize_prepaid_renewal(
@@ -2498,31 +2524,14 @@ def payment_method(call):
         return
     if method == "card":
         reseller = get_reseller_data(OWNER_ID) or {}
-        can_add, _limit, available = can_reseller_add_debt(reseller, quote["wholesale"])
-        prepaid_reserved = False
-        if not can_add:
-            reserved_amount = reserve_wholesale_balance(
-                OWNER_ID,
-                order_id,
-                quote["wholesale"],
-                metadata={"kind": "hosted_card_checkout"},
-            )
-            prepaid_reserved = round(float(reserved_amount or 0), 2) == round(float(quote["wholesale"]), 2)
-        if not can_add and not prepaid_reserved:
-            if float(reserved_amount or 0) > 0:
-                release_wholesale_balance(OWNER_ID, order_id)
+        try:
+            record['funding'] = reserve_funding(OWNER_ID, order_id, quote['wholesale'],
+                metadata={'kind': 'hosted_card_checkout', 'origin': 'hosted'})
+        except FundingUnavailable:
             _release_invite_discount(call.from_user.id, order_id)
-            _save_payment(order_id, {"status": "failed", "last_error": "Reseller credit is unavailable"})
-            bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "credit_unavailable"),
-                                      show_alert=True)
+            _save_payment(order_id, {'status': 'failed', 'last_error': 'Reseller funding is unavailable'})
+            bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, 'credit_unavailable'), show_alert=True)
             return
-        if can_add and not reserve_credit(OWNER_ID, order_id, quote["wholesale"], available):
-            _release_invite_discount(call.from_user.id, order_id)
-            _save_payment(order_id, {"status": "failed", "last_error": "Reseller credit is unavailable"})
-            bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "credit_unavailable"),
-                                      show_alert=True)
-            return
-        record["wholesale_prepaid"] = prepaid_reserved
         exchange_rate = get_exchange_rate()
         toman_price = quote["card_collected"] * exchange_rate
         record.update({"status": "waiting_receipt", "reservation_id": order_id,
@@ -4359,10 +4368,13 @@ def owner_generate_plan(call):
     if plan_id not in _sellable_plans():
         bot.answer_callback_query(call.id, _hosted_message(OWNER_ID, "plan_unavailable"), show_alert=True)
         return
-    _set_input_state(OWNER_ID, {"kind": "owner_generate", "plan_id": plan_id})
+    reseller = get_reseller_data(OWNER_ID) or {}
+    pricing = _reseller_plan_pricing(_sellable_plans()[plan_id], reseller)
+    funding = quote_funding(OWNER_ID, pricing['wholesale_price'])
+    _set_input_state(OWNER_ID, {"kind": "owner_generate", "plan_id": plan_id, 'funding': funding})
     bot.send_message(
         call.message.chat.id,
-        _hosted_message(OWNER_ID, "owner_generate_label") + "\n\n"
+        _hosted_message(OWNER_ID, "owner_generate_label") + "\n" + funding_text(_language(OWNER_ID), funding, reseller.get("debt", 0)) + "\n\n"
         + access_limit_text(_language(OWNER_ID), _sellable_plans()[plan_id], plan=True)
         + "\n\n" + build_credit_summary(_language(OWNER_ID), get_reseller_data(OWNER_ID) or {}, OWNER_ID),
     )
@@ -4387,37 +4399,24 @@ def owner_generate_input(message):
     reseller = get_reseller_data(OWNER_ID) or {}
     pricing = _reseller_plan_pricing(plan, reseller) if plan else None
     reservation_id = f"manual-{uuid.uuid4()}"
-    can_add, _limit, available = can_reseller_add_debt(
-        reseller, pricing["wholesale_price"] if pricing else 0
-    )
-    prepaid = False
-    prepaid_amount = 0.0
-    reserved = False
-    if plan and can_add:
-        reserved = reserve_credit(
-            OWNER_ID, reservation_id, pricing["wholesale_price"], available
-        )
-    elif plan:
-        prepaid_amount = reserve_wholesale_balance(
-            OWNER_ID,
-            reservation_id,
-            pricing["wholesale_price"],
-            metadata={"kind": "hosted_owner_config"},
-        )
-        prepaid = round(float(prepaid_amount or 0), 2) == round(float(pricing["wholesale_price"]), 2)
-        reserved = prepaid
-    if not plan or not reserved:
-        if plan and not can_add and float(prepaid_amount or 0) > 0:
-            release_wholesale_balance(OWNER_ID, reservation_id)
-        bot.reply_to(message, _hosted_message(OWNER_ID, "insufficient_credit"))
+    try:
+        if not plan:
+            raise FundingUnavailable('Plan unavailable')
+        funding = reserve_funding(OWNER_ID, reservation_id, pricing['wholesale_price'], expected=state.get('funding'),
+            metadata={'kind': 'hosted_owner_config', 'origin': 'hosted'})
+    except FundingChanged as error:
+        _set_input_state(OWNER_ID, {**state, 'funding': error.quote})
+        bot.reply_to(message, funding_text(_language(OWNER_ID), error.quote, reseller.get('debt', 0)) + '\n'
+            + _hosted_message(OWNER_ID, 'owner_generate_label'))
         return
+    except FundingUnavailable:
+        bot.reply_to(message, _hosted_message(OWNER_ID, 'insufficient_credit'))
+        return
+    remember_fulfillment(OWNER_ID, reservation_id)
     username, result, client = _create_user({"gb": plan_id, "days": plan.get("days", 30),
                                              "unlimited": plan.get("unlimited", False)}, label)
     if result is None:
-        if prepaid:
-            release_wholesale_balance(OWNER_ID, reservation_id)
-        else:
-            release_credit(OWNER_ID, reservation_id)
+        release_funding(OWNER_ID, reservation_id)
         bot.reply_to(message, _hosted_message(OWNER_ID, "vpn_creation_failed"))
         return
     config = {"username": username, "customer_name": label, "server_id": getattr(client, "server_id", None),
@@ -4427,19 +4426,16 @@ def owner_generate_input(message):
               "reseller_level": pricing["reseller_level"],
               "discount_percent": pricing["discount_percent"],
               "retail_order_id": reservation_id}
-    if prepaid:
-        try:
-            accounted = finalize_prepaid_config(
-                OWNER_ID, reservation_id, pricing["wholesale_price"], config
-            )
-        except Exception:
-            accounted = False
-    else:
-        accounted = consume_credit(OWNER_ID, reservation_id, config)
+    remember_fulfillment(OWNER_ID, reservation_id, config)
+    try:
+        accounted = finalize_funding(OWNER_ID, reservation_id, config)
+    except Exception:
+        accounted = False
     if not accounted:
-        client.delete_user(username)
-        bot.reply_to(message, _hosted_message(OWNER_ID, "accounting_failed"))
+        from utils.reseller_journey import journey_text
+        bot.reply_to(message, journey_text(_language(OWNER_ID), 'accounting_pending'))
         return
+    bot.send_message(OWNER_ID, funding_text(_language(OWNER_ID), funding) + '\n' + recovery_text(_language(OWNER_ID), get_reseller_data(OWNER_ID) or {}))
     _deliver_config(message.chat.id, username, client, include_downloads=False)
 
 
@@ -5400,9 +5396,10 @@ register_block_handlers(bot, _language, MultiServerAPI, owner_id=OWNER_ID)
 
 
 def run():
-    from utils.reseller import backfill_reseller_paid_activity, backfill_reseller_debt_deadlines
+    from utils.reseller import backfill_reseller_paid_activity, backfill_reseller_debt_deadlines, backfill_reseller_credit_recovery
     backfill_reseller_paid_activity()
     backfill_reseller_debt_deadlines()
+    backfill_reseller_credit_recovery()
     def auth_retry(error, wait_seconds):
         set_bot_runtime_status(
             OWNER_ID,

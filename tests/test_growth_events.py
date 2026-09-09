@@ -60,7 +60,7 @@ class GrowthEventTests(unittest.TestCase):
 
         connection = database.get_connection(self.db_path)
 
-        self.assertEqual(database.schema_version(self.db_path), 5)
+        self.assertEqual(database.schema_version(self.db_path), database.SCHEMA_VERSION)
         tables = {
             row["name"]
             for row in connection.execute(

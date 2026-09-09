@@ -1985,9 +1985,9 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         reseller_handlers.handle_reseller_buy(make_call("reseller:buy:5"))
 
         message = bot.edited_messages[0][0][0]
-        self.assertIn("Trust limit exceeded", message)
-        self.assertIn("projected $6.00", message)
-        self.assertIn("limit $5.00", message)
+        self.assertIn("prepaid_balance_insufficient", message)
+        self.assertIn("debt $6.00", message)
+        self.assertIn("Effective limit: $5.00", message)
 
     def test_ten_paid_reseller_can_reach_ten_dollar_trust_limit(self):
         bot = DummyBot()
@@ -2024,9 +2024,9 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
         reseller_handlers.handle_reseller_buy(make_call("reseller:buy:5"))
 
         message = bot.edited_messages[0][0][0]
-        self.assertIn("Trust limit exceeded", message)
-        self.assertIn("limit $30.00", message)
-        self.assertIn("credit $1.00", message)
+        self.assertIn("prepaid_balance_insufficient", message)
+        self.assertIn("Effective limit: $30.00", message)
+        self.assertIn("Remaining borrowing capacity: $1.00", message)
 
     def test_level_six_purchase_locks_discount_metadata_at_confirmation(self):
         bot = DummyBot()
@@ -2046,6 +2046,7 @@ class CryptoPaymentDiscountTests(unittest.TestCase):
             "configs": [],
         }
 
+        reseller_handlers.handle_reseller_buy(make_call("reseller:buy:5"))
         reseller_handlers.handle_reseller_confirm_buy(
             make_call("reseller:confirm_buy:5")
         )

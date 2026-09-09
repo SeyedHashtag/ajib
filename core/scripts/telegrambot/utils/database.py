@@ -17,7 +17,7 @@ from .renewal_migration import migrate_v4_renewal_timezone_rechecks
 
 DEFAULT_BOT_DIR = "/etc/ajib/core/scripts/telegrambot"
 DATABASE_NAME = "ajib.db"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 BUSY_TIMEOUT_MS = 5000
 SLOW_WRITE_TRANSACTION_MS = 250
 
@@ -56,6 +56,13 @@ def _transaction_depths() -> dict[str, int]:
 
 
 SCHEMA_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS reseller_order_funding (
+        reseller_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+        status TEXT NOT NULL, debt_cents INTEGER NOT NULL,
+        payload_json TEXT NOT NULL, PRIMARY KEY(reseller_id, operation_id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS reseller_order_funding_pending_idx ON reseller_order_funding(status, reseller_id)",
+
     """
     CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,

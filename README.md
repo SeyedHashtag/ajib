@@ -17,6 +17,7 @@ VPN panels through their HTTP APIs.
 - Balance new accounts across multiple VPN servers
 - Sell plans through manual and cryptocurrency payment flows
 - Manage resellers, referrals, test accounts, and expired accounts
+- Use [prepaid-first reseller funding and two $5 recovery cycles](docs/reseller-credit.md)
 - Host customer-facing Telegram bots for approved resellers on the same VPN infrastructure
 - Show customers their configurations and QR codes
 - Broadcast messages and provide operational dashboards to administrators
