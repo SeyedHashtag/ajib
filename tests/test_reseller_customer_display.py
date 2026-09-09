@@ -923,7 +923,7 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
             executor.run_next()
 
             self.assertEqual(len(processed), 1)
-            self.assertEqual(processed[0][1:], (1988, "en", "token-1"))
+            self.assertEqual(processed[0][1:], (1988, "en", "token-1", None, None))
             self.assertEqual(reseller_handlers.RESELLER_RENEWAL_INFLIGHT, set())
         finally:
             reseller_handlers.RESELLER_RENEWAL_EXECUTOR = original_executor

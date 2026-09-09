@@ -275,6 +275,41 @@ class RenewalTests(unittest.TestCase):
     def write_json(self, path, data):
         Path(path).write_text(json.dumps(data), encoding="utf-8")
 
+    def test_reseller_confirmation_tracks_purchase_history_only(self):
+        import copy
+
+        config = {'timestamp': '2026-06-09T00:00:00Z', 'renewals': [{
+            'timestamp': '2026-08-19T10:43:05Z',
+            'renewal_confirmation_id': 'reseller-renewal:7:old:100',
+        }]}
+        fingerprint = self.renewal.reseller_renewal_history_fingerprint
+        original = fingerprint(config)
+        changed = copy.deepcopy(config)
+        changed.update(cleanup_status='notified', cleanup_last_state={'gb_used': 100}, debt=0)
+        changed['renewals'][0].update(price=2, paid_at='today', outstanding_amount=0)
+        self.assertEqual(fingerprint(changed), original)
+        # Persistence/reload and mutable settlement fields do not invalidate buttons.
+        self.assertEqual(fingerprint(json.loads(json.dumps(changed))), original)
+        changed['renewals'].append({'timestamp': '2026-09-09T14:57:00Z',
+                                    'renewal_confirmation_id': 'new'})
+        self.assertNotEqual(fingerprint(changed), original)
+        changed['renewals'].reverse()
+        self.assertNotEqual(fingerprint(changed), original)
+
+    def test_reseller_confirmation_callback_size_and_generation(self):
+        callback = self.renewal.reseller_renewal_confirmation_callback
+        token = self.renewal.reseller_renewal_token(7, 0, 'alice', 's1')
+        fingerprint = self.renewal.reseller_renewal_history_fingerprint({'timestamp': '2026-08-19'})
+        for plan in ('5', '100', '10000000000000000'):
+            self.assertLessEqual(len(callback(token, plan, fingerprint).encode('utf-8')), 64)
+        with self.assertRaises(ValueError):
+            callback(token, '9' * 64, fingerprint)
+        identity = self.renewal.reseller_renewal_confirmation_id
+        self.assertNotEqual(identity(7, token, '100', fingerprint),
+                            f'reseller-renewal:7:{token}:100')
+        self.assertNotEqual(identity(7, token, '100', fingerprint),
+                            identity(7, token, '100', 'next-generation'))
+
     def read_json(self, path):
         return json.loads(Path(path).read_text(encoding="utf-8"))
 

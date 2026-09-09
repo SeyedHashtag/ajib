@@ -427,6 +427,47 @@ def reseller_renewal_token(reseller_id, config_index, username, server_id):
     return _token('reseller', reseller_id, config_index, server_id or 'primary', username)
 
 
+def reseller_renewal_history_fingerprint(config):
+    """Identify a purchase generation without including mutable account state."""
+    fields = ('timestamp', 'created_at', 'renewal_reserved_at', 'payment_id',
+              'reservation_id', 'retail_order_id', 'renewal_confirmation_id')
+    renewals = config.get('renewals') or []
+    if not isinstance(renewals, list):
+        renewals = []
+    history = [
+        {key: record.get(key) for key in fields}
+        if isinstance(record, dict) else None
+        for record in renewals
+    ]
+    payload = json.dumps(
+        [config.get('timestamp'), config.get('created_at'), history],
+        sort_keys=True, separators=(',', ':'),
+    )
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
+
+
+def reseller_renewal_confirmation_callback(token, plan_gb, fingerprint):
+    callback = f'reseller:rc2:{token}:{plan_gb}:{fingerprint}'
+    if len(callback.encode('utf-8')) > 64:
+        raise ValueError('Renewal confirmation exceeds Telegram callback limit')
+    return callback
+
+
+def reseller_renewal_confirmation_id(reseller_id, token, plan_gb, fingerprint):
+    return f'reseller-renewal:v2:{reseller_id}:{token}:{plan_gb}:{fingerprint}'
+
+
+def reseller_renewal_config_for_token(reseller_id, token, reseller_data):
+    """Resolve ownership locally, including history needed to recognize replays."""
+    for index, config in _iter_reseller_configs(reseller_id, reseller_data):
+        if reseller_renewal_token(
+            reseller_id, index, str(config.get('username') or '').strip(),
+            config.get('server_id'),
+        ) == token:
+            return config
+    return None
+
+
 def _record_plan_snapshot(record):
     if not isinstance(record, dict):
         return None

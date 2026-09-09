@@ -12,7 +12,7 @@ from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
-from utils.reseller_funding import quote_funding, reserve_funding, release_funding, finalize_funding, remember_fulfillment, pending_funding, FundingUnavailable, FundingChanged
+from utils.reseller_funding import quote_funding, reserve_funding, release_funding, finalize_funding, remember_fulfillment, pending_funding, get_funding, FundingUnavailable, FundingChanged
 from utils.reseller_journey import funding_text, journey_text
 from utils.reseller_experience import access_limit_text, build_credit_summary, build_credit_help, experience_text
 from utils.command import bot, ADMIN_USER_IDS, is_admin
@@ -2979,7 +2979,12 @@ def _renewal_reason_text(language, reason):
 
 
 def _show_reseller_renewal_confirmation(call, token, offer, reseller_data, language):
+    from utils.renewal import (
+        reseller_renewal_history_fingerprint, reseller_renewal_confirmation_callback,
+    )
+
     user_id = call.from_user.id
+    fingerprint = reseller_renewal_history_fingerprint(offer['config'])
     price = float(offer.get('price', 0.0))
     current_debt = float(reseller_data.get('debt', 0.0))
     funding_mode, trust_limit, available_credit, _balance = _reseller_order_funding(
@@ -2993,7 +2998,7 @@ def _show_reseller_renewal_confirmation(call, token, offer, reseller_data, langu
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton(
         get_button_text(language, "confirm"),
-        callback_data=f"reseller:renew_confirm:{token}:{offer['plan_gb']}",
+        callback_data=reseller_renewal_confirmation_callback(token, offer['plan_gb'], fingerprint),
     ))
     markup.add(types.InlineKeyboardButton(
         get_button_text(language, "back"), callback_data=f"reseller:renew:{token}"
@@ -3001,7 +3006,7 @@ def _show_reseller_renewal_confirmation(call, token, offer, reseller_data, langu
     markup.add(types.InlineKeyboardButton(
         get_button_text(language, "cancel"), callback_data="reseller:cancel"
     ))
-    RESELLER_FUNDING_PREVIEWS[(user_id, 'renewal', token)] = funding_mode
+    RESELLER_FUNDING_PREVIEWS[(user_id, 'renewal', token, str(offer['plan_gb']), fingerprint)] = funding_mode
     credit_summary = build_credit_summary(language, reseller_data, call.from_user.id)
     bot.edit_message_text(
         _reseller_renewal_details_message(language, offer, current_debt, trust_limit, funding_mode) + "\n\n" + credit_summary,
@@ -3131,12 +3136,11 @@ def handle_reseller_renewal_plan_choice(call):
         _release_reseller_renewal_view(claim_key)
 
 
-def _queue_reseller_renewal_confirm(call, user_id, language, token, target_plan_gb=None):
-    key = (
-        (user_id, token, str(target_plan_gb))
-        if target_plan_gb is not None
-        else (user_id, token)
-    )
+def _queue_reseller_renewal_confirm(
+    call, user_id, language, token, target_plan_gb=None, fingerprint=None
+):
+    # Different plans and confirmation messages still reset the same account.
+    key = (user_id, token)
     with RESELLER_RENEWAL_LOCK:
         if key in RESELLER_RENEWAL_INFLIGHT:
             return False
@@ -3144,12 +3148,9 @@ def _queue_reseller_renewal_confirm(call, user_id, language, token, target_plan_
 
     def run():
         try:
-            if target_plan_gb is None:
-                _process_reseller_renewal_confirm_job(call, user_id, language, token)
-            else:
-                _process_reseller_renewal_confirm_job(
-                    call, user_id, language, token, target_plan_gb
-                )
+            _process_reseller_renewal_confirm_job(
+                call, user_id, language, token, target_plan_gb, fingerprint
+            )
         finally:
             with RESELLER_RENEWAL_LOCK:
                 RESELLER_RENEWAL_INFLIGHT.discard(key)
@@ -3164,8 +3165,13 @@ def _queue_reseller_renewal_confirm(call, user_id, language, token, target_plan_
 
 
 def _process_reseller_renewal_confirm_job(
-    call, user_id, language, token, target_plan_gb=None
+    call, user_id, language, token, target_plan_gb=None, fingerprint=None
 ):
+    from utils.renewal import (
+        reseller_renewal_config_for_token, reseller_renewal_confirmation_id,
+        reseller_renewal_history_fingerprint,
+    )
+
     reseller_data = _get_active_reseller_data(user_id)
     if not reseller_data:
         safe_edit_message_text(
@@ -3186,6 +3192,45 @@ def _process_reseller_renewal_confirm_job(
         )
         return
 
+    config = reseller_renewal_config_for_token(user_id, token, reseller_data)
+    confirmation_id = (
+        reseller_renewal_confirmation_id(user_id, token, target_plan_gb, fingerprint)
+        if fingerprint is not None else None
+    )
+    # Check durable completion before eligibility: success changes the live
+    # account and history, but a replay must never buy the following cycle.
+    if config is not None and confirmation_id is not None:
+        existing_confirmation = next((
+            renewal for renewal in (config.get('renewals') or [])
+            if isinstance(renewal, dict)
+            and renewal.get('renewal_confirmation_id') == confirmation_id
+        ), None)
+        saved_funding = get_funding(user_id, confirmation_id)
+        if existing_confirmation or (saved_funding or {}).get('status') == 'completed':
+            safe_edit_message_text(
+                bot, get_message_text(language, 'renewal_confirmation_duplicate'),
+                chat_id=call.message.chat.id, message_id=call.message.message_id,
+            )
+            return
+        for pending in pending_funding(user_id):
+            metadata = pending.get('metadata') or {}
+            same_account = (
+                metadata.get('kind') == 'renewal'
+                and metadata.get('username') == config.get('username')
+                and metadata.get('origin') == 'main'
+            )
+            if (pending.get('operation_id') == confirmation_id or same_account) and (
+                pending.get('fulfillment_started_at') or pending.get('fulfillment')
+                or pending.get('operation_id') != confirmation_id
+            ):
+                # The existing reconciler finalizes saved fulfillment. If the
+                # panel outcome is unknown, leave it pending for review.
+                safe_edit_message_text(
+                    bot, journey_text(language, 'accounting_pending'),
+                    chat_id=call.message.chat.id, message_id=call.message.message_id,
+                )
+                return
+
     offer, reseller_data = _resolve_reseller_renewal_offer_for_call(
         call, token, target_plan_gb
     )
@@ -3199,22 +3244,9 @@ def _process_reseller_renewal_confirm_job(
         )
         return
 
-    confirmation_id = (
-        f"reseller-renewal:{user_id}:{token}:{offer.get('plan_gb')}"
-    )
-    existing_confirmation = next((
-        renewal
-        for renewal in (offer.get('config') or {}).get('renewals', [])
-        if isinstance(renewal, dict)
-        and renewal.get('renewal_confirmation_id') == confirmation_id
-    ), None)
-    if existing_confirmation:
-        safe_edit_message_text(
-            bot,
-            get_message_text(language, 'renewal_confirmation_duplicate'),
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-        )
+    if fingerprint is None or fingerprint != reseller_renewal_history_fingerprint(offer['config']):
+        # Old/unversioned buttons cannot authorize work against newer history.
+        _show_reseller_renewal_confirmation(call, token, offer, reseller_data, language)
         return
 
     price = float(offer.get('price', 0.0))
@@ -3228,7 +3260,7 @@ def _process_reseller_renewal_confirm_job(
 
     wholesale_reservation_id = confirmation_id
     if isinstance(funding_mode, dict):
-        expected = RESELLER_FUNDING_PREVIEWS.get((user_id, 'renewal', token))
+        expected = RESELLER_FUNDING_PREVIEWS.get((user_id, 'renewal', token, str(target_plan_gb), fingerprint))
         if expected != funding_mode:
             _show_reseller_renewal_confirmation(call, token, offer, reseller_data, language)
             return
@@ -3454,7 +3486,7 @@ def _process_reseller_renewal_confirm_job(
         )
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("reseller:renew_confirm:"))
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("reseller:renew_confirm:", "reseller:rc2:")))
 def handle_reseller_renewal_confirm(call):
     user_id = call.from_user.id
     language = get_user_language(user_id)
@@ -3477,11 +3509,22 @@ def handle_reseller_renewal_confirm(call):
         )
         return
 
-    parts = call.data.split(":", 3)
+    parts = call.data.split(":")
+    fingerprint = None
+    if parts[1] == 'rc2':
+        if (len(parts) != 5 or not re.fullmatch(r'[0-9a-f]{16}', parts[2])
+                or not re.fullmatch(r'[1-9][0-9]*', parts[3])
+                or not re.fullmatch(r'[0-9a-f]{16}', parts[4])):
+            safe_answer_callback_query(bot, call.id, get_message_text(language, 'renewal_generic_unavailable_reason'))
+            return
+        fingerprint = parts[4]
+    elif len(parts) not in (3, 4):
+        safe_answer_callback_query(bot, call.id, get_message_text(language, 'renewal_generic_unavailable_reason'))
+        return
     token = parts[2]
-    target_plan_gb = parts[3] if len(parts) == 4 else None
+    target_plan_gb = parts[3] if len(parts) >= 4 else None
     if _queue_reseller_renewal_confirm(
-        call, user_id, language, token, target_plan_gb
+        call, user_id, language, token, target_plan_gb, fingerprint
     ):
         safe_answer_callback_query(
             bot,

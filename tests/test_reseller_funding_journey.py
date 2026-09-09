@@ -321,44 +321,262 @@ def test_admin_restore_callback_rechecks_authorization_and_ignores_replay(app):
     assert namespace['_render_admin_reseller_detail'].call_count == 1
 
 
-@pytest.mark.parametrize('kind', ['immediate', 'reserved'])
-def test_main_renewal_handler_commits_split(app, monkeypatch, kind):
+@pytest.fixture
+def main_renewal(app, monkeypatch):
     from unittest.mock import Mock
     store, funding, wallet = app
+    renewal = importlib.import_module('utils.renewal')
+    token = renewal.reseller_renewal_token(7, 0, 'alice', 's1')
     record = store.get_reseller_data(7)
-    record['configs'] = [{'username': 'alice', 'server_id': 's1', 'price': 0}]
+    record['configs'] = [{'username': 'alice', 'server_id': 's1', 'price': 0,
+        'timestamp': '2026-06-09T00:00:00Z', 'renewals': [{
+            'timestamp': '2026-08-19T10:43:05Z', 'gb': '100', 'days': 60,
+            'price': 0, 'renewal_confirmation_id': f'reseller-renewal:7:{token}:100',
+        }]}]
     store.save_resellers({'7': record})
-    wallet.credit_wholesale_balance(7, 2, 'topup')
-    split = funding.quote_funding(7, 5)
-    offer = {'eligible': True, 'price': 5, 'plan_gb': '5', 'days': 30, 'username': 'alice',
-             'server_id': 's1', 'config': record['configs'][0], 'renewal_mode': kind}
-    renewal = types.ModuleType('utils.renewal')
-    renewal.execute_reseller_renewal = Mock(return_value={'success': True})
-    renewal.reseller_renewal_record = lambda *a: {'price': 5}
-    renewal.reserved_renewal_record = lambda *a: {'price': 5}
-    renewal.format_renewal_success = lambda *a, **kw: 'renewed'
-    renewal.mark_cleanup_state_renewed = Mock()
-    monkeypatch.setitem(sys.modules, 'utils.renewal', renewal)
+    state = types.SimpleNamespace(mode='immediate', eligible=True)
+
+    def resolve(*args):
+        record = store.get_reseller_data(7)
+        offer = {'eligible': state.eligible, 'price': 5, 'plan_gb': args[2] or '100',
+                 'days': 60, 'username': 'alice', 'server_id': 's1', 'config_index': 0,
+                 'config': record['configs'][0], 'renewal_mode': state.mode}
+        return offer, record
+
+    class Markup:
+        def __init__(self, **kwargs):
+            self.buttons = []
+
+        def add(self, *buttons):
+            self.buttons.extend(buttons)
+
+    monkeypatch.setattr(renewal, 'execute_reseller_renewal', Mock(return_value={'success': True}))
+    monkeypatch.setattr(renewal, 'format_renewal_success', lambda *a, **kw: 'renewed')
+    monkeypatch.setattr(renewal, 'mark_cleanup_state_renewed', Mock())
     namespace = {name: getattr(funding, name) for name in (
-        'reserve_funding', 'finalize_funding', 'release_funding', 'remember_fulfillment', 'FundingUnavailable')}
+        'reserve_funding', 'finalize_funding', 'release_funding', 'remember_fulfillment',
+        'get_funding', 'pending_funding', 'FundingUnavailable')}
     namespace.update({
         '_get_active_reseller_data': store.get_reseller_data, '_is_reseller_suspended': lambda r: False,
-        '_resolve_reseller_renewal_offer_for_call': lambda *a: (offer, store.get_reseller_data(7)),
-        '_reseller_order_funding': lambda *a: (split, 5, 5, {}),
-        'RESELLER_FUNDING_PREVIEWS': {(7, 'renewal', 'token'): split},
+        '_resolve_reseller_renewal_offer_for_call': Mock(side_effect=resolve),
+        '_reseller_order_funding': lambda *a: (funding.quote_funding(7, 5), 5, 5, {}),
+        'RESELLER_FUNDING_PREVIEWS': {},
         'get_reseller_data': store.get_reseller_data, 'bot': Mock(),
-        'get_message_text': lambda *a: 'success', 'escape_markdown_code': str,
+        'get_message_text': lambda language, key: key, 'get_button_text': lambda *a: 'button',
+        'escape_markdown_code': str, '_renewal_reason_text': lambda *a: 'unavailable',
         'format_usd_amount': lambda n: f'{n:.2f}', 'funding_text': lambda *a: 'split',
+        'journey_text': lambda language, key: key,
         'build_credit_summary': lambda *a, **kw: 'journey',
+        '_reseller_renewal_details_message': lambda *a: 'details',
+        'types': types.SimpleNamespace(InlineKeyboardMarkup=Markup,
+            InlineKeyboardButton=lambda text, **kw: types.SimpleNamespace(text=text, **kw)),
         'safe_edit_message_text': Mock(), 'safe_send_message': Mock(),
     })
-    run = load_function('core/scripts/telegrambot/utils/reseller_handlers.py', '_process_reseller_renewal_confirm_job', namespace)
-    call = types.SimpleNamespace(message=types.SimpleNamespace(chat=types.SimpleNamespace(id=7), message_id=1))
-    run(call, 7, 'en', 'token')
-    record = store.get_reseller_data(7)
-    assert record['debt'] == 3 and record['total_paid'] == 2
-    assert len(record['configs'][0]['renewals']) == 1
-    assert renewal.execute_reseller_renewal.call_count == (1 if kind == 'immediate' else 0)
+    path = 'core/scripts/telegrambot/utils/reseller_handlers.py'
+    show = load_function(path, '_show_reseller_renewal_confirmation', namespace)
+    run = load_function(path, '_process_reseller_renewal_confirm_job', namespace)
+    call = types.SimpleNamespace(from_user=types.SimpleNamespace(id=7),
+        message=types.SimpleNamespace(chat=types.SimpleNamespace(id=7), message_id=1))
+
+    def confirmation(plan='100'):
+        offer, record = resolve(call, token, plan)
+        show(call, token, offer, record, 'en')
+        callback = namespace['bot'].edit_message_text.call_args.kwargs['reply_markup'].buttons[0].callback_data
+        assert len(callback.encode('utf-8')) <= 64
+        return callback.split(':')[4]
+
+    return types.SimpleNamespace(store=store, funding=funding, wallet=wallet, renewal=renewal,
+        token=token, state=state, ns=namespace, call=call, confirmation=confirmation,
+        run=lambda fingerprint, plan='100': run(call, 7, 'en', token, plan, fingerprint))
+
+
+@pytest.mark.parametrize('kind', ['immediate', 'reserved'])
+@pytest.mark.parametrize('balance', [0, 2, 5])
+def test_main_renewal_handler_commits_split(main_renewal, kind, balance):
+    ctx = main_renewal
+    ctx.state.mode = kind
+    if balance:
+        ctx.wallet.credit_wholesale_balance(7, balance, 'topup')
+    fingerprint = ctx.confirmation()
+    ctx.run(fingerprint)
+    record = ctx.store.get_reseller_data(7)
+    assert record['debt'] == 5 - balance and record['total_paid'] == balance
+    assert len(record['configs'][0]['renewals']) == 2
+    assert ctx.renewal.execute_reseller_renewal.call_count == (1 if kind == 'immediate' else 0)
+    # Even when the live account is now ineligible, the exact replay is recognized locally.
+    ctx.state.eligible = False
+    ctx.ns['_resolve_reseller_renewal_offer_for_call'].reset_mock()
+    ctx.run(fingerprint)
+    assert ctx.store.get_reseller_data(7) == record
+    ctx.ns['_resolve_reseller_renewal_offer_for_call'].assert_not_called()
+    assert ctx.ns['safe_edit_message_text'].call_args.args[1] == 'renewal_confirmation_duplicate'
+
+
+def test_main_same_plan_can_renew_again_next_cycle(main_renewal):
+    ctx = main_renewal
+    ctx.wallet.credit_wholesale_balance(7, 15, 'topup')
+    first = ctx.confirmation()
+    ctx.run(first)
+    second = ctx.confirmation()
+    assert second != first
+    ctx.run(second)
+    record = ctx.store.get_reseller_data(7)
+    assert len(record['configs'][0]['renewals']) == 3
+    assert record['total_paid'] == 10
+    ctx.run(first)
+    ctx.run(second)
+    assert ctx.store.get_reseller_data(7) == record
+    assert ctx.renewal.execute_reseller_renewal.call_count == 2
+
+
+@pytest.mark.parametrize('fingerprint', [None, '0' * 16])
+def test_main_legacy_and_stale_confirmation_only_refresh(main_renewal, fingerprint):
+    ctx = main_renewal
+    before = ctx.store.get_reseller_data(7)
+    ctx.run(fingerprint)
+    assert ctx.store.get_reseller_data(7) == before
+    ctx.renewal.execute_reseller_renewal.assert_not_called()
+    assert ctx.funding.pending_funding(7) == []
+    callback = ctx.ns['bot'].edit_message_text.call_args.kwargs['reply_markup'].buttons[0].callback_data
+    assert callback.startswith('reseller:rc2:')
+    ctx.run(callback.split(':')[4])
+    assert ctx.renewal.execute_reseller_renewal.call_count == 1
+
+
+@pytest.mark.parametrize('saved_result', [False, True])
+@pytest.mark.parametrize('plan', ['100', '200'])
+def test_main_restart_with_pending_fulfillment_never_resets_again(main_renewal, saved_result, plan):
+    ctx = main_renewal
+    fingerprint = ctx.confirmation()
+    operation = ctx.renewal.reseller_renewal_confirmation_id(7, ctx.token, '100', fingerprint)
+    ctx.funding.reserve_funding(7, operation, 5,
+        metadata={'kind': 'renewal', 'username': 'alice', 'origin': 'main'})
+    data = {'timestamp': '2026-09-09T14:57:00Z', 'price': 5,
+            'renewal_confirmation_id': operation} if saved_result else None
+    ctx.funding.remember_fulfillment(7, operation, data, kind='renewal', username='alice', server_id='s1')
+    ctx.ns['RESELLER_FUNDING_PREVIEWS'].clear()
+    ctx.funding.database.close_connections()
+    ctx.run(fingerprint, plan)
+    ctx.renewal.execute_reseller_renewal.assert_not_called()
+    assert ctx.ns['safe_edit_message_text'].call_args.args[1] == 'accounting_pending'
+    future = datetime.now(timezone.utc) + timedelta(minutes=10)
+    recovered = ctx.funding.reconcile_funding(now=future)
+    assert len(recovered) == int(saved_result)
+    ctx.run(fingerprint)
+    ctx.renewal.execute_reseller_renewal.assert_not_called()
+    assert len(ctx.store.get_reseller_data(7)['configs'][0]['renewals']) == 1 + int(saved_result)
+
+
+def test_main_accounting_failure_retry_uses_recovery(main_renewal):
+    from unittest.mock import Mock
+    ctx = main_renewal
+    fingerprint = ctx.confirmation()
+    ctx.ns['finalize_funding'] = Mock(side_effect=RuntimeError('accounting unavailable'))
+    ctx.run(fingerprint)
+    assert ctx.renewal.execute_reseller_renewal.call_count == 1
+    ctx.ns['RESELLER_FUNDING_PREVIEWS'].clear()
+    ctx.funding.database.close_connections()
+    ctx.run(fingerprint)
+    assert ctx.renewal.execute_reseller_renewal.call_count == 1
+    recovered = ctx.funding.reconcile_funding(now=datetime.now(timezone.utc) + timedelta(minutes=10))
+    assert len(recovered) == 1
+    ctx.run(fingerprint)
+    assert ctx.renewal.execute_reseller_renewal.call_count == 1
+    assert len(ctx.store.get_reseller_data(7)['configs'][0]['renewals']) == 2
+    assert ctx.store.get_reseller_data(7)['debt'] == 5
+
+
+def test_main_funding_completion_is_checked_without_history(main_renewal):
+    from unittest.mock import Mock
+    ctx = main_renewal
+    fingerprint = ctx.confirmation()
+    ctx.ns['get_funding'] = Mock(return_value={'status': 'completed'})
+    ctx.run(fingerprint)
+    ctx.renewal.execute_reseller_renewal.assert_not_called()
+    ctx.ns['_resolve_reseller_renewal_offer_for_call'].assert_not_called()
+
+
+def test_main_renewal_different_plans_share_account_lock(main_renewal):
+    import threading
+    ctx = main_renewal
+    ctx.wallet.credit_wholesale_balance(7, 15, 'topup')
+    fingerprints = [ctx.confirmation(plan) for plan in ('100', '200')]
+    jobs = []
+    ctx.ns.update(RESELLER_RENEWAL_LOCK=threading.Lock(), RESELLER_RENEWAL_INFLIGHT=set(),
+                  RESELLER_RENEWAL_EXECUTOR=types.SimpleNamespace(submit=jobs.append))
+    queue = load_function('core/scripts/telegrambot/utils/reseller_handlers.py',
+                          '_queue_reseller_renewal_confirm', ctx.ns)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda item: queue(ctx.call, 7, 'en', ctx.token, *item),
+                                    zip(('100', '200'), fingerprints)))
+    assert sorted(results) == [False, True]
+    assert len(jobs) == 1
+    jobs.pop()()
+    assert not ctx.ns['RESELLER_RENEWAL_INFLIGHT']
+    # A queued click from a different old message must refresh, not reserve the next cycle.
+    assert queue(ctx.call, 7, 'en', ctx.token, '200' if results[0] else '100', fingerprints[0])
+    jobs.pop()()
+    assert ctx.renewal.execute_reseller_renewal.call_count == 1
+    assert len(ctx.store.get_reseller_data(7)['configs'][0]['renewals']) == 2
+    assert ctx.store.get_reseller_data(7)['total_paid'] == 5
+
+
+@pytest.mark.parametrize('mode', ['debt', 'prepaid'])
+@pytest.mark.parametrize('kind', ['immediate', 'reserved'])
+def test_main_legacy_funding_paths_keep_duplicate_protection(main_renewal, mode, kind):
+    ctx = main_renewal
+    ctx.state.mode = kind
+    if mode == 'prepaid':
+        ctx.wallet.credit_wholesale_balance(7, 10, 'topup')
+    ctx.ns['_reseller_order_funding'] = lambda *a: (mode, 5, 5, {})
+    for name in ('reserve_wholesale_balance', 'release_wholesale_balance',
+                 'finalize_prepaid_renewal', 'finalize_prepaid_reserved_renewal'):
+        ctx.ns[name] = getattr(ctx.wallet, name)
+    fingerprint = ctx.confirmation()
+    ctx.run(fingerprint)
+    record = ctx.store.get_reseller_data(7)
+    assert len(record['configs'][0]['renewals']) == 2
+    assert record['debt'] == (5 if mode == 'debt' else 0)
+    assert ctx.renewal.execute_reseller_renewal.call_count == int(kind == 'immediate')
+    ctx.run(fingerprint)
+    assert ctx.store.get_reseller_data(7) == record
+
+
+@pytest.mark.parametrize('version', ['v2', 'legacy', 'legacy_no_plan'])
+def test_main_confirmation_callback_routes_and_refreshes(main_renewal, version):
+    import re
+    from unittest.mock import Mock
+    ctx = main_renewal
+    fingerprint = ctx.confirmation()
+    ctx.call.id = 'callback'
+    ctx.call.data = (ctx.renewal.reseller_renewal_confirmation_callback(ctx.token, '100', fingerprint)
+                     if version == 'v2' else f'reseller:renew_confirm:{ctx.token}'
+                     + (':100' if version == 'legacy' else ''))
+    queue = Mock(side_effect=lambda call, uid, language, token, plan, fp: (ctx.run(fp, plan), True)[1])
+    ctx.ns.update(re=re, get_user_language=lambda user: 'en',
+                  _queue_reseller_renewal_confirm=queue, safe_answer_callback_query=Mock())
+    handler = load_function('core/scripts/telegrambot/utils/reseller_handlers.py',
+                            'handle_reseller_renewal_confirm', ctx.ns)
+    handler(ctx.call)
+    assert queue.call_args.args[3:] == (ctx.token, None if version == 'legacy_no_plan' else '100',
+                                       fingerprint if version == 'v2' else None)
+    assert ctx.renewal.execute_reseller_renewal.call_count == int(version == 'v2')
+
+
+@pytest.mark.parametrize('suffix', ['', ':100', ':100:invalid', ':100:' + 'a' * 16 + ':extra',
+                                    ':0:' + 'a' * 16, ':-1:' + 'a' * 16])
+def test_main_malformed_confirmation_cannot_queue(main_renewal, suffix):
+    import re
+    from unittest.mock import Mock
+    ctx = main_renewal
+    ctx.call.id = 'callback'
+    ctx.call.data = f'reseller:rc2:{ctx.token}{suffix}'
+    ctx.ns.update(re=re, get_user_language=lambda user: 'en',
+                  _queue_reseller_renewal_confirm=Mock(), safe_answer_callback_query=Mock())
+    handler = load_function('core/scripts/telegrambot/utils/reseller_handlers.py',
+                            'handle_reseller_renewal_confirm', ctx.ns)
+    handler(ctx.call)
+    ctx.ns['_queue_reseller_renewal_confirm'].assert_not_called()
 
 
 def test_failure_after_order_write_rolls_back_every_financial_effect(app, monkeypatch):
