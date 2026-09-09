@@ -179,3 +179,4 @@ core/scripts/telegrambot/broadcast_logs/
 # AI agent instructions (local only)
 AGENTS.md
 agents.md
+logs_and_backups/
