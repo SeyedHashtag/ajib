@@ -1,3 +1,11 @@
+## v2.7.13
+✨ Fund reseller wholesale orders with prepaid balance first and credit for the remainder, with shared reservations across main and hosted bots
+✨ Restore reseller credit eligibility after two $5 prepaid spending cycles, with localized progress guidance and audited administrator restoration controls
+🛠️ Persist order funding and retry unfinished accounting without repeating completed service operations, while retaining uncertain reservations for investigation
+🐛 Track reseller renewal history and refresh stale confirmations to prevent duplicate renewals while allowing later renewal cycles
+📚 Document the schema 6 upgrade: back up the database, stop main and hosted runtimes together, and upgrade all workers with managed SQLite storage enabled; do not mix older workers or downgrade against schema 6
+✅ Expand regression coverage for split funding, credit recovery, renewal confirmations, concurrent orders, rollback, and restart recovery
+
 ## v2.7.12
 ✨ Notify administrators about reseller wholesale top-ups across card, crypto, and account-credit payments, with duplicate-transfer notification protection
 ✨ Add localized hosted-bot owner payment summaries for purchases, renewals, and reserved renewals, including collected amounts, wholesale costs, referral rewards, and profit
