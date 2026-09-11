@@ -7,17 +7,8 @@ import os
 PLANS_FILE = '/etc/ajib/core/scripts/telegrambot/plans.json'
 
 def load_plans():
-    try:
-        if os.path.exists(PLANS_FILE):
-            with open(PLANS_FILE, 'r') as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {
-        "40": {"price": 1.20, "days": 30},
-        "60": {"price": 1.50, "days": 30},
-        "100": {"price": 2.00, "days": 30}
-    }
+    from utils.catalog_service import load_catalog
+    return load_catalog(PLANS_FILE)
 
 def save_plans(plans):
     os.makedirs(os.path.dirname(PLANS_FILE), exist_ok=True)

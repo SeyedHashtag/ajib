@@ -291,3 +291,54 @@ def finalize_main_checkout(
         "reward_base": reward_base,
         "growth_recorded": growth_recorded,
     }
+
+
+def reserve_order_checkout(
+    user_id, reservation_id, original_price, payment_method, *,
+    renewal_discount_percent=0, discount_cap_percent=None,
+    allow_invite_discount=True, allow_account_credit=True,
+    crypto_discount_percent=5, payments=None,
+):
+    """Apply the bot's payment/credit rules and reserve one immutable quote."""
+    quote = reserve_main_checkout(
+        user_id,
+        reservation_id,
+        original_price,
+        payment_method=payment_method,
+        payment_discount_percent=(
+            crypto_discount_percent if payment_method == 'crypto' else 0
+        ),
+        renewal_discount_percent=renewal_discount_percent,
+        discount_cap_percent=discount_cap_percent,
+        payments=payments,
+        allow_invite_discount=allow_invite_discount,
+        allow_account_credit=allow_account_credit,
+    )
+    if (
+        payment_method == 'crypto'
+        and float(quote.get('price', 0) or 0) <= 0
+        and float(quote.get('account_credit_reserved', 0) or 0) > 0
+        and float(quote.get('renewal_discount_percent', 0) or 0) <= 0
+    ):
+        # A crypto discount is earned only when some crypto is actually paid.
+        # Requote without that discount. Credit may still fund part of the
+        # order, with only the remaining amount sent to the crypto gateway.
+        release_main_checkout(user_id, reservation_id)
+        quote = reserve_main_checkout(
+            user_id,
+            reservation_id,
+            original_price,
+            payment_method='account_credit',
+            payment_discount_percent=0,
+            renewal_discount_percent=renewal_discount_percent,
+            discount_cap_percent=discount_cap_percent,
+            payments=payments,
+            allow_invite_discount=allow_invite_discount,
+            allow_account_credit=allow_account_credit,
+        )
+    quote['fully_credit_funded'] = bool(
+        float(quote.get('price', 0) or 0) <= 0
+        and float(quote.get('account_credit_reserved', 0) or 0) > 0
+    )
+    quote['incentive_reservation_id'] = str(reservation_id)
+    return quote

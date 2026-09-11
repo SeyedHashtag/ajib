@@ -87,17 +87,8 @@ def _customer_cycle(user_id, username, server_id):
 
 
 def _user_config_patterns(user_id):
-    return (
-        (
-            re.compile(rf"^s{user_id}[a-z]*$", re.IGNORECASE),
-            re.compile(rf"^{user_id}t"),
-            re.compile(rf"^sell{user_id}t"),
-        ),
-        (
-            re.compile(rf"^t{user_id}[a-z]*$", re.IGNORECASE),
-            re.compile(rf"^test{user_id}t"),
-        ),
-    )
+    from utils.account_access import user_config_patterns
+    return user_config_patterns(user_id)
 
 
 def _username_belongs_to_user(username, user_id):

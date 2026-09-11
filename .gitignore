@@ -1,5 +1,11 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+.venv-web/
+web/node_modules/
+web/test-results/
+web/playwright-report/
+web/*.tsbuildinfo
+.web-local/
 *.py[cod]
 *$py.class
 

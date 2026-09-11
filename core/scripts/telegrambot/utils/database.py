@@ -535,6 +535,29 @@ def _configure_connection(connection: sqlite3.Connection) -> None:
 
 def _ensure_permissions(path: str) -> None:
     parent = os.path.dirname(path) or "."
+    shared_group = os.getenv("AJIB_DB_SHARED_GROUP")
+    if shared_group and os.name == "posix" and os.path.abspath(path) == database_path():
+        # Opt-in only for a dedicated state directory, never the code/.env tree.
+        if not os.getenv("AJIB_DB_PATH") or os.path.realpath(parent) == os.path.realpath(bot_dir()):
+            raise RuntimeError("Shared database access requires AJIB_DB_PATH in a dedicated state directory")
+        import grp
+        import stat
+        group_id = grp.getgrnam(shared_group).gr_gid
+        os.makedirs(parent, mode=0o2770, exist_ok=True)
+        for target, mode in ((parent, 0o2770), (path, 0o660)):
+            if not os.path.exists(target):
+                continue
+            if os.path.islink(target):
+                raise RuntimeError("Shared database paths must not be symbolic links")
+            current = os.stat(target)
+            if current.st_uid in {os.geteuid()} or os.geteuid() == 0:
+                if current.st_gid != group_id:
+                    os.chown(target, -1, group_id)
+                os.chmod(target, mode)
+            current = os.stat(target)
+            if current.st_gid != group_id or stat.S_IMODE(current.st_mode) != mode:
+                raise PermissionError("The CLI operator must prepare shared database permissions")
+        return
     os.makedirs(parent, mode=0o700, exist_ok=True)
     try:
         os.chmod(parent, 0o700)

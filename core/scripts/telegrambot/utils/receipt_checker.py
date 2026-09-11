@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from utils.time_utils import format_utc_timestamp, parse_utc_timestamp, utc_now
 
 
-TELEGRAM_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
+TELEGRAM_ENV_PATH = os.path.abspath(os.getenv('AJIB_ENV_FILE') or os.path.join(os.path.dirname(__file__), '..', '.env'))
 CHECKER_SETTLEMENTS_FILE = '/etc/ajib/core/scripts/telegrambot/checker_settlements.json'
 
 RECEIPT_TYPE_REGULAR = 'regular'

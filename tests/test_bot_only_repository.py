@@ -1,4 +1,5 @@
 import unittest
+import os
 from pathlib import Path
 
 
@@ -26,7 +27,15 @@ class BotOnlyRepositoryTests(unittest.TestCase):
             "127.0.0.1:25413",
         )
 
-        for path in ROOT.rglob("*"):
+        # Inspect maintained runtime sources, excluding local snapshots/dependencies.
+        paths = []
+        for parent, directories, files in os.walk(ROOT):
+            directories[:] = [name for name in directories if name not in {
+                '.git', '.venv', '.venv-web', '.web-local', 'node_modules',
+                'logs_and_backups', '__pycache__', 'dist', 'tests', 'tests_web',
+            }]
+            paths.extend(Path(parent) / name for name in files)
+        for path in paths:
             if not path.is_file() or ".git" in path.parts or "tests" in path.parts:
                 continue
             if path.name == "changelog" or "__pycache__" in path.parts:

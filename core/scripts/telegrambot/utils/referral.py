@@ -6,11 +6,24 @@ import string
 import uuid
 import math
 from copy import deepcopy
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from utils.time_utils import format_utc_timestamp
 
 REFERRALS_FILE = '/etc/ajib/core/scripts/telegrambot/referrals.json'
 referral_lock = threading.RLock()
+
+
+def _storage_guard():
+    # SQLite serializes mutations itself. Taking a Python lock before BEGIN
+    # deadlocks with callers that already hold a transaction (checkout/rewards).
+    if (__package__ or "").startswith("utils"):
+        try:
+            from utils.state_store import is_managed_path
+            if is_managed_path(REFERRALS_FILE):
+                return nullcontext()
+        except ImportError:
+            pass
+    return referral_lock
 
 
 def _atomic_helpers():
@@ -115,7 +128,7 @@ def _safe_int(value, default=0):
         return int(default)
 
 def load_referrals():
-    with referral_lock:
+    with _storage_guard():
         try:
             helpers = _atomic_helpers()
             if helpers:
@@ -132,7 +145,7 @@ def load_referrals():
         return _default_referrals_data()
 
 def save_referrals(data):
-    with referral_lock:
+    with _storage_guard():
         helpers = _atomic_helpers()
         if helpers:
             with helpers[0](REFERRALS_FILE, _default_referrals_data()) as stored:
@@ -148,7 +161,7 @@ def save_referrals(data):
 
 @contextmanager
 def _edit_referrals():
-    with referral_lock:
+    with _storage_guard():
         helpers = _atomic_helpers()
         if helpers:
             with helpers[0](REFERRALS_FILE, _default_referrals_data()) as data:

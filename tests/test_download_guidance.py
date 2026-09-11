@@ -97,7 +97,7 @@ def _load_guidance_module():
         sys.modules["telebot"] = telebot_stub
 
         utils_stub = types.ModuleType("utils")
-        utils_stub.__path__ = []
+        utils_stub.__path__ = [str(BOT_DIR / "utils")]
         sys.modules["utils"] = utils_stub
 
         translations_stub = types.ModuleType("utils.translations")

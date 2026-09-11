@@ -36,7 +36,7 @@ from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 
 
-TELEGRAM_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
+TELEGRAM_ENV_PATH = os.path.abspath(os.getenv('AJIB_ENV_FILE') or os.path.join(os.path.dirname(__file__), '..', '.env'))
 _HTTP_POOL_CONNECTIONS = 8
 _HTTP_POOL_MAXSIZE = 16
 GIB = 1024 ** 3

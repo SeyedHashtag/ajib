@@ -150,6 +150,9 @@ def claim_payment_for_processing(payment_id, allowed_statuses=None):
             if not payment:
                 return False
 
+            if payment.get('fulfillment_owner') == 'web':
+                return False
+
             current_status = str(payment.get('status', ''))
             if current_status not in allowed_statuses:
                 return False

@@ -1,0 +1,1778 @@
+[
+  {
+    "source": "core/cli.py",
+    "line": 289,
+    "function": "cli",
+    "entrypoints": [
+      "click.group(context_settings={'help_option_names': ['-h', '--help']})"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 297,
+    "function": "setup_command",
+    "entrypoints": [
+      "cli.command('setup')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 321,
+    "function": "status_command",
+    "entrypoints": [
+      "cli.command('status')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 342,
+    "function": "doctor_command",
+    "entrypoints": [
+      "cli.command('doctor')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 360,
+    "function": "logs_command",
+    "entrypoints": [
+      "cli.command('logs')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 380,
+    "function": "restart_command",
+    "entrypoints": [
+      "cli.command('restart')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 386,
+    "function": "stop_command",
+    "entrypoints": [
+      "cli.command('stop')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 392,
+    "function": "rollback_config_command",
+    "entrypoints": [
+      "cli.command('rollback-config')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 404,
+    "function": "server_group",
+    "entrypoints": [
+      "click.group('server')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 427,
+    "function": "server_list",
+    "entrypoints": [
+      "server_group.command('list')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 447,
+    "function": "server_show",
+    "entrypoints": [
+      "server_group.command('show')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 480,
+    "function": "server_test",
+    "entrypoints": [
+      "server_group.command('test')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 517,
+    "function": "server_add",
+    "entrypoints": [
+      "server_group.command('add')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 539,
+    "function": "server_edit",
+    "entrypoints": [
+      "server_group.command('edit')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 576,
+    "function": "server_enable",
+    "entrypoints": [
+      "server_group.command('enable')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 584,
+    "function": "server_disable",
+    "entrypoints": [
+      "server_group.command('disable')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 593,
+    "function": "server_weight",
+    "entrypoints": [
+      "server_group.command('weight')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 604,
+    "function": "server_remove",
+    "entrypoints": [
+      "server_group.command('remove')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 662,
+    "function": "server_migrate",
+    "entrypoints": [
+      "server_group.command('migrate')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 703,
+    "function": "migration_group",
+    "entrypoints": [
+      "click.group('migration')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 720,
+    "function": "migration_status",
+    "entrypoints": [
+      "migration_group.command('status')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 736,
+    "function": "migration_cancel",
+    "entrypoints": [
+      "migration_group.command('cancel')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 747,
+    "function": "migration_resume",
+    "entrypoints": [
+      "migration_group.command('resume')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 759,
+    "function": "migration_export",
+    "entrypoints": [
+      "migration_group.command('export')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 774,
+    "function": "server_manage",
+    "entrypoints": [
+      "server_group.command('manage')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 885,
+    "function": "backup_command",
+    "entrypoints": [
+      "cli.command('backup')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 896,
+    "function": "restore_command",
+    "entrypoints": [
+      "cli.command('restore')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 921,
+    "function": "version_command",
+    "entrypoints": [
+      "cli.command('version')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 934,
+    "function": "upgrade_command",
+    "entrypoints": [
+      "cli.command('upgrade')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 949,
+    "function": "uninstall_command",
+    "entrypoints": [
+      "cli.command('uninstall')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 971,
+    "function": "server_info",
+    "entrypoints": [
+      "cli.command('server-info')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 985,
+    "function": "backup_ajib_legacy",
+    "entrypoints": [
+      "cli.command('backup-ajib')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 996,
+    "function": "restore_ajib_legacy",
+    "entrypoints": [
+      "cli.command('restore-ajib')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 1006,
+    "function": "show_version_legacy",
+    "entrypoints": [
+      "cli.command('show-version')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 1016,
+    "function": "check_version_legacy",
+    "entrypoints": [
+      "cli.command('check-version')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 1026,
+    "function": "services_status_legacy",
+    "entrypoints": [
+      "cli.command('get-services-status')"
+    ]
+  },
+  {
+    "source": "core/cli.py",
+    "line": 1042,
+    "function": "telegram_legacy",
+    "entrypoints": [
+      "cli.command('telegram')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 2314,
+    "function": "start",
+    "entrypoints": [
+      "bot.message_handler(commands=['start'])"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 2341,
+    "function": "plans",
+    "entrypoints": [
+      "bot.message_handler(func=lambda m: m.text in _all_button_values('purchase_plan'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 2350,
+    "function": "plans_back",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data == 'hb:plans')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 2361,
+    "function": "plans_all",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data == 'hb:plans:all')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 2372,
+    "function": "buy",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:buy:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 2379,
+    "function": "payment_method",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:pay:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 2646,
+    "function": "cancel_card_payment",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:cancel:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 2668,
+    "function": "receipt_photo",
+    "entrypoints": [
+      "bot.message_handler(content_types=['photo'])"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 2726,
+    "function": "owner_receipt",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith(('hb:approve:', 'hb:reject:')))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 2763,
+    "function": "check_crypto",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:check:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 2837,
+    "function": "my_configs",
+    "entrypoints": [
+      "bot.message_handler(func=lambda m: m.text in _all_button_values('my_configs'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 2888,
+    "function": "configs_callback",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data == 'hb:configs')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 2894,
+    "function": "config_detail",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:cfg:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 2967,
+    "function": "renew",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:renew:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3003,
+    "function": "renew_config_direct",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:renewcfg:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3050,
+    "function": "support",
+    "entrypoints": [
+      "bot.message_handler(func=lambda m: m.text in _all_button_values('support'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3055,
+    "function": "support_callback",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data == 'hb:support')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3061,
+    "function": "language",
+    "entrypoints": [
+      "bot.message_handler(func=lambda m: m.text in _all_button_values('language'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3070,
+    "function": "language_set",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:lang:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3083,
+    "function": "downloads",
+    "entrypoints": [
+      "bot.message_handler(func=lambda m: m.text in _all_button_values('downloads'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3094,
+    "function": "download_selection",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:download:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3114,
+    "function": "free_test",
+    "entrypoints": [
+      "bot.message_handler(func=lambda m: m.text in _all_button_values('test_config'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3217,
+    "function": "test_action",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:test:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3274,
+    "function": "referral",
+    "entrypoints": [
+      "bot.message_handler(func=lambda m: m.text in _all_button_values('referral') or m.text in _all_hosted_values('invite_and_earn_button'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3318,
+    "function": "referral_action",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data in {'hb:refwallet', 'hb:refwithdraw'})"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3364,
+    "function": "referral_wallet_input",
+    "entrypoints": [
+      "bot.message_handler(func=lambda m: (_get_input_state(m.from_user.id) or {}).get('kind') == 'referral_wallet')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3377,
+    "function": "referral_resolve",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:refresolve:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3892,
+    "function": "owner_panel",
+    "entrypoints": [
+      "bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and m.text in {catalog['owner_panel'] for catalog in HOSTED_TRANSLATIONS.values()})"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3930,
+    "function": "owner_setting",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:setting:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3943,
+    "function": "owner_menu_action",
+    "entrypoints": [
+      "bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and _owner_menu_command(m.text) is not None)"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 3966,
+    "function": "owner_setting_input",
+    "entrypoints": [
+      "bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and (_get_input_state(OWNER_ID) or {}).get('kind') == 'owner_setting')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 4276,
+    "function": "owner_setup_action",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:setup:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 4290,
+    "function": "owner_payment_action",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:payment:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 4315,
+    "function": "owner_messages_action",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:messages:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 4350,
+    "function": "owner_action",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:owner:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 4367,
+    "function": "owner_generate_plan",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:ogen:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 4389,
+    "function": "owner_generate_input",
+    "entrypoints": [
+      "bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and (_get_input_state(OWNER_ID) or {}).get('kind') == 'owner_generate')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 4447,
+    "function": "plan_toggle",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:plantoggle:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 4472,
+    "function": "plan_recommend",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:planrecommend:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 4506,
+    "function": "owner_plans_done",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data == 'hb:plansdone')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 4522,
+    "function": "earnings_action",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:earn:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 4548,
+    "function": "earnings_destination",
+    "entrypoints": [
+      "bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and (_get_input_state(OWNER_ID) or {}).get('kind') == 'earnings_destination')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 4815,
+    "function": "hosted_renewal_review",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda c: c.data.startswith('hb:rr:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/hosted_worker.py",
+    "line": 5384,
+    "function": "owner_credit_customer_controls",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('hb:ownercustomers:') or call.data == 'hb:credithelp')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/tbot.py",
+    "line": 25,
+    "function": "send_welcome",
+    "entrypoints": [
+      "bot.message_handler(commands=['start'])"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/tbot.py",
+    "line": 105,
+    "function": "handle_admin_menu_navigation",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and resolve_admin_menu_view(message.text) is not None)"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/tbot.py",
+    "line": 128,
+    "function": "handle_welcome_plans",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'welcome:plans')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/tbot.py",
+    "line": 134,
+    "function": "handle_welcome_configs",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'welcome:configs')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/tbot.py",
+    "line": 145,
+    "function": "handle_admin_cancel_fallback",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == '❌ Cancel')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/tbot.py",
+    "line": 160,
+    "function": "show_admin_growth_funnel",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == GROWTH_FUNNEL_BUTTON_TEXT)"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/adduser.py",
+    "line": 43,
+    "function": "add_user",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('add_user'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/adduser.py",
+    "line": 116,
+    "function": "process_add_user_step4",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('unlimited_user_choice:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/backup.py",
+    "line": 71,
+    "function": "backup_bot",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('backup_bot'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/bot_logs.py",
+    "line": 65,
+    "function": "send_bot_logs",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == BOT_LOGS_BUTTON_TEXT)"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/broadcast.py",
+    "line": 420,
+    "function": "start_broadcast",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('broadcast_message'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/bulk_transfer_handlers.py",
+    "line": 107,
+    "function": "show_bulk_transfer",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('bulk_transfer'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/bulk_transfer_handlers.py",
+    "line": 385,
+    "function": "handle_bulk_transfer_callback",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: str(call.data or '').startswith('bulk:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/cpu.py",
+    "line": 50,
+    "function": "check_system",
+    "entrypoints": [
+      "bot.message_handler(commands=['system'])"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/deleteuser.py",
+    "line": 14,
+    "function": "handle_cancel_delete",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'cancel_delete')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/deleteuser.py",
+    "line": 20,
+    "function": "delete_user",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('delete_user'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/downloads.py",
+    "line": 11,
+    "function": "downloads",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: any((message.text == translations['downloads'] for translations in BUTTON_TRANSLATIONS.values())))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/downloads.py",
+    "line": 22,
+    "function": "handle_download_selection",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('download:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edit_plans.py",
+    "line": 67,
+    "function": "edit_plans",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('edit_plans'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edit_plans.py",
+    "line": 73,
+    "function": "handle_add_plan",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'add_plan')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edit_plans.py",
+    "line": 85,
+    "function": "handle_plan_select",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('select_plan:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edit_plans.py",
+    "line": 148,
+    "function": "handle_recommend_customer_plan",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('recommend_customer_plan:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edit_plans.py",
+    "line": 178,
+    "function": "handle_edit_plan",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('edit_plan:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edit_plans.py",
+    "line": 217,
+    "function": "handle_edit_field",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('edit_field:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edit_plans.py",
+    "line": 322,
+    "function": "handle_update_target",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('update_target:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edit_plans.py",
+    "line": 359,
+    "function": "handle_confirm_delete_plan",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('confirm_delete_plan:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edit_plans.py",
+    "line": 382,
+    "function": "handle_plan_delete",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('delete_plan:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edit_plans.py",
+    "line": 414,
+    "function": "handle_plan_navigation",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'admin_back_to_plans')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edit_plans.py",
+    "line": 487,
+    "function": "process_unlimited_choice",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('unlimited_choice:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edit_plans.py",
+    "line": 516,
+    "function": "process_newplan_target",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('newplan_target:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edit_support.py",
+    "line": 34,
+    "function": "edit_support",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('edit_support'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edit_support.py",
+    "line": 63,
+    "function": "show_support",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: any((message.text == translations['support'] for translations in BUTTON_TRANSLATIONS.values())))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edituser.py",
+    "line": 133,
+    "function": "handle_cancel_show_user",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'cancel_show_user')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edituser.py",
+    "line": 140,
+    "function": "show_user",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('show_user'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edituser.py",
+    "line": 177,
+    "function": "handle_show_user_ref",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('show_user_ref:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edituser.py",
+    "line": 289,
+    "function": "handle_edit_callback",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: any((call.data.startswith(prefix) for prefix in EDIT_ACTIONS)))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edituser.py",
+    "line": 332,
+    "function": "handle_block_confirmation",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('confirm_block:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edituser.py",
+    "line": 400,
+    "function": "handle_copy_user",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('copy_user:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edituser.py",
+    "line": 427,
+    "function": "handle_copy_destination",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('copy_dest:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edituser.py",
+    "line": 465,
+    "function": "handle_copy_inbound_toggle",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('copy_in:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edituser.py",
+    "line": 484,
+    "function": "handle_copy_inbound_done",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('copy_in_done:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edituser.py",
+    "line": 513,
+    "function": "handle_copy_cancel",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'copy_cancel')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/edituser.py",
+    "line": 539,
+    "function": "handle_copy_confirm",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('copy_confirm:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/expired_cleanup.py",
+    "line": 3659,
+    "function": "admin_expired_cleanup_menu",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('expired_cleanup'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/expired_cleanup.py",
+    "line": 3670,
+    "function": "handle_admin_expired_cleanup",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith(('admin_expired_cleanup:', 'aec:')))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/expired_cleanup.py",
+    "line": 3729,
+    "function": "send_deleted_expired_users_json",
+    "entrypoints": [
+      "bot.message_handler(commands=['deleted_expired_users', 'deleted_expired_users_json'])"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/hosted_bot_handlers.py",
+    "line": 102,
+    "function": "hosted_menu",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'hosted:menu')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/hosted_bot_handlers.py",
+    "line": 114,
+    "function": "hosted_refresh",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'hosted:refresh')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/hosted_bot_handlers.py",
+    "line": 120,
+    "function": "hosted_token_prompt",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'hosted:token')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/hosted_bot_handlers.py",
+    "line": 133,
+    "function": "hosted_token_input",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: message.from_user.id in TOKEN_INPUT)"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/hosted_bot_handlers.py",
+    "line": 188,
+    "function": "hosted_disconnect",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'hosted:disconnect')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/hosted_bot_handlers.py",
+    "line": 218,
+    "function": "hosted_disconnect_resolution",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('hosted:disconnect:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/hosted_bot_handlers.py",
+    "line": 247,
+    "function": "hosted_admin",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('hosted_bots'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/hosted_bot_handlers.py",
+    "line": 264,
+    "function": "hosted_admin_callback",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('hosted_admin:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/language.py",
+    "line": 101,
+    "function": "language_selection",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: any((message.text == translations['language'] for translations in BUTTON_TRANSLATIONS.values())))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/language.py",
+    "line": 110,
+    "function": "handle_language_selection",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('lang:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/my_configs.py",
+    "line": 214,
+    "function": "my_configs",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: any((message.text == translations['my_configs'] for translations in BUTTON_TRANSLATIONS.values())))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/my_configs.py",
+    "line": 322,
+    "function": "handle_show_config",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('show_config:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/payment_setup.py",
+    "line": 46,
+    "function": "payment_settings",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('payment_settings'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/payment_setup.py",
+    "line": 286,
+    "function": "handle_receipt_checker_type_selection",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('checker_types:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/payment_setup.py",
+    "line": 496,
+    "function": "handle_my_checker_stats",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'checker_stats:my')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/payment_setup.py",
+    "line": 510,
+    "function": "handle_checker_settlement_callback",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('checker_settlement:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/payment_setup.py",
+    "line": 647,
+    "function": "process_checker_settlement_amount",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and CHECKER_SETTLEMENT_INPUT_STATE.get(message.from_user.id, {}).get('state') == 'waiting_open_account_amount')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/payment_setup.py",
+    "line": 791,
+    "function": "handle_card_to_card_mode_selection",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('c2c_mode:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 1928,
+    "function": "purchase_plan",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: any((message.text == get_button_text(get_user_language(message.from_user.id), 'purchase_plan') for lang in BUTTON_TRANSLATIONS)))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 1932,
+    "function": "back_to_plans",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'back_to_plans')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 1941,
+    "function": "handle_show_all_plans",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'show_all_plans')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 1953,
+    "function": "handle_purchase_selection",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('purchase:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 2059,
+    "function": "handle_purchase_support",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'purchase_support')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 2075,
+    "function": "handle_cancel_purchase",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'cancel_purchase')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 2252,
+    "function": "handle_customer_renewal_start",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('renew_plan:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 2287,
+    "function": "handle_customer_renewal_plan_choice",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('renew_plan_choice:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 2316,
+    "function": "handle_customer_renewal_payment_method",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('renew_payment_method:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 2570,
+    "function": "handle_payment_method_selection",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('payment_method:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 2988,
+    "function": "handle_photo",
+    "entrypoints": [
+      "bot.message_handler(content_types=['photo'])"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 2998,
+    "function": "handle_text_while_waiting",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: message.from_user.id in user_data and user_data[message.from_user.id]['state'] == 'waiting_receipt')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 3139,
+    "function": "show_pending_confirmations",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: message.text == admin_action_text('confirmations') and _is_confirmation_viewer(message.from_user.id))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 3473,
+    "function": "handle_admin_approval",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('admin_approval:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 3738,
+    "function": "handle_check_payment",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('check_payment:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/purchase_plan.py",
+    "line": 4280,
+    "function": "handle_reserved_renewal_review",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('rr:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/referral_handlers.py",
+    "line": 117,
+    "function": "referral_menu",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: any((message.text == get_button_text(get_user_language(message.from_user.id), 'referral') for lang in BUTTON_TRANSLATIONS)))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/referral_handlers.py",
+    "line": 198,
+    "function": "handle_recruitment_reward_claim",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('recruit_reward:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/referral_handlers.py",
+    "line": 333,
+    "function": "admin_referral_payouts_menu",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('referral_payouts'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/referral_handlers.py",
+    "line": 338,
+    "function": "handle_admin_referral_payouts",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('admin_referral:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/referral_handlers.py",
+    "line": 401,
+    "function": "handle_set_wallet",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'ref_set_wallet')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/referral_handlers.py",
+    "line": 426,
+    "function": "handle_withdraw",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'ref_withdraw')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/referral_handlers.py",
+    "line": 460,
+    "function": "handle_withdraw_cancel",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'ref_withdraw_cancel')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/referral_handlers.py",
+    "line": 466,
+    "function": "handle_withdraw_confirm",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'ref_withdraw_confirm')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/referral_handlers.py",
+    "line": 540,
+    "function": "handle_admin_mark_paid",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('admin_pay_ref:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_block_ui.py",
+    "line": 84,
+    "function": "block_callback",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('rb:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 608,
+    "function": "reseller_panel",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: any((message.text == get_button_text(get_user_language(message.from_user.id), 'reseller_panel') for lang in BUTTON_TRANSLATIONS)))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 664,
+    "function": "handle_reseller_eligible_plans",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'reseller:eligible_plans')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 745,
+    "function": "handle_reseller_request",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'reseller:request')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 790,
+    "function": "handle_admin_reseller",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('admin_reseller:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 860,
+    "function": "handle_reseller_generate",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'reseller:generate')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 903,
+    "function": "handle_reseller_buy",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('reseller:buy:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 963,
+    "function": "handle_reseller_purchase_details",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('reseller:details:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 1004,
+    "function": "handle_reseller_confirm_buy",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('reseller:confirm_buy:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 1246,
+    "function": "handle_reseller_username_input",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: message.from_user.id in user_data and user_data[message.from_user.id].get('state') == 'waiting_reseller_username')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 1287,
+    "function": "handle_reseller_debt",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'reseller:debt')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 1315,
+    "function": "handle_reseller_wholesale_balance",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'reseller:wholesale')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 1358,
+    "function": "handle_reseller_wholesale_fund",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('reseller:wholesale_fund:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 1402,
+    "function": "handle_reseller_wholesale_payment",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('reseller:wholesale_pay:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 1512,
+    "function": "handle_reseller_settle",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('reseller:settle:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 1560,
+    "function": "handle_reseller_payment",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('reseller:pay:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 1760,
+    "function": "handle_reseller_cancel",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'reseller:cancel')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 1767,
+    "function": "handle_reseller_stats",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'reseller:stats')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 1814,
+    "function": "handle_reseller_levels",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'reseller:levels')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 2352,
+    "function": "handle_reseller_my_customers",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith(('reseller:my_customers:', 'reseller:my_customers_refresh:')))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 2396,
+    "function": "handle_reseller_customers_noop",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'reseller:my_customers_noop')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 2424,
+    "function": "handle_reseller_customer_config",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith(('reseller:cfg:', 'reseller:cfg_index:')))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 3021,
+    "function": "handle_reseller_renewal_start",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('reseller:renew:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 3098,
+    "function": "handle_reseller_renewal_plan_choice",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('reseller:renew_plan:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 3490,
+    "function": "handle_reseller_renewal_confirm",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith(('reseller:renew_confirm:', 'reseller:rc2:')))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 4422,
+    "function": "handle_admin_manual_payment_input",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: message.from_user.id in ADMIN_RESELLER_DEBT_INPUT_STATE and ADMIN_RESELLER_DEBT_INPUT_STATE[message.from_user.id].get('state') == 'waiting_manual_payment')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 4464,
+    "function": "handle_admin_custom_debt_input",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: message.from_user.id in ADMIN_RESELLER_DEBT_INPUT_STATE and ADMIN_RESELLER_DEBT_INPUT_STATE[message.from_user.id].get('state') == 'waiting_custom_debt')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 4530,
+    "function": "admin_manage_resellers",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and (message.text == admin_action_text('manage_resellers') or message.text in {translations.get('manage_resellers') for translations in BUTTON_TRANSLATIONS.values() if translations.get('manage_resellers')}))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 4548,
+    "function": "handle_admin_credit_restore_reason",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: message.from_user.id in ADMIN_CREDIT_RESTORE_STATE and ADMIN_CREDIT_RESTORE_STATE[message.from_user.id].get('state') == 'reason')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 4579,
+    "function": "handle_admin_reseller_ui",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('admin_reseller_ui:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/reseller_handlers.py",
+    "line": 5092,
+    "function": "handle_reseller_credit_help",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'reseller:credit_help')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/serverinfo.py",
+    "line": 271,
+    "function": "server_info",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('server_info'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/serverinfo.py",
+    "line": 277,
+    "function": "handle_server_info_callback",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('server_info:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/test_config.py",
+    "line": 550,
+    "function": "test_config",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: any((message.text == translations['test_config'] for translations in BUTTON_TRANSLATIONS.values())))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/test_config.py",
+    "line": 604,
+    "function": "handle_cancel_test_config",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'cancel_test_config')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/test_config.py",
+    "line": 653,
+    "function": "handle_confirm_test_config",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data in {'confirm_test_config', 'start_free_test'})"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/test_config.py",
+    "line": 780,
+    "function": "handle_trial_connected",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'trial_connected')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/test_config.py",
+    "line": 812,
+    "function": "handle_trial_need_help",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'trial_need_help')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/test_config.py",
+    "line": 824,
+    "function": "handle_trial_see_plans",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'trial_see_plans')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/test_config.py",
+    "line": 1155,
+    "function": "reset_test_accounts_menu",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('manage_test_accounts'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/test_config.py",
+    "line": 1166,
+    "function": "handle_toggle_test_creation",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('toggle_test_creation:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/test_config.py",
+    "line": 1195,
+    "function": "handle_manage_waiting",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data == 'manage_waiting')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/test_config.py",
+    "line": 1211,
+    "function": "handle_waiting_action",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('waiting_action:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/test_config.py",
+    "line": 1260,
+    "function": "handle_waiting_prompt",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('waiting_prompt:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/test_config.py",
+    "line": 1281,
+    "function": "handle_waiting_chunk",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('waiting_chunk:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/test_config.py",
+    "line": 1432,
+    "function": "handle_reset_test_selection",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('reset_test:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/test_config.py",
+    "line": 1467,
+    "function": "handle_reset_test_confirm",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('reset_test_confirm:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/update_keyboards.py",
+    "line": 9,
+    "function": "handle_update_keyboards",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: message.text == admin_action_text('update_keyboards') and is_admin(message.from_user.id))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/vpn_servers.py",
+    "line": 180,
+    "function": "show_vpn_servers",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('vpn_servers'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/vpn_servers.py",
+    "line": 185,
+    "function": "handle_vpn_server_callback",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('vpn_server:'))"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/vpn_servers.py",
+    "line": 232,
+    "function": "handle_server_weight_input",
+    "entrypoints": [
+      "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and server_admin_state.get(message.from_user.id, {}).get('state') == 'waiting_server_weight')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/web_auth.py",
+    "line": 139,
+    "function": "confirm",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith('webauth:'))"
+    ]
+  }
+]

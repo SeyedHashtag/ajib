@@ -2314,6 +2314,10 @@ def _send_onboarding(chat_id, user_id, reply_to=None):
 def start(message):
     parts = (message.text or "").split(maxsplit=1)
     start_payload = parts[1].strip() if len(parts) == 2 else ""
+    if start_payload.startswith("web_"):
+        from utils.web_auth import handle_login_start
+        if handle_login_start(bot, message, f"hosted:{OWNER_ID}"):
+            return
     if start_payload == "owner_setup" and message.from_user.id == OWNER_ID:
         _show_owner_dashboard(message.chat.id, reply_to=message)
         return
@@ -5457,4 +5461,6 @@ def run():
 
 
 if __name__ == "__main__":
+    from utils.web_auth import register_login_callback
+    register_login_callback(bot, f"hosted:{OWNER_ID}")
     run()

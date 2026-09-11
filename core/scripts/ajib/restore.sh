@@ -4,6 +4,7 @@ set -euo pipefail
 
 INSTALL_DIR=${AJIB_INSTALL_DIR:-/etc/ajib}
 BOT_DIR="$INSTALL_DIR/core/scripts/telegrambot"
+LIVE_DATABASE=${AJIB_DB_PATH:-"$BOT_DIR/ajib.db"}
 BACKUP_DIR=${AJIB_BACKUP_DIR:-/opt/ajib-backups}
 BACKUP_FILE=${1:-}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -12,6 +13,8 @@ BACKUP_SCRIPT="$SCRIPT_DIR/backup.sh"
 PYTHON_BIN=${AJIB_PYTHON_BIN:-python3}
 RESTORE_DIR=$(mktemp -d)
 was_active=false
+web_api_active=false
+web_worker_active=false
 restore_succeeded=false
 state_changed=false
 safety_backup=
@@ -35,11 +38,12 @@ install_prepared_state() {
         fi
     done
 
-    database_temp="$BOT_DIR/ajib.db.restore.$$"
+    mkdir -p -- "$(dirname -- "$LIVE_DATABASE")"
+    database_temp="$LIVE_DATABASE.restore.$$"
     cp -p "$source_database" "$database_temp"
     chmod 600 "$database_temp"
-    rm -f "$BOT_DIR/ajib.db-wal" "$BOT_DIR/ajib.db-shm"
-    mv -f "$database_temp" "$BOT_DIR/ajib.db"
+    rm -f "$LIVE_DATABASE-wal" "$LIVE_DATABASE-shm"
+    mv -f "$database_temp" "$LIVE_DATABASE"
 
     # Mutable JSON is represented by SQLite. Images are restored as an exact
     # snapshot, while application logs and reports remain untouched.
@@ -65,8 +69,24 @@ install_prepared_state() {
         cp -a "$source_bot_dir/hosted_bots/." "$BOT_DIR/hosted_bots/"
     fi
 
-    chmod 700 "$BOT_DIR"
-    chmod 600 "$BOT_DIR/ajib.db"
+    if [ -n "${AJIB_DB_SHARED_GROUP:-}" ]; then
+        chgrp "$AJIB_DB_SHARED_GROUP" "$BOT_DIR"
+        chmod 750 "$BOT_DIR"
+        for name in plans.json support_info.json; do
+            if [ -f "$BOT_DIR/$name" ]; then
+                chgrp "$AJIB_DB_SHARED_GROUP" "$BOT_DIR/$name"
+                chmod 640 "$BOT_DIR/$name"
+            fi
+        done
+    else
+        chmod 700 "$BOT_DIR"
+    fi
+    chmod 600 "$LIVE_DATABASE"
+    if [ -n "${AJIB_DB_SHARED_GROUP:-}" ]; then
+        chgrp "$AJIB_DB_SHARED_GROUP" "$(dirname -- "$LIVE_DATABASE")" "$LIVE_DATABASE"
+        chmod 2770 "$(dirname -- "$LIVE_DATABASE")"
+        chmod 660 "$LIVE_DATABASE"
+    fi
     chmod 600 "$BOT_DIR/.env" 2>/dev/null || true
     if [ -d "$BOT_DIR/hosted_bots" ]; then
         find "$BOT_DIR/hosted_bots" -type d -exec chmod 700 {} +
@@ -94,6 +114,12 @@ cleanup() {
     if [ "$restore_succeeded" != true ] && [ "$was_active" = true ]; then
         systemctl start ajib-telegram-bot.service >/dev/null 2>&1 || true
     fi
+    if [ "$web_api_active" = true ]; then
+        systemctl start ajib-web-api.service >/dev/null 2>&1 || true
+    fi
+    if [ "$web_worker_active" = true ]; then
+        systemctl start ajib-web-worker.service >/dev/null 2>&1 || true
+    fi
     exit "$status"
 }
 trap cleanup EXIT
@@ -103,9 +129,30 @@ if [ -z "$BACKUP_FILE" ] || [ ! -f "$BACKUP_FILE" ]; then
     exit 1
 fi
 
+case "$LIVE_DATABASE" in
+    /*) ;;
+    *) echo "AJIB_DB_PATH must be an absolute path." >&2; exit 1 ;;
+esac
+if [ -n "${AJIB_DB_SHARED_GROUP:-}" ] && \
+    [ "$(realpath -m -- "$(dirname -- "$LIVE_DATABASE")")" = "$(realpath -m -- "$BOT_DIR")" ]; then
+    echo "Shared database access requires a dedicated state directory." >&2
+    exit 1
+fi
+
 "$PYTHON_BIN" "$ARCHIVE_HELPER" prepare-restore \
     --archive "$BACKUP_FILE" \
     --staging-dir "$RESTORE_DIR" >/dev/null
+
+if [ "${AJIB_SKIP_SERVICE_RESTART:-0}" != "1" ]; then
+    if systemctl is-active --quiet ajib-web-api.service; then
+        web_api_active=true
+        systemctl stop ajib-web-api.service
+    fi
+    if systemctl is-active --quiet ajib-web-worker.service; then
+        web_worker_active=true
+        systemctl stop ajib-web-worker.service
+    fi
+fi
 
 if [ "${AJIB_SKIP_SERVICE_RESTART:-0}" != "1" ] && \
     systemctl is-active --quiet ajib-telegram-bot.service; then

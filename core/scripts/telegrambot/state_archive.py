@@ -76,7 +76,10 @@ def create_backup(
     with tempfile.TemporaryDirectory(prefix="ajib-backup-") as temp_name:
         temp = Path(temp_name)
         snapshot = temp / database.DATABASE_NAME
-        live_database = bot_dir / database.DATABASE_NAME
+        configured_database = os.getenv("AJIB_DB_PATH")
+        live_database = Path(configured_database) if configured_database else bot_dir / database.DATABASE_NAME
+        if configured_database and (not live_database.is_absolute() or not live_database.is_file()):
+            raise StateArchiveError("AJIB_DB_PATH must identify an existing absolute database file.")
         if live_database.is_file():
             database.backup_database(snapshot, live_database)
         else:

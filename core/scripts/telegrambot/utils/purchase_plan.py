@@ -176,7 +176,7 @@ def _reserve_checkout_incentives(
 ):
     """Build and reserve the auditable main-store checkout quote."""
     try:
-        from utils.purchase_incentives import release_main_checkout, reserve_main_checkout
+        from utils.purchase_incentives import reserve_order_checkout
     except ImportError:
         # Compatibility for isolated deployments/tests during a rolling update.
         original = Decimal(str(original_price)).quantize(
@@ -242,48 +242,15 @@ def _reserve_checkout_incentives(
             'fully_credit_funded': False,
         }
 
-    quote = reserve_main_checkout(
-        user_id,
-        reservation_id,
-        original_price,
-        payment_method=payment_method,
-        payment_discount_percent=(
-            CRYPTO_PAYMENT_DISCOUNT_PERCENT if payment_method == 'crypto' else 0
-        ),
+    return reserve_order_checkout(
+        user_id, reservation_id, original_price, payment_method,
         renewal_discount_percent=renewal_discount_percent,
         discount_cap_percent=discount_cap_percent,
-        payments=get_user_payments(user_id),
         allow_invite_discount=allow_invite_discount,
         allow_account_credit=allow_account_credit,
+        crypto_discount_percent=CRYPTO_PAYMENT_DISCOUNT_PERCENT,
+        payments=get_user_payments(user_id),
     )
-    if (
-        payment_method == 'crypto'
-        and float(quote.get('price', 0) or 0) <= 0
-        and float(quote.get('account_credit_reserved', 0) or 0) > 0
-        and float(quote.get('renewal_discount_percent', 0) or 0) <= 0
-    ):
-        # A crypto discount is earned only when some crypto is actually paid.
-        # Requote without that discount. Credit may still fund part of the
-        # order, with only the remaining amount sent to the crypto gateway.
-        release_main_checkout(user_id, reservation_id)
-        quote = reserve_main_checkout(
-            user_id,
-            reservation_id,
-            original_price,
-            payment_method='account_credit',
-            payment_discount_percent=0,
-            renewal_discount_percent=renewal_discount_percent,
-            discount_cap_percent=discount_cap_percent,
-            payments=get_user_payments(user_id),
-            allow_invite_discount=allow_invite_discount,
-            allow_account_credit=allow_account_credit,
-        )
-    quote['fully_credit_funded'] = bool(
-        float(quote.get('price', 0) or 0) <= 0
-        and float(quote.get('account_credit_reserved', 0) or 0) > 0
-    )
-    quote['incentive_reservation_id'] = str(reservation_id)
-    return quote
 
 
 def _release_checkout_incentives(user_id, reservation_id):
@@ -3523,6 +3490,12 @@ def handle_admin_approval(call):
         if action not in {'approve', 'reject'}:
             safe_answer_callback_query(bot, call.id, text=get_message_text(language, "error_occurred").format(error="invalid action"))
             return
+        if payment_record.get('fulfillment_owner') == 'web':
+            from utils.web_orders import Orders
+            from utils.web_services import Services
+            Orders(Services()).review(user_id, 'main', payment_id, action == 'approve', 'Reviewed in Telegram')
+            safe_answer_callback_query(bot, call.id, text='Review saved. Delivery will continue automatically.')
+            return
         if not _claim_payment_or_answer(call, language, payment_id, {'pending_approval'}):
             return
 
@@ -4492,6 +4465,8 @@ def check_pending_payments():
         payment_handler = CryptoPayment()
         
         for payment_id, record in payments.items():
+            if record.get('fulfillment_owner') == 'web':
+                continue
             if record.get('status') == 'pending':
                 # Check if payment is not too old (e.g., > 24 hours) — mark as expired
                 created_at_str = record.get('created_at')

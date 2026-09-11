@@ -2,7 +2,7 @@ import os
 
 # Hosted workers import selected infrastructure modules directly. Importing the
 # primary handler graph here would create a second bot with operator handlers.
-if os.getenv("AJIB_BOT_ROLE") in {"hosted", "supervisor"}:
+if os.getenv("AJIB_BOT_ROLE") in {"hosted", "supervisor", "api", "web-worker"}:
     __all__ = []
 else:
     from .api_client import *

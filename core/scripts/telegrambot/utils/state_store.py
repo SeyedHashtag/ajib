@@ -1374,6 +1374,9 @@ def claim_payment_for_processing(path, payment_id, allowed_statuses, timestamp):
         payload = _load(row["payload_json"])
         if not isinstance(payload, dict):
             raise ValueError(f"Payment record {payment_key!r} must be an object.")
+        # Check the durable owner under the same transaction as the claim.
+        if payload.get("fulfillment_owner") == "web":
+            return False
         update = {
             "status": "processing",
             "timestamp": timestamp,

@@ -23,6 +23,10 @@ EXPIRED_CLEANUP_INTERVAL_SECONDS = 3600
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
+    if len((message.text or "").split()) == 2 and message.text.split()[1].startswith("web_"):
+        from utils.web_auth import handle_login_start
+        if handle_login_start(bot, message):
+            return
     user_id = message.from_user.id
     admin_user = is_admin(user_id)
     language = None
@@ -347,6 +351,8 @@ def write_readiness_marker():
             pass
 
 if __name__ == '__main__':
+    from utils.web_auth import register_login_callback
+    register_login_callback(bot)
     from utils.reseller import backfill_reseller_paid_activity, backfill_reseller_debt_deadlines, backfill_reseller_credit_recovery
     backfill_reseller_paid_activity()
     backfill_reseller_debt_deadlines()

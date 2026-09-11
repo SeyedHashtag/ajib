@@ -6,7 +6,7 @@ import requests
 import os
 from dotenv import load_dotenv
 
-TELEGRAM_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
+TELEGRAM_ENV_PATH = os.path.abspath(os.getenv('AJIB_ENV_FILE') or os.path.join(os.path.dirname(__file__), '..', '.env'))
 load_dotenv(TELEGRAM_ENV_PATH)
 
 
