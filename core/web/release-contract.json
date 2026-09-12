@@ -1,0 +1,9 @@
+{
+  "format": 1,
+  "bot_schema": 6,
+  "web_schema": 1,
+  "fulfillment_contract": 1,
+  "unit_contract": 1,
+  "live_release_policy": true,
+  "customer_release_ready": false
+}

@@ -363,6 +363,37 @@ class HostedWorkerRecoveryTests(unittest.TestCase):
         self.assertIn("RuntimeError", detail)
         self.assertEqual(self.worker._tenant_payments()["payment"]["status"], "paid_provision_failed")
 
+    def test_durable_panel_operation_is_not_returned_to_payment_review(self):
+        self.worker._save_payment('payment', {'status': 'processing', 'processing_from_status': 'pending_approval'})
+        self.age_payment_claim('payment')
+        with mock.patch.object(self.worker, '_account_payment_operation', return_value={'status': 'uncertain'}):
+            self.assertIsNone(self.worker._claim_payment('payment', {'pending_approval'}))
+        self.assertEqual(self.worker._tenant_payments()['payment']['status'], 'uncertain')
+
+    def test_failed_financial_completion_keeps_panel_operation_under_investigation(self):
+        self.worker._save_payment('payment', {'status': 'processing'})
+        with (
+            mock.patch.object(self.worker, '_account_payment_operation', return_value={'status': 'succeeded'}),
+            mock.patch.object(self.worker, '_provision_payment', side_effect=RuntimeError('synthetic accounting failure')),
+        ):
+            success, _ = self.worker._provision_claimed_payment('payment', {}, False, 'pending_approval')
+        self.assertFalse(success)
+        self.assertEqual(self.worker._tenant_payments()['payment']['status'], 'uncertain')
+
+    def test_uncertain_payment_keeps_hosted_credit_and_referral_reservations(self):
+        self.worker._save_payment('payment', {'status': 'uncertain', 'user_id': 100})
+        with (
+            mock.patch.object(self.worker, 'reconcile_funding', return_value=[]) as funding,
+            mock.patch.object(self.worker, 'release_stale_credit_reservations', return_value=[]) as release,
+        ):
+            self.worker._reconcile_credit_reservations()
+        self.assertIn('payment', funding.call_args.kwargs['active_ids'])
+        self.assertIn('payment', release.call_args.args[1])
+        path = self.hosted_bots.tenant_file('7', 'referrals.json')
+        with self.worker.locked_json(path, self.worker._referral_data()) as data:
+            data['buyer_discount_reservations'] = {'100': {'order_id': 'payment'}}
+        self.assertEqual(self.worker._reconcile_invite_discount_reservations(), [])
+
     def test_invite_discount_reservation_release_and_redemption_are_idempotent(self):
         referrals_path = self.hosted_bots.tenant_file("7", "referrals.json")
         with self.worker.locked_json(referrals_path, self.worker._referral_data()) as data:

@@ -56,6 +56,12 @@ def _transaction_depths() -> dict[str, int]:
 
 
 SCHEMA_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS account_operations(
+        operation_id TEXT PRIMARY KEY,server_id TEXT NOT NULL,username TEXT NOT NULL,
+        kind TEXT NOT NULL,status TEXT NOT NULL,request_json TEXT NOT NULL,
+        result_json TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS account_operation_active
+        ON account_operations(server_id,username) WHERE status IN ('executing','uncertain')""",
     """CREATE TABLE IF NOT EXISTS reseller_order_funding (
         reseller_id TEXT NOT NULL, operation_id TEXT NOT NULL,
         status TEXT NOT NULL, debt_cents INTEGER NOT NULL,

@@ -11,6 +11,15 @@ from . import database
 
 SCHEMA = (
     "CREATE TABLE IF NOT EXISTS web_schema(version INTEGER PRIMARY KEY)",
+    """CREATE TABLE IF NOT EXISTS web_release_control(
+        id INTEGER PRIMARY KEY CHECK(id=1), access TEXT NOT NULL,
+        pilot_users_json TEXT NOT NULL,accept_writes INTEGER NOT NULL,
+        process_existing INTEGER NOT NULL,revision TEXT NOT NULL,
+        pilot_started_at INTEGER,updated_at INTEGER NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS web_release_checks(
+        revision TEXT NOT NULL,name TEXT NOT NULL,passed INTEGER NOT NULL,
+        evidence_json TEXT NOT NULL,recorded_at INTEGER NOT NULL,
+        PRIMARY KEY(revision,name))""",
     """CREATE TABLE IF NOT EXISTS web_worker_health(
         role TEXT PRIMARY KEY, heartbeat_at INTEGER NOT NULL,
         last_success_at INTEGER, last_error TEXT, writes_enabled INTEGER NOT NULL)""",

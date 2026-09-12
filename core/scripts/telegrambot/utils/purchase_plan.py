@@ -1206,7 +1206,7 @@ def _process_customer_renewal_payment(payment_id, payment_record, notify_chat_id
         bot.send_message(notify_chat_id, reserved_text, parse_mode='Markdown')
         return True
 
-    result = execute_customer_renewal(payment_record)
+    result = execute_customer_renewal({**payment_record, 'mutation_operation_id': 'main-payment:' + str(payment_id)})
     if not result.get('success'):
         lookup_result = result.get('lookup_result') or {}
         update_payment_record_fields(payment_id, {
@@ -1216,6 +1216,13 @@ def _process_customer_renewal_payment(payment_id, payment_record, notify_chat_id
             "renewal_api_http_status": lookup_result.get('http_status'),
             "renewal_api_stage": lookup_result.get('stage'),
         })
+        if result.get('uncertain'):
+            update_payment_status(payment_id, 'uncertain')
+            update_payment_record_fields(payment_id, {'renewal_attention_reason': result.get('reason'),
+                                                     'mutation_operation_id': 'main-payment:' + str(payment_id)})
+            bot.send_message(notify_chat_id, get_message_text(language, 'renewal_failed').format(
+                reason=_renewal_reason_text(language, result.get('reason'))), parse_mode='Markdown')
+            return False
         update_payment_status(payment_id, 'renewal_failed')
         _release_checkout_incentives(
             user_id,

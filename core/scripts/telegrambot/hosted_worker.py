@@ -657,6 +657,9 @@ def _claim_payment(payment_id, allowed):
                 return None
         elif current_status not in allowed_statuses:
             return None
+        if _account_payment_operation(payment_id):
+            record.update(status='uncertain', last_error='Account operation requires reconciliation', updated_at=_now())
+            return None
         record["status"] = "processing"
         record["processing_from_status"] = (
             record.get("processing_from_status") if current_status == "processing" else current_status
@@ -919,6 +922,9 @@ def _recover_stale_payment_claims():
             started_at = _parse_time(record.get("processing_started_at"))
             if started_at is not None and (utc_now() - started_at).total_seconds() < PROCESSING_LEASE_SECONDS:
                 continue
+            if _account_payment_operation(payment_id):
+                record.update(status='uncertain', last_error='Account operation requires reconciliation', updated_at=_now())
+                continue
             retry_status = record.get("processing_from_status")
             if retry_status not in {"waiting_receipt", "pending_approval", "pending", "paid_provision_failed"}:
                 retry_status = "paid_provision_failed" if record.get("gateway_payment_id") else "pending_approval"
@@ -943,7 +949,7 @@ def _reconcile_credit_reservations():
         str(payment_id)
         for payment_id, record in payments.items()
         if isinstance(record, dict) and record.get("status") in {
-            "creating", "waiting_receipt", "pending_approval", "processing"
+            "creating", "waiting_receipt", "pending_approval", "processing", "pending", "paid_provision_failed", "uncertain"
         }
     }
     for recovered in reconcile_funding(reseller_id=OWNER_ID, origin='hosted', active_ids=active):
@@ -1236,7 +1242,7 @@ def _reconcile_invite_discount_reservations():
     payments = _tenant_payments()
     active_statuses = {
         "creating", "waiting_receipt", "pending_approval", "pending", "processing",
-        "paid_provision_failed",
+        "paid_provision_failed", "uncertain",
     }
     released = []
     with locked_json(tenant_file(OWNER_ID, "referrals.json"), _referral_data()) as data:
@@ -1800,11 +1806,13 @@ def _provision_payment(payment_id, record, funded):
     if renewed:
         from utils.renewal import execute_hosted_renewal
 
-        renewal_result = execute_hosted_renewal(record, multi_api=MultiServerAPI())
+        renewal_result = execute_hosted_renewal({**record, 'mutation_operation_id': f'hosted-payment:{OWNER_ID}:{payment_id}'}, multi_api=MultiServerAPI())
         client = renewal_result.get("api_client")
         if not renewal_result.get("success") or not client:
             lookup_result = renewal_result.get("lookup_result") or {}
             _save_payment(payment_id, {
+                **({'status': 'uncertain', 'mutation_operation_id': f'hosted-payment:{OWNER_ID}:{payment_id}'}
+                   if renewal_result.get('uncertain') else {}),
                 "renewal_api_error": lookup_result.get("error"),
                 "renewal_api_http_status": lookup_result.get("http_status"),
                 "renewal_api_stage": lookup_result.get("stage"),
@@ -1933,6 +1941,13 @@ def _provision_payment(payment_id, record, funded):
     return True, username
 
 
+def _account_payment_operation(payment_id):
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from utils.account_operations import existing
+        return existing(f'hosted-payment:{OWNER_ID}:{payment_id}')
+    return None
+
+
 def _provision_claimed_payment(payment_id, record, funded, retry_status):
     try:
         success, detail = _provision_payment(payment_id, record, funded=funded)
@@ -1943,7 +1958,11 @@ def _provision_claimed_payment(payment_id, record, funded, retry_status):
             flush=True,
         )
     if not success:
-        _save_payment(payment_id, {"status": retry_status, "last_error": str(detail)[:500]})
+        current = _tenant_payments().get(payment_id) or {}
+        uncertain = current.get('status') == 'uncertain'
+        operation = _account_payment_operation(payment_id)
+        uncertain = uncertain or bool(operation and operation['status'] in {'executing', 'uncertain', 'succeeded'})
+        _save_payment(payment_id, {"status": 'uncertain' if uncertain else retry_status, "last_error": str(detail)[:500]})
     return success, detail
 
 

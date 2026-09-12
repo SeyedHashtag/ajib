@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+if [ -f /etc/ajib-web/deployment.json ]; then
+    echo "This installation shares bot/web state. Legacy uninstall is disabled; use a reviewed coordinated removal procedure." >&2
+    exit 1
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script must be run as root."
     exit 1

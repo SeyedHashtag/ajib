@@ -936,9 +936,28 @@ def version_command(check: bool) -> None:
 @click.option("--channel", type=click.Choice(["stable", "main"]), default="stable", show_default=True)
 @click.option("--version", "target_version", type=str, help="Install an explicit release tag.")
 @click.option("--yes", is_flag=True)
-def upgrade_command(channel: str, target_version: str | None, yes: bool) -> None:
+@click.option("--dry-run", is_flag=True, help="Inspect a coordinated web upgrade without changing services.")
+def upgrade_command(channel: str, target_version: str | None, yes: bool, dry_run: bool) -> None:
     """Upgrade through the transactional stable-release upgrader."""
     command = ["bash", str(operator.install_dir() / "upgrade.sh"), "--channel", channel]
+    import web_operator as web
+    if (web.CONFIG / 'deployment.json').is_file():
+        import web_upgrade
+        try:
+            if dry_run:
+                click.echo(json.dumps(web_upgrade.preview(channel, target_version), indent=2))
+                return
+            if not yes:
+                if not sys.stdin.isatty():
+                    raise click.ClickException('Preview with --dry-run, then apply with --yes.')
+                click.echo(json.dumps(web_upgrade.preview(channel, target_version), indent=2))
+                click.confirm('Back up and upgrade the bot and website together?', abort=True)
+            click.echo(json.dumps(web_upgrade.upgrade(channel, target_version), indent=2))
+            return
+        except (ValueError, OSError, subprocess.CalledProcessError) as error:
+            raise click.ClickException(str(error)) from error
+    if dry_run:
+        raise click.ClickException('--dry-run is currently supported for coordinated website upgrades.')
     if target_version:
         command.extend(["--version", target_version])
     if yes:

@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import uuid
+from contextlib import nullcontext
 from datetime import timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -1785,7 +1786,13 @@ def process_payment_renewal_reservation(
             }
 
         stage = 'execute'
-        result = execute_reserved_renewal(record, multi_api=multi_api, force=force_apply)
+        mutation_id = 'main-payment:' + str(payment_id)
+        if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+            from utils.state_store import describe_path
+            descriptor = describe_path(path)
+            if descriptor and descriptor.scope != 'main':
+                mutation_id = 'hosted-payment:' + descriptor.scope.removeprefix('hosted:') + ':' + str(payment_id)
+        result = execute_reserved_renewal({**record, 'mutation_operation_id': mutation_id}, multi_api=multi_api, force=force_apply)
         if not result.get('success'):
             reason = result.get('reason') or 'renewal_reset_failed'
             alert_flags = reservation_alert_flags(record, reason, now=current)
@@ -2050,7 +2057,7 @@ def process_reseller_renewal_reservation(
             }
 
         stage = 'execute'
-        result = execute_reserved_renewal(record, multi_api=multi_api, force=force_apply)
+        result = execute_reserved_renewal({**record, 'mutation_operation_id': f'reseller-reservation:{reseller_id}:{reservation_id}'}, multi_api=multi_api, force=force_apply)
         if not result.get('success'):
             reason = result.get('reason') or 'renewal_reset_failed'
             alert_flags = reservation_alert_flags(reservation, reason, now=current)
@@ -2195,15 +2202,46 @@ def _execute_reset(
     username, server_id, plan_record, source, multi_api=None, require_expired=True,
     validate_plan=True, business_expired=False, clear_cleanup=True,
 ):
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from utils import account_operations
+        from utils.api_client import MultiServerAPI
+        operation_id = plan_record.get('mutation_operation_id')
+        if not operation_id:
+            return {'success': False, 'reason': 'renewal_operation_identity_required'}
+        if operation_id:
+            previous = account_operations.existing(operation_id)
+            if previous:
+                previous_intent = json.loads(previous['request_json'])
+                recorded_server = previous_intent.get('recorded_server_id', previous['server_id'])
+                if (recorded_server, previous['username'], previous['kind']) != (str(server_id), str(username), 'renewal') or previous_intent.get('target') != _record_plan_snapshot(plan_record):
+                    return {'success': False, 'reason': 'renewal_operation_conflict', 'uncertain': True}
+                if previous['status'] == 'succeeded':
+                    # Complete financial persistence after a crash without another reset.
+                    result = json.loads(previous['result_json'])
+                    client, user, lookup = lookup_renewal_user(multi_api or MultiServerAPI(), username, server_id=previous['server_id'])
+                    if (not client or not user or lookup.get('status') != 'found'
+                            or not lookup.get('uniqueness_verified')
+                            or str(getattr(client, 'server_id', None)) != previous['server_id']):
+                        return {'success': False, 'reason': 'renewal_identity_unverified', 'uncertain': True}
+                    return {**result, 'api_client': client, 'reconciled': True}
+                return {'success': False, 'reason': 'renewal_requires_reconciliation', 'uncertain': True}
     from utils.reseller_blocks import renewal_block_guard
-    with renewal_block_guard(username, server_id) as allowed:
-        if not allowed:
-            return {'success': False, 'reason': 'renewal_ineligible_protected_block'}
-        return _execute_reset_unlocked(
-            username, server_id, plan_record, source, multi_api=multi_api,
-            require_expired=require_expired, validate_plan=validate_plan,
-            business_expired=business_expired, clear_cleanup=clear_cleanup,
-        )
+    try:
+        with renewal_block_guard(username, server_id) as allowed:
+            if not allowed:
+                return {'success': False, 'reason': 'renewal_ineligible_protected_block'}
+            return _execute_reset_unlocked(
+                username, server_id, plan_record, source, multi_api=multi_api,
+                require_expired=require_expired, validate_plan=validate_plan,
+                business_expired=business_expired, clear_cleanup=clear_cleanup,
+            )
+    except Exception as error:
+        if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+            from utils.account_operations import AccountBusy, existing
+            saved = existing(plan_record['mutation_operation_id'])
+            if isinstance(error, AccountBusy) or saved:
+                return {'success': False, 'reason': 'renewal_requires_reconciliation', 'uncertain': True}
+        raise
 
 
 def _execute_reset_unlocked(
@@ -2238,6 +2276,25 @@ def _execute_reset_unlocked(
         or server_id
     )
 
+    from utils.reseller_blocks import renewal_block_guard
+    guard = renewal_block_guard(username, actual_server_id) if os.getenv('AJIB_SQLITE_ACTIVE') == '1' else nullcontext(True)
+    with guard as allowed:
+        if not allowed:
+            return {'success': False, 'reason': 'renewal_ineligible_protected_block'}
+        if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+            # A relocated account was initially read before its lock was held.
+            # Refresh under that lock before deriving any mutation intent.
+            api_client, user_data, lookup_result = lookup_renewal_user(multi_api, username, server_id=actual_server_id)
+            if (not api_client or not user_data
+                    or str(getattr(api_client, 'server_id', None)) != str(actual_server_id)):
+                return {'success': False, 'reason': 'renewal_identity_unverified'}
+        return _execute_reset_resolved(username, server_id, actual_server_id, plan_record,
+            api_client, user_data, lookup_result, require_expired, validate_plan, business_expired, clear_cleanup)
+
+
+def _execute_reset_resolved(username, server_id, actual_server_id, plan_record,
+                           api_client, user_data, lookup_result, require_expired,
+                           validate_plan, business_expired, clear_cleanup):
     before_state = capture_user_state(user_data)
     if require_expired and not (is_user_expired(user_data) or business_expired):
         return {'success': False, 'reason': 'renewal_ineligible_not_expired', 'before_state': before_state}
@@ -2257,6 +2314,24 @@ def _execute_reset_unlocked(
         if not partial_target:
             return {'success': False, 'reason': 'renewal_ineligible_plan_mismatch', 'before_state': before_state}
 
+    def perform():
+        return _perform_panel_reset(api_client, username, target_snapshot, user_data, before_state,
+                                    lookup_result, actual_server_id, server_id, plan_record, clear_cleanup)
+    if os.getenv('AJIB_SQLITE_ACTIVE') != '1':
+        return perform()
+    from utils import account_operations
+    # Ledger cycle fingerprints are not panel fields. Compare the captured
+    # generation using the same normalization rules as reserved renewals.
+    if validate_plan and reservation_generation_changed(plan_record, user_data):
+        return {'success': False, 'reason': 'renewal_cycle_changed', 'before_state': before_state}
+    intent = {'target': target_snapshot, 'before': before_state, 'recorded_server_id': str(server_id),
+              'cycle_fingerprint': (plan_record.get('renewal_before_state') or {}).get('cycle_fingerprint')}
+    operation_id = plan_record['mutation_operation_id']
+    return account_operations.execute(operation_id, actual_server_id, username, 'renewal', intent, perform)
+
+
+def _perform_panel_reset(api_client, username, target_snapshot, user_data, before_state,
+                         lookup_result, actual_server_id, server_id, plan_record, clear_cleanup):
     renew_result_method = getattr(api_client, 'renew_user_result', None)
     if callable(renew_result_method):
         reset_outcome = renew_result_method(
@@ -2373,6 +2448,8 @@ def execute_reseller_renewal(offer, multi_api=None):
             'days': offer.get('days'),
             'unlimited': offer.get('unlimited', False),
             'renewal_source_plan_snapshot': offer.get('source_plan_snapshot'),
+            'renewal_before_state': offer.get('before_state'),
+            'mutation_operation_id': offer.get('mutation_operation_id'),
         },
         'reseller_customer',
         multi_api=multi_api,
@@ -2424,6 +2501,8 @@ def execute_reserved_renewal(record, multi_api=None, force=False):
             'renewal_source_plan_snapshot': record.get('renewal_source_plan_snapshot'),
             'renewal_recorded_server_id': record.get('renewal_recorded_server_id'),
             'renewal_api_stage': record.get('renewal_api_stage'),
+            'renewal_before_state': record.get('renewal_before_state') or record.get('before_state'),
+            'mutation_operation_id': record.get('mutation_operation_id'),
         },
         record.get('renewal_source') or 'reserved',
         multi_api=multi_api,

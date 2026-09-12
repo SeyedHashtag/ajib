@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+if [ -f /etc/ajib-web/deployment.json ]; then
+    echo "Shared bot/web state requires coordinated recovery and payment/panel reconciliation. Legacy restore has not changed anything; use an isolated restore drill and the web recovery runbook." >&2
+    exit 1
+fi
+
 INSTALL_DIR=${AJIB_INSTALL_DIR:-/etc/ajib}
 BOT_DIR="$INSTALL_DIR/core/scripts/telegrambot"
 LIVE_DATABASE=${AJIB_DB_PATH:-"$BOT_DIR/ajib.db"}

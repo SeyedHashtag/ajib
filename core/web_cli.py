@@ -7,11 +7,15 @@ import subprocess
 import click
 
 import web_operator as web
+from web_release_cli import release_group
 
 
 @click.group('web')
 def web_group():
     """Set up and operate the website and Telegram Mini App."""
+
+
+web_group.add_command(release_group)
 
 
 @web_group.command('setup')
@@ -115,6 +119,39 @@ def sync_config(dry_run, recover, yes):
         if not yes:
             raise click.ClickException('Preview with --dry-run, then apply with --yes.')
         click.echo(json.dumps(web_config.sync(recover=recover), indent=2))
+    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@web_group.command('upgrade-status')
+def upgrade_status():
+    """Inspect pending coordinated upgrade recovery without exposing configuration."""
+    import web_upgrade
+    click.echo(json.dumps(web_upgrade.status(), indent=2))
+
+
+@web_group.command('recover-upgrade')
+@click.option('--yes', is_flag=True)
+def recover_upgrade(yes):
+    """Restore the compatible release after an interrupted upgrade; retain live data."""
+    if not yes:
+        raise click.ClickException('Inspect upgrade-status, then use --yes to recover.')
+    import web_upgrade
+    try:
+        click.echo(json.dumps(web_upgrade.recover(), indent=2))
+    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@web_group.command('adopt-baseline')
+@click.option('--yes', is_flag=True)
+def adopt_baseline(yes):
+    """Record reviewed compatible installed files as the first managed baseline."""
+    if not yes:
+        raise click.ClickException('Review the installed bot/web code before adopting it with --yes.')
+    import web_upgrade
+    try:
+        click.echo(json.dumps(web_upgrade.adopt_baseline(), indent=2))
     except (ValueError, OSError, subprocess.CalledProcessError) as exc:
         raise click.ClickException(str(exc)) from exc
 

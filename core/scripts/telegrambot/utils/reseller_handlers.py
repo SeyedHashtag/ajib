@@ -3381,11 +3381,11 @@ def _process_reseller_renewal_confirm_job(
 
     if isinstance(funding_mode, dict):
         remember_fulfillment(user_id, wholesale_reservation_id)
-    result = execute_reseller_renewal(offer)
+    result = execute_reseller_renewal({**offer, 'mutation_operation_id': 'reseller-renewal:' + str(wholesale_reservation_id)})
     if not result.get('success'):
-        if isinstance(funding_mode, dict):
+        if isinstance(funding_mode, dict) and not result.get('uncertain'):
             release_funding(user_id, wholesale_reservation_id)
-        elif funding_mode == 'prepaid':
+        elif funding_mode == 'prepaid' and not result.get('uncertain'):
             release_wholesale_balance(user_id, wholesale_reservation_id)
         bot.edit_message_text(
             get_message_text(language, "renewal_failed").format(reason=_renewal_reason_text(language, result.get('reason'))),

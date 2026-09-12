@@ -1,4 +1,4 @@
-"""CLI-only synchronization of the installed read-only pilot's bot configuration.
+"""CLI-only synchronization of the installed website's bot configuration.
 
 No database restoration, Telegram calls, or changes to the bot/proxy service.
 Interrupted work leaves a private journal; recovery retries from current bot data.
@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -19,6 +20,28 @@ from dotenv import dotenv_values
 import web_operator as web
 
 CATALOGS = ('plans.json', 'support_info.json')
+
+
+def _live_policy(plan):
+    with sqlite3.connect(Path(plan['database']).as_uri() + '?mode=ro', uri=True) as db:
+        installed = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='web_release_control'").fetchone()
+    if installed:
+        import web_upgrade
+        return web_upgrade._policy(plan)
+    return None
+
+
+def reject_secret_rotation(current, desired):
+    keys = set(current) | set(desired)
+    sensitive = {key for key in keys if re.search(r'(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|MERCHANT_ID)$', key)}
+    if any(current.get(key) != desired.get(key) for key in sensitive):
+        raise ValueError('Credential changes require coordinated CLI secret rotation; sync-config cannot rotate secrets.')
+    old_servers = {str(item.get('id')): item for item in json.loads(current.get('SERVERS_JSON') or '[]')}
+    new_servers = {str(item.get('id')): item for item in json.loads(desired.get('SERVERS_JSON') or '[]')}
+    for key in old_servers.keys() & new_servers.keys():
+        for secret in ('token', 'TOKEN', 'password', 'username'):
+            if old_servers[key].get(secret) != new_servers[key].get(secret):
+                raise ValueError('Existing panel credentials require coordinated CLI secret rotation.')
 
 
 def _read(path):
@@ -61,8 +84,9 @@ def _desired(plan, inputs):
     bot = _environment(inputs['.env'])
     if not bot.get('API_TOKEN') or bot.get('API_TOKEN') != current.get('API_TOKEN'):
         raise ValueError('Bot token changes require coordinated CLI secret rotation; sync-config cannot rotate identity.')
-    if current.get('AJIB_WEB_WRITES_ENABLED') != '0':
-        raise ValueError('This synchronization command currently supports the read-only pilot only.')
+    reject_secret_rotation(current, {**bot, **{key: value for key, value in current.items() if key.startswith('AJIB_WEB_')}})
+    if current.get('AJIB_WEB_WRITES_ENABLED') != '0' and _live_policy(plan) is None:
+        raise ValueError('Install coordinated release controls before synchronizing an installation with writes enabled.')
     if current.get('AJIB_WEB_ORIGIN') != 'https://' + plan['domain']:
         raise ValueError('Website origin differs from the deployment manifest.')
     if current.get('AJIB_DB_PATH') != plan['database']:
@@ -89,9 +113,11 @@ def preview():
     plan = web.load()
     inputs = _inputs(plan)
     _text, keys = _desired(plan, inputs)
+    policy = _live_policy(plan)
     return {'environment_keys': keys,
             'catalogs': [name for name in CATALOGS if _read(_targets()[name]) != inputs[name]],
-            'restart_services': list(web.UNITS), 'writes_enabled': False,
+            'restart_services': list(web.UNITS), 'writes_enabled': bool(policy and policy['accept_writes']),
+            'pause_and_drain': policy is not None,
             'recovery_pending': (web.CONFIG / 'config-sync.json').exists()}
 
 
@@ -143,6 +169,8 @@ def _install(contents, gid):
 def sync(*, recover=False):
     web.root_required()
     with web.maintenance():
+        if (web.CONFIG / 'upgrade.json').exists():
+            raise ValueError('Recover the interrupted upgrade first: ajib web recover-upgrade --yes.')
         journal_path = web.CONFIG / 'config-sync.json'
         pending = journal_path.exists()
         if pending and not recover:
@@ -166,7 +194,7 @@ def sync(*, recover=False):
             backup.mkdir(parents=True, mode=0o700)
             journal = {'id': ident, 'checkout': plan['checkout'], 'database': plan['database'],
                        'active': [unit for unit in web.UNITS if _active(unit)],
-                       'phase': 'prepared', 'backup': str(backup)}
+                       'phase': 'prepared', 'backup': str(backup), 'policy': _live_policy(plan)}
             for name, target in _targets().items():
                 old = _read(target)
                 if old is not None:
@@ -177,6 +205,14 @@ def sync(*, recover=False):
         journal.update(phase='stopping', input_digest=_digest(inputs))
         web.write(journal_path, json.dumps(journal), 0o600)
         try:
+            if journal.get('policy') is not None:
+                import web_upgrade
+                original_policy = journal['policy']
+                web_upgrade._save_policy(plan, {**original_policy, 'accept_writes': 0,
+                    'process_existing': 0 if pending else original_policy['process_existing']})
+                web.run('systemctl', 'stop', 'ajib-web-api')
+                web_upgrade._drain(plan)
+                web_upgrade._save_policy(plan, {**original_policy, 'accept_writes': 0, 'process_existing': 0})
             # Stop both in recovery too: an interrupted start may have left one running.
             web.run('systemctl', 'stop', *web.UNITS)
             if _inputs(plan) != inputs:
@@ -196,6 +232,8 @@ def sync(*, recover=False):
             _bot_ready(plan)
             if _inputs(plan) != inputs:
                 raise ValueError('Bot configuration changed during synchronization; retry recovery.')
+            if journal.get('policy') is not None:
+                web_upgrade._save_policy(plan, journal['policy'])
             journal['phase'] = 'complete'
             web.write(Path(journal['backup']) / 'result.json', json.dumps(journal), 0o600)
             journal_path.unlink()
@@ -204,7 +242,11 @@ def sync(*, recover=False):
             # Do not resume a stale permission/configuration snapshot. Keep the new
             # settings and journal for a retry against the now-current bot settings.
             try:
-                web.run('systemctl', 'stop', *web.UNITS)
+                try:
+                    if journal.get('policy') is not None:
+                        web_upgrade._save_policy(plan, {**journal['policy'], 'accept_writes': 0, 'process_existing': 0})
+                finally:
+                    web.run('systemctl', 'stop', *web.UNITS)
             except Exception:
                 journal['phase'] = 'stop_failed'
             else:

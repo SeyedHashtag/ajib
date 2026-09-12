@@ -1,11 +1,13 @@
 """Durable, account-scoped temporary blocks shared by both bot runtimes.
 
-Intent is committed before a panel mutation. The second transaction serializes
-the mutation with admin/debt changes; an interrupted mutation remains retryable.
+Intent is committed before a panel mutation. SQLite deployments serialize the
+account across processes and keep panel I/O outside database transactions.
 """
 
 import logging
 import uuid
+import os
+from functools import wraps
 from copy import deepcopy
 from datetime import timedelta
 from contextlib import contextmanager
@@ -15,6 +17,39 @@ from utils.time_utils import utc_now, parse_utc_timestamp, format_utc_timestamp
 
 LOG = logging.getLogger('ajib.reseller_blocks')
 ACTIVE_STATES = {'pending', 'blocked', 'releasing'}
+
+
+def _serialize_change(function):
+    @wraps(function)
+    def wrapped(reseller_id, token, *args, **kwargs):
+        if os.getenv('AJIB_SQLITE_ACTIVE') != '1':
+            return function(reseller_id, token, *args, **kwargs)
+        from utils import account_operations
+        with store.reseller_lock, store._resellers_file_lock():
+            _, config = _find(store._read_resellers_file(), reseller_id, token, authorize=False)
+            server, username = config.get('block_server_id') or config.get('server_id'), config.get('username')
+        with account_operations.serialize(server, username):
+            account_operations.assert_available(server, username)
+            return function(reseller_id, token, *args, **kwargs)
+    return wrapped
+
+
+def _serialize_owned_change(function):
+    @wraps(function)
+    def wrapped(reseller_id, config_index, client, live, **kwargs):
+        if os.getenv('AJIB_SQLITE_ACTIVE') != '1':
+            return function(reseller_id, config_index, client, live, **kwargs)
+        from utils import account_operations
+        with store.reseller_lock, store._resellers_file_lock():
+            records = store._read_resellers_file()
+            configs = (records.get(str(reseller_id)) or {}).get('configs', [])
+            if not 0 <= config_index < len(configs):
+                return None
+            username = configs[config_index].get('username')
+        with account_operations.serialize(client.server_id, username):
+            account_operations.assert_available(client.server_id, username)
+            return function(reseller_id, config_index, client, live, **kwargs)
+    return wrapped
 
 
 def _now(value=None):
@@ -96,6 +131,7 @@ def _resolve(config, multi_api):
     return client, live
 
 
+@_serialize_change
 def request_block(reseller_id, token, hours, multi_api, *, now=None, request_id=None):
     if isinstance(hours, bool) or not isinstance(hours, int) or not 1 <= hours <= 720:
         raise ValueError('invalid')
@@ -129,6 +165,7 @@ def request_block(reseller_id, token, hours, multi_api, *, now=None, request_id=
     return block_view(reseller_id, token)['reseller_block']
 
 
+@_serialize_change
 def release_block(reseller_id, token, multi_api, *, now=None, expected_block_id=None):
     with store.reseller_lock, store._resellers_file_lock():
         records = store._read_resellers_file()
@@ -146,6 +183,8 @@ def release_block(reseller_id, token, multi_api, *, now=None, expected_block_id=
 
 
 def reconcile_block(reseller_id, token, multi_api, *, now=None):
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        return _sqlite_reconcile(reseller_id, token, multi_api, now=now)
     current = _now(now)
     with store.reseller_lock, store._resellers_file_lock():
         records = store._read_resellers_file()
@@ -212,6 +251,7 @@ def process_due_blocks(multi_api=None, *, now=None, owner_id=None):
     return results
 
 
+@_serialize_owned_change
 def set_owned_block_reason(reseller_id, config_index, client, live, *, reason, blocked):
     """Commit admin/debt intent and compose it with temporary block ownership."""
     if reason not in {'admin_blocked', 'debt_policy_blocked'}:
@@ -237,6 +277,8 @@ def set_owned_block_reason(reseller_id, config_index, client, live, *, reason, b
         store._write_resellers_file(records)
     # Debt/admin callers already performed an exact account lookup. Keep that
     # identity while serializing the panel write with timer reconciliation.
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        return {'reconciled': True} if _sqlite_reconcile(reseller_id, token, None, known_client=client) else None
     with store.reseller_lock, store._resellers_file_lock():
         records = store._read_resellers_file()
         owner, config = _find(records, reseller_id, token, authorize=False)
@@ -250,6 +292,15 @@ def set_owned_block_reason(reseller_id, config_index, client, live, *, reason, b
 
 
 def set_admin_block(client, username, blocked, live):
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from utils import account_operations
+        with account_operations.serialize(client.server_id, username):
+            account_operations.assert_available(client.server_id, username)
+            return _set_admin_block(client, username, blocked, live)
+    return _set_admin_block(client, username, blocked, live)
+
+
+def _set_admin_block(client, username, blocked, live):
     with store.reseller_lock, store._resellers_file_lock():
         records = store._read_resellers_file()
         matches = [(owner_id, index) for owner_id, owner in records.items()
@@ -277,8 +328,74 @@ def _has_protected_block(records, username, server_id):
 @contextmanager
 def renewal_block_guard(username, server_id):
     """Serialize reset with block intent so a concurrent renewal cannot unblock."""
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from utils import account_operations
+        with account_operations.serialize(server_id, username):
+            account_operations.assert_available(server_id, username)
+            with store.reseller_lock, store._resellers_file_lock():
+                allowed = not _has_protected_block(store._read_resellers_file(), username, server_id)
+            yield allowed
+        return
     if not store._resellers_store_exists():
         yield True
         return
     with store.reseller_lock, store._resellers_file_lock():
         yield not _has_protected_block(store._read_resellers_file(), username, server_id)
+
+
+def _sqlite_reconcile(reseller_id, token, multi_api, *, now=None, known_client=None):
+    """Serialize the account while keeping network requests outside write transactions."""
+    from utils import account_operations
+    current = _now(now)
+    with store.reseller_lock, store._resellers_file_lock():
+        owner, config = _find(store._read_resellers_file(), reseller_id, token, authorize=False)
+        config, owner = deepcopy(config), deepcopy(owner)
+    username, server = config.get('username'), config.get('block_server_id') or config.get('server_id')
+    try:
+        with account_operations.serialize(server, username):
+            account_operations.assert_available(server, username)
+            with store.reseller_lock, store._resellers_file_lock():
+                owner, config = _find(store._read_resellers_file(), reseller_id, token, authorize=False)
+                config, owner = deepcopy(config), deepcopy(owner)
+                if (config.get('username'), config.get('block_server_id') or config.get('server_id')) != (username, server):
+                    raise ValueError('identity_changed')
+                desired = _effective_block(owner, config, current)
+                block = config.get('reseller_block') or {}
+                if block.get('state') in ACTIVE_STATES and (block.get('username'), block.get('server_id')) != (username, server):
+                    raise ValueError('identity_changed')
+            if known_client:
+                client, live = known_client, known_client.get_user(username)
+                if not live or str(client.server_id) != str(server):
+                    raise RuntimeError('identity_unverified')
+            else:
+                client, live = _resolve(config, multi_api)
+            if bool(live.get('blocked')) != desired:
+                if client.update_user(username, {'blocked': desired}) is None:
+                    raise RuntimeError('panel_update_failed')
+                confirmed = client.get_user(username)
+                if not confirmed or confirmed.get('blocked') is not desired:
+                    raise RuntimeError('panel_confirmation_pending')
+            with store.reseller_lock, store._resellers_file_lock():
+                records = store._read_resellers_file()
+                fresh_owner, fresh = _find(records, reseller_id, token, authorize=False)
+                if ((fresh.get('username'), fresh.get('block_server_id') or fresh.get('server_id')) != (username, server)
+                        or _effective_block(fresh_owner, fresh, current) != desired):
+                    raise RuntimeError('block_intent_changed')
+                block = fresh.get('reseller_block') or {}
+                if block.get('state') in ACTIVE_STATES:
+                    block['state'] = 'blocked' if _temporary_active(fresh, current) else 'complete'
+                    block['other_block'] = desired if block['state'] == 'complete' else False
+                    block.pop('last_error', None)
+                fresh.update(block_reconcile_pending=False, block_last_error=None, block_updated_at=format_utc_timestamp(current))
+                store._write_resellers_file(records)
+                return True
+    except Exception as error:
+        with store.reseller_lock, store._resellers_file_lock():
+            records = store._read_resellers_file()
+            _, fresh = _find(records, reseller_id, token, authorize=False)
+            block = fresh.get('reseller_block') or {}
+            if block:
+                block.update(attempts=int(block.get('attempts', 0))+1, last_error=type(error).__name__)
+            fresh.update(block_reconcile_pending=True, block_last_error=type(error).__name__)
+            store._write_resellers_file(records)
+        return False

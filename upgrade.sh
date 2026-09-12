@@ -2,11 +2,9 @@
 
 set -euo pipefail
 
-# The web pilot shares financial state and requires compatible bot adapters.
-# Do not let the legacy bot-only upgrader remove its fulfillment ownership guard.
+# Shared-state installations must upgrade all runtimes together.
 if [ -f /etc/ajib-web/deployment.json ]; then
-    echo "This installation has an active website deployment. A coordinated web/bot upgrade is required; the bot-only upgrader has not changed anything." >&2
-    exit 1
+    exec /etc/ajib/ajib_venv/bin/python /etc/ajib/core/web_upgrade.py "$@"
 fi
 
 INSTALL_DIR="/etc/ajib"

@@ -6,6 +6,7 @@ fulfil them concurrently with this worker.
 """
 import json
 import secrets
+import os
 import time
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -104,6 +105,10 @@ class Orders:
                       "payment_method": "Crypto" if method == "crypto" else "Card to Card",
                       "receipt_type": "regular", "currency": "USD", "fulfillment_owner": "web",
                       "status": "approved" if quote["price"] == 0 else "creating" if method == "crypto" else "waiting_receipt"}
+            release = connection.execute('SELECT revision FROM web_release_control WHERE id=1').fetchone()
+            record['web_revision'] = release['revision'] if release else ''
+            if method == 'crypto' and quote['price'] > 0:
+                record.update(gateway_order_id=payment_id, gateway_merchant_id=os.getenv('CRYPTO_MERCHANT_ID', ''))
             if card:
                 from .receipt_checker import should_route_to_receipt_checker, get_receipt_checker_user_id
                 routed = should_route_to_receipt_checker("regular")
@@ -119,10 +124,14 @@ class Orders:
         if method == "crypto" and quote["price"] > 0:
             from .payments import CryptoPayment
             response = CryptoPayment().create_payment(quote["price"], plan_id, int(user_id),
-                                                       additional_data={"web_order_id": payment_id})
+                                                       additional_data={"web_order_id": payment_id}, order_id=payment_id)
             result = response.get("result") or {}
             with database.transaction(operation="web_gateway_created") as connection:
-                if response.get("error") or not result.get("uuid") or not str(result.get("url", "")).startswith("https://"):
+                latest = connection.execute('SELECT status FROM web_operations WHERE id=?', (payment_id,)).fetchone()
+                if latest['status'] != 'creating':
+                    return payment_public(payment_id, self.services.payment(user_id, scope, payment_id))
+                if (response.get("error") or result.get('order_id') != payment_id or not result.get("uuid")
+                        or not str(result.get("url", "")).startswith("https://")):
                     record = save_payment(connection, scope, payment_id, {"status": "uncertain", "web_attention_reason": "gateway_creation_uncertain"})
                 else:
                     record = save_payment(connection, scope, payment_id, {"status": "pending", "gateway_payment_id": result["uuid"],
@@ -194,7 +203,7 @@ class Orders:
                     fields = {"renewal_status": "reserved"}
                 else:
                     from .renewal import execute_customer_renewal
-                    result = execute_customer_renewal(record, multi_api=self.services.panels)
+                    result = execute_customer_renewal({**record, 'mutation_operation_id': 'main-payment:' + payment_id}, multi_api=self.services.panels)
                     if not result.get("success"):
                         raise ServiceError("Renewal needs reconciliation")
                     fields = {"username": record["renewal_username"], "server_id": record["renewal_server_id"]}
@@ -212,9 +221,15 @@ class Orders:
                 note = build_user_note(username=username, traffic_limit=int(record["plan_gb"]),
                     expiration_days=int(record["days"]), unlimited=record.get("unlimited", False),
                     note_text=f"sale web-order:{payment_id}")
-                result = client.add_user(username, int(record["plan_gb"]), int(record["days"]),
-                                         unlimited=record.get("unlimited", False), note=note)
-                if not result:
+                from .account_operations import execute
+                def create_account():
+                    created = client.add_user(username, int(record['plan_gb']), int(record['days']),
+                                              unlimited=record.get('unlimited', False), note=note)
+                    return {'success': bool(created), **fields}
+                result = execute('main-payment:' + payment_id, client.server_id, username, 'create',
+                                 {'plan_gb': record['plan_gb'], 'days': record['days'],
+                                  'unlimited': record.get('unlimited', False), 'note': note}, create_account)
+                if not result.get('success'):
                     raise ServiceError("Account creation outcome is uncertain")
             with database.transaction(operation="web_fulfillment_complete") as connection:
                 completed = save_payment(connection, scope, payment_id, {**fields, "status": "completed"})

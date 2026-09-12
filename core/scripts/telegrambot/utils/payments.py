@@ -4,6 +4,7 @@ import uuid
 from hashlib import md5
 import requests
 import os
+import re
 from dotenv import load_dotenv
 
 TELEGRAM_ENV_PATH = os.path.abspath(os.getenv('AJIB_ENV_FILE') or os.path.join(os.path.dirname(__file__), '..', '.env'))
@@ -39,11 +40,13 @@ class CryptoPayment:
         ).decode("utf-8")
         return md5(f"{encoded_data}{self.payment_api_key}".encode("utf-8")).hexdigest()
 
-    def create_payment(self, amount, plan_gb, user_id, currency="USD", network=None, to_currency=None, url_return=None, url_success=None, url_callback=None, is_payment_multiple=False, lifetime=3600, additional_data=None, subtract=None, accuracy_payment_percent=None, currencies=None, except_currencies=None, course_source=None, from_referral_code=None, discount_percent=None, is_refresh=False):
+    def create_payment(self, amount, plan_gb, user_id, currency="USD", network=None, to_currency=None, url_return=None, url_success=None, url_callback=None, is_payment_multiple=False, lifetime=3600, additional_data=None, subtract=None, accuracy_payment_percent=None, currencies=None, except_currencies=None, course_source=None, from_referral_code=None, discount_percent=None, is_refresh=False, order_id=None):
         if not self._check_credentials():
             return {"error": "Payment credentials not configured"}
 
-        payment_id = str(uuid.uuid4())
+        payment_id = str(uuid.uuid4()) if order_id is None else str(order_id)
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', payment_id):
+            return {'error': 'Invalid merchant order ID'}
         payload = {
             "amount": str(amount),
             "currency": currency,
@@ -79,8 +82,7 @@ class CryptoPayment:
         if is_refresh:
             payload["is_refresh"] = is_refresh
         # Additional data
-        if additional_data is None:
-            additional_data = {}
+        additional_data = dict(additional_data or {})
         additional_data.update({
             "plan_gb": plan_gb,
             "payment_id": payment_id,
@@ -107,13 +109,13 @@ class CryptoPayment:
         except Exception as e:
             return {"error": f"Request Error: {str(e)}"}
 
-    def check_payment_status(self, payment_id):
+    def check_payment_status(self, payment_id=None, *, order_id=None):
         if not self._check_credentials():
             return {"error": "Payment credentials not configured"}
 
-        payload = {
-            "uuid": payment_id
-        }
+        if bool(payment_id) == bool(order_id):
+            return {'error': 'Supply one invoice UUID or merchant order ID'}
+        payload = {'order_id': order_id} if order_id else {'uuid': payment_id}
 
         try:
             headers = {

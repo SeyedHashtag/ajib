@@ -143,6 +143,14 @@ the workflow families below, rather than counted as separate menu buttons.
 
 ## Release rule
 
+### Coordinated upgrade and Stage 4 candidate, September 12
+
+The next local increment adds coordinated upgrade/recovery, live release gates,
+pause/drain configuration synchronization, durable renewal ownership, and stricter
+crypto reconciliation. It has not been deployed. The full implementation status,
+operator commands, and remaining blockers are tracked in
+[the customer release candidate ledger](web-customer-release.md).
+
 Do not enable the public customer release on the basis of the initial screens
 or API tests. Stage 4 includes trials, referrals/withdrawals and verified renewal
 recovery, as well as purchases. Keep public access and writes disabled until its

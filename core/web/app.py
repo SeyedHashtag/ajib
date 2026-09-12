@@ -90,7 +90,7 @@ class DownloadResponse(BaseModel):
 def create_app(settings=None, services=None):
     from .runtime import configure
     configure()
-    from utils import database, web_auth, web_store
+    from utils import database, web_auth, web_store, web_release
     from utils.web_services import Services, ServiceError, payment_public
     from utils.web_orders import Orders, save_payment
     settings = settings or Settings.from_env()
@@ -139,7 +139,7 @@ def create_app(settings=None, services=None):
     def session(request: Request):
         value = web_auth.authenticate(request.cookies.get("ajib_session"))
         identity = services.identity(value["user_id"], value["scope"])
-        if not settings.public_portal and value["user_id"] not in settings.pilot_users and "admin" not in identity["roles"]:
+        if not web_release.permits(identity, web_release.policy(settings)):
             raise ServiceError("The portal is currently open to pilot users", 403)
         if request.method not in {"GET", "HEAD"}:
             token = request.headers.get("x-csrf-token", "")
@@ -148,7 +148,7 @@ def create_app(settings=None, services=None):
         return {**value, **identity}
 
     def write_session(value=Depends(session)):
-        if not settings.writes_enabled:
+        if not web_release.policy(settings)['accept_writes']:
             raise ServiceError("Changes are temporarily paused", 503)
         return value
 
@@ -193,8 +193,9 @@ def create_app(settings=None, services=None):
     @app.get("/api/v1/storefront")
     def storefront(slug: str | None = None):
         store = services.storefront(slug)
-        return {**store, "public_portal": settings.public_portal,
-                "writes_enabled": settings.writes_enabled and store["scope"] == "main"}
+        current = web_release.policy(settings)
+        return {**store, "public_portal": current['access'] == 'public',
+                "writes_enabled": current['accept_writes'] and store["scope"] == "main"}
 
     @app.get("/api/v1/plans", response_model=list[PlanResponse])
     def plans(storefront: str | None = None):
@@ -240,7 +241,7 @@ def create_app(settings=None, services=None):
     @app.get("/api/v1/me", response_model=IdentityResponse)
     def me(request: Request, value=Depends(session)):
         return {**value, "csrf_token": web_store.digest("csrf:" + request.cookies["ajib_session"]),
-                "writes_enabled": settings.writes_enabled}
+                "writes_enabled": web_release.policy(settings)['accept_writes'] and value['scope'] == 'main'}
 
     @app.post("/api/v1/auth/logout")
     def logout(request: Request, response: Response, value=Depends(session)):

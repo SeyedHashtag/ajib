@@ -38,9 +38,9 @@ def installed(tmp_path, monkeypatch):
         db.execute('CREATE TABLE payments (id INTEGER)')
         db.execute('INSERT INTO payments VALUES (1)')
     bot = checkout / 'core/scripts/telegrambot'
-    (bot / '.env').write_text('API_TOKEN=synthetic\nADMIN_USER_IDS=[1]\nTOKEN=new-adapter\nAJIB_WEB_PUBLIC_PORTAL=1\n')
+    (bot / '.env').write_text('API_TOKEN=synthetic\nADMIN_USER_IDS=[1]\nURL=new-adapter\nAJIB_WEB_PUBLIC_PORTAL=1\n')
     (bot / 'plans.json').write_text('{"100":{"price":2}}')
-    current = {'API_TOKEN': 'synthetic', 'ADMIN_USER_IDS': '[1]', 'TOKEN': 'old-adapter',
+    current = {'API_TOKEN': 'synthetic', 'ADMIN_USER_IDS': '[1]', 'URL': 'old-adapter',
                'REMOVED_SETTING': 'old', 'AJIB_WEB_ORIGIN': 'https://example.com',
                'AJIB_WEB_WRITES_ENABLED': '0', 'AJIB_WEB_PUBLIC_PORTAL': '0',
                'AJIB_WEB_PILOT_USERS': '42', 'AJIB_WEB_BOT_USERNAME': 'SyntheticBot',
@@ -68,7 +68,7 @@ def test_preview_redacts_settings_and_does_not_mutate(installed):
     config, bot, plan, active, commands = installed
     result = CliRunner().invoke(web_group, ['sync-config', '--dry-run'])
     assert result.exit_code == 0, result.output
-    assert 'TOKEN' in result.output and 'REMOVED_SETTING' in result.output
+    assert 'URL' in result.output and 'REMOVED_SETTING' in result.output
     assert 'old-adapter' not in result.output and 'new-adapter' not in result.output
     assert 'synthetic' not in result.output
     assert commands == []
@@ -79,7 +79,7 @@ def test_sync_keeps_gates_drops_removed_settings_and_leaves_database(installed):
     config, bot, plan, active, commands = installed
     result = sync.sync()
     settings = sync._environment((config / 'runtime.env').read_text())
-    assert settings['TOKEN'] == 'new-adapter'
+    assert settings['URL'] == 'new-adapter'
     assert 'REMOVED_SETTING' not in settings
     assert settings['AJIB_WEB_PUBLIC_PORTAL'] == '0'
     assert settings['AJIB_WEB_WRITES_ENABLED'] == '0'
@@ -190,6 +190,73 @@ def test_restart_cannot_bypass_pending_recovery(installed):
     result = CliRunner().invoke(web_group, ['restart'])
     assert result.exit_code != 0 and '--recover' in result.output
     assert commands == []
+
+
+@pytest.mark.parametrize('failure', [False, True])
+def test_live_sync_pauses_drains_and_recovers_original_access_policy(installed, monkeypatch, failure):
+    import web_upgrade
+    config, bot, plan, active, commands = installed
+    with sqlite3.connect(plan['database']) as db:
+        db.execute('''CREATE TABLE web_release_control (id INTEGER PRIMARY KEY,access TEXT,pilot_users_json TEXT,
+            accept_writes INTEGER,process_existing INTEGER,revision TEXT,pilot_started_at INTEGER,updated_at INTEGER)''')
+        db.execute("INSERT INTO web_release_control VALUES (1,'pilot','[2,3]',1,1,'revision',123,123)")
+    original = web_upgrade._policy(plan)
+    drains = []
+    def drain(plan):
+        policy = web_upgrade._policy(plan)
+        assert policy['accept_writes'] == 0
+        assert 'ajib-web-api' not in active
+        drains.append(policy['process_existing'])
+    monkeypatch.setattr(web_upgrade, '_drain', drain)
+    def health(*args):
+        policy = web_upgrade._policy(plan)
+        assert policy['accept_writes'] == policy['process_existing'] == 0
+        if failure:
+            raise ValueError('synthetic health failure')
+    monkeypatch.setattr(sync, '_health', health)
+    assert sync.preview()['pause_and_drain']
+    if failure:
+        with pytest.raises(ValueError, match='--recover'):
+            sync.sync()
+        assert active == set()
+        policy = web_upgrade._policy(plan)
+        assert policy['accept_writes'] == policy['process_existing'] == 0
+        with sqlite3.connect(plan['database']) as db:
+            db.execute('INSERT INTO payments VALUES(2)')
+        failure = False
+        sync.sync(recover=True)
+        assert drains == [1, 0]
+    else:
+        sync.sync()
+        assert drains == [1]
+    current = web_upgrade._policy(plan)
+    for key in ('access', 'pilot_users_json', 'accept_writes', 'process_existing', 'revision', 'pilot_started_at'):
+        assert current[key] == original[key]
+    assert active == set(web.UNITS)
+    assert not (config / 'config-sync.json').exists()
+
+
+@pytest.mark.parametrize('key', ['TOKEN', 'CRYPTO_API_KEY', 'CRYPTO_MERCHANT_ID', 'PANEL_PASSWORD'])
+def test_sync_rejects_credential_changes_before_stopping(installed, key):
+    config, bot, plan, active, commands = installed
+    settings = sync._environment((config / 'runtime.env').read_text())
+    settings[key] = 'synthetic-old'
+    (config / 'runtime.env').write_text(sync._encode(settings))
+    with pytest.raises(ValueError, match='secret rotation'):
+        sync.sync()
+    assert not commands
+
+
+def test_sync_rejects_rotated_token_inside_server_catalog(installed):
+    config, bot, plan, active, commands = installed
+    settings = sync._environment((config / 'runtime.env').read_text())
+    settings['SERVERS_JSON'] = json.dumps([{'id': 'server', 'token': 'synthetic-old'}])
+    (config / 'runtime.env').write_text(sync._encode(settings))
+    with (bot / '.env').open('a') as stream:
+        stream.write('SERVERS_JSON=' + json.dumps([{'id': 'server', 'token': 'synthetic-new'}]) + '\n')
+    with pytest.raises(ValueError, match='secret rotation'):
+        sync.sync()
+    assert not commands
 
 
 def test_real_readiness_validation_rejects_stale_configuration_metadata(tmp_path, monkeypatch):

@@ -137,6 +137,8 @@ def maintained(function):
     def wrapped(*args, **kwargs):
         root_required()
         with maintenance():
+            if (CONFIG / 'upgrade.json').exists():
+                raise ValueError('Recover the interrupted upgrade first: ajib web recover-upgrade --yes.')
             if (CONFIG / 'config-sync.json').exists():
                 raise ValueError('Recover the interrupted configuration sync before other website changes: '
                                  'ajib web sync-config --recover --yes.')
@@ -364,6 +366,8 @@ def setup(plan, *, email=None):
     for name in ('plans.json', 'support_info.json'):
         if (bot / name).is_file():
             shutil.copyfile(bot / name, SOURCE / 'core/scripts/telegrambot' / name)
+    if (checkout / 'core/web/release-contract.json').is_file():
+        shutil.copyfile(checkout / 'core/web/release-contract.json', SOURCE / 'core/web/release-contract.json')
     for path in SOURCE.rglob('*'):
         if not path.is_symlink():
             path.chmod(0o755 if path.is_dir() else 0o644)
