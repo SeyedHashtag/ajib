@@ -55,6 +55,8 @@ main_menu() {
         echo "5. Stop bot"
         echo "6. Show recent logs"
         echo "7. Upgrade ajib"
+        echo "8. Website setup / reconfigure"
+        echo "9. Website diagnostics"
         echo "0. Exit"
         if ! read -r -p "Choose an option: " choice; then
             echo
@@ -69,6 +71,8 @@ main_menu() {
             5) run_ajib_cli stop || true ;;
             6) run_ajib_cli logs --lines 100 || true ;;
             7) run_ajib_cli upgrade || true ;;
+            8) run_ajib_cli web setup || true ;;
+            9) run_ajib_cli web doctor || true ;;
             0) return 0 ;;
             *) echo "Invalid option. Please try again." ;;
         esac

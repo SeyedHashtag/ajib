@@ -64,8 +64,8 @@ the workflow families below, rather than counted as separate menu buttons.
 | Business/growth reports | Admin | Existing event deduplication, lifecycle dates, scope | Totals match bot reports | 6: pending |
 | Worker health and attention | Admin/operator | Pending payments, notifications and uncertain operations | Failed work is visible and recoverable | 2/6: operation list, trial attention, heartbeat, outbox retries and audit implemented; recovery actions pending |
 | Telegram notifications | Correct bot and recipient | Durable outbox, isolated failure and bounded retry | Delivery failure never repeats purchase/renewal | 2–7: worker implemented; full event parity pending |
-| Backups/migrations/restore | CLI operator | All runtimes coordinated, SQLite backup API, safety snapshot | Restore includes extension tables/receipt BLOBs and is exercised | 2/8: CLI supports shared database location and web service coordination; synthetic Linux restore passes; VPS drill pending |
-| Staging/pilot/rollback | Operator, selected pilot users | Opt-in gates, compatible revisions, pending operation preservation | Full journeys pass before expanding access | 8: gates implemented; production rollout not started |
+| Backups/migrations/restore | CLI operator | All runtimes coordinated, SQLite backup API, safety snapshot | Restore includes extension tables/receipt BLOBs and is exercised | 2/8: shared database CLI and isolated VPS restore verified; coordinated live recovery pending |
+| Staging/pilot/rollback | Operator, selected pilot users | Opt-in gates, compatible revisions, pending operation preservation | Full journeys pass before expanding access | 8: informational deployment live; operator confirmed browser/Mini App sign-in pilot; full customer release pending |
 
 ## Verification ledger
 
@@ -90,9 +90,56 @@ the workflow families below, rather than counted as separate menu buttons.
   languages, Persian RTL, account/configuration access, permission denial,
   mobile role switching/logout, paused write controls, Telegram dark theme and
   safe areas, downloads, and administrator operation visibility.
-- Real Telegram clients, gateway/panel integration, production deployment, and
-  coordinated VPS recovery have not been exercised. Deployment templates and
-  instructions are in `web-deployment.md`; rendering does not install services.
+- The operator confirmed real browser/Mini App sign-in on September 12. Full
+  gateway/panel journeys and coordinated live VPS recovery remain unverified.
+  Deployment details and evidence are in `web-deployment.md`.
+
+### September 11 informational deployment
+
+- `utility.jibijij.top` now serves public pages through the existing Traefik and
+  Cloudflare proxy, with a verified Let's Encrypt origin certificate. Access to
+  the portal remains administrator-only; writes are disabled.
+- The VPS was upgraded by the operator from 2 GB to 4 GB RAM. Existing n8n,
+  Traefik, and VPN services were preserved and their post-deployment status checked.
+- Added `ajib web setup/status/doctor/logs/stop/restart/renew-certificate`, menu
+  entries, database-path propagation to the operator CLI, and private companion
+  configuration backups. The legacy bot-only upgrader is blocked for web installs.
+- Bot, hosted workers, API, and paused worker all use the same relocated database.
+  Integrity passed; 1,347 payments, 71 resellers, and 10 hosted-bot records were
+  preserved at deployment. No web fulfillment operations were created.
+- Deployment caught a root-created SQLite SHM permission mismatch. Shared
+  permissions now cover the database, WAL, and SHM; an actual separate-identity
+  Linux regression test covers unprivileged writes while a root connection is open.
+- Full bot suite rerun: 1,186 tests and 369 subtests passed. The expanded API and
+  deployment suite passed 45 tests, and 49 targeted CLI/backup tests passed. The
+  production build passed, and all 14 desktop/mobile browser assertions passed
+  (the Windows test-server teardown did not exit promptly). Live checks covered
+  TLS, unauthorized access, CSRF, socket survival across an API restart, and an
+  isolated restore of the real backup without replacing the live database.
+  Full customer journeys and live recovery release gates
+  remain open; public informational availability does not close Stage 4.
+
+### September 12 operator pilot and configuration maintenance
+
+- The operator reports that browser Telegram sign-in and the Mini App pilot both
+  worked. This closes the initial administrator sign-in check, not customer purchase
+  or renewal acceptance. Public portal and financial writes remain disabled.
+- Added `ajib web sync-config --dry-run/--yes/--recover` for the read-only pilot,
+  preserving website access settings while copying current bot configuration and
+  public catalogs. A private journal supports interrupted synchronization; recovery
+  leaves the live database authoritative and preserves prior service activity.
+- Installed and exercised the command on the VPS. Its first attempt refused before
+  changing services because the bot's saved configuration checksum was stale.
+  A verified database/configuration backup preceded a checksum-only repair and an
+  ajib supervisor restart; readiness then matched the saved configuration. The
+  command synchronized the changed catalog and restarted only the API/worker.
+  Local/public health and Nginx configuration passed; unrelated services stayed up.
+- Validation: 61 API/deployment tests and 55 existing CLI/backup tests passed
+  (plus 3 subtests). The subsequent readiness-check regression passed with all
+  17 configuration-sync tests. Fixtures exercise partial installation/start,
+  failed health checks, recovery with newer payments, and previously stopped services.
+- Coordinated code upgrades and secret rotation remain pending. The legacy bot-only
+  upgrade block is still required and must not be bypassed.
 
 ## Release rule
 

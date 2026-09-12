@@ -1,9 +1,117 @@
 # VPS installation and recovery
 
+## Current pilot and CLI setup
+
+The public informational site is deployed at `https://utility.jibijij.top`.
+Portal access is restricted to configured administrators and financial writes
+remain disabled. This is an informational release and a read-only pilot, not
+the Stage 4 customer release. On September 12 the operator confirmed that browser
+sign-in and the Mini App pilot both worked. Purchase/renewal journeys and broader
+customer/device coverage remain separate release gates.
+
+On an ajib installation containing this implementation:
+
+```sh
+ajib web setup --domain utility.example.com --dry-run
+ajib web setup --domain utility.example.com --yes
+ajib web status
+ajib web doctor
+ajib web logs --lines 100
+ajib backup
+```
+
+The interactive menu also offers website setup and diagnostics. Setup detects
+one existing Docker-based Traefik installation with an HTTP-01 resolver and adds
+only a hostname-specific Docker route. It preserves the existing proxy and
+other containers. On this VPS the existing resolver `mytlschallenge` manages
+the new Let's Encrypt certificate automatically; no Traefik restart was needed.
+
+Without Traefik, `--proxy standalone` uses a dedicated Nginx container on ports
+80/443 and Let's Encrypt HTTP-01 through Certbot, with a renewal timer. Occupied
+ports fail closed. Docker is installed on a fresh supported Debian/Ubuntu host
+if absent; neither Traefik nor a local VPN panel is required. Standalone setup
+has automated configuration tests but still needs a separate fresh-VPS integration
+drill before being treated as a verified installation path.
+
+The API and worker use systemd and a dedicated virtual environment. The Nginx
+container reaches the API through a private Unix socket instead of a TCP port;
+this keeps the API private while allowing reuse of an existing Docker proxy.
+No Docker socket, database, or credentials are mounted into the Nginx container.
+Cloudflare visitor headers are accepted only through the validated proxy/edge
+chain. API responses are not cached. Keep Cloudflare proxying enabled and verify
+Full (strict) mode for this hostname without changing unrelated domain settings.
+The Cloudflare account's encryption-mode setting has not been inspected.
+
+Persistent locations are `/etc/ajib-web` (configuration), `/opt/ajib-web/app`
+(public code/build), `/opt/ajib-web/venv`, and `/var/lib/ajib-state/ajib.db`.
+The bot's systemd drop-in sets the shared database path and `UMask=0007`.
+The API unit preserves `/run/ajib-web` across stops/restarts so the Nginx bind
+mount continues to see its socket. An API-only restart was exercised on the VPS
+and public health recovered without restarting Traefik or the website proxy.
+The database, WAL, and SHM files must all be group-writable by `ajib-state`.
+`ajib` automatically loads the installed database path for backup/restore and
+rejects a conflicting `AJIB_DB_PATH`. After applying bot configuration changes,
+refresh the copied public catalogs and adapter settings with:
+
+```sh
+ajib web sync-config --dry-run
+ajib web sync-config --yes
+ajib web doctor
+```
+
+The preview prints changed setting names, never credential values. Sync requires
+the bot to be running and ready with its saved configuration. It preserves website
+access settings, drops removed adapter settings, and restarts only previously
+running API/worker services. The main bot, hosted workers, Nginx, Traefik, and other
+services are not restarted. No database snapshot is restored. This command currently
+supports only the read-only pilot; token rotation and enabled financial writes
+require the later coordinated maintenance implementation.
+
+Sync stores private configuration history under `/etc/ajib-web/history` and an
+in-progress journal at `/etc/ajib-web/config-sync.json`. If interrupted or unhealthy,
+it attempts to stop both web services, preserves the journal, and reports failure.
+Check `ajib web status` and `ajib web logs`, correct the bot configuration if needed,
+then run `ajib web sync-config --recover --yes`. Recovery retries from current bot
+settings and restores the original service activity states. It never restores an
+older database or silently resumes stale permissions. Setup/restart cannot bypass
+the pending recovery record. Avoid concurrent bot configuration edits during sync;
+detected edits fail the sync and require recovery. Old bot handlers do not invoke
+this synchronization automatically.
+
+The command was installed and exercised on this VPS on September 12. The initial
+preflight caught stale saved configuration checksum metadata before any service
+changes. A verified state/configuration backup preceded a checksum-only repair and
+an ajib supervisor restart. Sync then refreshed the divergent plans and passed
+private/public health and Nginx checks. CLI rollback files and the repair backup
+are under `/opt/ajib-backups/config-sync-cli-20260912`; private synchronization
+history is retained under `/etc/ajib-web/history`. Other VPS services remained up.
+
+`ajib backup` creates the normal state ZIP plus a private web-configuration TAR.
+The companion includes the web environment and service configuration; restore
+it only as part of a coordinated CLI recovery. The pilot's initial code/config
+and database snapshots are in `/opt/ajib-backups/pre-web-20260911`, with the
+relocation snapshot under `/opt/ajib-backups/web-install-*`.
+The post-deployment state ZIP was prepared/restored into an isolated root-only
+directory on this VPS: integrity passed and 1,348 payment records, 71 resellers,
+10 hosted-bot records and the web worker table were present. The count includes
+normal bot activity after the initial snapshot. Both backup files were mode 0600.
+This verifies backup readability and isolated restoration, not a live database
+rollback or payment/panel reconciliation drill.
+
+`ajib web stop` stops only the website, retaining all state. `ajib web restart`
+restarts only its processes. The legacy bot-only `ajib upgrade` is deliberately
+blocked on an installed website until a coordinated web/bot upgrader is delivered;
+do not bypass it or downgrade the bot's web fulfillment-owner guard. Do not use
+the old uninstall script on this pilot. A repeat setup pauses web processes while
+refreshing their code and resets access to the administrator-only read-only pilot.
+
+## Earlier manual templates
+
 The implementation is not cleared for public customer access. Keep both gates
 off until the remaining Stage 4 acceptance criteria in `web-roadmap.md` pass.
 These steps prepare an isolated pilot; they do not authorize bypassing its gates.
-No production services or database have been changed by this implementation.
+The manual renderer below remains available for reviewing alternative layouts;
+the installed CLI-managed pilot uses the deployment described above.
 
 ## Build and review
 

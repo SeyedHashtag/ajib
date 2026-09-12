@@ -2,6 +2,13 @@
 
 set -euo pipefail
 
+# The web pilot shares financial state and requires compatible bot adapters.
+# Do not let the legacy bot-only upgrader remove its fulfillment ownership guard.
+if [ -f /etc/ajib-web/deployment.json ]; then
+    echo "This installation has an active website deployment. A coordinated web/bot upgrade is required; the bot-only upgrader has not changed anything." >&2
+    exit 1
+fi
+
 INSTALL_DIR="/etc/ajib"
 BOT_DIR="$INSTALL_DIR/core/scripts/telegrambot"
 BACKUP_DIR=${AJIB_BACKUP_DIR:-/opt/ajib-backups}

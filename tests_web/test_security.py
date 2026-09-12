@@ -21,6 +21,10 @@ def test_api_does_not_import_handlers(client):
     assert "utils.purchase_plan" not in sys.modules
     assert "utils.edit_plans" not in sys.modules
     assert client.get("/api/v1/health").json() == {"status": "ok"}
+    storefront = client.get('/api/v1/storefront').json()
+    assert isinstance(storefront['writes_enabled'], bool)
+    assert isinstance(storefront['public_portal'], bool)
+    assert 'API_TOKEN' not in storefront
 
 
 def test_login_is_bound_to_browser_and_single_use(client, login):

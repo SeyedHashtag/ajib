@@ -544,7 +544,8 @@ def _ensure_permissions(path: str) -> None:
         import stat
         group_id = grp.getgrnam(shared_group).gr_gid
         os.makedirs(parent, mode=0o2770, exist_ok=True)
-        for target, mode in ((parent, 0o2770), (path, 0o660)):
+        for target, mode in ((parent, 0o2770), (path, 0o660),
+                             (path + '-wal', 0o660), (path + '-shm', 0o660)):
             if not os.path.exists(target):
                 continue
             if os.path.islink(target):

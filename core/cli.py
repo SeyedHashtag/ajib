@@ -15,6 +15,7 @@ import click
 
 import ajib_operator as operator
 import cli_api
+from web_cli import web_group, apply_database_environment
 
 
 def pretty_print(data: Any) -> None:
@@ -886,6 +887,10 @@ def backup_command() -> None:
     """Create a private, versioned bot-state backup."""
     try:
         click.echo(cli_api.backup_ajib())
+        from web_operator import backup_configuration
+        companion = backup_configuration()
+        if companion:
+            click.echo(f"Website configuration backup: {companion}")
     except Exception as error:
         raise _echo_error(error) from error
 
@@ -1074,5 +1079,8 @@ def telegram_legacy(action: str, token: str | None, adminid: str | None, api_url
         raise click.exceptions.Exit(result.exit_code)
 
 
+cli.add_command(web_group)
+
 if __name__ == "__main__":
+    apply_database_environment()
     cli()

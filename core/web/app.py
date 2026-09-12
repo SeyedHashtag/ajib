@@ -192,7 +192,9 @@ def create_app(settings=None, services=None):
 
     @app.get("/api/v1/storefront")
     def storefront(slug: str | None = None):
-        return services.storefront(slug)
+        store = services.storefront(slug)
+        return {**store, "public_portal": settings.public_portal,
+                "writes_enabled": settings.writes_enabled and store["scope"] == "main"}
 
     @app.get("/api/v1/plans", response_model=list[PlanResponse])
     def plans(storefront: str | None = None):

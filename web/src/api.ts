@@ -3,7 +3,7 @@ import type { components } from './api-schema';
 export type Identity = components['schemas']['IdentityResponse'];
 export type Plan = components['schemas']['PlanResponse'];
 export type Language = Identity['language'];
-export type Store = {scope: string; slug: string | null; title: string; bot_username: string; support: Record<string, string>};
+export type Store = {public_portal?: boolean; writes_enabled?: boolean; scope: string; slug: string | null; title: string; bot_username: string; support: Record<string, string>};
 export type Account = {username: string; server_id: string; state: string; expires_at: string | null; used_bytes: number; limit_bytes: number; available: boolean};
 export type Payment = {id: string; status?: string; type?: string; plan_gb?: string; price?: number; currency?: string; converted_amount?: number; converted_currency?: string; payment_url?: string; card_number?: string; created_at?: string; receipt_id?: string; review_in_telegram?: boolean};
 
