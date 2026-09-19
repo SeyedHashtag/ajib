@@ -13,6 +13,7 @@ os.environ.update(AJIB_BOT_ROLE="api", AJIB_BOT_DIR=str(DATA),
     AJIB_DB_PATH=str(DATA / "ajib.db"), AJIB_SQLITE_ACTIVE="1",
     API_TOKEN="123456:synthetic-browser-test-token", ADMIN_USER_IDS="[1]",
     AJIB_WEB_BOT_USERNAME="SyntheticTestBot", SERVERS_JSON="[]")
+os.environ.update(CRYPTO_MERCHANT_ID='synthetic-merchant', CRYPTO_API_KEY='synthetic-provider-key')
 
 from core.web.runtime import configure
 configure()
@@ -46,12 +47,27 @@ class Panels:
 
 
 web_store.initialize()
+from utils import receipt_checker, exchange_rate, payments
+receipt_checker.get_card_number_for_receipt_type = lambda _: '0000 0000 0000 0000'
+exchange_rate.get_exchange_rate = lambda: 100000
+payments.CryptoPayment.create_payment = lambda self, *args, **kwargs: {'result': {
+    'uuid': 'synthetic-invoice-' + kwargs['order_id'], 'order_id': kwargs['order_id'],
+    'url': 'https://payment.invalid/' + kwargs['order_id']}}
 with database.transaction() as connection:
     save_payment(connection, "main", "synthetic-purchase", {
         "user_id": 123, "status": "completed", "plan_gb": "40", "price": 1.20,
         "days": 30, "username": "s123a", "server_id": "test", "payment_method": "Crypto",
     })
-app = create_app(Settings(origin="http://127.0.0.1:5173", public_portal=True), Services(Panels()))
+    save_payment(connection, 'main', 'synthetic-reserved', {'user_id': 125, 'status': 'completed',
+        'price': 1.2, 'plan_gb': '40', 'renewal_mode': 'reserved', 'renewal_status': 'reserved'})
+    save_payment(connection, 'main', 'synthetic-attention', {'user_id': 124, 'status': 'uncertain',
+        'price': 1.2, 'web_attention_reason': 'internal-marker-private-error'})
+app = create_app(Settings(origin="http://127.0.0.1:5173", public_portal=True,
+    writes_enabled=os.getenv('SYNTHETIC_CUSTOMER_WRITES') == '1'), Services(Panels()))
+if os.getenv('SYNTHETIC_CUSTOMER_WRITES') == '1':
+    from utils import referral
+    for user_id in (601, 701):
+        referral.credit_manual_referral_reward(user_id, 5, f'synthetic-browser-reward-{user_id}')
 
 if __name__ == "__main__":
     import uvicorn

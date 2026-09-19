@@ -19,7 +19,7 @@ the CLI. A deployment must retain these capabilities for the existing bot.
 `web-entrypoints.json` records every statically decorated Telegram and CLI
 entrypoint, including source location and dispatch expression. Regenerate it
 with `python tools/inventory_web_features.py`. The initial baseline contains
-221 entrypoints; the current generated inventory contains 222. Scheduled work and dynamic next-step flows are included in
+221 entrypoints; the current generated inventory contains 244. Scheduled work and dynamic next-step flows are included in
 the workflow families below, rather than counted as separate menu buttons.
 
 | Workflow family | Actor and ownership | Rules and dependencies | Acceptance criterion | Stage / current evidence |
@@ -68,6 +68,13 @@ the workflow families below, rather than counted as separate menu buttons.
 | Staging/pilot/rollback | Operator, selected pilot users | Opt-in gates, compatible revisions, pending operation preservation | Full journeys pass before expanding access | 8: informational deployment live; operator confirmed browser/Mini App sign-in pilot; full customer release pending |
 
 ## Verification ledger
+
+The current main-store customer increment is tracked in the
+[Stage 4 customer acceptance matrix](stage4-customer-acceptance.md). It supersedes
+earlier pending local-implementation notes for renewal options, payment progress,
+checker receipt continuation and customer browser journeys. Real-client,
+production/provider and pilot gates remain pending. The entries below retain the
+historical baseline evidence.
 
 - Initial Windows/Python 3.14 baseline: 901 passed, 38 failed, 247 errors,
   1 skipped, 369 subtests passed. Sandbox/temp-path and OS differences affect this run.

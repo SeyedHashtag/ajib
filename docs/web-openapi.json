@@ -352,7 +352,83 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AccountResponse"
+                  },
+                  "type": "array",
+                  "title": "Response Accounts Api V1 Accounts Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/accounts/{server_id}/{username}/renewal-options": {
+      "get": {
+        "summary": "Renewal Options",
+        "operationId": "renewal_options_api_v1_accounts__server_id___username__renewal_options_get",
+        "parameters": [
+          {
+            "name": "server_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Server Id"
+            }
+          },
+          {
+            "name": "username",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Username"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenewalOptionsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/payment-methods": {
+      "get": {
+        "summary": "Payment Methods",
+        "operationId": "payment_methods_api_v1_payment_methods_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PaymentMethodResponse"
+                  },
+                  "type": "array",
+                  "title": "Response Payment Methods Api V1 Payment Methods Get"
+                }
               }
             }
           }
@@ -460,7 +536,13 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PaymentResponse"
+                  },
+                  "type": "array",
+                  "title": "Response Payments Api V1 Payments Get"
+                }
               }
             }
           }
@@ -487,7 +569,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentResponse"
+                }
               }
             }
           },
@@ -523,7 +607,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentResponse"
+                }
               }
             }
           },
@@ -560,7 +646,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentResponse"
+                }
               }
             }
           },
@@ -1084,6 +1172,57 @@
   },
   "components": {
     "schemas": {
+      "AccountResponse": {
+        "properties": {
+          "username": {
+            "type": "string",
+            "title": "Username"
+          },
+          "server_id": {
+            "type": "string",
+            "title": "Server Id"
+          },
+          "state": {
+            "type": "string",
+            "title": "State"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "used_bytes": {
+            "type": "integer",
+            "title": "Used Bytes"
+          },
+          "limit_bytes": {
+            "type": "integer",
+            "title": "Limit Bytes"
+          },
+          "available": {
+            "type": "boolean",
+            "title": "Available"
+          }
+        },
+        "type": "object",
+        "required": [
+          "username",
+          "server_id",
+          "state",
+          "expires_at",
+          "used_bytes",
+          "limit_bytes",
+          "available"
+        ],
+        "title": "AccountResponse"
+      },
       "AttributionInput": {
         "properties": {
           "code": {
@@ -1342,6 +1481,366 @@
         ],
         "title": "MiniAppInput"
       },
+      "PaymentMethodResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "crypto",
+              "card"
+            ],
+            "title": "Id"
+          },
+          "available": {
+            "type": "boolean",
+            "title": "Available"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "available",
+          "reason"
+        ],
+        "title": "PaymentMethodResponse"
+      },
+      "PaymentProgressResponse": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "preparing_payment",
+              "awaiting_receipt",
+              "awaiting_payment",
+              "awaiting_review",
+              "preparing_service",
+              "needs_attention",
+              "completed",
+              "cancelled",
+              "rejected",
+              "expired",
+              "renewal_reserved",
+              "renewal_activating"
+            ],
+            "title": "Code"
+          },
+          "actions": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "upload_receipt",
+                "cancel",
+                "pay",
+                "contact_support"
+              ]
+            },
+            "type": "array",
+            "title": "Actions"
+          },
+          "poll": {
+            "type": "boolean",
+            "title": "Poll"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "actions",
+          "poll"
+        ],
+        "title": "PaymentProgressResponse"
+      },
+      "PaymentResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          },
+          "plan_gb": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Gb"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          },
+          "original_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Original Price"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          },
+          "payment_method": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payment Method"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Days"
+          },
+          "username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Username"
+          },
+          "server_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Server Id"
+          },
+          "renewal_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Renewal Username"
+          },
+          "renewal_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Renewal Status"
+          },
+          "converted_amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Converted Amount"
+          },
+          "converted_currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Converted Currency"
+          },
+          "account_credit_reserved": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Account Credit Reserved"
+          },
+          "discount_amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Discount Amount"
+          },
+          "payment_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payment Url"
+          },
+          "card_number": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Card Number"
+          },
+          "receipt_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Receipt Id"
+          },
+          "review_in_telegram": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review In Telegram"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/PaymentProgressResponse"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "progress"
+        ],
+        "title": "PaymentResponse"
+      },
       "PlanResponse": {
         "properties": {
           "id": {
@@ -1403,6 +1902,111 @@
           "choice"
         ],
         "title": "RecruitmentInput"
+      },
+      "RenewalChoiceResponse": {
+        "properties": {
+          "plan": {
+            "$ref": "#/components/schemas/PlanResponse"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "immediate",
+              "reserved"
+            ],
+            "title": "Mode"
+          },
+          "available": {
+            "type": "boolean",
+            "title": "Available"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "plan",
+          "mode",
+          "available",
+          "reason"
+        ],
+        "title": "RenewalChoiceResponse"
+      },
+      "RenewalOptionsResponse": {
+        "properties": {
+          "username": {
+            "type": "string",
+            "title": "Username"
+          },
+          "server_id": {
+            "type": "string",
+            "title": "Server Id"
+          },
+          "choices": {
+            "items": {
+              "$ref": "#/components/schemas/RenewalChoiceResponse"
+            },
+            "type": "array",
+            "title": "Choices"
+          },
+          "reservation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReservationResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "username",
+          "server_id",
+          "choices",
+          "reservation",
+          "reason"
+        ],
+        "title": "RenewalOptionsResponse"
+      },
+      "ReservationResponse": {
+        "properties": {
+          "payment_id": {
+            "type": "string",
+            "title": "Payment Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "payment_id",
+          "status"
+        ],
+        "title": "ReservationResponse"
       },
       "ReviewInput": {
         "properties": {

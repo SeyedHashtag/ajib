@@ -7,6 +7,7 @@ import json
 import logging
 import secrets
 import time
+from datetime import datetime
 
 from fastapi import Depends, FastAPI, Request, Response, UploadFile, File, Query
 from fastapi.responses import JSONResponse
@@ -86,6 +87,77 @@ class DownloadResponse(BaseModel):
     label: str
     url: str
     details: str
+
+
+class AccountResponse(BaseModel):
+    username: str
+    server_id: str
+    state: str
+    expires_at: datetime | None
+    used_bytes: int
+    limit_bytes: int
+    available: bool
+
+
+class PaymentMethodResponse(BaseModel):
+    id: Literal['crypto', 'card']
+    available: bool
+    reason: str | None
+
+
+class RenewalChoiceResponse(BaseModel):
+    plan: PlanResponse
+    mode: Literal['immediate', 'reserved']
+    available: bool
+    reason: str | None
+
+
+class ReservationResponse(BaseModel):
+    payment_id: str
+    status: str
+
+
+class RenewalOptionsResponse(BaseModel):
+    username: str
+    server_id: str
+    choices: list[RenewalChoiceResponse]
+    reservation: ReservationResponse | None
+    reason: str | None
+
+
+class PaymentProgressResponse(BaseModel):
+    code: Literal['preparing_payment', 'awaiting_receipt', 'awaiting_payment', 'awaiting_review',
+                  'preparing_service', 'needs_attention', 'completed', 'cancelled', 'rejected',
+                  'expired', 'renewal_reserved', 'renewal_activating']
+    actions: list[Literal['upload_receipt', 'cancel', 'pay', 'contact_support']]
+    poll: bool
+
+
+class PaymentResponse(BaseModel):
+    id: str
+    status: str | None = None
+    type: str | None = None
+    plan_gb: str | int | float | None = None
+    price: float | str | None = None
+    original_price: float | str | None = None
+    currency: str | None = None
+    payment_method: str | None = None
+    created_at: str | None = None
+    completed_at: str | None = None
+    days: int | None = None
+    username: str | None = None
+    server_id: str | None = None
+    renewal_username: str | None = None
+    renewal_status: str | None = None
+    converted_amount: float | str | None = None
+    converted_currency: str | None = None
+    account_credit_reserved: float | str | None = None
+    discount_amount: float | str | None = None
+    payment_url: str | None = None
+    card_number: str | None = None
+    receipt_id: str | None = None
+    review_in_telegram: bool | None = None
+    progress: PaymentProgressResponse
 
 
 def create_app(settings=None, services=None):
@@ -270,9 +342,21 @@ def create_app(settings=None, services=None):
         services.set_language(value["user_id"], value["scope"], data.language)
         return {"language": data.language}
 
-    @app.get("/api/v1/accounts")
+    @app.get("/api/v1/accounts", response_model=list[AccountResponse])
     def accounts(value=Depends(session)):
         return services.accounts(value["user_id"], value["scope"])
+
+    @app.get('/api/v1/accounts/{server_id}/{username}/renewal-options', response_model=RenewalOptionsResponse)
+    def renewal_options(server_id: str, username: str, value=Depends(session)):
+        from utils.customer_options import renewal_options as options
+        return options(services, value['user_id'], value['scope'], server_id, username,
+                       writes=web_release.policy(settings)['accept_writes'])
+
+    @app.get('/api/v1/payment-methods', response_model=list[PaymentMethodResponse])
+    def payment_methods(value=Depends(session)):
+        from utils.customer_options import payment_methods as options
+        return options(services, value['scope'], value['language'],
+                       writes=web_release.policy(settings)['accept_writes'])
 
     @app.get("/api/v1/accounts/{server_id}/{username}/configuration")
     def configuration(server_id: str, username: str, value=Depends(session)):
@@ -289,19 +373,20 @@ def create_app(settings=None, services=None):
         qrcode.make(uri).save(output, format="PNG")
         return Response(output.getvalue(), media_type="image/png")
 
-    @app.get("/api/v1/payments")
+    @app.get("/api/v1/payments", response_model=list[PaymentResponse], response_model_exclude_unset=True)
     def payments(value=Depends(session)):
-        return [payment_public(key, row) for key, row in services.payments(value["user_id"], value["scope"]).items()]
+        return [payment_public(key, row, scope=value['scope'], writes=web_release.policy(settings)['accept_writes'])
+                for key, row in services.payments(value["user_id"], value["scope"]).items()]
 
-    @app.get("/api/v1/payments/{payment_id}")
+    @app.get("/api/v1/payments/{payment_id}", response_model=PaymentResponse, response_model_exclude_unset=True)
     def payment(payment_id: str, value=Depends(session)):
         record = services.payment(value["user_id"], value["scope"], payment_id)
-        result = payment_public(payment_id, record)
+        result = payment_public(payment_id, record, scope=value['scope'], writes=web_release.policy(settings)['accept_writes'])
         if record.get("status") == "waiting_receipt":
             result["card_number"] = record.get("card_number")
         return result
 
-    @app.post("/api/v1/orders")
+    @app.post("/api/v1/orders", response_model=PaymentResponse, response_model_exclude_unset=True)
     def create_order(data: CheckoutInput, request: Request, value=Depends(write_session)):
         key = action_key(request)
         if not web_store.rate_limit(f"orders:{value['scope']}:{value['user_id']}", maximum=20):
@@ -309,45 +394,15 @@ def create_app(settings=None, services=None):
         return orders.create(value["user_id"], value["scope"], key, data.plan_id, data.method,
                              value["language"], data.username, data.server_id, data.reserved)
 
-    @app.post("/api/v1/payments/{payment_id}/cancel")
+    @app.post("/api/v1/payments/{payment_id}/cancel", response_model=PaymentResponse, response_model_exclude_unset=True)
     def cancel(payment_id: str, value=Depends(write_session)):
         return orders.cancel(value["user_id"], value["scope"], payment_id)
 
     @app.post("/api/v1/payments/{payment_id}/receipt")
     async def receipt(payment_id: str, file: Annotated[UploadFile, File()], value=Depends(write_session)):
-        from PIL import Image, UnidentifiedImageError
+        from utils.customer_payments import submit_receipt
         contents = await file.read(5 * 1024 * 1024 + 1)
-        if len(contents) > 5 * 1024 * 1024:
-            raise ServiceError("Receipt must be smaller than 5 MB", 413)
-        try:
-            source = Image.open(io.BytesIO(contents))
-            if source.format not in {"PNG", "JPEG"} or source.width * source.height > 20_000_000:
-                raise ValueError("Invalid receipt")
-            source.load()
-            output = io.BytesIO()
-            source.convert("RGB").save(output, format="JPEG", quality=88)
-            contents = output.getvalue()
-        except (ValueError, OSError, Image.DecompressionBombError, UnidentifiedImageError):
-            raise ServiceError("Upload a valid PNG or JPEG receipt")
-        receipt_id = secrets.token_hex(16)
-        with database.transaction(operation="web_receipt_upload") as connection:
-            record = services.payment(value["user_id"], value["scope"], payment_id)
-            if record.get("fulfillment_owner") != "web" or record.get("status") != "waiting_receipt":
-                raise ServiceError("Payment is not awaiting a receipt", 409)
-            connection.execute("INSERT INTO web_receipts VALUES (?,?,?,?,?,?,?)",
-                               (receipt_id, value["scope"], payment_id, value["user_id"], "image/jpeg", contents, int(time.time())))
-            record = save_payment(connection, value["scope"], payment_id, {"status": "pending_approval", "web_receipt_id": receipt_id})
-            connection.execute("UPDATE web_operations SET status='pending_approval',updated_at=? WHERE id=?", (int(time.time()), payment_id))
-            web_store.audit(connection, value["user_id"], value["scope"], "receipt.upload", payment_id)
-            import os
-            admins = json.loads(os.getenv("ADMIN_USER_IDS", "[]"))
-            recipients = {str(actor) for actor in admins}
-            if record.get("routed_to_checker") and record.get("receipt_checker_user_id"):
-                recipients.add(str(record["receipt_checker_user_id"]))
-            for actor in recipients:
-                web_store.enqueue(connection, f"receipt:{receipt_id}:{actor}", value["scope"], actor,
-                                  f"Receipt pending review: {settings.origin}/admin/payments/{payment_id}")
-        return {"id": receipt_id, "status": "pending_approval"}
+        return submit_receipt(value['user_id'], value['scope'], payment_id, contents)
 
     @app.get("/api/v1/receipts/{receipt_id}")
     def view_receipt(receipt_id: str, value=Depends(session)):
@@ -453,7 +508,7 @@ def create_app(settings=None, services=None):
         result = []
         for key, record in services.payments(value["user_id"], value["scope"], all_users=True).items():
             if record.get("status") == "pending_approval" and can_review_receipt(int(value["user_id"]), record, is_admin_user="admin" in value["roles"]):
-                result.append({**payment_public(key, record), "receipt_id": record.get("web_receipt_id"),
+                result.append({**payment_public(key, record, scope=value['scope']), "receipt_id": record.get("web_receipt_id"),
                                "review_in_telegram": record.get("fulfillment_owner") != "web"})
         return result
 

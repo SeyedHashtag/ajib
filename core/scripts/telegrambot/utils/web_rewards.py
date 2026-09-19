@@ -37,8 +37,9 @@ def perform(user_id, scope, kind, key, payload):
                 raise ServiceError(str(request), 409)
             result = {"id": request["id"], "amount": request["amount"], "status": "pending"}
             for admin in json.loads(os.getenv("ADMIN_USER_IDS", "[]")):
+                from .customer_messages import message, language_for
                 web_store.enqueue(connection, f"withdrawal:{request['id']}:{admin}", "main", admin,
-                                  f"Referral withdrawal {request['id']} is awaiting review in the bot.")
+                                  message(language_for(admin), 'withdrawal_review') + '\n' + request['id'])
         elif kind == "recruitment":
             result = recruitment.claim_recruitment_reward(user_id, payload["reseller_id"], payload["choice"])
             if not result:

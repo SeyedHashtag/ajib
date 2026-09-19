@@ -8,6 +8,7 @@ import json
 import secrets
 import os
 import time
+from contextlib import nullcontext
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from . import database, web_store
@@ -45,6 +46,20 @@ class Orders:
         self.services = services
 
     def create(self, user_id, scope, key, plan_id, method, language="en", username=None, server_id=None, reserved=False):
+        from . import account_operations
+        from .reseller_blocks import renewal_block_guard
+        if bool(username) != bool(server_id) or (reserved and not username):
+            raise ServiceError('Choose an account and an available renewal option', 409)
+        guard = renewal_block_guard(username, server_id) if username else nullcontext(True)
+        try:
+            with guard as allowed:
+                if not allowed:
+                    raise ServiceError('This account requires support review before renewal', 409)
+                return self._create(user_id, scope, key, plan_id, method, language, username, server_id, reserved)
+        except account_operations.AccountBusy:
+            raise ServiceError('This account has work in progress; contact support', 409) from None
+
+    def _create(self, user_id, scope, key, plan_id, method, language, username, server_id, reserved):
         if scope != "main":
             raise ServiceError("Hosted checkout is not enabled in this release", 409)
         if method not in {"card", "crypto"}:
@@ -57,12 +72,17 @@ class Orders:
             if existing["request_hash"] != request_hash:
                 raise ServiceError("This request key was already used for another checkout", 409)
             return payment_public(existing["id"], self.services.payment(user_id, scope, existing["id"]))
+        from .customer_options import payment_methods
+        if not any(item['id'] == method and item['available'] for item in payment_methods(self.services, scope, language)):
+            raise ServiceError('This payment method is currently unavailable', 409)
         plan = next((item for item in self.services.catalog(scope) if item["id"] == plan_id), None)
         if not plan:
             raise ServiceError("Plan unavailable", 404)
         from .purchase_incentives import reserve_order_checkout
         offer, renewal_metadata = None, {}
         if username:
+            from .account_operations import assert_available
+            assert_available(server_id, username)
             from .catalog_service import load_catalog
             from .renewal import find_customer_renewal_offer, customer_payment_metadata
             client, data, lookup = self.services.resolve_account(user_id, scope, username, server_id)
@@ -70,8 +90,9 @@ class Orders:
                 load_catalog(Path(database.bot_dir()) / "plans.json"),
                 payments=self.services.payments(user_id, scope), server_id=server_id,
                 allow_reservation=reserved, target_plan_gb=plan_id, lookup_result=lookup)
-            if not offer.get("eligible"):
-                raise ServiceError(offer.get("reason", "Renewal unavailable"), 409)
+            if (not offer.get("eligible")
+                    or offer.get('renewal_mode') != ('reserved' if reserved else 'immediate')):
+                raise ServiceError('Renewal options changed; refresh and choose an available option', 409)
             renewal_metadata = customer_payment_metadata(offer)
         card, rate = None, None
         if method == "card":
@@ -91,8 +112,9 @@ class Orders:
                     raise ServiceError("Request key conflict", 409)
                 return payment_public(existing["id"], self.services.payment(user_id, scope, existing["id"]))
             if username:
-                pending = connection.execute("SELECT payload_json FROM web_operations WHERE scope=? AND user_id=? AND kind='renewal' AND status NOT IN ('completed','cancelled','rejected')", (scope, str(user_id)))
-                if any(json.loads(row[0]).get("username") == username for row in pending):
+                pending = connection.execute("SELECT payload_json FROM payments WHERE scope=? AND user_id=? AND status NOT IN ('completed','paid','success','succeeded','cancelled','rejected','expired')", (scope, str(user_id)))
+                if any(str((item := json.loads(row[0])).get('renewal_username') or item.get('renew_username') or item.get('username') or '').casefold() == username.casefold()
+                       for row in pending):
                     raise ServiceError("Another renewal is already pending for this account", 409)
             quote = reserve_order_checkout(int(user_id), payment_id,
                 offer.get("full_price", plan["price"]) if offer else plan["price"],
@@ -149,6 +171,9 @@ class Orders:
             raise ServiceError("Review this legacy payment in Telegram", 409)
         with database.transaction(operation="web_payment_review") as connection:
             current = self.services.payment(actor, scope, payment_id, reviewer=True)
+            is_admin = 'admin' in self.services.identity(actor, scope)['roles']
+            if current.get('fulfillment_owner') != 'web' or not can_review_receipt(int(actor), current, is_admin_user=is_admin):
+                raise ServiceError('This receipt requires review by its assigned reviewer', 403)
             if current.get("status") != "pending_approval":
                 raise ServiceError("Payment is no longer awaiting review", 409)
             status = "approved" if approve else "rejected"
@@ -169,20 +194,14 @@ class Orders:
                 from .purchase_incentives import release_main_checkout
                 release_main_checkout(record["user_id"], payment_id)
             web_store.audit(connection, actor, scope, "payment.approve" if approve else "payment.reject", payment_id, {"reason": reason})
-            web_store.enqueue(connection, "review:" + payment_id, scope, record["user_id"], f"Payment {payment_id}: {status}.")
+            from .customer_messages import message
+            web_store.enqueue(connection, "review:" + payment_id, scope, record["user_id"],
+                              message(record.get('language', 'en'), 'review_approved' if approve else 'review_rejected'))
         return payment_public(payment_id, record)
 
     def cancel(self, actor, scope, payment_id):
-        with database.transaction(operation="web_checkout_cancel") as connection:
-            record = self.services.payment(actor, scope, payment_id)
-            if record.get("fulfillment_owner") != "web" or record.get("status") != "waiting_receipt":
-                raise ServiceError("This payment cannot be cancelled automatically", 409)
-            from .purchase_incentives import release_main_checkout
-            release_main_checkout(record["user_id"], payment_id)
-            record = save_payment(connection, scope, payment_id, {"status": "cancelled"})
-            connection.execute("UPDATE web_operations SET status='cancelled',updated_at=? WHERE id=?", (int(time.time()), payment_id))
-            web_store.audit(connection, actor, scope, "checkout.cancel", payment_id)
-        return payment_public(payment_id, record)
+        from .customer_payments import cancel
+        return cancel(actor, scope, payment_id)
 
     def process_one(self):
         # Worker ownership is claimed durably before any external call.

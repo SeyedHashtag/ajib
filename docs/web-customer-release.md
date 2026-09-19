@@ -104,11 +104,13 @@ of the intentional deployment changes.
    remain conservatively blocked and require reviewed forward repair. Synthetic
    concurrency passes with three distinct Linux UIDs; actual production identities
    and deployment still require a coordinated drill.
-3. Finish the Stage 4 acceptance ledger: legacy-order continuation, checker receipt
-   routing, account ownership/history edge cases, trial recovery and cleanup,
-   referral/credit/withdrawal journeys, and four-language statuses/notifications.
-4. Add server-calculated renewal choices, payment availability and safe progress
-   responses, generated frontend types, and their browser journeys.
+3. Complete the external evidence in the [Stage 4 customer acceptance matrix](stage4-customer-acceptance.md):
+   live legacy-order continuation, checker receipt routing, account history, trial
+   recovery/cleanup, rewards/withdrawals and four-language real-client journeys.
+   Their local synthetic acceptance now has a per-workflow test mapping.
+4. Verify server-calculated renewal choices, payment availability, safe progress
+   and typed customer interfaces against the deployed candidate. Local implementation
+   and browser checks are included in the Stage 4 matrix.
 5. Install and exercise the baseline/candidate on the VPS with general access and
    new customer writes disabled. Complete real service interruption, upgrade,
    recovery, and isolated backup-restoration drills against the deployed revision.

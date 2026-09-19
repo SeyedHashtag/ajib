@@ -191,6 +191,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/accounts/{server_id}/{username}/renewal-options": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Renewal Options */
+        get: operations["renewal_options_api_v1_accounts__server_id___username__renewal_options_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/payment-methods": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Payment Methods */
+        get: operations["payment_methods_api_v1_payment_methods_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/accounts/{server_id}/{username}/configuration": {
         parameters: {
             query?: never;
@@ -621,6 +655,23 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AccountResponse */
+        AccountResponse: {
+            /** Username */
+            username: string;
+            /** Server Id */
+            server_id: string;
+            /** State */
+            state: string;
+            /** Expires At */
+            expires_at: string | null;
+            /** Used Bytes */
+            used_bytes: number;
+            /** Limit Bytes */
+            limit_bytes: number;
+            /** Available */
+            available: boolean;
+        };
         /** AttributionInput */
         AttributionInput: {
             /** Code */
@@ -711,6 +762,80 @@ export interface components {
             /** Init Data */
             init_data: string;
         };
+        /** PaymentMethodResponse */
+        PaymentMethodResponse: {
+            /**
+             * Id
+             * @enum {string}
+             */
+            id: "crypto" | "card";
+            /** Available */
+            available: boolean;
+            /** Reason */
+            reason: string | null;
+        };
+        /** PaymentProgressResponse */
+        PaymentProgressResponse: {
+            /**
+             * Code
+             * @enum {string}
+             */
+            code: "preparing_payment" | "awaiting_receipt" | "awaiting_payment" | "awaiting_review" | "preparing_service" | "needs_attention" | "completed" | "cancelled" | "rejected" | "expired" | "renewal_reserved" | "renewal_activating";
+            /** Actions */
+            actions: ("upload_receipt" | "cancel" | "pay" | "contact_support")[];
+            /** Poll */
+            poll: boolean;
+        };
+        /** PaymentResponse */
+        PaymentResponse: {
+            /** Id */
+            id: string;
+            /** Status */
+            status?: string | null;
+            /** Type */
+            type?: string | null;
+            /** Plan Gb */
+            plan_gb?: string | number | null;
+            /** Price */
+            price?: number | string | null;
+            /** Original Price */
+            original_price?: number | string | null;
+            /** Currency */
+            currency?: string | null;
+            /** Payment Method */
+            payment_method?: string | null;
+            /** Created At */
+            created_at?: string | null;
+            /** Completed At */
+            completed_at?: string | null;
+            /** Days */
+            days?: number | null;
+            /** Username */
+            username?: string | null;
+            /** Server Id */
+            server_id?: string | null;
+            /** Renewal Username */
+            renewal_username?: string | null;
+            /** Renewal Status */
+            renewal_status?: string | null;
+            /** Converted Amount */
+            converted_amount?: number | string | null;
+            /** Converted Currency */
+            converted_currency?: string | null;
+            /** Account Credit Reserved */
+            account_credit_reserved?: number | string | null;
+            /** Discount Amount */
+            discount_amount?: number | string | null;
+            /** Payment Url */
+            payment_url?: string | null;
+            /** Card Number */
+            card_number?: string | null;
+            /** Receipt Id */
+            receipt_id?: string | null;
+            /** Review In Telegram */
+            review_in_telegram?: boolean | null;
+            progress: components["schemas"]["PaymentProgressResponse"];
+        };
         /** PlanResponse */
         PlanResponse: {
             /** Id */
@@ -735,6 +860,38 @@ export interface components {
              * @enum {string}
              */
             choice: "cash" | "credit";
+        };
+        /** RenewalChoiceResponse */
+        RenewalChoiceResponse: {
+            plan: components["schemas"]["PlanResponse"];
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "immediate" | "reserved";
+            /** Available */
+            available: boolean;
+            /** Reason */
+            reason: string | null;
+        };
+        /** RenewalOptionsResponse */
+        RenewalOptionsResponse: {
+            /** Username */
+            username: string;
+            /** Server Id */
+            server_id: string;
+            /** Choices */
+            choices: components["schemas"]["RenewalChoiceResponse"][];
+            reservation: components["schemas"]["ReservationResponse"] | null;
+            /** Reason */
+            reason: string | null;
+        };
+        /** ReservationResponse */
+        ReservationResponse: {
+            /** Payment Id */
+            payment_id: string;
+            /** Status */
+            status: string;
         };
         /** ReviewInput */
         ReviewInput: {
@@ -1077,7 +1234,59 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["AccountResponse"][];
+                };
+            };
+        };
+    };
+    renewal_options_api_v1_accounts__server_id___username__renewal_options_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                server_id: string;
+                username: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RenewalOptionsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    payment_methods_api_v1_payment_methods_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PaymentMethodResponse"][];
                 };
             };
         };
@@ -1161,7 +1370,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["PaymentResponse"][];
                 };
             };
         };
@@ -1183,7 +1392,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["PaymentResponse"];
                 };
             };
             /** @description Validation Error */
@@ -1216,7 +1425,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["PaymentResponse"];
                 };
             };
             /** @description Validation Error */
@@ -1247,7 +1456,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["PaymentResponse"];
                 };
             };
             /** @description Validation Error */

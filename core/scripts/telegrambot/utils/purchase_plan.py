@@ -1353,6 +1353,10 @@ def _format_pending_receipt_caption(payment_id, payment_record, telegram_usernam
 def _send_receipt_confirmation(chat_id, payment_id, payment_record, caption=None):
     caption = caption or _format_pending_receipt_caption(payment_id, payment_record)
     markup = _build_receipt_approval_markup(payment_id)
+    if payment_record.get('web_receipt_id'):
+        from utils.customer_payments import receipt_bytes
+        return bot.send_photo(chat_id, io.BytesIO(receipt_bytes(payment_id, payment_record)),
+                              caption=caption, reply_markup=markup, parse_mode='HTML')
     receipt_path = payment_record.get('receipt_path')
     if receipt_path and os.path.exists(receipt_path):
         with open(receipt_path, 'rb') as photo:
@@ -2108,6 +2112,15 @@ def handle_purchase_support(call):
 def handle_cancel_purchase(call):
     user_id = call.from_user.id
     language = get_user_language(user_id)
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1' and user_data.get(user_id, {}).get('payment_id'):
+        from utils.customer_payments import cancel
+        try:
+            cancel(user_id, 'main', user_data[user_id]['payment_id'])
+        except Exception:
+            safe_answer_callback_query(bot, call.id, text=public_error(language))
+            return
+        _close_card_checkout(user_data[user_id].get('card_checkout_id'), 'canceled')
+        del user_data[user_id]
     safe_answer_callback_query(bot, call.id)
     bot.delete_message(
         chat_id=call.message.chat.id,
@@ -2585,6 +2598,9 @@ def _handle_customer_renewal_card_to_card(call, offer):
             'incentive_metadata': dict(quote),
             'language': language,
         }
+        if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+            from utils.customer_payments import persist_bot_checkout
+            persist_bot_checkout(user_id, user_data[user_id], offer['plan'], card_number)
         checkout_persisted = True
         bot.edit_message_text(
             message,
@@ -2848,6 +2864,9 @@ def handle_card_to_card_payment(call, plan_gb):
             'incentive_metadata': dict(quote),
             'language': language,
         }
+        if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+            from utils.customer_payments import persist_bot_checkout
+            persist_bot_checkout(user_id, user_data[user_id], plan, card_number)
         checkout_persisted = True
         bot.edit_message_text(
             message,
@@ -2868,6 +2887,15 @@ def process_receipt_photo(message, plan_gb, price):
     try:
         user_id = message.from_user.id
         language = get_user_language(user_id)
+        if os.getenv('AJIB_SQLITE_ACTIVE') == '1' and user_data.get(user_id, {}).get('payment_id'):
+            from utils.customer_payments import submit_receipt
+            state = user_data[user_id]
+            file_info = bot.get_file(message.photo[-1].file_id)
+            submit_receipt(user_id, 'main', state['payment_id'], bot.download_file(file_info.file_path))
+            _close_card_checkout(state.get('card_checkout_id'), 'submitted')
+            user_data.pop(user_id, None)
+            bot.reply_to(message, get_message_text(language, 'receipt_submitted'))
+            return
         receipt_prompt_message_id = None
         converted_amount = None
         converted_currency = None
@@ -3017,6 +3045,60 @@ def process_receipt_photo(message, plan_gb, price):
         bot.reply_to(message, get_message_text(language, "error_occurred").format(error=public_error(language)))
 
 # New: State-aware handler for photos
+@bot.message_handler(commands=['payments'])
+def show_customer_pending_payments(message):
+    if os.getenv('AJIB_SQLITE_ACTIVE') != '1':
+        return
+    from utils.web_services import Services
+    from utils.customer_messages import message as customer_message
+    language = get_user_language(message.from_user.id)
+    rows = Services().payments(message.from_user.id, 'main')
+    requested = (message.text or '').split(maxsplit=1)
+    if len(requested) == 2:
+        rows = {key: value for key, value in rows.items() if key == requested[1].strip()}
+    pending = [(key, record) for key, record in rows.items()
+               if record.get('status') in {'waiting_receipt', 'pending', 'pending_approval', 'processing', 'uncertain'}]
+    for payment_id, record in pending[:50]:
+        if record.get('status') not in {'waiting_receipt', 'pending', 'pending_approval', 'processing', 'uncertain'}:
+            continue
+        markup = types.InlineKeyboardMarkup()
+        callback = 'customer_payment:' + payment_id
+        if len(callback.encode()) <= 64:
+            markup.add(types.InlineKeyboardButton(customer_message(language, 'continue'), callback_data=callback))
+        bot.send_message(message.chat.id, customer_message(language, 'pending_payments') + '\n' + payment_id,
+                         reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('customer_payment:'))
+def resume_customer_payment(call):
+    from utils.web_services import Services
+    from utils.customer_payments import customer_actions
+    language = get_user_language(call.from_user.id)
+    try:
+        payment_id = call.data.split(':', 1)[1]
+        record = Services().payment(call.from_user.id, 'main', payment_id)
+        actions = customer_actions(payment_id, record)
+        markup = types.InlineKeyboardMarkup()
+        if 'upload_receipt' in actions:
+            user_data[call.from_user.id] = {'state': 'waiting_receipt', 'payment_id': payment_id,
+                                          'plan_gb': record['plan_gb'], 'price': record['price']}
+            markup.add(types.InlineKeyboardButton(get_button_text(language, 'cancel'), callback_data='cancel_purchase'))
+            bot.send_message(call.message.chat.id, str(record['card_number']) + '\n' +
+                             str(record['converted_amount']) + ' ' + str(record.get('converted_currency', '')) + '\n' +
+                             get_message_text(language, 'upload_receipt'), reply_markup=markup)
+        elif 'pay' in actions:
+            markup.add(types.InlineKeyboardButton(get_button_text(language, 'payment_link'), url=record['payment_url']))
+            bot.send_message(call.message.chat.id, get_message_text(language, 'purchase_delivery_note'), reply_markup=markup)
+        else:
+            from utils.customer_messages import message as customer_message
+            bot.send_message(call.message.chat.id, customer_message(language, 'attention')
+                             if record.get('status') in {'uncertain', 'paid_provision_failed'} else
+                             get_message_text(language, 'purchase_delivery_note'))
+        safe_answer_callback_query(bot, call.id)
+    except Exception:
+        safe_answer_callback_query(bot, call.id, text=public_error(language))
+
+
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     user_id = message.from_user.id
@@ -3528,7 +3610,8 @@ def handle_admin_approval(call):
             from utils.web_orders import Orders
             from utils.web_services import Services
             Orders(Services()).review(user_id, 'main', payment_id, action == 'approve', 'Reviewed in Telegram')
-            safe_answer_callback_query(bot, call.id, text='Review saved. Delivery will continue automatically.')
+            from utils.customer_messages import message as customer_message
+            safe_answer_callback_query(bot, call.id, text=customer_message(language, 'review_saved'))
             return
         if not _claim_payment_or_answer(call, language, payment_id, {'pending_approval'}):
             return
@@ -3568,6 +3651,13 @@ def _process_check_payment_job(call):
         return
     if not _can_access_payment_record(caller_id, payment_record):
         safe_send_message(bot, caller_id, get_message_text(language, "not_authorized"))
+        return
+    if payment_record.get('fulfillment_owner') == 'web':
+        from utils.customer_messages import message as customer_message
+        safe_send_message(bot, caller_id, customer_message(language, 'attention')
+            if payment_record.get('status') == 'uncertain' else
+            get_message_text(language, 'payment_already_processed').format(
+                status=_localized_payment_status(language, payment_record.get('status', 'processing'))))
         return
     if payment_record.get('status') == 'completed':
         safe_send_message(
@@ -4478,6 +4568,11 @@ def handle_reserved_renewal_review(call):
 
 
 def check_pending_payments():
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from utils.customer_payments import deliver_bot_notifications
+        for _ in range(20):
+            if not deliver_bot_notifications(bot):
+                break
     try:
         try:
             process_main_reserved_renewals()

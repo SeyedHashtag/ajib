@@ -15,6 +15,8 @@ def storage(tmp_path, monkeypatch):
     monkeypatch.setenv("AJIB_DB_PATH", str(tmp_path / "ajib.db"))
     monkeypatch.setenv("AJIB_SQLITE_ACTIVE", "1")
     monkeypatch.setenv("API_TOKEN", "123456:synthetic-test-token")
+    monkeypatch.setenv('CRYPTO_MERCHANT_ID', 'synthetic-merchant')
+    monkeypatch.setenv('CRYPTO_API_KEY', 'synthetic-provider-key')
     monkeypatch.setenv("ADMIN_USER_IDS", "[1]")
     monkeypatch.setenv("AJIB_WEB_BOT_USERNAME", "SyntheticTestBot")
     monkeypatch.delenv("RECEIPT_CHECKER_USER_ID", raising=False)

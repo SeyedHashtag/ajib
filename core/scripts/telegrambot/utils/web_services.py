@@ -23,7 +23,7 @@ def _object(value, default=None):
         return default or {}
 
 
-def payment_public(payment_id, data):
+def payment_public(payment_id, data, *, writes=True, scope='main'):
     fields = ("status", "type", "plan_gb", "price", "original_price", "currency",
               "payment_method", "created_at", "completed_at", "days", "username",
               "server_id", "renewal_username", "renewal_status", "converted_amount",
@@ -32,7 +32,8 @@ def payment_public(payment_id, data):
     url = data.get("payment_url")
     if isinstance(url, str) and url.startswith("https://"):
         result["payment_url"] = url
-    return {"id": payment_id, **result}
+    from .customer_progress import safe_progress
+    return {"id": payment_id, **result, 'progress': safe_progress(payment_id, data, scope, writes=writes)}
 
 
 class Services:
@@ -154,7 +155,7 @@ class Services:
         if not all_users:
             query += " AND user_id=?"
             params.append(str(user_id))
-        query += " ORDER BY created_at DESC LIMIT 500"
+        query += " ORDER BY created_at DESC"
         return {row[0]: _object(row[1]) for row in database.get_connection().execute(query, params)}
 
     def payment(self, user_id, scope, payment_id, *, reviewer=False):
@@ -209,7 +210,8 @@ class Services:
         if not self.owned(user_id, scope, username, server_id):
             raise ServiceError("Account not found", 404)
         client, user, result = self.panels.resolve_unique_user(username, preferred_server_id=server_id)
-        if result.get("status") != "found" or not result.get("uniqueness_verified", False):
+        if (result.get("status") != "found" or not result.get("uniqueness_verified", False)
+                or str(getattr(client, 'server_id', '')) != str(server_id)):
             raise ServiceError("Account identity could not be verified; contact support", 409)
         return client, user, result
 

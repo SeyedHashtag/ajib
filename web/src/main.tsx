@@ -1,13 +1,14 @@
-import {useEffect, useRef, useState, type ReactNode} from 'react';
+import {useCallback, useEffect, useRef, useState, type ReactNode} from 'react';
 import {createRoot} from 'react-dom/client';
 import {BrowserRouter, Link, NavLink, useLocation, useNavigate} from 'react-router-dom';
 import {ArrowUpRight, ArrowRight, Check, ChevronDown, Copy, Globe2, LayoutDashboard, Link2, LoaderCircle, LogOut, Menu, MessageCircle, Plus, ReceiptText, ShieldCheck, Users, Wallet, X} from 'lucide-react';
-import {api, ApiError, safeLink, setCsrf, type Account, type Identity, type Language, type Payment, type Plan, type Store} from './api';
+import {api, ApiError, safeLink, setCsrf, type Account, type Identity, type Language, type Payment, type Plan, type Store, type RenewalOptions, type PaymentMethod} from './api';
 import {dictionaries, type Text} from './i18n';
 import './style.css';
 import {Rewards} from './Rewards';
 import {Trial} from './Trial';
 import {Operations} from './Operations';
+import {customerText} from './customer-i18n';
 
 type TelegramApp = {initData: string; ready(): void; expand(): void; colorScheme: string;
   safeAreaInset?:{top:number;bottom:number;left:number;right:number};contentSafeAreaInset?:{top:number;bottom:number;left:number;right:number};
@@ -20,14 +21,17 @@ function useData<T>(path: string | null) {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const [revision, setRevision] = useState(0);
+  const previousPath = useRef(path);
   useEffect(() => {
     let alive = true;
-    setData(undefined); setError(''); setLoading(true);
+    if (previousPath.current !== path) setData(undefined);
+    previousPath.current = path; setError(''); setLoading(true);
     if (!path) {setLoading(false); return;}
     api<T>(path).then(value => {if (alive) setData(value);}).catch(e => {if (alive) setError(e.message);}).finally(() => {if (alive) setLoading(false);});
     return () => {alive = false;};
   }, [path, revision]);
-  return {data, error, loading, refresh: () => setRevision(n => n + 1)};
+  const refresh = useCallback(() => setRevision(n => n + 1), []);
+  return {data, error, loading, refresh};
 }
 
 function Feedback({error, loading, retry, t}: {error?: string; loading?: boolean; retry?: () => void; t: Text}) {
@@ -35,7 +39,7 @@ function Feedback({error, loading, retry, t}: {error?: string; loading?: boolean
   return loading ? <div className="loading" role="status"><LoaderCircle className="spin" size={20}/>{t.loading}</div> : null;
 }
 function Empty({children}: {children: ReactNode}) {return <div className="empty"><Link2 size={28}/><p>{children}</p></div>;}
-function Money({amount, lang}: {amount?: number | string; lang: Language}) {return <bdi>{new Intl.NumberFormat(lang === 'tk' ? 'en' : lang, {style: 'currency', currency: 'USD'}).format(Number(amount || 0))}</bdi>;}
+function Money({amount, lang}: {amount?: number | string | null; lang: Language}) {return <bdi>{new Intl.NumberFormat(lang === 'tk' ? 'en' : lang, {style: 'currency', currency: 'USD'}).format(Number(amount || 0))}</bdi>;}
 function DateText({value, lang}: {value?: string | null; lang: Language}) {return <bdi>{value && !isNaN(Date.parse(value)) ? new Intl.DateTimeFormat(lang === 'tk' ? 'en' : lang, {dateStyle: 'medium'}).format(new Date(value)) : '—'}</bdi>;}
 function Modal({title, children, close, t}: {title: string; children: ReactNode; close: () => void; t: Text}) {
   const ref = useRef<HTMLDialogElement>(null);
@@ -204,25 +208,61 @@ function Downloads({t,lang}:{t:Text;lang:Language}) {
 function Connections({t,lang,plans,choose,writes}: {t:Text;lang:Language;plans:Plan[];choose:(p:Plan,a:Account)=>void;writes:boolean}) {
   const state = useData<Account[]>('/accounts');
   const [config,setConfig] = useState<{account:Account;values:Record<string,string>}>(),[error,setError] = useState(''),[copied,setCopied] = useState(false),[opening,setOpening] = useState('');
-  return <><PageTitle title={t.connections}/><Trial t={t} lang={lang} writes={writes} onComplete={state.refresh}/><Feedback {...state} error={state.error || error} retry={state.refresh} t={t}/>{state.data?.length === 0 && <Empty>{t.noAccounts}</Empty>}<div className="connection-grid">{state.data?.map(a => <article className="card account-card" key={`${a.server_id}:${a.username}`}><div className="account-top"><span className="metric-icon"><Link2/></span><span className={`badge ${a.available ? 'good' : 'warning'}`}>{a.available ? a.state : t.unavailable}</span></div><h2><bdi>{a.username}</bdi></h2><div className="usage-line"><span>{t.usage}</span><bdi>{(a.used_bytes/1073741824).toFixed(1)} / {(a.limit_bytes/1073741824).toFixed(0)} {t.gb}</bdi></div><progress max={Math.max(a.limit_bytes,1)} value={a.used_bytes} aria-label={t.usage}/><p className="expiry">{t.expires}<DateText value={a.expires_at} lang={lang}/></p><div className="account-actions"><button disabled={!a.available || opening === a.username} className="button secondary" onClick={async () => {setOpening(a.username);setError('');try {const values = await api<Record<string,string>>(`/accounts/${encodeURIComponent(a.server_id)}/${encodeURIComponent(a.username)}/configuration`);setConfig({account:a,values});setCopied(false);} catch(e){setError((e as Error).message);} finally{setOpening('');}}}>{t.configuration}</button><button className="text-button" disabled={!writes || !a.available || !plans.length} onClick={() => choose(plans.find(p => p.traffic_gb === a.limit_bytes/1073741824) || plans[0],a)}>{t.renew}</button></div></article>)}</div>{config && <Modal title={t.configuration} t={t} close={() => setConfig(undefined)}><img className="qr" alt={t.configuration} src={`/api/v1/accounts/${encodeURIComponent(config.account.server_id)}/${encodeURIComponent(config.account.username)}/qr`}/>{Object.entries(config.values).map(([key,value]) => <div key={key}><label>{key}<textarea readOnly dir="ltr" value={value}/></label><button className="button secondary" onClick={async () => {try{await navigator.clipboard.writeText(value);setCopied(true);}catch{setError('Copy is unavailable. Select the configuration text to copy it.');}}}>{copied ? <Check size={16}/> : <Copy size={16}/>} {copied ? t.copied : t.copy}</button></div>)}</Modal>}</>;
+  return <><PageTitle title={t.connections}/><Trial t={t} lang={lang} writes={writes} onComplete={state.refresh}/><Feedback {...state} error={state.error || error} retry={state.refresh} t={t}/>{state.data?.length === 0 && <Empty>{t.noAccounts}</Empty>}<div className="connection-grid">{state.data?.map(a => <article className="card account-card" key={`${a.server_id}:${a.username}`}><div className="account-top"><span className="metric-icon"><Link2/></span><span className={`badge ${a.available ? 'good' : 'warning'}`}>{a.available ? customerText(lang,'account_'+a.state) : t.unavailable}</span></div><h2><bdi>{a.username}</bdi></h2><div className="usage-line"><span>{t.usage}</span><bdi>{(a.used_bytes/1073741824).toFixed(1)} / {(a.limit_bytes/1073741824).toFixed(0)} {t.gb}</bdi></div><progress max={Math.max(a.limit_bytes,1)} value={a.used_bytes} aria-label={t.usage}/><p className="expiry">{t.expires}<DateText value={a.expires_at} lang={lang}/></p><div className="account-actions"><button disabled={!a.available || opening === a.username} className="button secondary" onClick={async () => {setOpening(a.username);setError('');try {const values = await api<Record<string,string>>(`/accounts/${encodeURIComponent(a.server_id)}/${encodeURIComponent(a.username)}/configuration`);setConfig({account:a,values});setCopied(false);} catch(e){setError((e as Error).message);} finally{setOpening('');}}}>{t.configuration}</button><button className="text-button" disabled={!writes || !a.available || !plans.length} onClick={() => choose(plans.find(p => p.traffic_gb === a.limit_bytes/1073741824) || plans[0],a)}>{t.renew}</button></div></article>)}</div>{config && <Modal title={t.configuration} t={t} close={() => setConfig(undefined)}><img className="qr" alt={t.configuration} src={`/api/v1/accounts/${encodeURIComponent(config.account.server_id)}/${encodeURIComponent(config.account.username)}/qr`}/>{Object.entries(config.values).map(([key,value]) => <div key={key}><label>{key}<textarea readOnly dir="ltr" value={value}/></label><button className="button secondary" onClick={async () => {try{await navigator.clipboard.writeText(value);setCopied(true);}catch{setError('Copy is unavailable. Select the configuration text to copy it.');}}}>{copied ? <Check size={16}/> : <Copy size={16}/>} {copied ? t.copied : t.copy}</button></div>)}</Modal>}</>;
 }
 
 function Checkout({t,lang,plan,account,writes,close,done}: {t:Text;lang:Language;plan:Plan;account?:Account;writes:boolean;close:()=>void;done:(id:string)=>void}) {
-  const [method,setMethod] = useState<'crypto'|'card'>('crypto'), [reserved,setReserved] = useState(false),[busy,setBusy] = useState(false),[error,setError] = useState('');
+  const methods = useData<PaymentMethod[]>('/payment-methods');
+  const options = useData<RenewalOptions>(account ? `/accounts/${encodeURIComponent(account.server_id)}/${encodeURIComponent(account.username)}/renewal-options` : null);
+  const [method,setMethod] = useState(''), [mode,setMode] = useState(''), [busy,setBusy] = useState(false), [error,setError] = useState('');
   const key = useRef(crypto.randomUUID());
-  return <Modal title={account ? t.renew : t.checkout} close={close} t={t}><div className="checkout-summary"><h3>{plan.traffic_gb} {t.gb} / {plan.days} {t.days}</h3><strong><Money amount={plan.price} lang={lang}/></strong>{account && <p><bdi>{account.username}</bdi></p>}</div><label>{t.paymentMethod}<select disabled={busy} value={method} onChange={e => {setMethod(e.target.value as 'crypto'|'card');key.current=crypto.randomUUID();}}><option value="crypto">{t.crypto}</option>{lang==='fa' && <option value="card">{t.card}</option>}</select></label>{account && <label className="checkbox"><input type="checkbox" checked={reserved} onChange={e => {setReserved(e.target.checked);key.current=crypto.randomUUID();}}/>{t.reserve}</label>}<Feedback error={error} t={t}/><button className="button full" disabled={busy || !writes} onClick={async () => {setBusy(true);setError('');try {const result=await api<Payment>('/orders',{method:'POST',headers:{'Idempotency-Key':key.current},body:JSON.stringify({plan_id:plan.id,method,username:account?.username,server_id:account?.server_id,reserved})});done(result.id);}catch(e){setError((e as Error).message);}finally{setBusy(false);}}}>{busy?t.loading:t.continue}<ArrowRight size={18}/></button></Modal>;
+  const [planId,setPlanId] = useState(plan.id);
+  const choices = options.data?.choices.filter(c => c.plan.id === planId) || [];
+  const renewalPlans = [...new Map(options.data?.choices.map(c => [c.plan.id,c.plan]) || []).values()];
+  const selectedPlan = renewalPlans.find(p => p.id===planId) || plan;
+  useEffect(() => {setMethod(current => methods.data?.some(m => m.id===current && m.available) ? current : methods.data?.find(m => m.available)?.id || '');}, [methods.data]);
+  useEffect(() => {setMode(current => choices.some(c => c.mode===current && c.available) ? current : choices.find(c => c.available)?.mode || '');}, [options.data,planId]);
+  useEffect(() => {key.current=crypto.randomUUID();}, [method,mode,planId]);
+  const ready = writes && methods.data?.some(m => m.id===method && m.available) && (!account || choices.some(c => c.mode===mode && c.available));
+  return <Modal title={account ? t.renew : t.checkout} close={close} t={t}>
+    <div className="checkout-summary"><h3>{selectedPlan.traffic_gb} {t.gb} / {selectedPlan.days} {t.days}</h3><strong><Money amount={selectedPlan.price} lang={lang}/></strong>{account && <p><bdi>{account.username}</bdi></p>}</div>
+    <Feedback loading={methods.loading || options.loading} error={methods.error || options.error || error} retry={()=>{methods.refresh();options.refresh();}} t={t}/>
+    <label>{t.paymentMethod}<select disabled={busy || methods.loading} value={method} onChange={e=>setMethod(e.target.value)}>
+      {!method && <option value="">{t.unavailable}</option>}{methods.data?.map(m=><option key={m.id} value={m.id} disabled={!m.available}>{m.id==='card'?t.card:t.crypto}{m.reason ? ` — ${customerText(lang,m.reason)}` : ''}</option>)}
+    </select></label>
+    {account && <><label>{t.plans}<select value={planId} disabled={busy || options.loading} onChange={e=>setPlanId(e.target.value)}>{renewalPlans.map(p=><option key={p.id} value={p.id}>{p.traffic_gb} {t.gb} / {p.days} {t.days}</option>)}</select></label><label>{customerText(lang,'renewal_mode')}<select disabled={busy || options.loading} value={mode} onChange={e=>setMode(e.target.value)}>
+      {!mode && <option value="">{t.unavailable}</option>}{choices.map(c=><option key={c.mode} value={c.mode} disabled={!c.available}>{customerText(lang,c.mode)}{c.reason ? ` — ${customerText(lang,c.reason)}` : ''}</option>)}
+    </select></label>{options.data?.reason && <p role="status">{customerText(lang,options.data.reason)}</p>}{options.data?.reservation && <p>{customerText(lang,'already_reserved')} <bdi>{options.data.reservation.payment_id}</bdi></p>}</>}
+    <button className="button full" disabled={busy || !ready || methods.loading || options.loading} onClick={async()=>{setBusy(true);setError('');try{const result=await api<Payment>('/orders',{method:'POST',headers:{'Idempotency-Key':key.current},body:JSON.stringify({plan_id:planId,method,username:account?.username,server_id:account?.server_id,reserved:mode==='reserved'})});done(result.id);}catch(e){setError((e as Error).message);methods.refresh();options.refresh();}finally{setBusy(false);}}}>{busy?t.loading:t.continue}<ArrowRight size={18}/></button>
+  </Modal>;
 }
 
 function PaymentTable({data,t,lang,href}: {data:Payment[];t:Text;lang:Language;href:(s:string)=>string}) {
   if (!data.length) return <Empty>{t.empty}</Empty>;
-  return <div className="table-wrap card"><table><thead><tr><th>{t.plans}</th><th>{t.amount}</th><th>{t.status}</th><th>{t.date}</th><th>{t.details}</th></tr></thead><tbody>{data.map(p => <tr key={p.id}><td><bdi>{p.plan_gb || '—'}</bdi></td><td><Money amount={p.price} lang={lang}/></td><td><span className="badge">{p.status}</span></td><td><DateText value={p.created_at} lang={lang}/></td><td><Link to={href(`/app/payments/${p.id}`)}>{t.details}<ArrowUpRight size={14}/></Link></td></tr>)}</tbody></table></div>;
+  return <div className="table-wrap card"><table><thead><tr><th>{t.plans}</th><th>{t.amount}</th><th>{t.status}</th><th>{t.date}</th><th>{t.details}</th></tr></thead><tbody>{data.map(p => <tr key={p.id}><td><bdi>{p.plan_gb || '—'}</bdi></td><td><Money amount={p.price} lang={lang}/></td><td><span className="badge">{customerText(lang,p.progress?.code || 'needs_attention')}</span></td><td><DateText value={p.created_at} lang={lang}/></td><td><Link to={href(`/app/payments/${p.id}`)}>{t.details}<ArrowUpRight size={14}/></Link></td></tr>)}</tbody></table></div>;
 }
 function Payments({t,lang,href}: {t:Text;lang:Language;href:(s:string)=>string}) {const state=useData<Payment[]>('/payments');return <><PageTitle title={t.payments}/><Feedback {...state} retry={state.refresh} t={t}/>{state.data && <PaymentTable data={state.data} t={t} lang={lang} href={href}/>}</>;}
 function PaymentDetails({id,t,lang,writes}: {id:string;t:Text;lang:Language;writes:boolean}) {
-  const state=useData<Payment>(`/payments/${encodeURIComponent(id)}`),[busy,setBusy]=useState(false),[error,setError]=useState('');
-  useEffect(() => {if (!state.data || ['completed','cancelled','rejected','uncertain'].includes(state.data.status || '')) return;const timer=setInterval(state.refresh,10000);return()=>clearInterval(timer);},[state.data?.status]);
-  const p=state.data;
-  return <><PageTitle title={t.paymentDetails}/><Feedback {...state} error={state.error || error} retry={state.refresh} t={t}/>{p && <div className="card payment-detail"><span className="badge">{p.status}</span><h2><Money amount={p.price} lang={lang}/></h2><p className="muted"><bdi>{p.id}</bdi></p>{safeLink(p.payment_url) && <a className="button" target="_blank" rel="noreferrer" href={safeLink(p.payment_url)}>{t.payNow}<ArrowUpRight size={17}/></a>}{p.status==='waiting_receipt' && <><p><bdi>{p.converted_amount?.toLocaleString()} {p.converted_currency}</bdi></p><pre dir="ltr">{p.card_number}</pre><p>{t.receiptHelp}</p><label className="button secondary">{busy?t.loading:t.upload}<input className="file-input" type="file" accept="image/png,image/jpeg" disabled={busy || !writes} onChange={async e=>{const file=e.target.files?.[0];if(!file)return;setBusy(true);setError('');try{const form=new FormData();form.append('file',file);await api(`/payments/${id}/receipt`,{method:'POST',body:form});state.refresh();}catch(err){setError((err as Error).message);}finally{setBusy(false);}}}/></label><button className="text-button danger" disabled={!writes || busy} onClick={async()=>{setBusy(true);try{await api(`/payments/${id}/cancel`,{method:'POST'});state.refresh();}catch(e){setError((e as Error).message);}finally{setBusy(false);}}}>{t.cancelOrder}</button></>}</div>}</>;
+  const state=useData<Payment>(`/payments/${encodeURIComponent(id)}`), [busy,setBusy]=useState(false), [error,setError]=useState('');
+  useEffect(()=>{
+    if (!state.data?.progress.poll) return;
+    const refreshVisible=()=>{if(!document.hidden)state.refresh();};
+    const timer=setInterval(refreshVisible,10000);
+    document.addEventListener('visibilitychange',refreshVisible);
+    return()=>{clearInterval(timer);document.removeEventListener('visibilitychange',refreshVisible);};
+  },[id,state.data?.progress.poll,state.refresh]);
+  const p=state.data, actions=p?.progress.actions || [];
+  return <><PageTitle title={t.paymentDetails}/><Feedback {...state} error={state.error || error} retry={state.refresh} t={t}/>
+    <button className="button secondary" disabled={state.loading} onClick={state.refresh}>{customerText(lang,'refresh')}</button>
+    {p && <div className="card payment-detail"><span className="badge" role="status">{customerText(lang,p.progress.code)}</span><h2><Money amount={p.price} lang={lang}/></h2><p className="muted"><bdi>{p.id}</bdi></p>
+      {actions.includes('pay') && writes && safeLink(p.payment_url) && <a className="button" target="_blank" rel="noreferrer" href={safeLink(p.payment_url)}>{t.payNow}<ArrowUpRight size={17}/></a>}
+      {actions.includes('contact_support') && <p><Link to={window.location.pathname.startsWith('/s/') ? window.location.pathname.split('/').slice(0,3).join('/')+'/support' : '/support'}>{t.support}</Link>: {customerText(lang,'needs_attention')}</p>}
+      <p>{customerText(lang,'telegram_resume')}</p>
+      {actions.includes('upload_receipt') && <><p><bdi>{Number(p.converted_amount || 0).toLocaleString(lang==='tk'?'en':lang)} {p.converted_currency}</bdi></p><pre dir="ltr">{p.card_number}</pre><p>{t.receiptHelp}</p>
+        <label className="button secondary">{busy?t.loading:t.upload}<input className="file-input" type="file" accept="image/png,image/jpeg" disabled={busy || !writes} onChange={async e=>{const file=e.target.files?.[0];if(!file)return;setBusy(true);setError('');try{const form=new FormData();form.append('file',file);await api(`/payments/${encodeURIComponent(id)}/receipt`,{method:'POST',body:form});state.refresh();}catch(err){setError((err as Error).message);}finally{setBusy(false);}}}/></label></>}
+      {actions.includes('cancel') && <button className="text-button danger" disabled={!writes || busy} onClick={async()=>{setBusy(true);setError('');try{await api(`/payments/${encodeURIComponent(id)}/cancel`,{method:'POST'});state.refresh();}catch(e){setError((e as Error).message);}finally{setBusy(false);}}}>{t.cancelOrder}</button>}
+    </div>}
+  </>;
 }
 
 

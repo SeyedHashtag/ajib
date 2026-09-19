@@ -112,13 +112,13 @@ def rate_limit(bucket, maximum=10, window=60):
         return True
 
 
-def claim_notification():
+def claim_notification(scope=None):
     now = int(time.time())
     with database.transaction(operation="web_outbox_claim") as connection:
         row = connection.execute("""SELECT * FROM web_outbox
-            WHERE (status='pending' AND next_attempt_at<=?)
-               OR (status='sending' AND lease_until<=?)
-            ORDER BY next_attempt_at LIMIT 1""", (now, now)).fetchone()
+            WHERE ((status='pending' AND next_attempt_at<=?)
+               OR (status='sending' AND lease_until<=?)) AND (? IS NULL OR scope=?)
+            ORDER BY next_attempt_at LIMIT 1""", (now, now, scope, scope)).fetchone()
         if not row:
             return None
         token = secrets.token_hex(16)

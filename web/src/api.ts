@@ -4,8 +4,10 @@ export type Identity = components['schemas']['IdentityResponse'];
 export type Plan = components['schemas']['PlanResponse'];
 export type Language = Identity['language'];
 export type Store = {public_portal?: boolean; writes_enabled?: boolean; scope: string; slug: string | null; title: string; titles?: Record<string,string>; bot_username: string; support: Record<string, string>};
-export type Account = {username: string; server_id: string; state: string; expires_at: string | null; used_bytes: number; limit_bytes: number; available: boolean};
-export type Payment = {id: string; status?: string; type?: string; plan_gb?: string; price?: number; currency?: string; converted_amount?: number; converted_currency?: string; payment_url?: string; card_number?: string; created_at?: string; receipt_id?: string; review_in_telegram?: boolean};
+export type Account = components['schemas']['AccountResponse'];
+export type Payment = components['schemas']['PaymentResponse'];
+export type RenewalOptions = components['schemas']['RenewalOptionsResponse'];
+export type PaymentMethod = components['schemas']['PaymentMethodResponse'];
 
 let csrf = '';
 export function setCsrf(value: string) { csrf = value; }
@@ -21,7 +23,7 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   return data;
 }
 
-export function safeLink(value?: string): string | undefined {
+export function safeLink(value?: string | null): string | undefined {
   if (!value) return;
   try { const url = new URL(value); if (url.protocol === 'https:') return url.href; } catch { /* Invalid public link. */ }
 }
