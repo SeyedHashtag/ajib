@@ -1,3 +1,4 @@
+from utils.public_branding import public_error
 import psutil
 import time
 from utils.command import *
@@ -61,4 +62,4 @@ def check_system(message):
         )
         bot.reply_to(message, response)
     except Exception as e:
-        bot.reply_to(message, f"Error checking system resources: {str(e)}")
+        bot.reply_to(message, f"Error checking system resources: {public_error()}")

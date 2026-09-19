@@ -1099,6 +1099,8 @@ def telegram_legacy(action: str, token: str | None, adminid: str | None, api_url
 
 
 cli.add_command(web_group)
+from operations_cli import operations_group
+cli.add_command(operations_group)
 
 if __name__ == "__main__":
     apply_database_environment()

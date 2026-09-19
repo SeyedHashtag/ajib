@@ -89,7 +89,7 @@ def hashes(root):
 
 def validate_contract(contract, previous=None):
     expected = {'format': 1, 'bot_schema': 6, 'web_schema': 1,
-                'fulfillment_contract': 1, 'unit_contract': 1, 'live_release_policy': True}
+                'fulfillment_contract': 2, 'unit_contract': 1, 'live_release_policy': True}
     if any(contract.get(key) != value for key, value in expected.items()):
         raise ValueError('Release does not declare the supported shared-state and recovery contract.')
     if previous and any(contract.get(key) != previous.get(key) for key in expected):

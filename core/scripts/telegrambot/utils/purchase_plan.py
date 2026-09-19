@@ -1,3 +1,4 @@
+from utils.public_branding import public_error
 import json
 import datetime
 import html
@@ -66,6 +67,7 @@ from utils.receipt_checker import (
     should_route_to_receipt_checker,
 )
 import qrcode
+from utils.public_branding import make_qr as make_public_qr
 import io
 import os
 import threading
@@ -1284,7 +1286,7 @@ def _process_customer_renewal_payment(payment_id, payment_record, notify_chat_id
     success_message = format_renewal_success(language, result, plan_gb, days, sub_url=sub_url, ipv4_url=ipv4_url)
 
     if sub_url:
-        qr = qrcode.make(ipv4_url or sub_url)
+        qr = make_public_qr(ipv4_url or sub_url, encoder=qrcode.make)
         bio = io.BytesIO()
         qr.save(bio, 'PNG')
         bio.seek(0)
@@ -1566,6 +1568,14 @@ def _complete_sale_payment_or_notify(payment_id, user_id, username, api_client, 
     completion_fields = dict(fields or {})
     completion_fields.setdefault("username", username)
     completion_fields.setdefault("server_id", server_id)
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from utils.operation_completion import main_payment
+        try:
+            main_payment(str(payment_id), completion_fields)
+            return True
+        except Exception as error:
+            update_payment_record_fields(payment_id, {'incentive_finalization_error': type(error).__name__})
+            return False
     if complete_payment_record(payment_id, completion_fields):
         try:
             completed_record = get_payment_record(payment_id) or {
@@ -1607,6 +1617,21 @@ def create_sale_username(api_client, user_id):
         users = api_client.get_users()
         usernames = extract_existing_usernames(users)
     return allocate_username("s", user_id, set(usernames) | recorded_usernames)
+
+
+def create_sale_user_for_payment(payment_id, api_client, user_id, plan_gb, days, unlimited):
+    if os.getenv('AJIB_SQLITE_ACTIVE') != '1':
+        return create_sale_user_with_note(api_client, user_id, plan_gb, days, unlimited)
+    from utils.account_mutations import create
+    from utils.account_operations import AccountBusy
+    recorded = load_recorded_usernames()
+    try:
+        return create('main-payment:' + str(payment_id), MultiServerAPI(),
+            lambda names: allocate_username('s', user_id, set(names) | recorded),
+            {'gb': plan_gb, 'days': days, 'unlimited': unlimited}, note_text='sale')
+    except AccountBusy:
+        update_payment_status(payment_id, 'uncertain')
+        raise
 
 
 def create_sale_user_with_note(api_client, user_id, plan_gb, days, unlimited):
@@ -1695,7 +1720,8 @@ def _fulfill_credit_funded_purchase(call, plan_gb, plan, quote):
         raise
 
     api_client = _configured_primary_api_client()
-    username, result, api_client = create_sale_user_with_note(
+    username, result, api_client = create_sale_user_for_payment(
+        payment_id,
         api_client,
         user_id,
         plan_gb,
@@ -1739,7 +1765,7 @@ def _fulfill_credit_funded_purchase(call, plan_gb, plan, quote):
     except Exception:
         pass
     if sub_url:
-        qr = qrcode.make(ipv4_url or sub_url)
+        qr = make_public_qr(ipv4_url or sub_url, encoder=qrcode.make)
         bio = io.BytesIO()
         qr.save(bio, 'PNG')
         bio.seek(0)
@@ -2059,7 +2085,7 @@ def handle_purchase_selection(call):
     except Exception as e:
         user_id = call.from_user.id
         language = get_user_language(user_id)
-        safe_answer_callback_query(bot, call.id, text=get_message_text(language, "error_occurred").format(error=str(e)))
+        safe_answer_callback_query(bot, call.id, text=get_message_text(language, "error_occurred").format(error=public_error(language)))
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "purchase_support")
@@ -2433,7 +2459,7 @@ def _handle_customer_renewal_crypto(call, offer):
         raise
     _record_checkout_started(payment_id, payment_record)
 
-    qr = qrcode.make(payment_url)
+    qr = make_public_qr(payment_url, encoder=qrcode.make)
     bio = io.BytesIO()
     qr.save(bio, 'PNG')
     bio.seek(0)
@@ -2620,7 +2646,7 @@ def handle_payment_method_selection(call, data=None):
     except Exception as e:
         user_id = call.from_user.id
         language = get_user_language(user_id)
-        bot.answer_callback_query(call.id, text=get_message_text(language, "error_occurred").format(error=str(e)))
+        bot.answer_callback_query(call.id, text=get_message_text(language, "error_occurred").format(error=public_error(language)))
 
 def handle_crypto_payment(call, plan_gb, answer_callback=True):
     incentive_reservation_id = None
@@ -2699,7 +2725,7 @@ def handle_crypto_payment(call, plan_gb, answer_callback=True):
                 raise
             payment_persisted = True
             _record_checkout_started(payment_id, payment_record)
-            qr = qrcode.make(payment_url)
+            qr = make_public_qr(payment_url, encoder=qrcode.make)
             bio = io.BytesIO()
             qr.save(bio, 'PNG')
             bio.seek(0)
@@ -2739,7 +2765,7 @@ def handle_crypto_payment(call, plan_gb, answer_callback=True):
         language = get_user_language(user_id)
         if incentive_reservation_id and not payment_persisted:
             _release_checkout_incentives(user_id, incentive_reservation_id)
-        bot.answer_callback_query(call.id, text=get_message_text(language, "error_processing_payment").format(error=str(e)))
+        bot.answer_callback_query(call.id, text=get_message_text(language, "error_processing_payment").format(error=public_error(language)))
 
 def handle_card_to_card_payment(call, plan_gb):
     incentive_reservation_id = None
@@ -2835,7 +2861,7 @@ def handle_card_to_card_payment(call, plan_gb):
         language = get_user_language(user_id)
         if incentive_reservation_id and not checkout_persisted:
             _release_checkout_incentives(user_id, incentive_reservation_id)
-        bot.answer_callback_query(call.id, text=get_message_text(language, "error_occurred").format(error=str(e)))
+        bot.answer_callback_query(call.id, text=get_message_text(language, "error_occurred").format(error=public_error(language)))
 
 # Modified: Remove photo check and re-registration; assume called only on photos
 def process_receipt_photo(message, plan_gb, price):
@@ -2988,7 +3014,7 @@ def process_receipt_photo(message, plan_gb, price):
     except Exception as e:
         user_id = message.from_user.id
         language = get_user_language(user_id)
-        bot.reply_to(message, get_message_text(language, "error_occurred").format(error=str(e)))
+        bot.reply_to(message, get_message_text(language, "error_occurred").format(error=public_error(language)))
 
 # New: State-aware handler for photos
 @bot.message_handler(content_types=['photo'])
@@ -3200,12 +3226,12 @@ def show_pending_confirmations(message):
             })
             _save_receipt_message_refs(payment_id, refs)
         except Exception as e:
-            bot.send_message(message.chat.id, f"Failed to show receipt {payment_id}: {str(e)}")
+            bot.send_message(message.chat.id, f"Failed to show receipt {payment_id}: {public_error()}")
     for withdrawal_request in pending_withdrawals:
         try:
             _send_referral_withdrawal_confirmation(message.chat.id, withdrawal_request)
         except Exception as e:
-            bot.send_message(message.chat.id, f"Failed to show withdrawal {withdrawal_request.get('id')}: {str(e)}")
+            bot.send_message(message.chat.id, f"Failed to show withdrawal {withdrawal_request.get('id')}: {public_error()}")
     if admin_data:
         for kind, identity, item in admin_data['renewals']:
             try:
@@ -3359,7 +3385,8 @@ def _process_admin_approval_job(call, action, payment_id, payment_record, review
                      unlimited = False
             
             api_client = _configured_primary_api_client()
-            username, result, api_client = create_sale_user_with_note(
+            username, result, api_client = create_sale_user_for_payment(
+                payment_id,
                 api_client,
                 user_to_notify,
                 plan_gb,
@@ -3407,7 +3434,7 @@ def _process_admin_approval_job(call, action, payment_id, payment_record, review
                     sub_url = user_uri_data['normal_sub']
                     ipv4_url = user_uri_data.get('ipv4', '')
 
-                    qr = qrcode.make(ipv4_url or sub_url)
+                    qr = make_public_qr(ipv4_url or sub_url, encoder=qrcode.make)
                     bio = io.BytesIO()
                     qr.save(bio, 'PNG')
                     bio.seek(0)
@@ -3473,7 +3500,7 @@ def _process_admin_approval_job(call, action, payment_id, payment_record, review
             _update_receipt_message_refs(payment_id, payment_record, rejection_caption)
     except Exception as e:
         _record_processing_error(payment_id, e)
-        safe_answer_callback_query(bot, call.id, text=get_message_text(language, "error_occurred").format(error=str(e)))
+        safe_answer_callback_query(bot, call.id, text=get_message_text(language, "error_occurred").format(error=public_error(language)))
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('admin_approval:'))
@@ -3529,7 +3556,7 @@ def handle_admin_approval(call):
     except Exception as e:
         user_id = call.from_user.id
         language = get_user_language(user_id)
-        safe_answer_callback_query(bot, call.id, text=get_message_text(language, "error_occurred").format(error=str(e)))
+        safe_answer_callback_query(bot, call.id, text=get_message_text(language, "error_occurred").format(error=public_error(language)))
 
 def _process_check_payment_job(call):
     caller_id = call.from_user.id
@@ -3653,7 +3680,8 @@ def _process_check_payment_job(call):
                     unlimited = False
         
         api_client = _configured_primary_api_client()
-        username, result, api_client = create_sale_user_with_note(
+        username, result, api_client = create_sale_user_for_payment(
+            payment_id,
             api_client,
             user_id,
             plan_gb,
@@ -3686,7 +3714,7 @@ def _process_check_payment_job(call):
                 ipv4_url = user_uri_data.get('ipv4', '')
                 ipv4_info = _localized_ipv4_info(user_language, ipv4_url)
 
-                qr = qrcode.make(ipv4_url or sub_url)
+                qr = make_public_qr(ipv4_url or sub_url, encoder=qrcode.make)
                 bio = io.BytesIO()
                 qr.save(bio, 'PNG')
                 bio.seek(0)
@@ -3878,7 +3906,8 @@ def process_payment_webhook(request_data):
                         unlimited = False
                 
                 api_client = _configured_primary_api_client()
-                username, result, api_client = create_sale_user_with_note(
+                username, result, api_client = create_sale_user_for_payment(
+                    record_key,
                     api_client,
                     user_id,
                     plan_gb,
@@ -3931,7 +3960,7 @@ def process_payment_webhook(request_data):
                         ),
                     )
                     if sub_url:
-                        qr = qrcode.make(ipv4_url or sub_url)
+                        qr = make_public_qr(ipv4_url or sub_url, encoder=qrcode.make)
                         bio = io.BytesIO()
                         qr.save(bio, 'PNG')
                         bio.seek(0)
@@ -4149,7 +4178,7 @@ def _deliver_reserved_renewal(event, recipient_id):
         None,
     )
     if sub_url:
-        qr = qrcode.make(ipv4_url or sub_url)
+        qr = make_public_qr(ipv4_url or sub_url, encoder=qrcode.make)
         bio = io.BytesIO()
         qr.save(bio, 'PNG')
         bio.seek(0)
@@ -4584,7 +4613,8 @@ def check_pending_payments():
                                 unlimited = False
                         
                         api_client = _configured_primary_api_client()
-                        username, add_result, api_client = create_sale_user_with_note(
+                        username, add_result, api_client = create_sale_user_for_payment(
+                            payment_id,
                             api_client,
                             user_id,
                             plan_gb,
@@ -4621,7 +4651,7 @@ def check_pending_payments():
                                 sub_url = user_uri_data['normal_sub']
                                 ipv4_url = user_uri_data.get('ipv4', '')
 
-                                qr = qrcode.make(ipv4_url or sub_url)
+                                qr = make_public_qr(ipv4_url or sub_url, encoder=qrcode.make)
                                 bio = io.BytesIO()
                                 qr.save(bio, 'PNG')
                                 bio.seek(0)

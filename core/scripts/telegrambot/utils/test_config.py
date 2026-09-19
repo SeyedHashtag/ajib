@@ -24,6 +24,7 @@ from utils.account_state import (
 from utils.translations import BUTTON_TRANSLATIONS, get_message_text
 from utils.language import get_user_language
 import qrcode
+from utils.public_branding import make_qr as make_public_qr
 import io
 import logging
 from utils.username_utils import (
@@ -412,6 +413,9 @@ def _claim_test_config_creation(user_id, now=None):
 
 
 def _release_test_config_creation(user_id):
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from .trial_operations import release_unallocated
+        return release_unallocated(user_id)
     key = str(user_id)
 
     def mutate(configs):
@@ -735,7 +739,7 @@ def _send_created_test_config(chat_id, username, user_uri_data, is_automatic=Fal
         ipv4_url = user_uri_data.get('ipv4', '')
 
         # Create QR code for IPv4 URL when available.
-        qr = qrcode.make(ipv4_url or sub_url)
+        qr = make_public_qr(ipv4_url or sub_url, encoder=qrcode.make)
         bio = io.BytesIO()
         qr.save(bio, 'PNG')
         bio.seek(0)
@@ -837,6 +841,8 @@ def _create_test_config_with_client(
     language=None,
     telegram_username=None,
 ):
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        return _create_durable_trial(user_id, chat_id, is_automatic, language, telegram_username)
     if _has_used_test_config_from(test_configs, user_id):
         return False
     if not _claim_test_config_creation(user_id):
@@ -934,6 +940,9 @@ def create_test_config(user_id, chat_id, is_automatic=False, language=None, tele
     if is_test_creation_disabled() and not ignore_creation_disabled:
         return False
 
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        return _create_durable_trial(user_id, chat_id, is_automatic, language, telegram_username)
+
     if not _claim_test_config_creation(user_id):
         return False
 
@@ -1023,6 +1032,35 @@ def create_test_config(user_id, chat_id, is_automatic=False, language=None, tele
 
     notify_creation_failed()
     return False
+
+def _create_durable_trial(user_id, chat_id, is_automatic=False, language=None, telegram_username=None):
+    from . import trial_operations
+    from .account_operations import AccountBusy
+    try:
+        ident = trial_operations.claim(user_id, language=language)
+    except AccountBusy:
+        return False
+    try:
+        panels = MultiServerAPI()
+        replacement_valid, _ = _revalidate_pending_replacement(user_id, panels)
+        if not replacement_valid:
+            trial_operations.release_unallocated(user_id)
+            return False
+        recorded = load_recorded_usernames()
+        username, result, client = trial_operations.create(ident, user_id, panels,
+            lambda existing: allocate_username('t', user_id, set(existing) | recorded),
+            {'gb': TEST_TRAFFIC_GB, 'days': TEST_DAYS, 'unlimited': True})
+        if not result:
+            trial_operations.release_unallocated(user_id)
+            return False
+        trial_operations.complete(ident)
+    except Exception:
+        trial_operations.release_unallocated(user_id)
+        raise
+    _send_created_test_config(chat_id, username, client.get_user_uri(username),
+                             is_automatic=is_automatic, language=language)
+    return True
+
 
 def _safe_server_weight(value):
     try:

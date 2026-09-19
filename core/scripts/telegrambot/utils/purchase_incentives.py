@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import os
 
 from utils.account_credit import (
     consume_account_credit,
@@ -188,6 +189,18 @@ def reserve_main_checkout(
 
 def release_main_checkout(user_id, reservation_id, *, path=None):
     """Release all unconsumed checkout benefits; safe to call repeatedly."""
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from . import database
+        with database.write_transaction(path, operation='checkout_benefits_release'):
+            return _release_main_checkout(user_id, reservation_id, path=path)
+    return _release_main_checkout(user_id, reservation_id, path=path)
+
+
+def _release_main_checkout(user_id, reservation_id, *, path=None):
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from .account_operations import assert_obligation_releasable
+        assert_obligation_releasable('main', reservation_id)
+        assert_obligation_releasable('main', 'credit-' + str(reservation_id))
     reservation_key = str(reservation_id or "").strip()
     if not reservation_key:
         return {"invite_released": False, "credit_released": False}

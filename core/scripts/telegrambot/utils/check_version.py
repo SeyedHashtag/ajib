@@ -7,14 +7,14 @@ def check_version():
     if result.startswith("Error:"):
         error_message = f"Error checking version: {result}"
         print(error_message)
-        notify_admins(error_message)
+        notify_admins('Version check failed. Inspect the server through the operator console.')
         return
 
     bot_version = re.search(r'Bot Version: (\d+\.\d+\.\d+)', result)
     latest_version = re.search(r'Latest Version: (\d+\.\d+\.\d+)', result)
 
     if bot_version and latest_version and bot_version.group(1) != latest_version.group(1):
-        notify_admins(f"🔔 New version available!\n\n{result}")
+        notify_admins(f"🔔 Version {latest_version.group(1)} is available. Use the operator console to review the upgrade.")
 
 def notify_admins(message):
     for admin_id in ADMIN_USER_IDS:

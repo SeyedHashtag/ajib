@@ -296,6 +296,8 @@ def release_account_credit(user_id, reservation_id, *, path=None):
     user_key = _user_key(user_id)
     reservation_key = str(reservation_id or "").strip()
     with database.write_transaction(path, operation="account_credit_release") as connection:
+        from .account_operations import assert_obligation_releasable
+        assert_obligation_releasable('main', reservation_key)
         row = connection.execute(
             """
             SELECT amount_cents FROM account_credit_reservations

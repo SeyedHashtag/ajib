@@ -390,4 +390,6 @@ def install_safe_telegram_methods(bot):
         setattr(bot, method_name, wrapped)
 
     setattr(bot, "_ajib_safe_telegram_installed", True)
+    from utils.public_branding import install_telegram_guard
+    install_telegram_guard(bot)
     return bot

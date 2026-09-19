@@ -207,6 +207,7 @@ def test_localized_profile_and_recovery(app, language, stats):
 def load_function(path, name, namespace):
     """Run the real handler with only Telegram/panel boundaries replaced."""
     import ast
+    namespace.setdefault('os', __import__('os'))
     tree = ast.parse((Path(__file__).resolve().parents[1] / path).read_text(encoding='utf-8'))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
     node.decorator_list = []
@@ -223,10 +224,11 @@ def test_main_creation_runs_split_accounting_and_completion(app):
     namespace = {name: getattr(funding, name) for name in (
         'reserve_funding', 'finalize_funding', 'release_funding', 'remember_fulfillment', 'FundingUnavailable')}
     namespace.update({
+        'os': __import__('os'),
         'get_reseller_data': store.get_reseller_data,
         'reseller_config_is_recorded': store.reseller_config_is_recorded,
         '_configured_primary_api_client': lambda: client,
-        '_create_reseller_user_with_note': lambda *a, **kw: ('alice', True, client),
+        '_create_funded_reseller_user': lambda *a, **kw: ('alice', True, client),
         'bot': Mock(), 'safe_send_message': Mock(), 'safe_reply_to': Mock(),
         'funding_text': lambda *a: 'split', 'build_credit_summary': lambda *a, **kw: 'journey',
         'get_message_text': lambda *a: 'created', 'escape_markdown_code': str,
@@ -255,24 +257,38 @@ def test_hosted_fulfillment_uses_saved_split_and_does_not_repeat(app, monkeypatc
     split = funding.reserve_funding(7, 'hosted-order', 5)
     client = Mock(server_id='s1')
     renewal = types.ModuleType('utils.renewal')
-    renewal.execute_hosted_renewal = Mock(return_value={'success': True, 'api_client': client})
+    from utils import account_operations, state_store, hosted_settlement
+    def dispatch():
+        account_operations.execute('hosted-payment:7:hosted-order', 's1', 'alice',
+                                   'renewal' if renewed else 'create', {}, lambda: {'success': True})
+    def create(*args, **kwargs):
+        dispatch()
+        return 'alice', True, client
+    def renew(*args, **kwargs):
+        dispatch()
+        return {'success': True, 'api_client': client}
+    renewal.execute_hosted_renewal = Mock(side_effect=renew)
+    renewal.mark_cleanup_state_renewed = Mock()
     monkeypatch.setitem(sys.modules, 'utils.renewal', renewal)
     namespace = {name: getattr(funding, name) for name in ('finalize_funding', 'get_funding')}
     namespace.update({
         'OWNER_ID': 7, 'os': os, 'bot': Mock(), 'get_reseller_data': store.get_reseller_data,
         '_settlement_financials': lambda r: {'referral_reward': 0, 'margin': 0},
-        '_create_user': Mock(return_value=('alice', True, client)),
+        '_create_user': Mock(side_effect=create),
         '_save_payment': Mock(), '_credit_sale_and_referral': Mock(),
         '_owner_payment_snapshot': Mock(return_value={}), '_notify_owner_payment': Mock(),
         '_record_completed_growth': Mock(), '_deliver_config_safely': Mock(),
         '_resolve_hosted_user': Mock(return_value=(client, {'username': 'alice'}, {'status': 'found', 'uniqueness_verified': True})),
         'MultiServerAPI': Mock(),
+        '_complete_verified_hosted_payment': lambda payment_id, record, funded: (
+            True, hosted_settlement.finalize(7, payment_id)['username']),
     })
     run = load_function('core/scripts/telegrambot/hosted_worker.py', '_provision_payment', namespace)
     payment = {'user_id': 42, 'funding': split, 'wholesale_price': 5, 'retail_price': 7,
-               'plan_gb': 5, 'days': 30, 'server_id': 's1'}
+               'plan_gb': 5, 'days': 30, 'server_id': 's1', 'status': 'processing', 'fulfillment_owner': 'hosted'}
     if renewed:
         payment['renew_username'] = 'alice'
+    state_store._save_payment_record(funding.database.get_connection(), 'hosted:7', 'hosted-order', payment)
     for _ in range(2):
         assert run('hosted-order', payment, False)[0]
     record = store.get_reseller_data(7)

@@ -76,6 +76,44 @@ def test_mutation_inside_write_transaction_is_rejected(storage):
                 pytest.fail('must not allow panel I/O')
 
 
+@pytest.mark.parametrize('boundary,phase,dispatched', [
+    ('account_operation_claim', 'prepared', False),
+    ('account_operation_dispatch', 'dispatched', False),
+    ('account_operation_finish', 'panel_verified', True),
+    ('account_operation_complete', 'completed', True),
+])
+def test_restart_at_each_committed_operation_boundary(storage, boundary, phase, dispatched):
+    from pathlib import Path
+    from utils import account_operations as operations, database
+    source = '''from utils import account_operations as a, database
+from contextlib import contextmanager
+from pathlib import Path
+import os, sys
+original = database.transaction
+@contextmanager
+def interrupted(*args, **kwargs):
+    with original(*args, **kwargs) as db:
+        yield db
+    if kwargs.get('operation') == sys.argv[1]:
+        os._exit(17)
+database.transaction = interrupted
+def panel():
+    assert not database.get_connection().in_transaction
+    Path(sys.argv[2]).write_text('one external request')
+    return {'success': True}
+a.execute('interrupted', 's1', 'alice', 'update', {}, panel)
+a.complete('interrupted')
+'''
+    marker = storage / 'synthetic-panel-effect'
+    env = {**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'core/scripts/telegrambot')}
+    child = subprocess.run([sys.executable, '-c', source, boundary, str(marker)], env=env, timeout=30)
+    assert child.returncode == 17
+    assert operations.details('interrupted')['phase'] == phase
+    assert marker.exists() == dispatched
+    count = database.get_connection().execute('SELECT COUNT(*) FROM account_operation_claims').fetchone()[0]
+    assert count == (0 if phase == 'completed' else 1)
+
+
 @pytest.fixture
 def renewal_panel(storage):
     from copy import deepcopy

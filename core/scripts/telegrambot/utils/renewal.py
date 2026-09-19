@@ -1304,6 +1304,15 @@ def claim_payment_renewal(
 
 
 def finish_payment_renewal(
+    payment_id, claim_id, status, payments_file=None, fields=None, now=None, retry=False,
+):
+    if status == 'applied' and os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from .reserved_completion import payment
+        return payment(payment_id, claim_id, payments_file=payments_file or PAYMENTS_FILE, fields=fields, now=now)
+    return _finish_payment_renewal(payment_id, claim_id, status, payments_file=payments_file, fields=fields, now=now, retry=retry)
+
+
+def _finish_payment_renewal(
     payment_id,
     claim_id,
     status,
@@ -1337,6 +1346,13 @@ def finish_payment_renewal(
             record.pop('renewal_api_http_status', None)
             for field in INTERNAL_ERROR_FIELDS:
                 record.pop(field, None)
+            if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+                from . import account_operations
+                from .state_store import describe_path
+                descriptor = describe_path(path)
+                scope = descriptor.scope if descriptor else 'main'
+                ident = ('main-payment:' if scope == 'main' else 'hosted-payment:' + scope.removeprefix('hosted:') + ':') + str(payment_id)
+                account_operations.complete(ident)
         elif status == 'reserved':
             record.pop('renewal_next_attempt_at', None)
             record.pop('renewal_attention_reason', None)
@@ -2057,7 +2073,14 @@ def process_reseller_renewal_reservation(
             }
 
         stage = 'execute'
-        result = execute_reserved_renewal({**record, 'mutation_operation_id': f'reseller-reservation:{reseller_id}:{reservation_id}'}, multi_api=multi_api, force=force_apply)
+        origin = None
+        if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+            from .reserved_completion import reseller_obligation, reseller_terms
+            origin = {'type': 'reseller_reservation', 'scope': 'reseller:' + str(reseller_id),
+                      'id': str(reservation_id), 'reseller_id': str(reseller_id), 'actor': 'scheduler',
+                      'terms_digest': reseller_terms({'config': config, 'reservation': reservation})}
+        result = execute_reserved_renewal({**record, 'mutation_operation_id': f'reseller-reservation:{reseller_id}:{reservation_id}',
+                                          'mutation_origin': origin}, multi_api=multi_api, force=force_apply)
         if not result.get('success'):
             reason = result.get('reason') or 'renewal_reset_failed'
             alert_flags = reservation_alert_flags(reservation, reason, now=current)
@@ -2223,11 +2246,17 @@ def _execute_reset(
                             or not lookup.get('uniqueness_verified')
                             or str(getattr(client, 'server_id', None)) != previous['server_id']):
                         return {'success': False, 'reason': 'renewal_identity_unverified', 'uncertain': True}
+                    after = result.get('after_state') or {}
+                    if any(str(after.get(key)) != str(user.get(key)) for key in (
+                            'account_creation_date', 'expiration_days', 'max_download_bytes')):
+                        return {'success': False, 'reason': 'renewal_cycle_changed', 'uncertain': True}
                     return {**result, 'api_client': client, 'reconciled': True}
-                return {'success': False, 'reason': 'renewal_requires_reconciliation', 'uncertain': True}
+                if (account_operations.details(operation_id) or {}).get('phase') != 'ready':
+                    return {'success': False, 'reason': 'renewal_requires_reconciliation', 'uncertain': True}
     from utils.reseller_blocks import renewal_block_guard
     try:
-        with renewal_block_guard(username, server_id) as allowed:
+        guard_options = {'operation_id': plan_record.get('mutation_operation_id')} if os.getenv('AJIB_SQLITE_ACTIVE') == '1' else {}
+        with renewal_block_guard(username, server_id, **guard_options) as allowed:
             if not allowed:
                 return {'success': False, 'reason': 'renewal_ineligible_protected_block'}
             return _execute_reset_unlocked(
@@ -2277,7 +2306,7 @@ def _execute_reset_unlocked(
     )
 
     from utils.reseller_blocks import renewal_block_guard
-    guard = renewal_block_guard(username, actual_server_id) if os.getenv('AJIB_SQLITE_ACTIVE') == '1' else nullcontext(True)
+    guard = renewal_block_guard(username, actual_server_id, operation_id=plan_record.get('mutation_operation_id')) if os.getenv('AJIB_SQLITE_ACTIVE') == '1' else nullcontext(True)
     with guard as allowed:
         if not allowed:
             return {'success': False, 'reason': 'renewal_ineligible_protected_block'}
@@ -2327,7 +2356,15 @@ def _execute_reset_resolved(username, server_id, actual_server_id, plan_record,
     intent = {'target': target_snapshot, 'before': before_state, 'recorded_server_id': str(server_id),
               'cycle_fingerprint': (plan_record.get('renewal_before_state') or {}).get('cycle_fingerprint')}
     operation_id = plan_record['mutation_operation_id']
-    return account_operations.execute(operation_id, actual_server_id, username, 'renewal', intent, perform)
+    previous = account_operations.existing(operation_id)
+    if previous:
+        saved_intent = json.loads(previous['request_json'])
+        if any(str(saved_intent.get('before', {}).get(key)) != str(before_state.get(key)) for key in (
+                'account_creation_date', 'expiration_days', 'max_download_bytes')):
+            return {'success': False, 'reason': 'renewal_cycle_changed', 'uncertain': True}
+        intent = saved_intent
+    return account_operations.execute(operation_id, actual_server_id, username, 'renewal', intent, perform,
+                                      origin=plan_record.get('mutation_origin'))
 
 
 def _perform_panel_reset(api_client, username, target_snapshot, user_data, before_state,
@@ -2450,6 +2487,7 @@ def execute_reseller_renewal(offer, multi_api=None):
             'renewal_source_plan_snapshot': offer.get('source_plan_snapshot'),
             'renewal_before_state': offer.get('before_state'),
             'mutation_operation_id': offer.get('mutation_operation_id'),
+            'mutation_origin': offer.get('mutation_origin'),
         },
         'reseller_customer',
         multi_api=multi_api,
@@ -2503,6 +2541,7 @@ def execute_reserved_renewal(record, multi_api=None, force=False):
             'renewal_api_stage': record.get('renewal_api_stage'),
             'renewal_before_state': record.get('renewal_before_state') or record.get('before_state'),
             'mutation_operation_id': record.get('mutation_operation_id'),
+            'mutation_origin': record.get('mutation_origin'),
         },
         record.get('renewal_source') or 'reserved',
         multi_api=multi_api,

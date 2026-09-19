@@ -79,37 +79,21 @@ def process_one(services):
                 if entry.get('username') and entry.get('used_at') and not entry.get('creation_pending_at'):
                     connection.execute("UPDATE web_trials SET status='completed',username=?,server_id=?,updated_at=? WHERE id=?", (entry['username'], entry.get('server_id'), now, row['id']))
                 return False
-            entry.update(creation_pending_at=format_utc_timestamp(), web_creation_pending=row['id'])
-            configs[row['user_id']] = entry
-        connection.execute("UPDATE web_trials SET status='processing',updated_at=? WHERE id=?", (now, row['id']))
+    from . import trial_operations, account_operations
+    try:
+        ident = trial_operations.claim(row['user_id'], owner='web', language=row['language'], web_id=row['id'])
+    except account_operations.AccountBusy:
+        return False
+    entry = read_json(CONFIGS, {}).get(row['user_id']) or {}
     try:
         if entry.get('replacement_eligible_at'):
             _verify_replacement(services, entry)
-        panel = services.panels.select_server_for_new_user()
-        if not panel:
-            raise RuntimeError('placement_unavailable')
         username = 't' + row['user_id'] + ''.join(chr(97+int(c,16)) for c in row['id'])
-        with database.transaction(operation='web_trial_intent') as connection:
-            connection.execute('UPDATE web_trials SET username=?,server_id=?,updated_at=? WHERE id=?', (username, panel.server_id, int(time.time()), row['id']))
-        # Never repeat an external mutation after a timeout or unknown response.
-        from .username_utils import build_user_note
-        note = build_user_note(username=username, traffic_limit=1, expiration_days=30, unlimited=True, note_text='test_config')
-        result = panel.add_user(username, 1, 30, unlimited=True, note=note)
+        username, result, panel = trial_operations.create(ident, row['user_id'], services.panels,
+            lambda existing: username, {'gb': 1, 'days': 30, 'unlimited': True})
         if not result:
             raise RuntimeError('panel_outcome_unknown')
-        with database.transaction(operation='web_trial_complete') as connection:
-            with locked_json(CONFIGS, {}) as configs:
-                archived = _mark_test_config_used_in_memory(configs, int(row['user_id']), username=username,
-                    language=row['language'], server_id=panel.server_id)
-            with locked_json(WAITING, {}) as waiting:
-                waiting.pop(row['user_id'], None)
-            connection.execute("UPDATE web_trials SET status='completed',updated_at=? WHERE id=?", (int(time.time()), row['id']))
-            web_store.audit(connection, row['user_id'], 'main', 'trial.completed', row['id'])
-            web_store.enqueue(connection, 'trial:'+row['id'], 'main', row['user_id'], 'Your trial is ready. Open My connections on the website or in Telegram.')
-        if archived:
-            from .expired_cleanup import queue_superseded_test_cleanup
-            queue_superseded_test_cleanup(telegram_user_id=int(row['user_id']), username=archived['username'],
-                server_id=archived['server_id'], history_index=archived['history_index'], language=row['language'])
+        trial_operations.complete(ident, notify=True)
     except Exception as error:
         with database.transaction(operation='web_trial_attention') as connection:
             connection.execute("UPDATE web_trials SET status='uncertain',reason=?,updated_at=? WHERE id=? AND status='processing'", (type(error).__name__, int(time.time()), row['id']))

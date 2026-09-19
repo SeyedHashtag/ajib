@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from utils import database
@@ -288,6 +289,20 @@ def claim_recruitment_reward(
 
 def evaluate_and_notify_recruitment_milestone(reseller_id, reseller_data=None, *, path=None):
     """Evaluate progress and notify the recruiter once qualification is reached."""
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from . import database, web_store
+        from .translations import get_message_text
+        with database.transaction(operation='recruitment_qualification_outbox') as db:
+            result = evaluate_recruitment_milestone(reseller_id, reseller_data, path=path)
+            if result and result.get('newly_qualified'):
+                recipient = int(result['referrer_id'])
+                preference = db.execute("SELECT value_json FROM kv_state WHERE namespace='user_languages' AND scope='main' AND state_key=?",
+                                        (str(recipient),)).fetchone()
+                language = json.loads(preference[0]) if preference else 'en'
+                text = get_message_text(language, 'recruitment_reward_qualified').format(
+                    amount=f"{result['reward_amount']:.2f}")
+                web_store.enqueue(db, f'recruitment-qualified:{reseller_id}', 'main', recipient, text)
+            return result
     result = evaluate_recruitment_milestone(
         reseller_id,
         reseller_data,

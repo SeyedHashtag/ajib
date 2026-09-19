@@ -94,11 +94,16 @@ of the intentional deployment changes.
 
 ## Outstanding release blockers
 
-1. Complete durable ownership coverage for account creation in legacy bot paths,
-   cleanup/deletion, migrations, and other conflicting mutations. Exercise bot,
-   API, and worker concurrency under their actual Linux service identities.
-2. Implement operator inspection and evidence-based reconciliation of uncertain
-   panel outcomes; retain reservations when success cannot be established.
+1. Finish end-to-end acceptance across cleanup/debt policy changes, migrations,
+   ownership-preserving renames and settlement. Shared claims and recovery adapters
+   are now implemented for these workflows; the coverage and remaining acceptance
+   decisions are recorded in the
+   [account-operation ledger](account-operation-acceptance.md).
+2. Exercise the implemented hosted-settlement and scheduled-renewal recovery
+   adapters in the deployment drill. Legacy records with incomplete provenance
+   remain conservatively blocked and require reviewed forward repair. Synthetic
+   concurrency passes with three distinct Linux UIDs; actual production identities
+   and deployment still require a coordinated drill.
 3. Finish the Stage 4 acceptance ledger: legacy-order continuation, checker receipt
    routing, account ownership/history edge cases, trial recovery and cleanup,
    referral/credit/withdrawal journeys, and four-language statuses/notifications.
@@ -115,6 +120,14 @@ acceptance gates. Do not set `customer_release_ready` merely because unit tests 
 
 ## Local validation for this increment
 
+The subsequent account-operation increment passed 1,189 legacy tests plus 369
+subtests and 216 Linux web/deployment/recovery tests on 2026-09-19, including the
+trial-replacement regression and synthetic service-identity concurrency drill.
+The production frontend build, public artifact scan and all 14 browser journeys
+also passed during this increment. See the [operation ledger](account-operation-acceptance.md) for its
+coverage and remaining blockers. The results below describe the earlier
+coordinator increment.
+
 - Python 3.12 bot suite: 1,189 tests and 369 subtests passed in a separate process.
 - API/deployment/shared-state suite: 123 tests passed, including interrupted
   upgrades, rollback retaining newer payment records, live configuration sync,
@@ -124,3 +137,37 @@ acceptance gates. Do not set `customer_release_ready` merely because unit tests 
 - All 14 desktop/mobile browser journeys passed. Windows server teardown required
   stopping the two verified synthetic test-server processes; the test runner then
   exited successfully. These journeys do not attest to real payment fulfillment.
+
+## Branding deployment handoff
+
+This handoff is pending; the local candidate does not change production sessions,
+cache state or access gates. Include it in coordinated maintenance with customer
+writes paused and compatible recovery artifacts retained.
+
+1. Inventory the deployed bot display names/usernames, public configuration labels,
+   links, download names and connection payloads privately. The new guards reject
+   embedded private branding instead of changing functional URLs or credentials.
+   Any affected flow requires a compatible migration and verification before release.
+2. Revoke existing web sessions and login challenges during the switch. Clear old
+   cookie identifiers using server-generated expiry headers scoped to this origin;
+   issue only neutral session/login cookies afterward. Users reauthenticate through
+   Telegram. Preserve database language preferences and restore them on sign-in.
+3. Clear obsolete local storage and cached client content through a reviewed,
+   origin-scoped transition. Do not embed old private identifiers in the new public
+   JavaScript to migrate them. An origin-wide storage reset requires checking that
+   the origin hosts only this application; otherwise provide a scoped transition.
+   Anonymous local-only language preferences may reset to browser language; stored
+   authenticated preferences must remain intact.
+4. Publish the production build, purge this application's Cloudflare HTML/assets,
+   stop serving superseded asset files, and verify old asset URLs and source maps
+   are unavailable. Browser caches already downloaded cannot be remotely erased
+   with certainty; verify fresh loads and supported reload paths. Preserve private
+   rollback builds outside the public asset directory.
+5. Verify public headers, rendered pages, Telegram messages, receipt/configuration
+   access, QR codes and error paths for all four languages and roles against the
+   deployed commit. Limit proxy/container changes to this application; unrelated
+   VPS services remain outside this maintenance operation.
+
+Keep `customer_release_ready: false` until the full release evidence is approved.
+Real Telegram clients, operator-performed card/crypto payments and the 24-hour
+pilot are separate acceptance gates, not consequences of a passing local build.

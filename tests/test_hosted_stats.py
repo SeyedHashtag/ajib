@@ -369,6 +369,7 @@ class HostedStatsWorkerTests(unittest.TestCase):
 
         namespace = {
             "locked_json": locked_json,
+            "os": __import__('os'),
             "tenant_file": lambda owner_id, name: f"{owner_id}/{name}",
             "OWNER_ID": 7,
             "_now": lambda: "2026-08-02 10:00:00",

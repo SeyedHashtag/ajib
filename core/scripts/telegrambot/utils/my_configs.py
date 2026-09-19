@@ -1,4 +1,6 @@
+from utils.public_branding import public_error
 import qrcode
+from utils.public_branding import make_qr as make_public_qr
 import io
 import logging
 import os
@@ -92,9 +94,8 @@ def _user_config_patterns(user_id):
 
 
 def _username_belongs_to_user(username, user_id):
-    paid_patterns, test_patterns = _user_config_patterns(user_id)
-    username = str(username or "")
-    return any(pattern.match(username) for pattern in paid_patterns + test_patterns)
+    from utils.account_access import username_belongs_to_user
+    return username_belongs_to_user(username, user_id)
 
 
 def _refresh_my_configs_snapshot_async(include_disabled=False):
@@ -252,7 +253,9 @@ def _my_configs_job(message, user_id):
                     (username, config_data, api_client)
                 )
         for api_client, username, config_data in _iter_users_from_snapshot_entries(all_entries):
-            if username and any(pattern.match(username) for pattern in paid_patterns):
+            if not username or not _username_belongs_to_user(username, user_id):
+                continue
+            if not any(pattern.match(username) for pattern in test_patterns):
                 paid_configs.append((username, config_data, api_client))
             elif username and any(pattern.match(username) for pattern in test_patterns):
                 test_configs.append((username, config_data, api_client))
@@ -312,7 +315,7 @@ def _my_configs_job(message, user_id):
     except Exception as e:
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
         print(f"[MyConfigs] user_id={user_id} error={type(e).__name__} elapsed_ms={elapsed_ms}")
-        bot.reply_to(message, f"⚠️ Error processing user data: {str(e)}")
+        bot.reply_to(message, f"⚠️ Error processing user data: {public_error()}")
         return
     finally:
         with MY_CONFIGS_INFLIGHT_LOCK:
@@ -336,7 +339,7 @@ def handle_show_config(call):
         print(f"Error enqueueing handle_show_config: {str(e)}")
         safe_edit_message_text(
             bot,
-            f"⚠️ Error processing your request: {str(e)}",
+            f"⚠️ Error processing your request: {public_error()}",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id
         )
@@ -419,7 +422,7 @@ def _show_config_job(call, key):
         print(f"Error in handle_show_config: {str(e)}")
         safe_edit_message_text(
             bot,
-            f"⚠️ Error processing your request: {str(e)}",
+            f"⚠️ Error processing your request: {public_error()}",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id
         )
@@ -449,6 +452,9 @@ def display_config(
         max_download_bytes = user_data.get('max_download_bytes', 0) or 0  # Convert None to 0
         server_id = getattr(api_client, 'server_id', None)
         is_test = str(username or '').lower().startswith('t')
+        if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+            from utils.identity_references import is_trial
+            is_test = is_trial(username, server_id)
         cycle = None if is_test else _customer_cycle(user_id or chat_id, username, server_id)
         shared_state = inspect_account(
             user_data,
@@ -676,7 +682,7 @@ def display_config(
             caption_status = None
         
         # Create QR code for IPv4 URL when available.
-        qr_code = qrcode.make(ipv4_url or sub_url)
+        qr_code = make_public_qr(ipv4_url or sub_url, encoder=qrcode.make)
         bio = io.BytesIO()
         qr_code.save(bio, 'PNG')
         bio.seek(0)

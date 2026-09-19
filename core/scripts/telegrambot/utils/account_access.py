@@ -15,5 +15,9 @@ def user_config_patterns(user_id):
 
 
 def username_belongs_to_user(username, user_id):
+    from .identity_references import ownership
+    owned = ownership(username, user_id)
+    if owned is not None:
+        return owned
     paid, test = user_config_patterns(user_id)
     return any(pattern.match(str(username or "")) for pattern in paid + test)

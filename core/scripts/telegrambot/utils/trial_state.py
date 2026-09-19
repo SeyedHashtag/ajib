@@ -8,7 +8,7 @@ _parse_config_time = parse_utc_timestamp
 def _creation_claim_is_active(entry, now=None):
     if not isinstance(entry, dict):
         return False
-    if entry.get('web_creation_pending'):
+    if entry.get('web_creation_pending') or entry.get('account_operation_id'):
         return True
     claimed_at = _parse_config_time(entry.get('creation_pending_at'))
     if claimed_at is None:
@@ -103,6 +103,7 @@ def _mark_test_config_used_in_memory(
     entry['telegram_id'] = user_id
     entry.pop('creation_pending_at', None)
     entry.pop('web_creation_pending', None)
+    entry.pop('account_operation_id', None)
     if username:
         entry['username'] = username
     if language:

@@ -29,6 +29,7 @@ jobs:
       - run: git diff --exit-code -- docs/web-openapi.json web/src/api-schema.d.ts
       - run: npm run build
         working-directory: web
+      - run: python tools/check_public_assets.py
       - run: npx playwright install --with-deps chromium
         working-directory: web
       - run: npm test -- --workers=2

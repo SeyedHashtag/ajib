@@ -2137,7 +2137,8 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
             reseller_handlers.is_admin = lambda user_id: True
             reseller_handlers.MultiServerAPI = lambda: object()
 
-            def cleanup(user_id, multi_api):
+            def cleanup(user_id, multi_api, *, actor):
+                self.assertEqual(actor, 1)
                 calls.append((user_id, multi_api))
                 return True, {
                     "deleted": [],

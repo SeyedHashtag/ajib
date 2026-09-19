@@ -273,6 +273,7 @@ class AdminServerDisplayTests(unittest.TestCase):
         )
         call = types.SimpleNamespace(
             data=f"copy_confirm:{token}",
+            from_user=types.SimpleNamespace(id=555),
             message=types.SimpleNamespace(chat=types.SimpleNamespace(id=555)),
         )
 

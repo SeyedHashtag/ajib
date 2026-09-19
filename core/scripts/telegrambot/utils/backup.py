@@ -35,8 +35,7 @@ def _run_backup_command():
     return (backup_file_path, latest_backup_file_or_error), None
 
 def _send_backup_file(chat_id, backup_file_path, latest_backup_file, caption_prefix="Backup completed"):
-    with open(backup_file_path, 'rb') as f:
-        bot.send_document(chat_id, f, caption=f"{caption_prefix}: {latest_backup_file}")
+    bot.send_message(chat_id, 'The backup is stored privately on the server. Use the operator console to retrieve it.')
 
 def run_backup_and_send(chat_id, start_message="Starting backup. This may take a few moments...", caption_prefix="Backup completed"):
     bot.send_message(chat_id, start_message)
@@ -46,7 +45,7 @@ def run_backup_and_send(chat_id, start_message="Starting backup. This may take a
         result, error = _run_backup_command()
 
     if error:
-        bot.send_message(chat_id, f"Backup failed: {error}")
+        bot.send_message(chat_id, 'Backup failed. Inspect the server through the operator console.')
         return
 
     backup_file_path, latest_backup_file = result
@@ -58,7 +57,7 @@ def run_backup_and_send_to_admins():
 
     if error:
         for admin_id in ADMIN_USER_IDS:
-            bot.send_message(admin_id, f"Automated backup failed: {error}")
+            bot.send_message(admin_id, 'Automated backup failed. Inspect the server through the operator console.')
         return
 
     backup_file_path, latest_backup_file = result

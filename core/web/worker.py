@@ -28,6 +28,8 @@ def run_once(services, *, writes_enabled=True):
     if item:
         try:
             import requests
+            from utils.public_branding import require_public
+            require_public(item['text'])
             token = services.bot_token(item["scope"])
             if not token:
                 raise RuntimeError("Bot token unavailable")

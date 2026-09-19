@@ -12,8 +12,15 @@ import web_operator as web
 import web_upgrade as upgrade
 
 CONTRACT = {'format': 1, 'bot_schema': 6, 'web_schema': 1,
-            'fulfillment_contract': 1, 'unit_contract': 1, 'live_release_policy': True,
+            'fulfillment_contract': 2, 'unit_contract': 1, 'live_release_policy': True,
             'customer_release_ready': False}
+
+
+def test_prior_fulfillment_contract_requires_reviewed_baseline():
+    with pytest.raises(ValueError, match='separately reviewed'):
+        upgrade.validate_contract(CONTRACT, {**CONTRACT, 'fulfillment_contract': 1})
+    with pytest.raises(ValueError, match='supported shared-state'):
+        upgrade.validate_contract({**CONTRACT, 'fulfillment_contract': 1})
 
 
 def code(root, version):

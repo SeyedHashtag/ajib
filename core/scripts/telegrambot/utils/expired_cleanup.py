@@ -2749,6 +2749,45 @@ def _mark_deleted(state, key, candidate, status, now_value, last_state=None, del
     _update_candidate_record(candidate, fields, stores=stores)
 
 
+def _delete_cleanup_account(client, candidate, user_data, last_state, now, *, actor='scheduler'):
+    from utils import account_operations
+    if not client:
+        return None
+
+    if not account_operations.enabled():
+        return client.delete_user(candidate['username'])
+    from utils.cleanup_operations import remove
+    def eligible(live):
+        if _candidate_has_reserved_renewal(candidate):
+            return False
+        # Reload the owning records for the final dispatch check. Discovery's
+        # scan snapshot cannot authorize deletion after a replacement/renewal.
+        stores = _load_cleanup_record_stores()
+        if candidate.get('cleanup_reason') == SUPERSEDED_ON_HOLD_TEST_REASON:
+            return _candidate_superseded_test_valid(candidate, stores, live)
+        if candidate.get('cleanup_reason') == ISSUE_DEADLINE_EXPIRED_REASON:
+            return _candidate_issue_deadline_valid(candidate, stores, live, now)[0]
+        return bool(_cleanup_eligibility_reason(candidate['username'], live, now=now))
+    try:
+        return remove(client, candidate, user_data, {'cleanup_last_state': last_state}, eligible, actor=actor)
+    except Exception as error:
+        CLEANUP_LOGGER.warning('cleanup_operation_retained error_type=%s', type(error).__name__)
+        return None
+
+
+def _merge_cleanup_scan_state(before, after):
+    from utils.atomic_store import locked_json
+    with locked_json(STATE_FILE, {}) as current:
+        for key in set(before) | set(after):
+            if current.get(key) != before.get(key):
+                continue
+            if key in after:
+                current[key] = after[key]
+            else:
+                current.pop(key, None)
+        return dict(current)
+
+
 def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, multi_api=None):
     now = parse_utc_timestamp(now) if now is not None else utc_now()
     now_value = _now_str(now)
@@ -2757,6 +2796,8 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
         state = _load_json_file(STATE_FILE, {})
         if not isinstance(state, dict):
             state = {}
+        import copy
+        original_state = copy.deepcopy(state)
         previous_state = _cleanup_transition_snapshot(state)
         unreachable_recipients = load_unreachable_recipients()
 
@@ -3193,7 +3234,7 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
 
             last_state = entry.get('last_state') or _capture_candidate_state(candidate, user_data, now=now)
             entry['last_state'] = last_state
-            delete_result = api_client.delete_user(username) if api_client else None
+            delete_result = _delete_cleanup_account(api_client, candidate, user_data, last_state, now)
             if delete_result is None:
                 entry['cleanup_status'] = 'delete_failed'
                 entry['cleanup_error'] = 'delete_failed'
@@ -3205,10 +3246,27 @@ def run_expired_user_cleanup(grace_hours=EXPIRED_CLEANUP_GRACE_HOURS, now=None, 
                 )
                 continue
 
-            _mark_deleted(state, key, candidate, 'deleted', now_value, last_state=last_state, delete_result='deleted', stores=record_stores)
+            from utils import account_operations
+            if account_operations.enabled():
+                # The service has already merged metadata and completed its claim.
+                # Never flush a pre-dispatch candidate over the current lifecycle.
+                ref = candidate.get('_record_ref') or ()
+                if ref:
+                    if ref[0] in {'test', 'test_history'}:
+                        record_stores['_test_dirty_ids'].discard(str(ref[1]))
+                    elif ref[0] == 'payment':
+                        record_stores['_payment_dirty_ids'].discard(str(ref[1]))
+                    elif ref[0] == 'reseller':
+                        record_stores['_reseller_dirty_refs'].discard(tuple(ref))
+            else:
+                _mark_deleted(state, key, candidate, 'deleted', now_value, last_state=last_state, delete_result='deleted', stores=record_stores)
 
         _save_dirty_cleanup_record_stores(record_stores)
-        _save_json_file(STATE_FILE, state)
+        from utils import account_operations
+        if account_operations.enabled():
+            state = _merge_cleanup_scan_state(original_state, state)
+        else:
+            _save_json_file(STATE_FILE, state)
         transition_counts = _log_cleanup_state_transitions(previous_state, state)
         recovery_changed = any(
             recovery_stats[field]
@@ -3544,7 +3602,7 @@ def _handle_manual_review_keep(record_id, admin_id):
         return "Kept for later review."
 
 
-def _handle_manual_review_delete(record_id):
+def _handle_manual_review_delete(record_id, actor='manual_review'):
     now_value = _now_str()
     with _cleanup_lock:
         state_key, entry, state = _find_state_key_by_record_id(record_id)
@@ -3592,7 +3650,7 @@ def _handle_manual_review_delete(record_id):
             _save_json_file(STATE_FILE, state)
             return "User is no longer expired."
 
-        delete_result = api_client.delete_user(candidate.get('username')) if api_client else None
+        delete_result = _delete_cleanup_account(api_client, candidate, user_data, last_state, utc_now(), actor=actor)
         if delete_result is None:
             entry['cleanup_status'] = 'delete_failed'
             entry['cleanup_error'] = 'delete_failed'
@@ -3601,6 +3659,9 @@ def _handle_manual_review_delete(record_id):
             _save_json_file(STATE_FILE, state)
             return "Delete failed."
 
+        from utils import account_operations
+        if account_operations.enabled():
+            return "User deleted."
         _mark_deleted(state, state_key, candidate, 'deleted', now_value, last_state=last_state, delete_result='deleted')
         _save_json_file(STATE_FILE, state)
         return "User deleted."
@@ -3620,13 +3681,13 @@ def _run_manual_review_action(chat_id, message_id, admin_id, review_action, retu
         if review_action == "review_keep":
             message = _handle_manual_review_keep(record_id, admin_id)
         else:
-            message = _handle_manual_review_delete(record_id)
+            message = _handle_manual_review_delete(record_id, actor=admin_id)
 
         _render_admin_expired_cleanup(chat_id, message_id, admin_id, return_filter, 0)
         bot.send_message(chat_id, f"Expired cleanup review: {message}")
     except Exception as e:
         print(f"Expired cleanup review action failed for {record_id}: {e}")
-        bot.send_message(chat_id, f"Expired cleanup review failed: {e}")
+        bot.send_message(chat_id, "Expired cleanup review failed. Inspect the operator console for details.")
     finally:
         _discard_manual_review_inflight(inflight_key)
 
@@ -3688,7 +3749,7 @@ def handle_admin_expired_cleanup(call):
                 record_id,
             )
         except Exception as e:
-            bot.answer_callback_query(call.id, f"Failed to start review action: {e}", show_alert=True)
+            bot.answer_callback_query(call.id, "Failed to start review action. Please try again later.", show_alert=True)
             return
 
         bot.answer_callback_query(

@@ -49,7 +49,7 @@ function Application() {
   const slug = match?.[1], prefix = slug ? `/s/${slug}` : '';
   const page = (slug ? match?.[2] || '/' : location.pathname).replace(/\/$/, '') || '/';
   const [lang, setLang] = useState<Language>(() => {
-    const saved = localStorage.getItem('ajib-language');
+    const saved = localStorage.getItem('service-language');
     return saved && saved in dictionaries ? saved as Language : 'fa';
   });
   const t = dictionaries[lang];
@@ -83,7 +83,7 @@ function Application() {
     })();
     return () => {alive = false;};
   }, [store.data?.scope]);
-  useEffect(() => {document.documentElement.lang = lang; document.documentElement.dir = lang === 'fa' ? 'rtl' : 'ltr'; localStorage.setItem('ajib-language', lang);}, [lang]);
+  useEffect(() => {document.documentElement.lang = lang; document.documentElement.dir = lang === 'fa' ? 'rtl' : 'ltr'; localStorage.setItem('service-language', lang);}, [lang]);
   useEffect(() => {
     setMenu(false);
     const tg = window.Telegram?.WebApp;
@@ -115,7 +115,8 @@ function Application() {
   const nav = role === 'customer' ? [ ['/app', t.overview, LayoutDashboard], ['/app/accounts',t.connections,Link2], ['/app/payments',t.payments,ReceiptText], ['/app/referrals',t.referrals,Users] ] as const
     : role === 'reseller' ? [['/reseller',t.overview,LayoutDashboard],['/reseller/customers',t.customers,Users],['/reseller/storefront',t.storefront,Globe2]] as const
       : [['/admin',t.overview,LayoutDashboard],['/admin/payments',t.reviews,ReceiptText],['/admin/operations',t.attention,LoaderCircle],['/admin/audit',t.audit,ShieldCheck]] as const;
-  const title = store.data?.title || 'ajib';
+  const title = store.data?.titles?.[lang] || store.data?.title || t.connections;
+  useEffect(() => {document.title = title;}, [title]);
   const privateContent = () => {
     if (authLoading) return <Feedback loading t={t}/>;
     if (!identity) return <Login t={t} slug={slug} onSuccess={async () => {await loadIdentity(); navigate(href('/app'));}}/>;
@@ -132,7 +133,7 @@ function Application() {
   };
   return <>
     <a className="skip-link" href="#main">{t.continue}</a>
-    <header className="header"><Link to={href('/')} className="brand"><span className="brand-symbol">a</span><b>{title}</b></Link>
+    <header className="header"><Link to={href('/')} className="brand"><span className="brand-symbol"><Link2 size={24}/></span><b>{title}</b></Link>
       <nav className="public-nav" aria-label={t.home}>{[['/plans',t.plans],['/guides',t.guides],['/support',t.support]].map(([path,label]) => <NavLink key={path} to={href(path)}>{label}</NavLink>)}</nav>
       <div className="header-actions"><label className="language-select"><Globe2 size={16}/><select aria-label={t.language} value={lang} onChange={e => void changeLanguage(e.target.value as Language)}><option value="fa">فارسی</option><option value="en">English</option><option value="tk">Türkmençe</option><option value="ru">Русский</option></select></label>
       <Link className="button small" to={href(identity ? '/app' : '/login')}>{identity ? t.account : t.login}<ArrowUpRight size={16}/></Link>

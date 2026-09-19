@@ -208,11 +208,14 @@ class Orders:
                         raise ServiceError("Renewal needs reconciliation")
                     fields = {"username": record["renewal_username"], "server_id": record["renewal_server_id"]}
             else:
-                client = self.services.panels.select_server_for_new_user()
+                from .account_operations import existing
+                previous = existing('main-payment:' + payment_id)
+                client = (self.services.panels.get_client(previous['server_id']) if previous
+                          else self.services.panels.select_server_for_new_user())
                 if client is None:
                     raise ServiceError("No server available")
                 suffix = "".join(chr(97 + int(char, 16)) for char in payment_id[4:])
-                username = f"s{record['user_id']}{suffix}"
+                username = previous['username'] if previous else f"s{record['user_id']}{suffix}"
                 fields = {"username": username, "server_id": client.server_id}
                 with database.transaction(operation="web_provision_intent") as connection:
                     save_payment(connection, scope, payment_id, fields)
@@ -221,23 +224,21 @@ class Orders:
                 note = build_user_note(username=username, traffic_limit=int(record["plan_gb"]),
                     expiration_days=int(record["days"]), unlimited=record.get("unlimited", False),
                     note_text=f"sale web-order:{payment_id}")
+                intent = (json.loads(previous['request_json']) if previous else
+                          {'plan_gb': record['plan_gb'], 'days': record['days'],
+                           'unlimited': record.get('unlimited', False), 'note': note})
+                note = intent['note']
                 from .account_operations import execute
                 def create_account():
                     created = client.add_user(username, int(record['plan_gb']), int(record['days']),
                                               unlimited=record.get('unlimited', False), note=note)
                     return {'success': bool(created), **fields}
                 result = execute('main-payment:' + payment_id, client.server_id, username, 'create',
-                                 {'plan_gb': record['plan_gb'], 'days': record['days'],
-                                  'unlimited': record.get('unlimited', False), 'note': note}, create_account)
+                                 intent, create_account)
                 if not result.get('success'):
                     raise ServiceError("Account creation outcome is uncertain")
-            with database.transaction(operation="web_fulfillment_complete") as connection:
-                completed = save_payment(connection, scope, payment_id, {**fields, "status": "completed"})
-                from .purchase_incentives import finalize_main_checkout
-                finalize_main_checkout(payment_id, completed)
-                connection.execute("UPDATE web_operations SET status='completed',updated_at=? WHERE id=?", (int(time.time()), payment_id))
-                web_store.audit(connection, "worker", scope, "checkout.fulfilled", payment_id)
-                web_store.enqueue(connection, "complete:" + payment_id, scope, record["user_id"], f"Payment {payment_id} completed. Open My Configs to view your service.")
+            from .operation_completion import main_payment
+            main_payment(payment_id, fields, notify=True)
         except Exception as error:
             with database.transaction(operation="web_fulfillment_uncertain") as connection:
                 save_payment(connection, scope, payment_id, {"status": "uncertain", "web_attention_reason": type(error).__name__})

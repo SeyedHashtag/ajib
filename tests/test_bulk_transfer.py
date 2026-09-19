@@ -770,6 +770,10 @@ def test_empty_notification_queue_does_not_request_a_write_lock(tmp_path, monkey
 
 
 def test_slow_notification_io_does_not_block_backup_or_key_persistence(tmp_path, monkeypatch):
+    # Legacy display fixtures replace utils modules during collection. Restore
+    # the real transfer module for the service's lazy recovery import.
+    monkeypatch.setitem(sys.modules, 'utils.bulk_transfer', bulk_transfer)
+    monkeypatch.setattr(sys.modules['utils'], 'bulk_transfer', bulk_transfer, raising=False)
     path = tmp_path / "contention.db"
     monkeypatch.setenv("AJIB_BOT_DIR", str(tmp_path))
     monkeypatch.setenv("AJIB_DB_PATH", str(path))

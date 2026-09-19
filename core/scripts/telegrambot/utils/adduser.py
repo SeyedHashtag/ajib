@@ -1,4 +1,6 @@
+from utils.public_branding import public_error
 import qrcode
+from utils.public_branding import make_qr as make_public_qr
 import io
 from telebot import types
 from utils.command import *
@@ -102,7 +104,7 @@ def process_add_user_step3(message, username, traffic_limit):
 
     try:
         expiration_days = int(message.text.strip())
-        
+
         markup = types.InlineKeyboardMarkup()
         markup.row(types.InlineKeyboardButton("✅ Yes", callback_data=f"unlimited_user_choice:yes:{username}:{traffic_limit}:{expiration_days}"),
                    types.InlineKeyboardButton("❌ No", callback_data=f"unlimited_user_choice:no:{username}:{traffic_limit}:{expiration_days}"))
@@ -118,9 +120,9 @@ def process_add_user_step4(call):
         bot.answer_callback_query(call.id)
         _, choice, username, traffic_limit, expiration_days = call.data.split(':')
         traffic_limit, expiration_days = int(traffic_limit), int(expiration_days)
-        
+
         unlimited = choice == 'yes'
-        
+
         multi_api = MultiServerAPI()
         api_client = multi_api.select_server_for_new_user()
         if api_client is None:
@@ -129,9 +131,11 @@ def process_add_user_step4(call):
                 "Failed to add user. No VPN server is accepting new users.",
             )
             return
-        
+
         bot.send_chat_action(call.message.chat.id, 'typing')
-        result = api_client.add_user(username, traffic_limit, expiration_days, unlimited)
+        from utils.admin_account_operations import create_from_telegram
+        api_client, result = create_from_telegram(call, multi_api, api_client, username,
+                                                  traffic_limit, expiration_days, unlimited)
 
         if not result:
             _finish_add_user_callback(
@@ -154,24 +158,24 @@ def process_add_user_step4(call):
         ipv4_url = user_uri_data.get('ipv4', '')
 
         # Generate QR code for IPv4 URL when available.
-        qr_code = qrcode.make(ipv4_url or sub_url)
+        qr_code = make_public_qr(ipv4_url or sub_url, encoder=qrcode.make)
         bio = io.BytesIO()
         qr_code.save(bio, 'PNG')
         bio.seek(0)
-        
+
         # Create success message
         unlimited_text = "Yes" if unlimited else "No"
         success_message = f"User '{escape_markdown_text(username)}' added successfully!\n"
         success_message += f"Traffic limit: {traffic_limit} GB\n"
         success_message += f"Expiration days: {expiration_days}\n"
         success_message += f"Unlimited Access: {unlimited_text}\n\n"
-        
+
         if ipv4_url:
             success_message += f"IPv4 URL:\n`{escape_markdown_code(ipv4_url)}`\n\n"
-            
+
         success_message += f"Subscription URL:\n{escape_markdown_text(sub_url)}"
-        
+
         bot.send_photo(call.message.chat.id, photo=bio, caption=success_message, parse_mode="Markdown", reply_markup=create_main_markup(is_admin=True))
 
     except Exception as e:
-        _finish_add_user_callback(call, f"❌ Error adding user: {str(e)}")
+        _finish_add_user_callback(call, f"❌ Error adding user: {public_error()}")

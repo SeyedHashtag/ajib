@@ -67,7 +67,8 @@ def process_delete_user(message):
         return
 
     bot.send_chat_action(message.chat.id, 'typing')
-    result = api_client.delete_user(username) if api_client else None
+    from utils.admin_account_operations import from_telegram
+    result = from_telegram(message, api_client, username, kind='delete') if api_client else None
 
     if result is None:
         bot.reply_to(message, f"Error: Failed to delete user '{username}'. They may not exist.", reply_markup=create_main_markup(is_admin=True))

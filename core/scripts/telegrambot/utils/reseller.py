@@ -1762,6 +1762,10 @@ def claim_reseller_renewal_reservation(
                     for reservation in config.get('renewals', []):
                         if not isinstance(reservation, dict) or str(reservation.get('reservation_id') or '') != str(reservation_id):
                             continue
+                        if os.getenv('AJIB_SQLITE_ACTIVE') == '1' and reservation.get('renewal_source') == 'hosted_customer':
+                            # Hosted payment history owns this renewal. The main
+                            # scheduler/reviewer cannot create a second owner.
+                            return None
                         status = reservation.get('renewal_status')
                         if status == 'processing':
                             claimed_at = _parse_renewal_time(reservation.get('renewal_claimed_at'))
@@ -1806,6 +1810,15 @@ def claim_reseller_renewal_reservation(
 
 
 def finish_reseller_renewal_reservation(
+    user_id, reservation_id, claim_id, status, fields=None, now=None, retry=False,
+):
+    if status == 'applied' and os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from .reserved_completion import reseller
+        return reseller(user_id, reservation_id, claim_id, fields=fields, now=now)
+    return _finish_reseller_renewal_reservation(user_id, reservation_id, claim_id, status, fields=fields, now=now, retry=retry)
+
+
+def _finish_reseller_renewal_reservation(
     user_id,
     reservation_id,
     claim_id,
@@ -1872,6 +1885,9 @@ def finish_reseller_renewal_reservation(
                                 reservation.pop('renewal_next_attempt_at', None)
                         resellers[user_id] = _ensure_reseller_defaults(current)
                         _write_resellers_file(resellers)
+                        if status == 'applied' and os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+                            from .account_operations import complete
+                            complete(f'reseller-reservation:{user_id}:{reservation_id}')
                         return True
                 return False
         except Exception:
@@ -2233,8 +2249,15 @@ def get_banned_reseller_cleanup_candidates(reseller_data):
     return candidates
 
 
-def cleanup_banned_reseller_users(user_id, multi_api):
+def cleanup_banned_reseller_users(user_id, multi_api, *, actor='operator'):
     """Delete unpaid customer configs for a banned reseller and tag local history."""
+    from utils import account_operations
+    if account_operations.enabled():
+        from utils.reseller_removal import cleanup_banned
+        try:
+            return cleanup_banned(user_id, multi_api, actor=actor)
+        except Exception:
+            return False, {'reason': 'Cleanup requires investigation; account and financial claims are retained'}
     user_id = str(user_id)
     with reseller_lock:
         try:
@@ -2529,6 +2552,13 @@ def process_reseller_debt_service_action(user_id, multi_api, action):
 
 def _process_reseller_debt_service_action(user_id, multi_api, action):
     """Apply a retry-safe hold, removal, or restoration for debt-linked users."""
+    from utils import account_operations
+    if action == 'remove' and account_operations.enabled():
+        from utils.reseller_removal import cleanup_banned
+        try:
+            return cleanup_banned(user_id, multi_api, actor='debt_scheduler', _mode='debt')
+        except Exception:
+            return False, {'reason': 'Removal requires investigation; financial claims are retained'}
     user_id = str(user_id)
     if action not in {'hold', 'remove', 'restore'}:
         return False, {'reason': 'invalid_action'}

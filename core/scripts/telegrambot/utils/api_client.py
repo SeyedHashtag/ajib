@@ -2284,11 +2284,36 @@ class MultiServerAPI:
             limit_ip=None,
         )
 
+        from utils import account_operations
+        workflow_id = account_operations.active_workflow() if account_operations.enabled() else None
+        if account_operations.enabled() and not workflow_id:
+            return {'ok': False, 'error': 'copy_workflow_required'}
+
+        def write_step(name, intent, call):
+            if not workflow_id:
+                return call()
+            result = account_operations.step(workflow_id, name, intent,
+                                              lambda: {'success': call() is not None})
+            return result if result.get('success') else None
+
+        from dataclasses import asdict
+        create_intent = json.loads(json.dumps(asdict(spec), default=str))
+        planned_steps = {'create_destination': create_intent}
+        if destination.panel_type == THREE_X_UI_PANEL:
+            planned_steps['import_traffic'] = {'upload': snapshot.upload_bytes, 'download': snapshot.download_bytes}
+        elif spec.creation_date and spec.note is not None:
+            planned_steps['restore_note'] = {'note': spec.note}
+        if snapshot.blocked:
+            planned_steps['restore_block'] = {'blocked': True}
+        if workflow_id:
+            account_operations.plan_steps(workflow_id, planned_steps)
         created = False
 
         def fail(error_code):
             if not created:
                 return {"ok": False, "error": error_code}
+            if workflow_id:
+                return {'ok': False, 'error': error_code, 'partial_destination': destination.server_id}
             rollback = destination.delete_user(source_ref.username)
             self.invalidate_all_caches()
             if rollback is None:
@@ -2302,13 +2327,13 @@ class MultiServerAPI:
 
         defer_note = False
         if destination.panel_type == THREE_X_UI_PANEL:
-            creation_result = destination.create_from_spec(spec)
+            creation_result = write_step('create_destination', create_intent, lambda: destination.create_from_spec(spec))
         else:
             # Blitz 2.5.x duplicates its positional ``false`` argument when a
             # limited started user has both a note and creation date. Defer the
             # note to a verified PATCH so existing servers remain compatible.
             defer_note = bool(spec.creation_date and spec.note is not None)
-            creation_result = destination.add_user(
+            creation_result = write_step('create_destination', create_intent, lambda: destination.add_user(
                 spec.username,
                 int(destination_limit // GIB),
                 spec.expiration_days,
@@ -2317,7 +2342,7 @@ class MultiServerAPI:
                 password=spec.password,
                 creation_date=spec.creation_date,
                 blocked=False,
-            )
+            ))
         if creation_result is None:
             post_create = destination.get_user_result(spec.username)
             if post_create.get("status") == "found":
@@ -2330,16 +2355,16 @@ class MultiServerAPI:
         created = True
 
         if destination.panel_type == THREE_X_UI_PANEL:
-            if destination.update_traffic(spec.username, snapshot.upload_bytes, snapshot.download_bytes) is None:
+            if write_step('import_traffic', {'upload': snapshot.upload_bytes, 'download': snapshot.download_bytes}, lambda: destination.update_traffic(spec.username, snapshot.upload_bytes, snapshot.download_bytes)) is None:
                 return fail("traffic_import_failed")
-        elif defer_note and destination.update_user(spec.username, {"note": spec.note}) is None:
+        elif defer_note and write_step('restore_note', {'note': spec.note}, lambda: destination.update_user(spec.username, {'note': spec.note})) is None:
             return fail("destination_note_failed")
 
         uri_data = destination.get_user_uri(spec.username)
         if not isinstance(uri_data, dict) or not uri_data.get("normal_sub"):
             return fail("destination_uri_failed")
 
-        if snapshot.blocked and destination.update_user(spec.username, {"blocked": True}) is None:
+        if snapshot.blocked and write_step('restore_block', {'blocked': True}, lambda: destination.update_user(spec.username, {'blocked': True})) is None:
             return fail("destination_state_failed")
 
         verification = destination.get_user_result(spec.username)

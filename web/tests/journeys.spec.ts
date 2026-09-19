@@ -19,6 +19,10 @@ test('public Persian website and all supported languages',async({page})=>{
   for(const lang of ['en','ru','tk','fa']) {
     await page.locator('.language-select select').selectOption(lang);
     await expect(page.locator('html')).toHaveAttribute('lang',lang);
+    await expect(page).not.toHaveTitle(/ajib/i);
+    expect(await page.locator('body').innerText()).not.toMatch(/ajib/i);
+    expect(await page.evaluate(()=>Object.keys(localStorage))).toContain('service-language');
+    expect((await page.context().cookies()).map(cookie=>cookie.name).join(' ')).not.toMatch(/ajib/i);
   }
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBeTruthy();
   await page.screenshot({path:`test-results/public-${test.info().project.name}.png`,fullPage:true});

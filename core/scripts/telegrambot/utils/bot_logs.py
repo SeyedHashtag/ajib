@@ -28,22 +28,10 @@ BOT_LOGS_EXECUTOR = ThreadPoolExecutor(
 
 
 def _send_bot_log_file(message, log_file):
-    logger = logging.getLogger("ajib.bot.admin_logs")
-    try:
-        with open(log_file, "rb") as document:
-            bot.send_document(
-                message.chat.id,
-                document,
-                visible_file_name=os.path.basename(log_file),
-                caption="Current bot log file.",
-            )
-        logger.info("Admin downloaded bot logs user_id=%s log_file=%s", message.from_user.id, log_file)
-    except Exception:
-        logger.exception("Failed to send bot logs user_id=%s log_file=%s", message.from_user.id, log_file)
-        bot.reply_to(message, "Failed to send bot logs. Check server file permissions.")
-    finally:
-        with BOT_LOGS_LOCK:
-            BOT_LOGS_INFLIGHT.discard(message.from_user.id)
+    bot.reply_to(message, 'Logs are available through the restricted operator console.')
+    with BOT_LOGS_LOCK:
+        BOT_LOGS_INFLIGHT.discard(message.from_user.id)
+    return
 
 
 def _queue_bot_log_send(message, log_file):

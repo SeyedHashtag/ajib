@@ -48,7 +48,8 @@ class Services:
 
     def storefront(self, slug=None, *, scope=None):
         if (not slug and not scope) or scope == "main":
-            return {"scope": "main", "slug": None, "title": "ajib",
+            from .public_branding import TITLES
+            return {"scope": "main", "slug": None, "title": TITLES['en'], "titles": TITLES,
                     "bot_username": os.getenv("AJIB_WEB_BOT_USERNAME", "").lstrip("@"),
                     "support": self.support()}
         connection = database.get_connection()
@@ -163,6 +164,10 @@ class Services:
         return _object(row[0])
 
     def owned(self, user_id, scope, username, server_id):
+        from .identity_references import ownership
+        owned = ownership(username, user_id, scope, server_id)
+        if owned is not None:
+            return owned
         records = self.payments(user_id, scope)
         # Recorded ownership works across migrations and old naming conventions.
         for record in records.values():
@@ -209,13 +214,18 @@ class Services:
         return client, user, result
 
     def configuration(self, user_id, scope, username, server_id):
-        client, _, _ = self.resolve_account(user_id, scope, username, server_id)
-        uri = client.get_user_uri(username)
+        from . import account_operations
+        from .public_branding import require_public
+        # Serialize authorization and retrieval with renames/migrations.
+        with account_operations.serialize(server_id, username):
+            account_operations.assert_available(server_id, username)
+            client, _, _ = self.resolve_account(user_id, scope, username, server_id)
+            uri = client.get_user_uri(username)
         if uri is None:
             raise ServiceError("Configuration temporarily unavailable", 503)
         if isinstance(uri, dict):
-            return {key: value for key, value in uri.items() if key in {"uri", "url", "sub_url", "ipv4", "ipv4_url", "ipv6", "ipv6_url"} and isinstance(value, str)}
-        return {"uri": str(uri)}
+            return require_public({key: value for key, value in uri.items() if key in {"uri", "url", "sub_url", "ipv4", "ipv4_url", "ipv6", "ipv6_url"} and isinstance(value, str)})
+        return require_public({"uri": str(uri)})
 
     def reseller_summary(self, user_id):
         from .reseller import get_reseller_data, get_reseller_credit_policy, get_reseller_level_summary
@@ -256,5 +266,9 @@ class Services:
             FROM web_trials WHERE status NOT IN ('completed','cancelled') ORDER BY created_at LIMIT 200""")]
         health = connection.execute("SELECT * FROM web_worker_health WHERE role='worker'").fetchone()
         outbox = connection.execute("SELECT COUNT(*) AS pending,MIN(next_attempt_at) AS oldest_due_at,MAX(attempts) AS maximum_attempts FROM web_outbox WHERE status!='sent'").fetchone()
+        worker = ({key: health[key] for key in ('heartbeat_at', 'last_success_at', 'writes_enabled')}
+                  if health else None)
+        if worker is not None:
+            worker['last_error'] = 'attention_required' if health['last_error'] else None
         return {"operations": sorted(orders + trials, key=lambda row:row['created_at']),
-                "worker": dict(health) if health else None, "notifications": dict(outbox)}
+                "worker": worker, "notifications": dict(outbox)}

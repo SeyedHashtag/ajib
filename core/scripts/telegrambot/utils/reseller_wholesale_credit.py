@@ -75,7 +75,11 @@ def consume_wholesale_balance(reseller_id, reservation_id, *, metadata=None):
 
 
 def release_wholesale_balance(reseller_id, reservation_id):
-    return release_account_credit(wholesale_account_key(reseller_id), reservation_id)
+    from .account_operations import assert_obligation_releasable
+    with database.write_transaction(operation='wholesale_release'):
+        assert_obligation_releasable('reseller:' + str(reseller_id), reservation_id)
+        assert_obligation_releasable('hosted:' + str(reseller_id), reservation_id)
+        return release_account_credit(wholesale_account_key(reseller_id), reservation_id)
 
 
 def finalize_prepaid_config(reseller_id, reservation_id, amount, config_data):
@@ -91,6 +95,8 @@ def finalize_prepaid_config(reseller_id, reservation_id, amount, config_data):
         )
         if round(float(consumed or 0), 2) != round(float(amount or 0), 2):
             raise RuntimeError("Prepaid wholesale reservation could not be consumed")
+        from .operation_completion import funding_operations
+        funding_operations(reseller_id, reservation_id)
     return True
 
 
@@ -113,6 +119,8 @@ def finalize_prepaid_renewal(reseller_id, reservation_id, username, amount, rene
         )
         if round(float(consumed or 0), 2) != round(float(amount or 0), 2):
             raise RuntimeError("Prepaid wholesale reservation could not be consumed")
+        from .operation_completion import funding_operations
+        funding_operations(reseller_id, reservation_id)
     return True
 
 

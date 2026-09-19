@@ -7,6 +7,7 @@ import time
 from types import SimpleNamespace
 
 import qrcode
+from utils.public_branding import make_qr as make_public_qr
 from telebot import types
 
 from utils.command import bot, is_admin
@@ -67,7 +68,9 @@ def _store_user_context(ref):
     _prune_contexts()
     token = _new_token()
     with _CONTEXT_LOCK:
-        _USER_CONTEXTS[token] = {"ref": ref, "created_at": time.monotonic()}
+        from utils.identity_references import revision
+        _USER_CONTEXTS[token] = {"ref": ref, "created_at": time.monotonic(),
+                                 "identity_revision": revision(ref.server_id, ref.username)}
     return token
 
 
@@ -75,14 +78,21 @@ def _get_user_context(token):
     _prune_contexts()
     with _CONTEXT_LOCK:
         entry = _USER_CONTEXTS.get(token)
-    return entry.get("ref") if entry else None
+    if entry:
+        from utils.identity_references import revision
+        ref = entry['ref']
+        if entry.get('identity_revision', 0) == revision(ref.server_id, ref.username):
+            return ref
+    return None
 
 
 def _store_copy_context(source_ref, destination_server_id, inbound_ids=None, inbound_options=None):
     _prune_contexts()
     token = _new_token()
     with _CONTEXT_LOCK:
+        from utils.identity_references import revision
         _COPY_CONTEXTS[token] = {
+            "identity_revision": revision(source_ref.server_id, source_ref.username),
             "source_ref": source_ref,
             "destination_server_id": destination_server_id,
             "inbound_ids": list(inbound_ids or []),
@@ -95,7 +105,13 @@ def _store_copy_context(source_ref, destination_server_id, inbound_ids=None, inb
 def _get_copy_context(token):
     _prune_contexts()
     with _CONTEXT_LOCK:
-        return _COPY_CONTEXTS.get(token)
+        entry = _COPY_CONTEXTS.get(token)
+        if entry:
+            from utils.identity_references import revision
+            ref = entry['source_ref']
+            if entry.get('identity_revision', 0) == revision(ref.server_id, ref.username):
+                return entry
+        return None
 
 
 def _make_ref(client, username):
@@ -110,6 +126,9 @@ def _resolve_user_context(token, multi_api=None):
     ref = _get_user_context(token)
     if ref is not None:
         return ref
+    from utils.account_operations import enabled
+    if enabled():
+        return None
     # Old callback messages carried only a username. Resolve them only when
     # that username is unique across every configured server.
     multi_api = multi_api or MultiServerAPI()
@@ -206,7 +225,7 @@ def _send_user_details(message, api_client, user_details, ref):
             )
         traffic_limit = int(user_details.get("max_download_bytes") or 0) / (1024 ** 3)
     except (TypeError, ValueError, OverflowError) as error:
-        bot.reply_to(message, f"Failed to process user data: {error}")
+        bot.reply_to(message, "Account details are temporarily unavailable. Please try again later.")
         return
 
     shared_state = inspect_account(user_details, source="admin_user_detail")
@@ -249,7 +268,7 @@ def _send_user_details(message, api_client, user_details, ref):
         return
     sub_url = uri_data["normal_sub"]
     ipv4_url = uri_data.get("ipv4", "")
-    qr_code = qrcode.make(ipv4_url or sub_url)
+    qr_code = make_public_qr(ipv4_url or sub_url, encoder=qrcode.make)
     bio = io.BytesIO()
     qr_code.save(bio, "PNG")
     bio.seek(0)
@@ -310,9 +329,11 @@ def handle_edit_callback(call):
         )
         bot.register_next_step_handler(msg, process_edit_expiration, token)
     elif action == "renew_password":
-        _report_update(call.message.chat.id, api_client.update_user(ref.username, {"renew_password": True}), "Password renewed.", "Password renewal failed.")
+        from utils.admin_account_operations import from_telegram
+        _report_update(call.message.chat.id, from_telegram(call, api_client, ref.username, changes={"renew_password": True}), "Password renewed.", "Password renewal failed.")
     elif action == "renew_creation":
-        _report_update(call.message.chat.id, api_client.update_user(ref.username, {"renew_creation_date": True}), "Creation date renewed.", "Creation-date renewal failed.")
+        from utils.admin_account_operations import from_telegram
+        _report_update(call.message.chat.id, from_telegram(call, api_client, ref.username, changes={"renew_creation_date": True}), "Creation date renewed.", "Creation-date renewal failed.")
     elif action == "block_user":
         markup = types.InlineKeyboardMarkup()
         markup.add(
@@ -321,7 +342,8 @@ def handle_edit_callback(call):
         )
         bot.send_message(call.message.chat.id, f"Set block status for {ref.username}:", reply_markup=markup)
     elif action == "reset_user":
-        _report_update(call.message.chat.id, api_client.reset_user(ref.username), "User reset successfully.", "User reset failed. For imported 3x-ui users, reset is refused when the original duration is unknown.")
+        from utils.admin_account_operations import from_telegram
+        _report_update(call.message.chat.id, from_telegram(call, api_client, ref.username, kind='reset'), "User reset successfully.", "User reset failed. For imported 3x-ui users, reset is refused when the original duration is unknown.")
 
 
 def _report_update(chat_id, result, success, failure):
@@ -330,6 +352,8 @@ def _report_update(chat_id, result, success, failure):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_block:"))
 def handle_block_confirmation(call):
+    if not is_admin(call.from_user.id):
+        return
     _, token, block_status = call.data.split(":", 2)
     multi_api = MultiServerAPI()
     ref = _resolve_user_context(token, multi_api)
@@ -342,7 +366,12 @@ def handle_block_confirmation(call):
         return
     is_blocked = block_status == "true"
     from utils.reseller_blocks import set_admin_block
-    result = set_admin_block(api_client, ref.username, is_blocked, live)
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        result = set_admin_block(api_client, ref.username, is_blocked, live,
+                                 operation_id=f'admin-block:{call.message.chat.id}:{call.message.message_id}:{block_status}',
+                                 actor=str(call.from_user.id))
+    else:
+        result = set_admin_block(api_client, ref.username, is_blocked, live)
     _report_update(call.message.chat.id, result, f"User '{ref.username}' {'blocked' if is_blocked else 'unblocked'} successfully.", "Failed to update block status.")
 
 
@@ -361,7 +390,8 @@ def process_edit_username(message, token):
         bot.reply_to(message, "Username cannot be empty.")
         return
     client, ref = _exact_client_for_step(token)
-    result = client.update_user(ref.username, {"new_username": new_username}) if client and ref else None
+    from utils.admin_account_operations import from_telegram
+    result = from_telegram(message, client, ref.username, changes={"new_username": new_username}) if client and ref else None
     bot.reply_to(message, f"Username updated to '{new_username}' successfully." if result is not None else "Failed to update username.")
 
 
@@ -374,7 +404,8 @@ def process_edit_traffic(message, token):
         bot.reply_to(message, "Invalid traffic limit. Please enter a positive number.")
         return
     client, ref = _exact_client_for_step(token)
-    result = client.update_user(ref.username, {"new_traffic_limit": value}) if client and ref else None
+    from utils.admin_account_operations import from_telegram
+    result = from_telegram(message, client, ref.username, changes={"new_traffic_limit": value}) if client and ref else None
     bot.reply_to(message, f"Traffic limit updated to {value} GB successfully." if result is not None else "Failed to update traffic limit.")
 
 
@@ -387,7 +418,8 @@ def process_edit_expiration(message, token):
         bot.reply_to(message, "Invalid expiration. Enter zero for unlimited or a positive number of days.")
         return
     client, ref = _exact_client_for_step(token)
-    result = client.update_user(ref.username, {"new_expiration_days": value}) if client and ref else None
+    from utils.admin_account_operations import from_telegram
+    result = from_telegram(message, client, ref.username, changes={"new_expiration_days": value}) if client and ref else None
     success = (
         "Expiration updated to unlimited successfully."
         if value == 0
@@ -537,6 +569,9 @@ COPY_ERRORS = {
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("copy_confirm:"))
 def handle_copy_confirm(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Administrator access required", show_alert=True)
+        return
     token = call.data.split(":", 1)[1]
     context = _get_copy_context(token)
     if context is None:
@@ -549,7 +584,14 @@ def handle_copy_confirm(call):
         destination_server_id=context["destination_server_id"],
         inbound_ids=tuple(context.get("inbound_ids") or []),
     )
-    if hasattr(multi_api, "copy_user"):
+    from utils import account_operations
+    if account_operations.enabled():
+        from utils.copy_operations import copy
+        try:
+            result = copy(f'admin-copy:{call.message.chat.id}:{call.message.message_id}', multi_api, copy_spec, call.from_user.id)
+        except Exception:
+            result = {'ok': False, 'error': 'copy_requires_reconciliation'}
+    elif hasattr(multi_api, "copy_user"):
         result = multi_api.copy_user(copy_spec)
     else:  # Rolling-upgrade compatibility.
         result = multi_api.copy_blitz_user(
@@ -575,7 +617,7 @@ def handle_copy_confirm(call):
         return
 
     sub_url = result["normal_sub"]
-    qr_code = qrcode.make(sub_url)
+    qr_code = make_public_qr(sub_url, encoder=qrcode.make)
     bio = io.BytesIO()
     qr_code.save(bio, "PNG")
     bio.seek(0)

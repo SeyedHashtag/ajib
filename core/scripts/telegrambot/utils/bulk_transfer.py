@@ -496,6 +496,10 @@ def _insert_recipient(connection, job, item, route_scope, recipient_id, now):
 
 def _rehome_records_and_hold_recipients(job, item, *, path=None):
     """Move exact operational references and journal recipients atomically."""
+    from . import account_operations
+    if account_operations.enabled():
+        from .migration_operations import move_references
+        return move_references(job, item)
     now = format_utc_timestamp()
     changed = 0
     recipient_keys = set()
@@ -660,6 +664,9 @@ def _set_item(job_id, ordinal, *, path=None, **fields):
 
 
 def _rollback_destination(multi_api, job, item):
+    from . import account_operations
+    if account_operations.enabled():
+        return False
     destination = _exact_client(multi_api, job["destination_server_id"])
     if destination is None:
         return False
@@ -787,6 +794,11 @@ def _release_item_notifications(connection, job, item, now):
 def _complete_item(job, item, *, path=None):
     now = format_utc_timestamp()
     with database.write_transaction(path, operation="complete_bulk_item") as connection:
+        from . import account_operations
+        if account_operations.active_workflow():
+            connection.execute("INSERT OR IGNORE INTO account_operation_steps VALUES (?,'domain_ready','verified','{}','{\"success\":true}',strftime('%s','now'))",
+                               (account_operations.active_workflow(),))
+            return
         _release_item_notifications(connection, job, item, now)
         connection.execute(
             """UPDATE bulk_transfer_items SET stage='completed', error_code=NULL,
@@ -817,6 +829,10 @@ def _recover_item(job, item, multi_api, *, path=None):
     destination_result = destination.get_user_result(item["username"])
     if item["stage"] == "copying":
         if destination_result.get("status") == "missing" and source_result.get("status") == "found":
+            from . import account_operations
+            if account_operations.enabled():
+                _set_item(job['job_id'], item['ordinal'], path=path, stage='manual_review', error_code='copy_outcome_unproven')
+                return True
             _set_item(job["job_id"], item["ordinal"], path=path, stage="pending", error_code=None)
             return True
         if destination_result.get("status") == "found" and source_result.get("status") == "found":
@@ -849,6 +865,10 @@ def _recover_item(job, item, multi_api, *, path=None):
                 error_code="destination_missing_after_copy", completed_at=format_utc_timestamp(),
             )
             return True
+        from . import account_operations
+        if account_operations.enabled():
+            from .migration_operations import verify_destination
+            verify_destination(job, {**item, 'destination_panel_type': _panel_type(destination)}, destination_result['data'])
         if job["mode"] == "copy":
             _complete_item(job, item, path=path)
             return True
@@ -875,6 +895,14 @@ def _recover_item(job, item, multi_api, *, path=None):
                 error_code="destination_missing_after_records_updated", completed_at=format_utc_timestamp(),
             )
             return True
+        from . import account_operations
+        if account_operations.enabled():
+            from .migration_operations import verify_destination
+            request = verify_destination(job, {**item, 'destination_panel_type': _panel_type(destination)}, destination_result['data'])
+            if source_result.get('status') == 'found':
+                from .account_rename import signature
+                if signature(source_result['data']) != request['generation']:
+                    raise account_operations.AccountBusy('Migration source generation changed')
         if source_result.get("status") == "missing":
             _complete_item(job, item, path=path)
             return True
@@ -885,7 +913,14 @@ def _recover_item(job, item, multi_api, *, path=None):
             job["job_id"], item["ordinal"], path=path,
             stage="source_delete_pending", delete_attempts=attempts,
         )
-        source.delete_user(item["username"])
+        if account_operations.enabled():
+            def delete_source():
+                source.delete_user(item['username'])
+                return {'success': source.get_user_result(item['username']).get('status') == 'missing'}
+            account_operations.step(account_operations.active_workflow(), 'delete_source',
+                                    {'generation': request['generation']}, delete_source)
+        else:
+            source.delete_user(item["username"])
         verification = source.get_user_result(item["username"])
         if verification.get("status") == "missing":
             _complete_item(job, item, path=path)
@@ -899,6 +934,14 @@ def _recover_item(job, item, multi_api, *, path=None):
 
 
 def _process_item(job, item, multi_api, *, path=None):
+    from . import account_operations
+    if account_operations.enabled():
+        from .migration_operations import process_item
+        return process_item(job, item, multi_api, path=path)
+    return _process_item_unclaimed(job, item, multi_api, path=path)
+
+
+def _process_item_unclaimed(job, item, multi_api, *, path=None):
     if item["stage"] != "pending":
         return _recover_item(job, item, multi_api, path=path)
     source = _exact_client(multi_api, job["source_server_id"])
@@ -1140,7 +1183,7 @@ def _claim_notification(route_scope, *, path=None):
         return None
     with database.write_transaction(path, operation="claim_bulk_notification") as connection:
         row = connection.execute(
-            """SELECT n.*, j.destination_server_id, i.result_json
+            """SELECT n.*, COALESCE(n.account_server_id,j.destination_server_id) AS destination_server_id, i.result_json
                FROM bulk_transfer_notifications n
                JOIN bulk_transfer_jobs j ON j.job_id=n.job_id
                JOIN bulk_transfer_items i

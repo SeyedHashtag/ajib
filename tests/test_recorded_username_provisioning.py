@@ -53,6 +53,7 @@ class FakeMultiServerAPI:
 
 
 def compile_function(relative_path, function_name, namespace):
+    namespace.setdefault('os', __import__('os'))
     module = ast.Module(
         body=[source_function(relative_path, function_name)],
         type_ignores=[],

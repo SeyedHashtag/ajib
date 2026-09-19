@@ -2,6 +2,7 @@ import telebot
 from telebot import types
 import uuid
 import qrcode
+from utils.public_branding import make_qr as make_public_qr
 import io
 import os
 import re
@@ -402,6 +403,18 @@ def _create_reseller_username(api_client, user_id):
     if not usernames and api_client is not None:
         usernames = extract_existing_usernames(api_client.get_users())
     return allocate_username("r", user_id, set(usernames) | recorded_usernames)
+
+
+def _create_funded_reseller_user(operation_id, api_client, user_id, gb, days, chosen_username, unlimited=False):
+    if os.getenv('AJIB_SQLITE_ACTIVE') != '1':
+        return _create_reseller_user_with_note(api_client, user_id, gb, days, chosen_username, unlimited=unlimited)
+    from utils.account_mutations import create
+    recorded = load_recorded_usernames()
+    return create(f'reseller-create:{user_id}:{operation_id}', MultiServerAPI(),
+        lambda names: allocate_username('r', user_id, set(names) | recorded),
+        {'gb': gb, 'days': days, 'unlimited': unlimited}, note_text=chosen_username,
+        origin={'type': 'funding', 'scope': 'reseller:' + str(user_id), 'id': str(operation_id),
+                'owner': 'reseller', 'reseller_id': str(user_id)})
 
 
 def _create_reseller_user_with_note(api_client, user_id, gb, days, chosen_username, unlimited=False):
@@ -1138,7 +1151,8 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
         remember_fulfillment(user_id, wholesale_reservation_id)
     try:
         api_client = _configured_primary_api_client()
-        username, result, api_client = _create_reseller_user_with_note(
+        username, result, api_client = _create_funded_reseller_user(
+            wholesale_reservation_id,
             api_client,
             user_id,
             gb,
@@ -1184,7 +1198,7 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
         else:
             debt_added = add_reseller_debt(user_id, price, config_data)
         if not debt_added or not reseller_config_is_recorded(user_id, username, api_client.server_id):
-            if isinstance(funding_mode, dict):
+            if isinstance(funding_mode, dict) or os.getenv('AJIB_SQLITE_ACTIVE') == '1':
                 _notify_reseller_accounting_failure(user_id, username, price, None)
                 safe_reply_to(bot, message, journey_text(language, 'accounting_pending'))
                 return
@@ -1199,6 +1213,9 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
             )
             return
 
+        if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+            from utils.account_operations import complete
+            complete(f'reseller-create:{user_id}:{wholesale_reservation_id}')
         safe_send_message(bot, message.chat.id, (funding_text(language, funding_mode) + '\n' if isinstance(funding_mode, dict) else '') + build_credit_summary(language, get_reseller_data(user_id) or {}, user_id, deadlines=False))
         user_uri_data = api_client.get_user_uri(username)
         sub_url = user_uri_data.get('normal_sub') if user_uri_data else None
@@ -1223,7 +1240,7 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
 
         msg += "\n" + access_limit_text(language, {"unlimited": unlimited})
         if sub_url:
-            qr = qrcode.make(ipv4_url or sub_url)
+            qr = make_public_qr(ipv4_url or sub_url, encoder=qrcode.make)
             bio = io.BytesIO()
             qr.save(bio, 'PNG')
             bio.seek(0)
@@ -1233,7 +1250,7 @@ def _run_reseller_customer_creation(message, user_id, language, data, chosen_use
     else:
         if isinstance(funding_mode, dict):
             release_funding(user_id, wholesale_reservation_id)
-        elif funding_mode == 'prepaid':
+        elif funding_mode == 'prepaid' and os.getenv('AJIB_SQLITE_ACTIVE') != '1':
             release_wholesale_balance(user_id, wholesale_reservation_id)
         safe_reply_to(
             bot,
@@ -1457,7 +1474,7 @@ def handle_reseller_wholesale_payment(call):
             'wholesale_topup_amount': amount,
             **discount,
         })
-        qr = qrcode.make(payment_url)
+        qr = make_public_qr(payment_url, encoder=qrcode.make)
         bio = io.BytesIO()
         qr.save(bio, 'PNG')
         bio.seek(0)
@@ -1696,7 +1713,7 @@ def handle_reseller_payment(call):
             }
             add_payment_record(payment_id, payment_record)
             
-            qr = qrcode.make(payment_url)
+            qr = make_public_qr(payment_url, encoder=qrcode.make)
             bio = io.BytesIO()
             qr.save(bio, 'PNG')
             bio.seek(0)
@@ -2892,7 +2909,7 @@ def _render_reseller_customer_config_job(
     )
 
     try:
-        qr_code = qrcode.make(ipv4_url or sub_url)
+        qr_code = make_public_qr(ipv4_url or sub_url, encoder=qrcode.make)
         bio = io.BytesIO()
         qr_code.save(bio, 'PNG')
         bio.seek(0)
@@ -3381,7 +3398,9 @@ def _process_reseller_renewal_confirm_job(
 
     if isinstance(funding_mode, dict):
         remember_fulfillment(user_id, wholesale_reservation_id)
-    result = execute_reseller_renewal({**offer, 'mutation_operation_id': 'reseller-renewal:' + str(wholesale_reservation_id)})
+    result = execute_reseller_renewal({**offer, 'mutation_operation_id': 'reseller-renewal:' + str(wholesale_reservation_id),
+        'mutation_origin': {'scope': 'reseller:' + str(user_id), 'type': 'funding', 'id': str(wholesale_reservation_id),
+                            'owner': 'reseller', 'reseller_id': str(user_id)}})
     if not result.get('success'):
         if isinstance(funding_mode, dict) and not result.get('uncertain'):
             release_funding(user_id, wholesale_reservation_id)
@@ -3445,6 +3464,9 @@ def _process_reseller_renewal_confirm_job(
         )
         return
 
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from utils.account_operations import complete
+        complete('reseller-renewal:' + str(wholesale_reservation_id))
     mark_cleanup_state_renewed(offer.get('username'), offer.get('server_id'))
     if offer.get('recorded_server_id') and offer.get('recorded_server_id') != offer.get('server_id'):
         mark_cleanup_state_renewed(offer.get('username'), offer.get('recorded_server_id'))
@@ -3464,7 +3486,7 @@ def _process_reseller_renewal_confirm_job(
     )
 
     if sub_url:
-        qr = qrcode.make(ipv4_url or sub_url)
+        qr = make_public_qr(ipv4_url or sub_url, encoder=qrcode.make)
         bio = io.BytesIO()
         qr.save(bio, 'PNG')
         bio.seek(0)
@@ -4224,7 +4246,7 @@ def _render_admin_reseller_cleanup_preview(call, reseller_id, return_status, ret
 def _render_admin_reseller_cleanup_result(call, reseller_id, return_status, return_page):
     language = get_user_language(call.from_user.id)
     multi_api = MultiServerAPI()
-    success, result = cleanup_banned_reseller_users(reseller_id, multi_api)
+    success, result = cleanup_banned_reseller_users(reseller_id, multi_api, actor=call.from_user.id)
     if not success:
         bot.answer_callback_query(call.id, result.get("reason", get_message_text(language, "admin_invalid_action")), show_alert=True)
         _render_admin_reseller_detail(call, reseller_id, return_status, return_page)

@@ -38,7 +38,8 @@ PRIVATE_PROJECT_IDENTIFIER = "".join(chr(code) for code in (97, 106, 105, 98))
 
 
 def _contains_private_identifier(value):
-    return PRIVATE_PROJECT_IDENTIFIER in str(value or "").casefold()
+    from .public_branding import contains_private
+    return contains_private(value)
 
 
 def _now():
@@ -599,7 +600,24 @@ def reserve_credit(reseller_id, reservation_id, amount, available_credit):
 
 
 def release_credit(reseller_id, reservation_id, kind="credit_released"):
+    from . import account_operations
     with locked_json(tenant_file(reseller_id, "ledger.json"), _default_ledger()) as ledger:
+        try:
+            account_operations.assert_obligation_releasable('hosted:' + str(reseller_id), reservation_id)
+        except account_operations.AccountBusy:
+            # These two events settle borrowing that has already become a
+            # recorded debt; they do not abandon a customer purchase.
+            operation = account_operations.existing(f'hosted-payment:{reseller_id}:{reservation_id}')
+            if kind not in {'credit_recovered', 'renewal_credit_consumed'} or not operation or operation['status'] != 'succeeded':
+                raise
+            configs = (reseller_store.get_reseller_data(reseller_id) or {}).get('configs', [])
+            accounted = any(isinstance(config, dict) and config.get('username') == operation['username']
+                and str(config.get('server_id')) == operation['server_id'] and (
+                    str(config.get('retail_order_id')) == str(reservation_id) or any(
+                        isinstance(renewal, dict) and str(renewal.get('retail_order_id')) == str(reservation_id)
+                        for renewal in config.get('renewals', []))) for config in configs)
+            if not accounted:
+                raise
         reservation = ledger.setdefault("credit_reservations", {}).pop(str(reservation_id), None)
         if not reservation:
             return False
@@ -622,6 +640,11 @@ def release_stale_credit_reservations(reseller_id, active_reservation_ids, max_a
             except (AttributeError, TypeError, ValueError):
                 created_at = current_time - timedelta(seconds=max_age_seconds + 1)
             if (current_time - created_at).total_seconds() < max_age_seconds:
+                continue
+            from .account_operations import assert_obligation_releasable, AccountBusy
+            try:
+                assert_obligation_releasable('hosted:' + str(reseller_id), reservation_id)
+            except AccountBusy:
                 continue
             reservations.pop(reservation_id, None)
             _append_transaction(

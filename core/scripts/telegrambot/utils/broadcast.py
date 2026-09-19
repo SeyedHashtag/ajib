@@ -1,3 +1,4 @@
+from utils.public_branding import public_error
 from telebot import types
 from utils.command import bot, is_admin, ADMIN_USER_IDS
 from utils.common import admin_action_text, create_main_markup
@@ -689,4 +690,4 @@ def send_broadcast(message, target, target_label, explicit_user_ids=None):
             )
     except Exception as e:
         print(f"Failed to send broadcast log file: {str(e)}")
-        bot.reply_to(message, f"⚠️ Could not send log file: {str(e)}")
+        bot.reply_to(message, f"⚠️ Could not send log file: {public_error()}")

@@ -686,7 +686,7 @@ class AdminLogButtonTests(unittest.TestCase):
             module.send_bot_logs(self.make_message())
             self.assertEqual(bot.replies[-1]["text"], "Bot log file is missing or empty.")
 
-    def test_admin_log_handler_sends_existing_log_file(self):
+    def test_admin_log_handler_keeps_existing_log_private(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             log_file = os.path.join(tmpdir, "bot.log")
             with open(log_file, "w", encoding="utf-8") as f:
@@ -695,9 +695,8 @@ class AdminLogButtonTests(unittest.TestCase):
             module, bot = self.load_bot_logs_module(log_file)
             module.send_bot_logs(self.make_message())
 
-            self.assertEqual(bot.documents[-1]["chat_id"], 456)
-            self.assertEqual(bot.documents[-1]["content"], b"line one\n")
-            self.assertEqual(bot.documents[-1]["kwargs"]["visible_file_name"], "bot.log")
+            self.assertEqual(bot.documents, [])
+            self.assertIn('restricted operator console', bot.replies[-1]['text'])
 
     def test_admin_log_handler_queues_upload_and_dedupes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -718,7 +717,8 @@ class AdminLogButtonTests(unittest.TestCase):
 
             executor.run_next()
 
-            self.assertEqual(bot.documents[-1]["chat_id"], 456)
+            self.assertEqual(bot.documents, [])
+            self.assertIn('restricted operator console', bot.replies[-1]['text'])
             self.assertEqual(module.BOT_LOGS_INFLIGHT, set())
 
 

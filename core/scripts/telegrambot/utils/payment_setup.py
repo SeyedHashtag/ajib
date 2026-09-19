@@ -1,3 +1,4 @@
+from utils.public_branding import public_error
 from telebot import types
 from utils.command import bot, is_admin
 from utils.common import admin_action_text, create_main_markup
@@ -156,7 +157,7 @@ def process_api_key(message, merchant_id):
     except Exception as e:
         bot.reply_to(
             message,
-            f"❌ Error updating Crypto credentials: {str(e)}",
+            f"❌ Error updating Crypto credentials: {public_error()}",
             reply_markup=create_main_markup(is_admin=True)
         )
 
@@ -211,7 +212,7 @@ def process_card_to_card_number(message, slot="main"):
     except Exception as e:
         bot.reply_to(
             message,
-            f"❌ Error updating {slot_label} Card to Card number: {str(e)}",
+            f"❌ Error updating {slot_label} Card to Card number: {public_error()}",
             reply_markup=create_main_markup(is_admin=True)
         )
 
@@ -256,7 +257,7 @@ def process_receipt_checker_id(message):
     except Exception as e:
         bot.reply_to(
             message,
-            f"❌ Error updating receipt checker: {str(e)}",
+            f"❌ Error updating receipt checker: {public_error()}",
             reply_markup=create_main_markup(is_admin=True)
         )
 
@@ -309,7 +310,7 @@ def handle_receipt_checker_type_selection(call):
             message_id=call.message.message_id
         )
     except Exception as e:
-        bot.answer_callback_query(call.id, text=f"Error: {str(e)}")
+        bot.answer_callback_query(call.id, text=f"Error: {public_error()}")
 
 
 def setup_receipt_checker_share(message):
@@ -358,7 +359,7 @@ def process_receipt_checker_share(message):
     except Exception as e:
         bot.reply_to(
             message,
-            f"❌ Error updating checker share: {str(e)}",
+            f"❌ Error updating checker share: {public_error()}",
             reply_markup=create_main_markup(is_admin=True)
         )
 
@@ -752,7 +753,7 @@ def process_exchange_rate(message):
     except Exception as e:
         bot.reply_to(
             message,
-            f"❌ Error updating exchange rate: {str(e)}",
+            f"❌ Error updating exchange rate: {public_error()}",
             reply_markup=create_main_markup(is_admin=True)
         )
 
@@ -813,7 +814,7 @@ def handle_card_to_card_mode_selection(call):
             message_id=call.message.message_id
         )
     except Exception as e:
-        bot.answer_callback_query(call.id, text=f"Error: {str(e)}")
+        bot.answer_callback_query(call.id, text=f"Error: {public_error()}")
 
 def setup_reseller_settlement_threshold(message):
     load_dotenv(env_path, override=True)
@@ -878,6 +879,6 @@ def process_reseller_settlement_threshold(message):
     except Exception as e:
         bot.reply_to(
             message,
-            f"❌ Error updating threshold: {str(e)}",
+            f"❌ Error updating threshold: {public_error()}",
             reply_markup=create_main_markup(is_admin=True)
         )

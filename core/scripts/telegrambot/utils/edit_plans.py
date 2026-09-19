@@ -1,3 +1,4 @@
+from utils.public_branding import public_error
 from telebot import types
 from utils.command import bot, is_admin
 from utils.common import admin_action_text, create_main_markup
@@ -141,7 +142,7 @@ def handle_plan_select(call):
             )
     except Exception as e:
         print(f"DEBUG: Error in handle_plan_select: {str(e)}")
-        bot.answer_callback_query(call.id, text=f"Error: {str(e)}")
+        bot.answer_callback_query(call.id, text=f"Error: {public_error()}")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("recommend_customer_plan:"))
@@ -172,7 +173,7 @@ def handle_recommend_customer_plan(call):
         )
     except Exception as e:
         print(f"DEBUG: Error in handle_recommend_customer_plan: {str(e)}")
-        bot.answer_callback_query(call.id, text=f"Error: {str(e)}")
+        bot.answer_callback_query(call.id, text=f"Error: {public_error()}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_plan:"))
 def handle_edit_plan(call):
@@ -211,7 +212,7 @@ def handle_edit_plan(call):
         )
     except Exception as e:
         print(f"DEBUG: Error in handle_edit_plan: {str(e)}")
-        bot.answer_callback_query(call.id, text=f"Error: {str(e)}")
+        bot.answer_callback_query(call.id, text=f"Error: {public_error()}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_field:"))
 def handle_edit_field(call):
@@ -246,7 +247,7 @@ def handle_edit_field(call):
             
     except Exception as e:
         print(f"DEBUG: Error in handle_edit_field: {str(e)}")
-        bot.answer_callback_query(call.id, text=f"Error: {str(e)}")
+        bot.answer_callback_query(call.id, text=f"Error: {public_error()}")
 
 def process_update_price(message, gb):
     try:
@@ -351,7 +352,7 @@ def handle_update_target(call):
              bot.edit_message_text("❌ Plan not found.", chat_id=call.message.chat.id, message_id=call.message.message_id)
     except Exception as e:
         print(f"DEBUG: Error in handle_update_target: {str(e)}")
-        bot.answer_callback_query(call.id, text=f"Error: {str(e)}")
+        bot.answer_callback_query(call.id, text=f"Error: {public_error()}")
 
 
 
@@ -376,7 +377,7 @@ def handle_confirm_delete_plan(call):
         )
     except Exception as e:
         print(f"DEBUG: Error in handle_confirm_delete_plan: {str(e)}")
-        bot.answer_callback_query(call.id, text=f"Error: {str(e)}")
+        bot.answer_callback_query(call.id, text=f"Error: {public_error()}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_plan:"))
 def handle_plan_delete(call):
@@ -408,7 +409,7 @@ def handle_plan_delete(call):
             bot.answer_callback_query(call.id, text="Plan not found!")
     except Exception as e:
         print(f"DEBUG: Error in handle_plan_delete: {str(e)}")
-        bot.answer_callback_query(call.id, text=f"Error: {str(e)}")
+        bot.answer_callback_query(call.id, text=f"Error: {public_error()}")
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_back_to_plans")
 def handle_plan_navigation(call):
@@ -427,7 +428,7 @@ def handle_plan_navigation(call):
         )
     except Exception as e:
         print(f"DEBUG: Error in handle_plan_navigation: {str(e)}")
-        bot.answer_callback_query(call.id, text=f"Error: {str(e)}")
+        bot.answer_callback_query(call.id, text=f"Error: {public_error()}")
 
 def process_new_plan_gb(message):
     try:
@@ -462,7 +463,7 @@ def process_new_plan_price(message, gb):
     except ValueError as e:
         bot.reply_to(
             message,
-            f"❌ Error: {str(e)}",
+            f"❌ Error: {public_error()}",
             reply_markup=create_main_markup(is_admin=True)
         )
 
@@ -480,7 +481,7 @@ def process_new_plan_days(message, gb, price):
     except ValueError as e:
         bot.reply_to(
             message,
-            f"❌ Error: {str(e)}",
+            f"❌ Error: {public_error()}",
             reply_markup=create_main_markup(is_admin=True)
         )
 @bot.callback_query_handler(func=lambda call: call.data.startswith("unlimited_choice:"))
@@ -508,7 +509,7 @@ def process_unlimited_choice(call):
     except Exception as e:
         bot.reply_to(
             call.message,
-            f"? Error: {str(e)}",
+            f"? Error: {public_error()}",
             reply_markup=create_main_markup(is_admin=True)
         )
 
@@ -543,6 +544,6 @@ def process_newplan_target(call):
     except Exception as e:
         bot.reply_to(
             call.message,
-            f"? Error: {str(e)}",
+            f"? Error: {public_error()}",
             reply_markup=create_main_markup(is_admin=True)
         )

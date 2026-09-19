@@ -17,6 +17,7 @@ from urllib.parse import quote as urlquote
 os.environ["AJIB_BOT_ROLE"] = "hosted"
 
 import qrcode
+from utils.public_branding import make_qr as make_public_qr
 import telebot
 from dotenv import load_dotenv
 from telebot import types
@@ -190,107 +191,7 @@ def _parse_time(value):
     return parse_utc_timestamp(value)
 
 
-def _financial_amount(value, field):
-    try:
-        amount = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError) as error:
-        raise ValueError(f"Invalid hosted payment {field}") from error
-    if not amount.is_finite() or amount < 0:
-        raise ValueError(f"Invalid hosted payment {field}")
-    return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-
-def _settlement_financials(record):
-    """Validate immutable hosted checkout economics before side effects."""
-    if not isinstance(record, dict):
-        raise ValueError("Invalid hosted payment record")
-
-    payment_method = str(record.get("payment_method") or "").strip().lower()
-    if payment_method == "account_credit":
-        raise ValueError("Main-account credit is not valid for hosted-store checkout")
-    for field in (
-        "account_credit_reserved",
-        "account_credit_consumed",
-        "account_credit_applied",
-    ):
-        if field in record and _financial_amount(record.get(field, 0), field) > 0:
-            raise ValueError("Main-account credit cannot reduce hosted-store proceeds")
-
-    collected_value = record.get("collected_amount")
-    if collected_value is None and payment_method == "crypto":
-        collected_value = record.get("crypto_collected")
-    if collected_value is None:
-        collected_value = record.get("retail_price")
-    collected = _financial_amount(collected_value, "collected amount")
-    wholesale = _financial_amount(record.get("wholesale_price"), "wholesale price")
-    margin = (collected - wholesale).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    if margin < 0:
-        raise ValueError("Hosted payment route falls below wholesale cost")
-
-    reward = _financial_amount(record.get("referral_reward", 0), "referral reward")
-    if reward > margin:
-        raise ValueError("Hosted referral reward exceeds positive post-discount margin")
-
-    if record.get("reward_calculation_base") is not None:
-        reward_base = _financial_amount(
-            record.get("reward_calculation_base"),
-            "reward calculation base",
-        )
-        if reward_base != margin:
-            raise ValueError("Hosted referral reward base is not the post-discount margin")
-
-    if record.get("margin") is not None:
-        recorded_margin = _financial_amount(record.get("margin"), "margin")
-        if recorded_margin != margin:
-            raise ValueError("Hosted payment margin does not match collected amount")
-
-    component_fields = ("invite_discount_percent", "crypto_discount_percent")
-    components = Decimal("0")
-    for field in component_fields:
-        if record.get(field) is not None:
-            components += _financial_amount(record.get(field), field)
-    if components > Decimal("10.00"):
-        raise ValueError("Hosted customer discount components exceed the 10% cap")
-    if record.get("total_discount_percent") is not None:
-        total_discount = _financial_amount(
-            record.get("total_discount_percent"),
-            "total discount percent",
-        )
-        if total_discount > Decimal("10.00"):
-            raise ValueError("Hosted customer discount exceeds the 10% cap")
-        if any(record.get(field) is not None for field in component_fields) and total_discount != components:
-            raise ValueError("Hosted customer discount components do not match the capped total")
-
-    if record.get("original_price") is not None and record.get("total_discount_amount") is not None:
-        original_price = _financial_amount(record.get("original_price"), "original price")
-        total_discount_amount = _financial_amount(
-            record.get("total_discount_amount"),
-            "total discount amount",
-        )
-        if total_discount_amount > original_price or original_price - total_discount_amount != collected:
-            raise ValueError("Hosted collected amount does not match the recorded discount")
-        if (
-            record.get("invite_discount_amount") is not None
-            or record.get("crypto_discount_amount") is not None
-        ):
-            invite_amount = _financial_amount(
-                record.get("invite_discount_amount", 0),
-                "invite discount amount",
-            )
-            crypto_amount = _financial_amount(
-                record.get("crypto_discount_amount", 0),
-                "crypto discount amount",
-            )
-            if invite_amount + crypto_amount != total_discount_amount:
-                raise ValueError("Hosted discount amounts do not match the collected total")
-
-    return {
-        "collected_amount": float(collected),
-        "wholesale_price": float(wholesale),
-        "margin": float(margin),
-        "reward_calculation_base": float(margin),
-        "referral_reward": float(reward),
-    }
+from utils.hosted_settlement import financial_amount as _financial_amount, settlement_financials as _settlement_financials
 
 
 def _escape_markdown(value):
@@ -522,6 +423,9 @@ def _save_payment(payment_id, record, *, owner_followup=None):
         current.setdefault("created_at", timestamp)
         current["updated_at"] = timestamp
         payments[payment_id] = current
+        if record.get('status') == 'completed' and os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+            from utils.account_operations import complete
+            complete(f'hosted-payment:{OWNER_ID}:{payment_id}')
         return dict(current)
 
 
@@ -1506,6 +1410,21 @@ def _create_user(
             set(existing) | recorded_usernames,
         )
 
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from utils.account_mutations import create as create_account
+        from utils.account_operations import AccountBusy
+        if operation_id is None:
+            raise AccountBusy('A persisted hosted operation identity is required before allocation')
+        payment = _tenant_payments().get(str(operation_id))
+        if payment:
+            ident, origin = f'hosted-payment:{OWNER_ID}:{operation_id}', None
+        else:
+            ident = f'hosted-create:{OWNER_ID}:{operation_id}'
+            origin = {'scope': f'hosted:{OWNER_ID}', 'type': 'funding', 'id': str(operation_id),
+                      'owner': 'hosted', 'reseller_id': str(OWNER_ID)}
+        return create_account(ident, multi, allocate, plan, origin=origin, note_text=note,
+                              on_allocated=on_username_allocated)
+
     def create(client, username):
         note_parts = [str(note or "").strip()]
         if customer_id is not None:
@@ -1550,7 +1469,7 @@ def _deliver_config(chat_id, username, client, renewed=False, include_downloads=
         return
     url = uri.get("ipv4") or uri["normal_sub"]
     image = io.BytesIO()
-    qrcode.make(url).save(image, "PNG")
+    make_public_qr(url, encoder=qrcode.make).save(image, "PNG")
     image.seek(0)
     bot.send_photo(chat_id, image,
                    caption=_hosted_message(
@@ -1589,6 +1508,16 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
         settlement = settlement or _settlement_financials(record)
     except ValueError as error:
         return False, str(error)
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from utils.hosted_settlement import prepare, reserve
+        prepare(OWNER_ID, payment_id, record, funded, bot_id=os.getenv('AJIB_HOSTED_BOT_ID'),
+                owner_snapshot=_owner_payment_snapshot(payment_id, record, record.get('renew_username'), 'reserved', settlement))
+        saved = reserve(OWNER_ID, payment_id)
+        _notify_owner_payment(payment_id)
+        _record_completed_growth(payment_id, record, renewed=True)
+        if funded:
+            _record_hosted_prepaid_good(payment_id)
+        return True, saved['username']
     customer_id = int(record["user_id"])
     username = record.get("renew_username")
     server_id = record.get("server_id")
@@ -1720,6 +1649,22 @@ def _settle_hosted_reserved_renewal(payment_id, record, funded, settlement=None)
     return True, username
 
 
+def _complete_verified_hosted_payment(payment_id, record, funded):
+    from utils.hosted_settlement import finalize
+    saved = finalize(OWNER_ID, payment_id)
+    _notify_owner_payment(payment_id)
+    _record_completed_growth(payment_id, record, renewed=bool(record.get('renew_username')))
+    if funded:
+        _record_hosted_prepaid_good(payment_id)
+    if funded or record.get('wholesale_prepaid'):
+        present_pending_reseller_level(bot, OWNER_ID, _language(OWNER_ID), allow_introduction=False)
+    # Configurations are read and delivered only after the accounting commit.
+    client = MultiServerAPI().get_client(saved['server_id'])
+    if client:
+        _deliver_config_safely(int(record['user_id']), saved['username'], client, renewed=bool(record.get('renew_username')))
+    return True, saved['username']
+
+
 def _provision_payment(payment_id, record, funded):
     try:
         settlement = _settlement_financials(record)
@@ -1738,6 +1683,14 @@ def _provision_payment(payment_id, record, funded):
             funded,
             settlement=settlement,
         )
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from utils.hosted_settlement import prepare
+        from utils.account_operations import existing
+        prepare(OWNER_ID, payment_id, record, funded, bot_id=os.getenv('AJIB_HOSTED_BOT_ID'),
+                owner_snapshot=_owner_payment_snapshot(payment_id, record, None, 'renewal' if renewed else 'new', settlement))
+        previous = existing(f'hosted-payment:{OWNER_ID}:{payment_id}')
+        if previous and previous['status'] == 'succeeded':
+            return _complete_verified_hosted_payment(payment_id, record, funded)
     reseller_snapshot = get_reseller_data(OWNER_ID) or {}
     existing_config = None
     for item in reseller_snapshot.get("configs", []):
@@ -1752,6 +1705,8 @@ def _provision_payment(payment_id, record, funded):
             renewed = True
             break
     if existing_config:
+        if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+            return False, 'Existing fulfillment requires settlement provenance review'
         username = existing_config.get("username")
         client, live, lookup = _resolve_hosted_user(
             username,
@@ -1855,6 +1810,8 @@ def _provision_payment(payment_id, record, funded):
                 return False, "VPN user creation failed"
             _save_payment(payment_id, {"provisioned_username": username,
                                        "provisioned_server_id": getattr(client, "server_id", None)})
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        return _complete_verified_hosted_payment(payment_id, record, funded)
     server_id = getattr(client, "server_id", None)
     recorded_server_id = record.get("renewal_recorded_server_id") or record.get("server_id") or server_id
     common = {
@@ -1909,7 +1866,7 @@ def _provision_payment(payment_id, record, funded):
         accounted = (consume_renewal_credit(OWNER_ID, payment_id, username, common, recorded_server_id)
                      if renewed else consume_credit(OWNER_ID, payment_id, common))
     if not accounted:
-        if not renewed and client:
+        if not renewed and client and os.getenv('AJIB_SQLITE_ACTIVE') != '1':
             client.delete_user(username)
         return False, "Reseller accounting failed"
     if effective_funded:
@@ -2646,7 +2603,7 @@ def payment_method(call):
         payment_id=gateway_id,
     )
     image = io.BytesIO()
-    qrcode.make(url).save(image, "PNG")
+    make_public_qr(url, encoder=qrcode.make).save(image, "PNG")
     image.seek(0)
     bot.answer_callback_query(call.id)
     bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -3132,6 +3089,8 @@ def download_selection(call):
 @bot.message_handler(func=lambda m: m.text in _all_button_values("test_config"))
 def free_test(message, customer=None):
     customer = customer or message.from_user
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        return _free_test_durable(message, customer)
     recovering_pending_test = False
     pending_username = None
     pending_server_id = None
@@ -3205,6 +3164,34 @@ def free_test(message, customer=None):
     with locked_json(GLOBAL_TEST_FILE, {}) as tests:
         tests[str(customer.id)].update({"username": username, "server_id": getattr(client, "server_id", None),
                                         "used_at": _now(), "creation_pending_at": None})
+    _deliver_trial_activation(message, customer, username, client)
+
+
+def _free_test_durable(message, customer):
+    from utils import trial_operations
+    from utils.account_operations import AccountBusy
+    try:
+        ident = trial_operations.claim(customer.id, scope=f'hosted:{OWNER_ID}', owner='hosted',
+                                        language=_language(customer.id))
+    except AccountBusy:
+        bot.reply_to(message, _hosted_message(customer.id, 'test_already_used'))
+        return
+    try:
+        recorded = load_recorded_usernames(extra_paths=(tenant_file(OWNER_ID, 'payments.json'),))
+        username, result, client = trial_operations.create(ident, customer.id, MultiServerAPI(),
+            lambda existing: allocate_username('ht', OWNER_ID, set(existing) | recorded),
+            {'gb': 1, 'days': 30, 'unlimited': False})
+        if not result:
+            raise AccountBusy('Trial allocation unavailable')
+        trial_operations.complete(ident)
+    except Exception:
+        trial_operations.release_unallocated(customer.id)
+        bot.reply_to(message, _hosted_message(customer.id, 'test_creation_failed'))
+        return
+    _deliver_trial_activation(message, customer, username, client)
+
+
+def _deliver_trial_activation(message, customer, username, client):
     _deliver_config_safely(message.chat.id, username, client)
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton(
@@ -4437,7 +4424,8 @@ def owner_generate_input(message):
         return
     remember_fulfillment(OWNER_ID, reservation_id)
     username, result, client = _create_user({"gb": plan_id, "days": plan.get("days", 30),
-                                             "unlimited": plan.get("unlimited", False)}, label)
+                                             "unlimited": plan.get("unlimited", False)}, label,
+                                             **({'operation_id': reservation_id} if os.getenv('AJIB_SQLITE_ACTIVE') == '1' else {}))
     if result is None:
         release_funding(OWNER_ID, reservation_id)
         bot.reply_to(message, _hosted_message(OWNER_ID, "vpn_creation_failed"))
@@ -4458,6 +4446,9 @@ def owner_generate_input(message):
         from utils.reseller_journey import journey_text
         bot.reply_to(message, journey_text(_language(OWNER_ID), 'accounting_pending'))
         return
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        from utils.account_operations import complete
+        complete(f'hosted-create:{OWNER_ID}:{reservation_id}')
     bot.send_message(OWNER_ID, funding_text(_language(OWNER_ID), funding) + '\n' + recovery_text(_language(OWNER_ID), get_reseller_data(OWNER_ID) or {}))
     _deliver_config(message.chat.id, username, client, include_downloads=False)
 

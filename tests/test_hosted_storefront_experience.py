@@ -94,6 +94,7 @@ def _hosted_user_creator(
 
     namespace = {
         "MultiServerAPI": FakeMultiServerAPI,
+        "os": __import__('os'),
         "OWNER_ID": 5956844665,
         "allocate_username": USERNAME_UTILS.allocate_username,
         "build_user_note": fake_build_user_note,
@@ -490,7 +491,7 @@ class HostedStorefrontParityTests(unittest.TestCase):
             '"card_checkout"',
             '"crypto_checkout"',
             '"risk_disclosure"',
-            "qrcode.make(url)",
+            "make_public_qr(url, encoder=qrcode.make)",
             "format_toman_amount",
         ):
             with self.subTest(behavior=behavior):

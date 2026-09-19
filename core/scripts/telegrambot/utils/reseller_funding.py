@@ -97,7 +97,10 @@ def reserve_funding(reseller_id, operation_id, amount, *, expected=None, metadat
 
 
 def release_funding(reseller_id, operation_id):
+    from .account_operations import assert_obligation_releasable
     with store.reseller_lock, database.write_transaction(operation='reseller_funding_release') as connection:
+        assert_obligation_releasable('reseller:' + str(reseller_id), operation_id)
+        assert_obligation_releasable('hosted:' + str(reseller_id), operation_id)
         saved = _saved(connection, reseller_id, operation_id)
         if not saved or saved['status'] != 'reserved':
             return False
@@ -158,6 +161,8 @@ def finalize_funding(reseller_id, operation_id, data, *, kind='config', username
         if not saved or saved['status'] not in {'reserved', 'completed'}:
             raise FundingUnavailable('Funding reservation missing')
         if saved['status'] == 'completed':
+            from .operation_completion import funding_operations
+            funding_operations(reseller_id, operation_id)
             return saved.get('result', True)
         record = dict(data, retail_order_id=str(operation_id), funding=dict(saved))
         record['funding']['status'] = 'completed'
@@ -180,5 +185,7 @@ def finalize_funding(reseller_id, operation_id, data, *, kind='config', username
             raise FundingUnavailable('Order accounting failed')
         saved.update(status='completed', completed_at=store._now_str(), result=result)
         _save(connection, reseller_id, saved)
+        from .operation_completion import funding_operations
+        funding_operations(reseller_id, operation_id)
     store._update_recruitment_milestone(str(reseller_id), store.get_reseller_data(reseller_id) or {})
     return result

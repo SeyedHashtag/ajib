@@ -56,12 +56,40 @@ def _transaction_depths() -> dict[str, int]:
 
 
 SCHEMA_STATEMENTS = (
+    # Shared domain notifications also originate in bot-only runtimes.
+    """CREATE TABLE IF NOT EXISTS web_outbox(
+        id TEXT PRIMARY KEY, scope TEXT NOT NULL, recipient TEXT NOT NULL,
+        text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL,
+        lease_until INTEGER, lease_token TEXT, last_error TEXT)""",
+    "CREATE INDEX IF NOT EXISTS web_outbox_due ON web_outbox(status,next_attempt_at,lease_until)",
     """CREATE TABLE IF NOT EXISTS account_operations(
         operation_id TEXT PRIMARY KEY,server_id TEXT NOT NULL,username TEXT NOT NULL,
         kind TEXT NOT NULL,status TEXT NOT NULL,request_json TEXT NOT NULL,
         result_json TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)""",
     """CREATE UNIQUE INDEX IF NOT EXISTS account_operation_active
         ON account_operations(server_id,username) WHERE status IN ('executing','uncertain')""",
+    """CREATE TABLE IF NOT EXISTS account_operation_details(
+        operation_id TEXT PRIMARY KEY REFERENCES account_operations(operation_id),
+        phase TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,origin_json TEXT NOT NULL,
+        resources_json TEXT NOT NULL,updated_at INTEGER NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS account_operation_claims(
+        server_id TEXT NOT NULL,username_key TEXT NOT NULL,operation_id TEXT NOT NULL,
+        PRIMARY KEY(server_id,username_key))""",
+    """CREATE TABLE IF NOT EXISTS account_operation_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,operation_id TEXT NOT NULL,actor TEXT NOT NULL,
+        phase TEXT NOT NULL,reason TEXT NOT NULL,evidence_digest TEXT,occurred_at INTEGER NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS account_operation_steps(
+        operation_id TEXT NOT NULL REFERENCES account_operations(operation_id),step_id TEXT NOT NULL,
+        phase TEXT NOT NULL,intent_json TEXT NOT NULL,result_json TEXT,updated_at INTEGER NOT NULL,
+        PRIMARY KEY(operation_id,step_id))""",
+    """CREATE TABLE IF NOT EXISTS account_identity_history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,operation_id TEXT NOT NULL,source_server TEXT NOT NULL,
+        source_username TEXT NOT NULL,destination_server TEXT NOT NULL,destination_username TEXT NOT NULL,
+        references_json TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(operation_id))""",
+    """CREATE TABLE IF NOT EXISTS account_identity_owners(
+        server_id TEXT NOT NULL,username_key TEXT NOT NULL,scope TEXT NOT NULL,user_id TEXT NOT NULL,
+        retired INTEGER NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(server_id,username_key,scope,user_id))""",
     """CREATE TABLE IF NOT EXISTS reseller_order_funding (
         reseller_id TEXT NOT NULL, operation_id TEXT NOT NULL,
         status TEXT NOT NULL, debt_cents INTEGER NOT NULL,
@@ -598,6 +626,9 @@ def _ensure_schema(connection: sqlite3.Connection, path: str) -> None:
         try:
             for statement in SCHEMA_STATEMENTS:
                 connection.execute(statement)
+            notification_columns = {row['name'] for row in connection.execute('PRAGMA table_info(bulk_transfer_notifications)')}
+            if 'account_server_id' not in notification_columns:
+                connection.execute('ALTER TABLE bulk_transfer_notifications ADD COLUMN account_server_id TEXT')
             ledger_columns = {
                 row["name"]
                 for row in connection.execute(

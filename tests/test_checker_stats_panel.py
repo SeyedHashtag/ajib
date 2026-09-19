@@ -87,7 +87,7 @@ def load_payment_setup():
     )
 
     utils_pkg = types.ModuleType("utils")
-    utils_pkg.__path__ = []
+    utils_pkg.__path__ = [str(MODULE_PATH.parent)]
     sys.modules["utils"] = utils_pkg
 
     command_stub = types.ModuleType("utils.command")

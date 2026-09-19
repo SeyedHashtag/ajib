@@ -291,16 +291,16 @@ def set_owned_block_reason(reseller_id, config_index, client, live, *, reason, b
         return result
 
 
-def set_admin_block(client, username, blocked, live):
+def set_admin_block(client, username, blocked, live, *, operation_id=None, actor='admin'):
     if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
         from utils import account_operations
         with account_operations.serialize(client.server_id, username):
             account_operations.assert_available(client.server_id, username)
-            return _set_admin_block(client, username, blocked, live)
+            return _set_admin_block(client, username, blocked, live, operation_id=operation_id, actor=actor)
     return _set_admin_block(client, username, blocked, live)
 
 
-def _set_admin_block(client, username, blocked, live):
+def _set_admin_block(client, username, blocked, live, *, operation_id=None, actor='admin'):
     with store.reseller_lock, store._resellers_file_lock():
         records = store._read_resellers_file()
         matches = [(owner_id, index) for owner_id, owner in records.items()
@@ -309,6 +309,11 @@ def _set_admin_block(client, username, blocked, live):
                    and config.get('username') == username and str(config.get('server_id')) == str(client.server_id)]
     if len(matches) == 1:
         return set_owned_block_reason(*matches[0], client, live, reason='admin_blocked', blocked=blocked)
+    if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+        if not operation_id:
+            raise ValueError('A durable administrator action identity is required')
+        from .admin_account_operations import mutate
+        return mutate(operation_id, client, username, changes={'blocked': blocked}, actor=actor)
     return client.update_user(username, {'blocked': blocked})
 
 
@@ -326,12 +331,12 @@ def _has_protected_block(records, username, server_id):
 
 
 @contextmanager
-def renewal_block_guard(username, server_id):
+def renewal_block_guard(username, server_id, *, operation_id=None):
     """Serialize reset with block intent so a concurrent renewal cannot unblock."""
     if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
         from utils import account_operations
         with account_operations.serialize(server_id, username):
-            account_operations.assert_available(server_id, username)
+            account_operations.assert_available(server_id, username, operation_id=operation_id)
             with store.reseller_lock, store._resellers_file_lock():
                 allowed = not _has_protected_block(store._read_resellers_file(), username, server_id)
             yield allowed

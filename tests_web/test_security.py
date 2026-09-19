@@ -32,10 +32,10 @@ def test_login_is_bound_to_browser_and_single_use(client, login):
     started = client.post("/api/v1/auth/challenge", json={}).json()
     assert client.post("/api/v1/auth/consume", json={"challenge": started["challenge"]}).json()["status"] == "waiting"
     assert confirm_challenge(started["challenge"], 123, "main")
-    saved = client.cookies.get("ajib_login")
+    saved = client.cookies.get("service_login")
     client.cookies.clear()
     assert client.post("/api/v1/auth/consume", json={"challenge": started["challenge"]}).status_code == 401
-    client.cookies.set("ajib_login", saved, path="/api/v1/auth")
+    client.cookies.set("service_login", saved, path="/api/v1/auth")
     assert client.post("/api/v1/auth/consume", json={"challenge": started["challenge"]}).json()["status"] == "authenticated"
     assert client.post("/api/v1/auth/consume", json={"challenge": started["challenge"]}).status_code == 401
     assert client.get("/api/v1/me").json()["user_id"] == "123"

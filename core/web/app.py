@@ -10,6 +10,7 @@ import time
 
 from fastapi import Depends, FastAPI, Request, Response, UploadFile, File, Query
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 from .settings import Settings
 
@@ -93,6 +94,7 @@ def create_app(settings=None, services=None):
     from utils import database, web_auth, web_store, web_release
     from utils.web_services import Services, ServiceError, payment_public
     from utils.web_orders import Orders, save_payment
+    from utils.public_branding import PublicContentUnavailable, contains_private, UNAVAILABLE
     settings = settings or Settings.from_env()
     services = services or Services()
     orders = Orders(services)
@@ -105,9 +107,19 @@ def create_app(settings=None, services=None):
         web_store.initialize()
         yield
 
-    app = FastAPI(title="ajib API", version="0.1.0", lifespan=lifespan,
+    app = FastAPI(title="Connection service API", version="0.1.0", lifespan=lifespan,
                   docs_url="/api/docs", openapi_url="/api/v1/openapi.json", redoc_url=None)
     app.state.services = services
+
+    @app.exception_handler(PublicContentUnavailable)
+    async def private_content(request, error):
+        logging.getLogger('ajib.web').warning('public_content_blocked')
+        return JSONResponse({'detail': UNAVAILABLE}, status_code=503)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request, error):
+        # Validation input/context can contain secrets or private configured labels.
+        return JSONResponse({'detail': 'Request fields are invalid'}, status_code=422)
 
     @app.exception_handler(ServiceError)
     async def service_error(request, error):
@@ -128,7 +140,11 @@ def create_app(settings=None, services=None):
                 return JSONResponse({"detail": "Upload is too large"}, status_code=413)
         except ValueError:
             return JSONResponse({"detail": "Invalid request length"}, status_code=400)
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            logging.getLogger('ajib.web').exception('request_failed id=%s', request_id)
+            response = JSONResponse({'detail': UNAVAILABLE}, status_code=500)
         response.headers.update({"X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
                                  "Cache-Control": "no-store", "X-Request-ID": request_id})
         logging.getLogger("ajib.web").info("request id=%s method=%s status=%s elapsed_ms=%d",
@@ -137,7 +153,7 @@ def create_app(settings=None, services=None):
         return response
 
     def session(request: Request):
-        value = web_auth.authenticate(request.cookies.get("ajib_session"))
+        value = web_auth.authenticate(request.cookies.get("service_session"))
         identity = services.identity(value["user_id"], value["scope"])
         if not web_release.permits(identity, web_release.policy(settings)):
             raise ServiceError("The portal is currently open to pilot users", 403)
@@ -181,9 +197,9 @@ def create_app(settings=None, services=None):
         return key
 
     def set_session(response, credentials):
-        response.set_cookie("ajib_session", credentials[0], max_age=86400, httponly=True,
+        response.set_cookie("service_session", credentials[0], max_age=86400, httponly=True,
                             secure=settings.secure_cookies, samesite="lax", path="/")
-        response.delete_cookie("ajib_login", path="/api/v1/auth", secure=settings.secure_cookies, httponly=True, samesite="strict")
+        response.delete_cookie("service_login", path="/api/v1/auth", secure=settings.secure_cookies, httponly=True, samesite="strict")
 
     @app.get("/api/v1/health")
     def health():
@@ -217,14 +233,14 @@ def create_app(settings=None, services=None):
         if not store["bot_username"]:
             raise ServiceError("Telegram sign-in is not configured", 503)
         challenge_id, browser = web_auth.create_challenge(store["scope"])
-        response.set_cookie("ajib_login", browser, max_age=300, httponly=True,
+        response.set_cookie("service_login", browser, max_age=300, httponly=True,
                             secure=settings.secure_cookies, samesite="strict", path="/api/v1/auth")
         return {"challenge": challenge_id, "telegram_url": f"https://t.me/{store['bot_username']}?start=web_{challenge_id}", "expires_in": 300}
 
     @app.post("/api/v1/auth/consume")
     def consume(data: ConsumeInput, request: Request, response: Response):
         throttle(request, "poll")
-        credentials = web_auth.consume_challenge(data.challenge, request.cookies.get("ajib_login"))
+        credentials = web_auth.consume_challenge(data.challenge, request.cookies.get("service_login"))
         if credentials is None:
             return {"status": "waiting"}
         set_session(response, credentials)
@@ -240,13 +256,13 @@ def create_app(settings=None, services=None):
 
     @app.get("/api/v1/me", response_model=IdentityResponse)
     def me(request: Request, value=Depends(session)):
-        return {**value, "csrf_token": web_store.digest("csrf:" + request.cookies["ajib_session"]),
+        return {**value, "csrf_token": web_store.digest("csrf:" + request.cookies["service_session"]),
                 "writes_enabled": web_release.policy(settings)['accept_writes'] and value['scope'] == 'main'}
 
     @app.post("/api/v1/auth/logout")
     def logout(request: Request, response: Response, value=Depends(session)):
-        web_auth.revoke(request.cookies["ajib_session"])
-        response.delete_cookie("ajib_session", path="/")
+        web_auth.revoke(request.cookies["service_session"])
+        response.delete_cookie("service_session", path="/")
         return {"status": "signed_out"}
 
     @app.put("/api/v1/me/language")
@@ -409,6 +425,8 @@ def create_app(settings=None, services=None):
     @app.put("/api/v1/reseller/storefront")
     def save_storefront(data: StorefrontInput, value=Depends(reseller), writable=Depends(write_session)):
         import sqlite3
+        if contains_private([data.title, data.slug]):
+            raise ServiceError('Choose a different public title and address')
         with database.transaction(operation="web_storefront_update") as connection:
             try:
                 connection.execute("""INSERT INTO web_storefronts(scope,slug,title) VALUES (?,?,?)
@@ -445,6 +463,9 @@ def create_app(settings=None, services=None):
 
     @app.get("/api/v1/admin/audit")
     def audit(value=Depends(admin)):
-        return [dict(row) for row in database.get_connection().execute("SELECT * FROM web_audit ORDER BY id DESC LIMIT 200")]
+        return [dict(row) for row in database.get_connection().execute(
+            "SELECT id,actor,scope,action,resource,occurred_at FROM web_audit ORDER BY id DESC LIMIT 200")]
 
+    from .public_content import PublicContentMiddleware
+    app.add_middleware(PublicContentMiddleware)
     return app
