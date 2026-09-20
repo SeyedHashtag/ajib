@@ -1,10 +1,9 @@
 # Coordinated upgrade and customer release candidate
 
-This increment is a local candidate, not an approved Stage 4 release. The release
-contract deliberately sets `customer_release_ready` to `false`. Production remains
-on the administrator-only, read-only website installation until the remaining
-acceptance work is completed. Operator-selected pilot IDs belong in private
-deployment settings and are not stored in this document.
+This is not an approved Stage 4 release. The release contract deliberately keeps
+`customer_release_ready` set to `false`. Deployment status, operator confirmations,
+pilot identities and acceptance evidence belong in private operator records, not
+in this repository. Keep customer writes disabled until required gates pass.
 
 ## Implemented controls
 

@@ -624,7 +624,7 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
         entry = reseller_handlers._format_reseller_customer_entry(
             1,
             {
-                "username": "r1988033051a",
+                "username": "r900000001a",
                 "customer_name": "ali123",
                 "gb": 40,
                 "days": 20,
@@ -637,14 +637,14 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
         )
 
         self.assertIn("1. ✅ `ali123`", entry)
-        self.assertIn("   🆔 `r1988033051a`", entry)
+        self.assertIn("   🆔 `r900000001a`", entry)
         self.assertIn("   Active", entry)
 
     def test_legacy_customer_name_is_recovered_from_note(self):
         entry = reseller_handlers._format_reseller_customer_entry(
             2,
             {
-                "username": "r1988033051b",
+                "username": "r900000001b",
                 "gb": 60,
                 "days": 40,
                 "price": 1.6,
@@ -657,13 +657,13 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
         )
 
         self.assertIn("2. ✅ `sara88`", entry)
-        self.assertIn("   🆔 `r1988033051b`", entry)
+        self.assertIn("   🆔 `r900000001b`", entry)
 
     def test_legacy_without_customer_name_keeps_generated_username_only(self):
         entry = reseller_handlers._format_reseller_customer_entry(
             3,
             {
-                "username": "r1988033051",
+                "username": "r900000001",
                 "gb": 100,
                 "days": 60,
                 "price": 2,
@@ -675,7 +675,7 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
             "en",
         )
 
-        self.assertIn("3. ✅ `r1988033051`", entry)
+        self.assertIn("3. ✅ `r900000001`", entry)
         self.assertNotIn("🆔", entry)
 
     def test_external_bulk_customer_uses_username_and_unavailable_price(self):
@@ -704,7 +704,7 @@ class ResellerCustomerDisplayTests(unittest.TestCase):
         entry = reseller_handlers._format_reseller_customer_entry(
             4,
             {
-                "username": "r1988033051c",
+                "username": "r900000001c",
                 "customer_name": "reza",
                 "gb": 50,
                 "days": 30,

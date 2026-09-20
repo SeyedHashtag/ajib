@@ -186,3 +186,7 @@ core/scripts/telegrambot/broadcast_logs/
 AGENTS.md
 agents.md
 logs_and_backups/
+
+# Private operator reports must never be published with source code.
+/private-operations/
+/docs/production-gated-rollout.md
