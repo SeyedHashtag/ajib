@@ -210,7 +210,7 @@ def install(review, commit):
                    'active': [u for u in (*web.UNITS, upgrade.BOT_UNIT) if upgrade._active(u)],
                    'edge_image': edge['Image'], 'edge_running': edge['State']['Running'],
                    'hosted_ids': sorted(upgrade._hosted_processes()),
-                   'switches': [{'live': str(live), 'staged': str(staged), 'old': str(live.with_name('.' + live.name + '-' + ident))}
+                   'switches': [{'live': str(live), 'staged': str(staged), 'old': str(live.with_name('.' + live.name + '-previous-' + ident))}
                                 for live, staged in [(bot, staged_bot), (web.SOURCE, staged_web), (web.VENV, staged_venv)]]}
         web.write(root / 'private/review.json', json.dumps(review), 0o600)
         web.write(root / 'private/runtime.env', (web.CONFIG / 'runtime.env').read_text(), 0o600)

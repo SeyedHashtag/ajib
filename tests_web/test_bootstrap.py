@@ -83,6 +83,24 @@ def test_legacy_inflight_payment_keeps_runtimes_stopped(legacy, monkeypatch):
         assert json.loads(db.execute('SELECT payload_json FROM payments').fetchone()[0])['status'] == 'processing'
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='Linux retained environment symlink')
+def test_install_records_distinct_live_staged_and_retained_paths(legacy, monkeypatch):
+    from types import SimpleNamespace
+    root, plan = legacy
+    review = bootstrap.inventory(plan)
+    monkeypatch.setattr(bootstrap, 'preview', lambda *a: {'commit': 'a'*40, 'contract': {}})
+    monkeypatch.setattr(upgrade, 'RELEASES', root / 'releases')
+    monkeypatch.setattr(upgrade, '_prepare', lambda *a: None)
+    monkeypatch.setattr(upgrade, '_hosted_processes', lambda: set())
+    monkeypatch.setattr(upgrade, '_active', lambda _: True)
+    monkeypatch.setattr(web, 'run', lambda *a, **kw: SimpleNamespace(stdout='[{"Image":"image","State":{"Running":true}}]'))
+    monkeypatch.setattr(web, 'backup_configuration', lambda: 'private-backup')
+    monkeypatch.setattr(bootstrap, 'resume', lambda j: j)
+    journal = bootstrap.install(review, 'a'*40)
+    paths = [item[key] for item in journal['switches'] for key in ('live', 'staged', 'old')]
+    assert len(set(paths)) == 9
+
+
 @pytest.mark.skipif(os.name != 'posix', reason='Linux directory switches')
 @pytest.mark.parametrize('interruption', range(7))
 def test_each_rename_interruption_recovers_forward_once(tmp_path, monkeypatch, interruption):
