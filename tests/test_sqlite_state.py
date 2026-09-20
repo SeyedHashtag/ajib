@@ -44,6 +44,7 @@ def _worker_environment(root):
             "AJIB_DB_PATH": os.path.join(root, "ajib.db"),
             "AJIB_SQLITE_ACTIVE": "1",
             "AJIB_BACKUP_DIR": os.path.join(root, "backups"),
+            "AJIB_BOT_LOG_FILE": os.path.join(root, "logs", "bot.log"),
             "ADMIN_USER_IDS": "[]",
             "API_TOKEN": "123:testing",
         }

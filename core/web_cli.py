@@ -156,6 +156,28 @@ def adopt_baseline(yes):
         raise click.ClickException(str(exc)) from exc
 
 
+@web_group.command('bootstrap-baseline')
+@click.option('--review-file', type=click.Path(path_type=Path), required=True)
+@click.option('--commit', required=True, help='Full immutable commit with passing CI.')
+@click.option('--dry-run', is_flag=True)
+@click.option('--yes', is_flag=True)
+def bootstrap_baseline(review_file, commit, dry_run, yes):
+    """Install a reviewed contract-2 candidate on an unmanaged read-only website."""
+    import web_bootstrap
+    try:
+        web.root_required()
+        review = json.loads(review_file.read_text())
+        if dry_run:
+            result = web_bootstrap.preview(review, commit)
+        elif yes:
+            result = web_bootstrap.install(review, commit)
+        else:
+            raise click.ClickException('Review the inventory and dry-run before using --yes.')
+        click.echo(json.dumps(result, indent=2))
+    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def apply_database_environment():
     """CLI backups/restore must follow the same database as all service runtimes."""
     if (web.CONFIG / 'deployment.json').is_file():

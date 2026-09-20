@@ -1920,6 +1920,14 @@
     ]
   },
   {
+    "source": "core/web_cli.py",
+    "line": 164,
+    "function": "bootstrap_baseline",
+    "entrypoints": [
+      "web_group.command('bootstrap-baseline')"
+    ]
+  },
+  {
     "source": "core/web_release_cli.py",
     "line": 183,
     "function": "release_group",

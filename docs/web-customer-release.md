@@ -92,6 +92,11 @@ verify an old deployment's missing safeguards and cannot open the pilot itself.
 The first production baseline still needs a coordinated installation and review
 of the intentional deployment changes.
 
+For the unmanaged read-only installation, use the separately tested
+[gated bootstrap procedure](web-bootstrap.md). It retains the old files without
+claiming they support contract 2 and uses forward recovery until the actual
+candidate is installed and verified.
+
 ## Outstanding release blockers
 
 1. Finish end-to-end acceptance across cleanup/debt policy changes, migrations,

@@ -28,7 +28,8 @@ BOT_UNIT = 'ajib-telegram-bot'
 RELEASES = Path('/opt/ajib-web/releases')
 ROOT_FILES = {'ajib.sh', 'menu.sh', 'upgrade.sh', 'install.sh', 'VERSION', 'changelog',
               'requirements.txt', 'requirements-web.txt'}
-MUTABLE = ('.env', '.env.previous', 'plans.json', 'support_info.json', 'hosted_bots', 'logs', 'broadcast_logs')
+MUTABLE = ('.env', '.env.previous', 'plans.json', 'support_info.json', 'hosted_bots', 'logs', 'broadcast_logs',
+           'uploads', 'card_checkout_reminders.json', 'purchase_disclosures.json')
 
 
 def _json(path):
@@ -374,6 +375,9 @@ def recover():
     web.root_required()
     with web.maintenance():
         journal = _json(web.CONFIG / 'upgrade.json')
+        if journal.get('kind') == 'bootstrap':
+            import web_bootstrap
+            return web_bootstrap.resume(journal)
         if journal['plan']['checkout'] != web.load()['checkout'] or journal['plan']['database'] != web.load()['database']:
             raise ValueError('Deployment paths changed; recovery requires manual review.')
         if journal['phase'] not in {'complete', 'rolled_back'}:

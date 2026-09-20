@@ -50,13 +50,16 @@ test('customer cannot navigate into admin data',async({page})=>{
 
 test('Telegram navigation uses its back button',async({page})=>{
   await signIn(page);
+  // Keep the simulated SDK deterministic: the real network script otherwise
+  // overwrites this fixture on runners that can reach Telegram.
+  await page.route('https://telegram.org/js/telegram-web-app.js',route=>route.fulfill({contentType:'application/javascript',body:''}));
   await page.addInitScript(()=>{
     (window as any).__backShown=false;
     (window as any).Telegram={WebApp:{initData:'test',colorScheme:'dark',safeAreaInset:{top:24,bottom:18,left:0,right:0},ready(){},expand(){},BackButton:{show(){(window as any).__backShown=true;},hide(){(window as any).__backShown=false;},onClick(){},offClick(){}}}};
   });
   await page.goto('/app/accounts');
   await expect(page.locator('.account-card')).toBeVisible();
-  expect(await page.evaluate(()=>(window as any).__backShown)).toBeTruthy();
+  await expect.poll(()=>page.evaluate(()=>(window as any).__backShown)).toBeTruthy();
   await expect(page.locator('html')).toHaveAttribute('data-telegram-theme','dark');
   expect(await page.locator('body').evaluate(el=>getComputedStyle(el).paddingTop)).toBe('24px');
   await page.screenshot({path:`test-results/telegram-${test.info().project.name}.png`,fullPage:true});
