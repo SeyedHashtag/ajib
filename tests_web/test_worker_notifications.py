@@ -1,0 +1,32 @@
+from types import SimpleNamespace
+
+
+def test_financial_pause_delivers_committed_notification_without_processing_orders(storage, monkeypatch):
+    from core.web.worker import run_once
+    from utils import database, web_store, web_orders
+    web_store.initialize()
+    with database.transaction() as db:
+        web_store.enqueue(db, 'completed-synthetic-order', 'main', 123, 'Your service is ready.')
+    monkeypatch.setattr(web_orders.Orders, 'process_one', lambda *a: (_ for _ in ()).throw(AssertionError('financial processing paused')))
+    sent = []
+    def post(url, **kwargs):
+        assert not database.get_connection().in_transaction
+        sent.append(kwargs['json'])
+        return SimpleNamespace(status_code=200, json=lambda: {'ok': True})
+    monkeypatch.setattr('requests.post', post)
+    services = SimpleNamespace(bot_token=lambda scope: 'synthetic-token')
+    assert run_once(services, writes_enabled=False)
+    assert not run_once(services, writes_enabled=False)
+    assert sent == [{'chat_id': '123', 'text': 'Your service is ready.'}]
+
+
+def test_notification_failure_retains_retry_without_touching_financial_state(storage, monkeypatch):
+    from core.web.worker import run_once
+    from utils import database, web_store
+    web_store.initialize()
+    with database.transaction() as db:
+        web_store.enqueue(db, 'completed-synthetic-order', 'main', 123, 'Your service is ready.')
+    monkeypatch.setattr('requests.post', lambda *a, **k: (_ for _ in ()).throw(TimeoutError('synthetic failure')))
+    assert run_once(SimpleNamespace(bot_token=lambda scope: 'synthetic-token'), writes_enabled=False)
+    row = database.get_connection().execute('SELECT status,attempts,last_error FROM web_outbox').fetchone()
+    assert row['status'] == 'pending' and row['attempts'] == 1 and row['last_error'] == 'TimeoutError'

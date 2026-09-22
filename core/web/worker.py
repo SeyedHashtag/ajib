@@ -8,7 +8,7 @@ def run_once(services, *, writes_enabled=True):
     from utils import database, web_store
     from utils.web_orders import Orders, save_payment
     if not writes_enabled:
-        return False
+        return deliver_notification(services)
     now = int(time.time())
     # A process may have exited after sending an external request. Never replay it.
     with database.transaction(operation="web_worker_recover") as connection:
@@ -24,6 +24,12 @@ def run_once(services, *, writes_enabled=True):
     worked = Orders(services).process_one()
     from utils.web_trials import process_one as process_trial
     worked = process_trial(services) or worked
+    return deliver_notification(services) or worked
+
+
+def deliver_notification(services):
+    """Deliver committed messages independently of financial admission/recovery."""
+    from utils import web_store
     item = web_store.claim_notification()
     if item:
         try:
@@ -42,8 +48,7 @@ def run_once(services, *, writes_enabled=True):
             web_store.finish_notification(item, type(error).__name__)
         else:
             web_store.finish_notification(item)
-        worked = True
-    return worked
+    return bool(item)
 
 
 def main():
