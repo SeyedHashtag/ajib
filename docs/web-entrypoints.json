@@ -113,7 +113,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 577,
+    "line": 588,
     "function": "server_enable",
     "entrypoints": [
       "server_group.command('enable')"
@@ -121,7 +121,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 585,
+    "line": 596,
     "function": "server_disable",
     "entrypoints": [
       "server_group.command('disable')"
@@ -129,7 +129,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 594,
+    "line": 605,
     "function": "server_weight",
     "entrypoints": [
       "server_group.command('weight')"
@@ -137,7 +137,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 605,
+    "line": 616,
     "function": "server_remove",
     "entrypoints": [
       "server_group.command('remove')"
@@ -145,7 +145,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 663,
+    "line": 674,
     "function": "server_migrate",
     "entrypoints": [
       "server_group.command('migrate')"
@@ -153,7 +153,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 704,
+    "line": 715,
     "function": "migration_group",
     "entrypoints": [
       "click.group('migration')"
@@ -161,7 +161,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 721,
+    "line": 732,
     "function": "migration_status",
     "entrypoints": [
       "migration_group.command('status')"
@@ -169,7 +169,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 737,
+    "line": 748,
     "function": "migration_cancel",
     "entrypoints": [
       "migration_group.command('cancel')"
@@ -177,7 +177,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 748,
+    "line": 759,
     "function": "migration_resume",
     "entrypoints": [
       "migration_group.command('resume')"
@@ -185,7 +185,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 760,
+    "line": 771,
     "function": "migration_export",
     "entrypoints": [
       "migration_group.command('export')"
@@ -193,7 +193,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 775,
+    "line": 786,
     "function": "server_manage",
     "entrypoints": [
       "server_group.command('manage')"
@@ -201,7 +201,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 886,
+    "line": 897,
     "function": "backup_command",
     "entrypoints": [
       "cli.command('backup')"
@@ -209,7 +209,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 901,
+    "line": 912,
     "function": "restore_command",
     "entrypoints": [
       "cli.command('restore')"
@@ -217,7 +217,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 926,
+    "line": 937,
     "function": "version_command",
     "entrypoints": [
       "cli.command('version')"
@@ -225,7 +225,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 940,
+    "line": 951,
     "function": "upgrade_command",
     "entrypoints": [
       "cli.command('upgrade')"
@@ -233,7 +233,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 973,
+    "line": 984,
     "function": "uninstall_command",
     "entrypoints": [
       "cli.command('uninstall')"
@@ -241,7 +241,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 995,
+    "line": 1006,
     "function": "server_info",
     "entrypoints": [
       "cli.command('server-info')"
@@ -249,7 +249,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 1009,
+    "line": 1020,
     "function": "backup_ajib_legacy",
     "entrypoints": [
       "cli.command('backup-ajib')"
@@ -257,7 +257,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 1020,
+    "line": 1031,
     "function": "restore_ajib_legacy",
     "entrypoints": [
       "cli.command('restore-ajib')"
@@ -265,7 +265,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 1030,
+    "line": 1041,
     "function": "show_version_legacy",
     "entrypoints": [
       "cli.command('show-version')"
@@ -273,7 +273,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 1040,
+    "line": 1051,
     "function": "check_version_legacy",
     "entrypoints": [
       "cli.command('check-version')"
@@ -281,7 +281,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 1050,
+    "line": 1061,
     "function": "services_status_legacy",
     "entrypoints": [
       "cli.command('get-services-status')"
@@ -289,7 +289,7 @@
   },
   {
     "source": "core/cli.py",
-    "line": 1066,
+    "line": 1077,
     "function": "telegram_legacy",
     "entrypoints": [
       "cli.command('telegram')"
@@ -325,6 +325,54 @@
     "function": "reconcile_command",
     "entrypoints": [
       "operations_group.command('reconcile')"
+    ]
+  },
+  {
+    "source": "core/runtime_settings.py",
+    "line": 262,
+    "function": "settings_group",
+    "entrypoints": [
+      "click.group('settings')"
+    ]
+  },
+  {
+    "source": "core/runtime_settings.py",
+    "line": 270,
+    "function": "inbounds_command",
+    "entrypoints": [
+      "settings_group.command('inbounds')"
+    ]
+  },
+  {
+    "source": "core/runtime_settings.py",
+    "line": 280,
+    "function": "crypto_command",
+    "entrypoints": [
+      "settings_group.command('restore-crypto')"
+    ]
+  },
+  {
+    "source": "core/runtime_settings.py",
+    "line": 287,
+    "function": "recover_command",
+    "entrypoints": [
+      "settings_group.command('recover')"
+    ]
+  },
+  {
+    "source": "core/runtime_settings.py",
+    "line": 293,
+    "function": "apply_command",
+    "entrypoints": [
+      "settings_group.command('apply', hidden=True)"
+    ]
+  },
+  {
+    "source": "core/runtime_settings.py",
+    "line": 303,
+    "function": "retry_notification_command",
+    "entrypoints": [
+      "settings_group.command('retry-notification')"
     ]
   },
   {
@@ -745,7 +793,7 @@
   },
   {
     "source": "core/scripts/telegrambot/utils/backup.py",
-    "line": 70,
+    "line": 85,
     "function": "backup_bot",
     "entrypoints": [
       "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('backup_bot'))"
@@ -753,7 +801,7 @@
   },
   {
     "source": "core/scripts/telegrambot/utils/bot_logs.py",
-    "line": 53,
+    "line": 68,
     "function": "send_bot_logs",
     "entrypoints": [
       "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == BOT_LOGS_BUTTON_TEXT)"
@@ -1793,7 +1841,7 @@
   },
   {
     "source": "core/scripts/telegrambot/utils/vpn_servers.py",
-    "line": 180,
+    "line": 187,
     "function": "show_vpn_servers",
     "entrypoints": [
       "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text('vpn_servers'))"
@@ -1801,7 +1849,7 @@
   },
   {
     "source": "core/scripts/telegrambot/utils/vpn_servers.py",
-    "line": 185,
+    "line": 192,
     "function": "handle_vpn_server_callback",
     "entrypoints": [
       "bot.callback_query_handler(func=lambda call: call.data.startswith('vpn_server:'))"
@@ -1809,10 +1857,18 @@
   },
   {
     "source": "core/scripts/telegrambot/utils/vpn_servers.py",
-    "line": 232,
+    "line": 252,
     "function": "handle_server_weight_input",
     "entrypoints": [
       "bot.message_handler(func=lambda message: is_admin(message.from_user.id) and server_admin_state.get(message.from_user.id, {}).get('state') == 'waiting_server_weight')"
+    ]
+  },
+  {
+    "source": "core/scripts/telegrambot/utils/vpn_servers.py",
+    "line": 300,
+    "function": "handle_inbound_callback",
+    "entrypoints": [
+      "bot.callback_query_handler(func=lambda call: call.data.startswith('vpn_inbounds:'))"
     ]
   },
   {

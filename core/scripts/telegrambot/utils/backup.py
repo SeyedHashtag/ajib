@@ -1,5 +1,6 @@
 import os
 import threading
+import logging
 from utils.command import AJIB_PYTHON, ADMIN_USER_IDS, BACKUP_DIRECTORY, CLI_PATH, bot, is_admin, run_cli_command
 from utils.common import admin_action_text
 
@@ -35,9 +36,20 @@ def _run_backup_command():
     return (backup_file_path, latest_backup_file_or_error), None
 
 def _send_backup_file(chat_id, backup_file_path, latest_backup_file, caption_prefix="Backup completed"):
-    bot.send_message(chat_id, 'The backup is stored privately on the server. Use the operator console to retrieve it.')
+    if not isinstance(chat_id, int) or chat_id <= 0 or not is_admin(chat_id):
+        return False
+    try:
+        with open(backup_file_path, 'rb') as document:
+            bot.send_document(chat_id, document, visible_file_name='service-backup.zip',
+                              caption=caption_prefix, _operator_document=True)
+        return True
+    except Exception:
+        logging.getLogger(__name__).exception('Administrator backup delivery failed')
+        return False
 
 def run_backup_and_send(chat_id, start_message="Starting backup. This may take a few moments...", caption_prefix="Backup completed"):
+    if not isinstance(chat_id, int) or chat_id <= 0 or not is_admin(chat_id):
+        return
     bot.send_message(chat_id, start_message)
     bot.send_chat_action(chat_id, 'typing')
 
@@ -57,15 +69,20 @@ def run_backup_and_send_to_admins():
 
     if error:
         for admin_id in ADMIN_USER_IDS:
-            bot.send_message(admin_id, 'Automated backup failed. Inspect the server through the operator console.')
+            if is_admin(admin_id):
+                try:
+                    bot.send_message(admin_id, 'Automated backup failed. Inspect the server through the operator console.')
+                except Exception:
+                    logging.getLogger(__name__).exception('Administrator backup notice failed')
         return
 
     backup_file_path, latest_backup_file = result
     for admin_id in ADMIN_USER_IDS:
-        bot.send_message(admin_id, "Automated backup completed.")
         _send_backup_file(admin_id, backup_file_path, latest_backup_file, caption_prefix="Automated backup completed")
 
 
 @bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == admin_action_text("backup_bot"))
 def backup_bot(message):
-    run_backup_and_send(message.chat.id)
+    if (is_admin(message.from_user.id) and message.chat.id == message.from_user.id
+            and getattr(message.chat, 'type', None) == 'private'):
+        run_backup_and_send(message.from_user.id)

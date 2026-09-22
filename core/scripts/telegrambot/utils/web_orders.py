@@ -246,11 +246,17 @@ class Orders:
                 intent = (json.loads(previous['request_json']) if previous else
                           {'plan_gb': record['plan_gb'], 'days': record['days'],
                            'unlimited': record.get('unlimited', False), 'note': note})
+                if not previous and getattr(client, 'panel_type', None) == '3x-ui':
+                    intent['inbound_ids'] = list(client.default_inbound_ids)
+                if getattr(client, 'panel_type', None) == '3x-ui' and not intent.get('inbound_ids'):
+                    raise ServiceError('Recorded inbound selection requires investigation')
                 note = intent['note']
                 from .account_operations import execute
                 def create_account():
                     created = client.add_user(username, int(record['plan_gb']), int(record['days']),
-                                              unlimited=record.get('unlimited', False), note=note)
+                                              unlimited=record.get('unlimited', False), note=note,
+                                              **({'inbound_ids': list(intent['inbound_ids'])}
+                                                 if 'inbound_ids' in intent else {}))
                     return {'success': bool(created), **fields}
                 result = execute('main-payment:' + payment_id, client.server_id, username, 'create',
                                  intent, create_account)

@@ -76,6 +76,9 @@ def _created_matches(row, request, origin, user):
     if not marker or marker not in str(user.get('note') or ''):
         return False
     try:
+        if 'inbound_ids' in user or 'inbound_ids' in request:
+            if not request.get('inbound_ids') or not set(request['inbound_ids']).issubset(set(user.get('inbound_ids') or [])):
+                return False
         return (str(user.get('username', '')).casefold() == row['username'].casefold()
                 and int(user['max_download_bytes']) == int(request['plan_gb']) * 1024**3
                 and int(user['expiration_days']) == int(request['days'])
@@ -148,11 +151,16 @@ def inspect(operation_id, panels):
         report['observed'] = _snapshot(user)
         exact = (lookup.get('status') == 'found' and lookup.get('uniqueness_verified')
                  and client and str(client.server_id) == row['server_id'])
-        if row['phase'] in {'prepared', 'ready'}:
+        if row['kind'] == 'create' and getattr(client, 'panel_type', None) == '3x-ui' and not request.get('inbound_ids'):
+            report['reason'] = 'legacy_inbound_provenance_missing'
+        elif row['phase'] in {'prepared', 'ready'}:
             # This is durable local dispatch evidence, not an inference from absence.
             report.update(classification='not_dispatched', action='return_to_owner', reason='dispatch_never_started')
         elif row['phase'] == 'panel_verified' and row['status'] == 'succeeded' and exact and (
-                row['kind'] != 'renewal' or _renewal_generation_matches(row, user)):
+                row['kind'] != 'renewal' or _renewal_generation_matches(row, user)) and (
+                row['kind'] != 'create' or ('inbound_ids' not in request
+                    and getattr(client, 'panel_type', None) != '3x-ui')
+                or _created_matches(row, request, origin, user)):
             report.update(classification='panel_verified', action='complete_accounting', reason='durable_panel_success')
         elif row['kind'] == 'create' and exact and _created_matches(row, request, origin, user):
             report.update(classification='panel_verified', action='complete_accounting', reason='creation_identity_and_marker_match')

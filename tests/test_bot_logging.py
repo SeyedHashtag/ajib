@@ -670,7 +670,7 @@ class AdminLogButtonTests(unittest.TestCase):
     def make_message(self):
         return types.SimpleNamespace(
             from_user=types.SimpleNamespace(id=123),
-            chat=types.SimpleNamespace(id=456),
+            chat=types.SimpleNamespace(id=123, type="private"),
             text="📄 Bot Logs",
         )
 
@@ -686,7 +686,7 @@ class AdminLogButtonTests(unittest.TestCase):
             module.send_bot_logs(self.make_message())
             self.assertEqual(bot.replies[-1]["text"], "Bot log file is missing or empty.")
 
-    def test_admin_log_handler_keeps_existing_log_private(self):
+    def test_admin_log_handler_sends_complete_log_privately(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             log_file = os.path.join(tmpdir, "bot.log")
             with open(log_file, "w", encoding="utf-8") as f:
@@ -695,8 +695,36 @@ class AdminLogButtonTests(unittest.TestCase):
             module, bot = self.load_bot_logs_module(log_file)
             module.send_bot_logs(self.make_message())
 
+            self.assertEqual(bot.documents[0]['content'], b'line one\n')
+            self.assertEqual(bot.documents[0]['kwargs']['visible_file_name'], 'service.log')
+
+    def test_admin_log_handler_rechecks_revoked_permission_and_releases_lock(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, 'bot.log')
+            Path(log_file).write_text('complete private operator log')
+            module, bot = self.load_bot_logs_module(log_file)
+            executor = self.HoldingExecutor()
+            module.BOT_LOGS_EXECUTOR = executor
+            module.send_bot_logs(self.make_message())
+            module.is_admin = lambda ident: False
+            executor.run_next()
             self.assertEqual(bot.documents, [])
-            self.assertIn('restricted operator console', bot.replies[-1]['text'])
+            self.assertEqual(module.BOT_LOGS_INFLIGHT, set())
+
+    def test_admin_log_handler_rejects_groups_and_recovers_delivery_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, 'bot.log')
+            Path(log_file).write_text('complete private operator log')
+            module, bot = self.load_bot_logs_module(log_file)
+            group = self.make_message()
+            group.chat = types.SimpleNamespace(id=-100, type='group')
+            module.send_bot_logs(group)
+            self.assertEqual(bot.documents, [])
+            with mock.patch.object(bot, 'send_document', side_effect=RuntimeError('synthetic failure')):
+                module.send_bot_logs(self.make_message())
+            self.assertEqual(module.BOT_LOGS_INFLIGHT, set())
+            module.send_bot_logs(self.make_message())
+            self.assertEqual(len(bot.documents), 1)
 
     def test_admin_log_handler_queues_upload_and_dedupes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -717,8 +745,8 @@ class AdminLogButtonTests(unittest.TestCase):
 
             executor.run_next()
 
-            self.assertEqual(bot.documents, [])
-            self.assertIn('restricted operator console', bot.replies[-1]['text'])
+            self.assertEqual(bot.documents[0]['content'], b'line one\n')
+            self.assertEqual(bot.documents[0]['kwargs']['visible_file_name'], 'service.log')
             self.assertEqual(module.BOT_LOGS_INFLIGHT, set())
 
 

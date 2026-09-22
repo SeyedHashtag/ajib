@@ -137,6 +137,8 @@ def maintained(function):
     def wrapped(*args, **kwargs):
         root_required()
         with maintenance():
+            if (CONFIG / 'settings.json').exists():
+                raise ValueError('Recover interrupted settings: ajib settings recover --yes.')
             if (CONFIG / 'upgrade.json').exists():
                 raise ValueError('Recover the interrupted upgrade first: ajib web recover-upgrade --yes.')
             if (CONFIG / 'config-sync.json').exists():
@@ -466,7 +468,8 @@ def status():
             'services': {name: subprocess.run(['systemctl', 'is-active', name], capture_output=True, text=True).stdout.strip() for name in UNITS},
             'database': config['database'], 'writes_enabled': environment.get('AJIB_WEB_WRITES_ENABLED') == '1',
             'public_portal': environment.get('AJIB_WEB_PUBLIC_PORTAL') == '1',
-            'configuration_recovery_pending': (CONFIG / 'config-sync.json').exists()}
+            'configuration_recovery_pending': (CONFIG / 'config-sync.json').exists(),
+            'runtime_settings_recovery_pending': (CONFIG / 'settings.json').exists()}
 
 
 @maintained

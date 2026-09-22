@@ -543,6 +543,17 @@ def server_edit(server_id: str, config_source: str | None, yes: bool, allow_unve
     index, existing = _find_server(config, server_id)
     active = operator.active_transfer_for_server(existing["id"])
     candidate = _server_candidate(config_source, existing)
+    if candidate['default_inbound_ids'] != existing['default_inbound_ids']:
+        import web_operator
+        if (web_operator.CONFIG / 'deployment.json').exists():
+            if any(candidate.get(k) != existing.get(k) for k in candidate if k != 'default_inbound_ids'):
+                raise click.ClickException('Change inbound defaults separately from other server fields.')
+            import runtime_settings
+            request = runtime_settings.prepare({'kind': 'inbounds', 'server_id': server_id,
+                'inbound_ids': candidate['default_inbound_ids'], 'expected': operator.config_fingerprint(config)})
+            if yes or click.confirm('Apply inbound defaults to future accounts and refresh application services?'):
+                pretty_print(runtime_settings.apply(request))
+            return
     protected_changed = any(candidate[key] != existing[key] for key in ("url", "token", "panel", "default_inbound_ids"))
     if active and protected_changed:
         raise click.ClickException(f"Server is used by active transfer {active.get('job_id')}; endpoint changes are blocked.")
@@ -1101,6 +1112,8 @@ def telegram_legacy(action: str, token: str | None, adminid: str | None, api_url
 cli.add_command(web_group)
 from operations_cli import operations_group
 cli.add_command(operations_group)
+from runtime_settings import settings_group
+cli.add_command(settings_group)
 
 if __name__ == "__main__":
     apply_database_environment()

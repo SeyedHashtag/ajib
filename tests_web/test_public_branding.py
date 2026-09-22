@@ -82,6 +82,27 @@ def test_qr_checks_original_configuration_without_rewriting():
         make_qr('vless://original-credential@example.test#AJIB')
 
 
+def test_only_explicit_private_admin_attachment_can_contain_internal_details(monkeypatch):
+    import sys
+    import types
+    command = types.ModuleType('utils.command')
+    command.is_admin = lambda ident: ident == 123
+    monkeypatch.setitem(sys.modules, 'utils.command', command)
+    sent = []
+    bot = SimpleNamespace(send_document=lambda *a, **kw: sent.append((a, kw)))
+    install_telegram_guard(bot)
+    stream = io.BytesIO(b'private ajib log with complete diagnostic data')
+    stream.name = 'bot.log'
+    for recipient, explicit in [(123, False), (124, True), (-123, True)]:
+        with pytest.raises(PublicContentUnavailable):
+            bot.send_document(recipient, stream, _operator_document=explicit)
+    bot.send_document(123, stream, _operator_document=True, visible_file_name='service.log')
+    assert len(sent) == 1 and '_operator_document' not in sent[0][1]
+    command.is_admin = lambda ident: False
+    with pytest.raises(PublicContentUnavailable):
+        bot.send_document(123, stream, _operator_document=True)
+
+
 def test_encoded_configuration_label_cannot_bypass_qr_guard():
     import base64
     payload = base64.b64encode(b'{"ps":"AJIB","id":"original-credential"}').decode()

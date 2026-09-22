@@ -28,10 +28,25 @@ BOT_LOGS_EXECUTOR = ThreadPoolExecutor(
 
 
 def _send_bot_log_file(message, log_file):
-    bot.reply_to(message, 'Logs are available through the restricted operator console.')
-    with BOT_LOGS_LOCK:
-        BOT_LOGS_INFLIGHT.discard(message.from_user.id)
-    return
+    try:
+        if not _authorized(message):
+            return
+        with open(log_file, 'rb') as document:
+            bot.send_document(message.from_user.id, document,
+                              visible_file_name='service.log', caption='Current service log.',
+                              _operator_document=True)
+    except Exception:
+        logging.getLogger(__name__).exception('Administrator log delivery failed')
+        if _authorized(message):
+            bot.reply_to(message, 'Failed to send logs. Please try again.')
+    finally:
+        with BOT_LOGS_LOCK:
+            BOT_LOGS_INFLIGHT.discard(message.from_user.id)
+
+
+def _authorized(message):
+    return (is_admin(message.from_user.id) and message.chat.id == message.from_user.id
+            and getattr(message.chat, 'type', None) == 'private')
 
 
 def _queue_bot_log_send(message, log_file):
@@ -51,6 +66,8 @@ def _queue_bot_log_send(message, log_file):
 
 @bot.message_handler(func=lambda message: is_admin(message.from_user.id) and message.text == BOT_LOGS_BUTTON_TEXT)
 def send_bot_logs(message):
+    if not _authorized(message):
+        return
     log_file = get_bot_log_file()
 
     if not os.path.exists(log_file) or os.path.getsize(log_file) == 0:

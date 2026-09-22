@@ -74,7 +74,7 @@ def reconcile_command(operation_id, dry_run, evidence, reason, yes):
         else:
             import web_operator
             with web_operator.maintenance():
-                if any((web_operator.CONFIG / name).exists() for name in ('upgrade.json', 'config-sync.json')):
+                if any((web_operator.CONFIG / name).exists() for name in ('upgrade.json', 'config-sync.json', 'settings.json')):
                     raise ValueError('Finish coordinated maintenance before reconciling operations.')
                 report = recovery.reconcile(operation_id, panels, evidence, reason=reason)
         click.echo(json.dumps(report, indent=2))

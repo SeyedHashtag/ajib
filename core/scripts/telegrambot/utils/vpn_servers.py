@@ -2,6 +2,10 @@ from telebot import types
 import math
 import os
 import threading
+import secrets
+import time
+import sys
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 from utils.api_client import MultiServerAPI, get_server_configs, update_server_config
@@ -95,6 +99,9 @@ def _build_servers_menu():
             types.InlineKeyboardButton(f"{toggle_label} {status.get('name', server_id)}", callback_data=f"vpn_server:toggle:{server_id}"),
             types.InlineKeyboardButton(f"Weight {status.get('name', server_id)}", callback_data=f"vpn_server:weight:{server_id}"),
         )
+        if status.get('panel') == '3x-ui':
+            markup.add(types.InlineKeyboardButton('Inbounds for new accounts',
+                       callback_data=f'vpn_server:inbounds:{server_id}'))
     markup.add(types.InlineKeyboardButton("Refresh", callback_data="vpn_server:refresh"))
     return text, markup
 
@@ -206,6 +213,19 @@ def handle_vpn_server_callback(call):
         bot.answer_callback_query(call.id, "Server not found.")
         return
 
+    if action == 'inbounds':
+        if call.message.chat.id != call.from_user.id or getattr(call.message.chat, 'type', None) != 'private':
+            safe_answer_callback_query(bot, call.id, 'Open this setting in your private bot chat.', show_alert=True)
+            return
+        try:
+            state = _settings_module().inbound_options(server_id)
+            state.update(token=secrets.token_hex(6), expires=time.time() + 300, selected=set(state['selected']))
+            server_admin_state[call.from_user.id] = state
+            _render_inbounds(call, state)
+        except Exception:
+            safe_answer_callback_query(bot, call.id, 'Could not load inbounds. Try again.', show_alert=True)
+        return
+
     if action == "toggle":
         enabled = not bool(target.get("enabled", True))
         if not update_server_config(server_id, enabled=enabled):
@@ -248,3 +268,74 @@ def handle_server_weight_input(message):
 
     server_admin_state.pop(message.from_user.id, None)
     _queue_vpn_servers_reply(message)
+
+
+def _settings_module():
+    core = str(Path(__file__).resolve().parents[3])
+    if core not in sys.path:
+        sys.path.insert(0, core)
+    import runtime_settings
+    return runtime_settings
+
+
+def _render_inbounds(call, state, *, confirm=False):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    prefix = 'vpn_inbounds:' + state['token'] + ':'
+    if not confirm:
+        for item in state['options']:
+            if item['enabled']:
+                label = f"{'✅' if item['id'] in state['selected'] else '⬜'} {item['id']} ({item['protocol']})"
+                markup.add(types.InlineKeyboardButton(label, callback_data=prefix + 'toggle:' + str(item['id'])))
+    markup.add(types.InlineKeyboardButton('Apply' if confirm else 'Review selection',
+               callback_data=prefix + ('apply' if confirm else 'confirm')))
+    markup.add(types.InlineKeyboardButton('Cancel', callback_data=prefix + 'cancel'))
+    text = ('Inbounds for new accounts: ' + ', '.join(map(str, sorted(state['selected'])))
+            + '\nExisting accounts are unchanged. Application services will briefly refresh when applied.')
+    safe_edit_message_text(bot, text, chat_id=call.message.chat.id,
+                           message_id=call.message.message_id, reply_markup=markup)
+    safe_answer_callback_query(bot, call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('vpn_inbounds:'))
+def handle_inbound_callback(call):
+    if (not is_admin(call.from_user.id) or call.message.chat.id != call.from_user.id
+            or getattr(call.message.chat, 'type', None) != 'private'):
+        safe_answer_callback_query(bot, call.id, 'Unauthorized.', show_alert=True)
+        return
+    parts = call.data.split(':')
+    state = server_admin_state.get(call.from_user.id, {})
+    if len(parts) < 3 or state.get('token') != parts[1] or state.get('expires', 0) < time.time():
+        safe_answer_callback_query(bot, call.id, 'Selection expired. Reopen the server menu.', show_alert=True)
+        return
+    action = parts[2]
+    if action == 'cancel':
+        server_admin_state.pop(call.from_user.id, None)
+        safe_edit_message_text(bot, 'Selection cancelled.', chat_id=call.message.chat.id,
+                               message_id=call.message.message_id)
+        safe_answer_callback_query(bot, call.id)
+        return
+    if action == 'toggle' and len(parts) == 4:
+        valid = {str(item['id']): item['id'] for item in state['options'] if item['enabled']}
+        if parts[3] not in valid:
+            safe_answer_callback_query(bot, call.id, 'Invalid inbound.', show_alert=True)
+            return
+        value = valid[parts[3]]
+        state['selected'].symmetric_difference_update({value})
+        state['confirmed'] = False
+        _render_inbounds(call, state)
+    elif action == 'confirm' and state['selected']:
+        state['confirmed'] = True
+        _render_inbounds(call, state, confirm=True)
+    elif action == 'apply' and state.get('confirmed') and state['selected']:
+        state = server_admin_state.pop(call.from_user.id, None)
+        if not state:
+            return
+        safe_answer_callback_query(bot, call.id, 'Applying settings. You will receive a completion message.')
+        try:
+            _settings_module().queue_inbounds(state['server_id'], sorted(state['selected']),
+                                              state['expected'], call.from_user.id)
+        except Exception:
+            safe_send_message(bot, call.from_user.id,
+                              'Settings were not queued. Reopen the server menu or contact the operator.')
+    else:
+        safe_answer_callback_query(bot, call.id, 'Select at least one inbound and review the selection.', show_alert=True)

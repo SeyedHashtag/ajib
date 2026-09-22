@@ -245,3 +245,44 @@ class VpnServersTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_inbound_picker_requires_review_and_applies_only_selected_defaults():
+    module, bot = load_vpn_servers_module()
+    queued = []
+    module._settings_module = lambda: types.SimpleNamespace(
+        inbound_options=lambda server: {'server_id': server, 'expected': 'synthetic-version', 'selected': [1],
+            'options': [{'id': 1, 'protocol': 'hysteria', 'enabled': True},
+                        {'id': 2, 'protocol': 'hysteria', 'enabled': True}]},
+        queue_inbounds=lambda *args: queued.append(args))
+    call = types.SimpleNamespace(id='callback', data='vpn_server:inbounds:s1',
+        from_user=types.SimpleNamespace(id=1),
+        message=types.SimpleNamespace(chat=types.SimpleNamespace(id=1, type='private'), message_id=1))
+    module.handle_vpn_server_callback(call)
+    token = module.server_admin_state[1]['token']
+    call.data = f'vpn_inbounds:{token}:apply'
+    module.handle_inbound_callback(call)
+    assert not queued
+    call.data = f'vpn_inbounds:{token}:toggle:2'
+    module.handle_inbound_callback(call)
+    call.data = f'vpn_inbounds:{token}:confirm'
+    module.handle_inbound_callback(call)
+    call.data = f'vpn_inbounds:{token}:apply'
+    module.handle_inbound_callback(call)
+    assert queued == [('s1', [1, 2], 'synthetic-version', 1)]
+    module.handle_inbound_callback(call)
+    assert len(queued) == 1
+
+
+def test_expired_or_revoked_inbound_callback_cannot_apply():
+    module, bot = load_vpn_servers_module()
+    module.server_admin_state[1] = {'token': 'old', 'expires': 0, 'confirmed': True, 'selected': {1}}
+    module._settings_module = lambda: (_ for _ in ()).throw(AssertionError('must not apply'))
+    call = types.SimpleNamespace(id='callback', data='vpn_inbounds:old:apply',
+        from_user=types.SimpleNamespace(id=1),
+        message=types.SimpleNamespace(chat=types.SimpleNamespace(id=1, type='private'), message_id=1))
+    module.handle_inbound_callback(call)
+    assert 'expired' in bot.answers[-1][0][1]
+    module.is_admin = lambda user: False
+    module.handle_inbound_callback(call)
+    assert bot.answers[-1][0][1] == 'Unauthorized.'

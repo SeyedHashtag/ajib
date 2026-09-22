@@ -107,6 +107,20 @@ def install_telegram_guard(bot):
             continue
         @wraps(original)
         def guarded(*args, __original=original, __name=name, **kwargs):
+            operator_document = kwargs.pop('_operator_document', False)
+            if operator_document:
+                from utils.command import is_admin
+                recipient = args[0] if args else kwargs.get('chat_id')
+                if (__name != 'send_document' or type(recipient) is not int or recipient <= 0
+                        or not is_admin(recipient)):
+                    raise PublicContentUnavailable()
+                # Explicit operator-only delivery; captions and filenames still use
+                # public wording. No automatic exemption for other admin messages.
+                outgoing = args[2:]
+                metadata = {k: v for k, v in kwargs.items() if k != 'document'}
+                for value in (*outgoing, *metadata.values()):
+                    require_public(value)
+                return __original(*args, **kwargs)
             # reply_to's first argument is an INCOMING message, not a payload.
             # Do not reject a neutral reply just because the user typed a private name.
             outgoing = args[1:] if __name == 'reply_to' else args

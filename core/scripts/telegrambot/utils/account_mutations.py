@@ -26,13 +26,19 @@ def create(operation_id, panels, allocator, plan, *, origin=None, note_text='',
                                note_text=(note_text + '; ' + marker).strip('; '))
         request = {'plan_gb': str(plan['gb']), 'days': int(plan['days']),
                    'unlimited': bool(plan.get('unlimited')), 'note': note, 'marker': marker}
+        if getattr(client, 'panel_type', None) == '3x-ui':
+            request['inbound_ids'] = list(client.default_inbound_ids)
     if client is None:
         raise operations.AccountBusy('The recorded server is unavailable; allocation is retained')
+    if getattr(client, 'panel_type', None) == '3x-ui' and not request.get('inbound_ids'):
+        raise operations.AccountBusy('The recorded inbound selection requires investigation')
     def action():
         if on_allocated:
             on_allocated(username, client)
         result = client.add_user(username, int(request['plan_gb']), request['days'],
-                                 unlimited=request['unlimited'], note=request['note'])
+                                 unlimited=request['unlimited'], note=request['note'],
+                                 **({'inbound_ids': list(request['inbound_ids'])}
+                                    if 'inbound_ids' in request else {}))
         return {'success': bool(result), 'username': username, 'server_id': client.server_id}
     result = operations.execute(operation_id, client.server_id, username, 'create', request, action,
                                 origin=origin, resources=resources)

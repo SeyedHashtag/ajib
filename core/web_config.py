@@ -169,6 +169,8 @@ def _install(contents, gid):
 def sync(*, recover=False):
     web.root_required()
     with web.maintenance():
+        if (web.CONFIG / 'settings.json').exists():
+            raise ValueError('Recover interrupted settings: ajib settings recover --yes.')
         if (web.CONFIG / 'upgrade.json').exists():
             raise ValueError('Recover the interrupted upgrade first: ajib web recover-upgrade --yes.')
         journal_path = web.CONFIG / 'config-sync.json'

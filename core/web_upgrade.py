@@ -173,7 +173,7 @@ def adopt_baseline():
 
 
 def _no_pending():
-    if any((web.CONFIG / name).exists() for name in ('upgrade.json', 'config-sync.json')):
+    if any((web.CONFIG / name).exists() for name in ('upgrade.json', 'config-sync.json', 'settings.json')):
         raise ValueError('Recover pending website maintenance before starting another operation.')
 
 
