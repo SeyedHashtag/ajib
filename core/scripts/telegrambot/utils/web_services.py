@@ -5,6 +5,7 @@ import re
 import time
 from pathlib import Path
 from decimal import Decimal, InvalidOperation
+from contextlib import contextmanager, ExitStack
 from . import database, web_store
 from .account_access import username_belongs_to_user
 from .catalog_service import load_catalog
@@ -14,6 +15,27 @@ class ServiceError(ValueError):
     def __init__(self, message, status=400):
         super().__init__(message)
         self.status = status
+
+
+@contextmanager
+def _configuration_lock(server_id, username):
+    """Allow overlapping configuration/QR reads to finish, with a bounded wait."""
+    from . import account_operations
+    deadline = time.monotonic() + 5
+    with ExitStack() as stack:
+        while True:
+            try:
+                stack.enter_context(account_operations.serialize(server_id, username))
+                break
+            except account_operations.AccountBusy:
+                if database.get_connection().in_transaction or time.monotonic() >= deadline:
+                    raise ServiceError('Configuration temporarily unavailable. Try again shortly.', 409) from None
+                time.sleep(0.025)
+        try:
+            account_operations.assert_available(server_id, username)
+        except account_operations.AccountBusy:
+            raise ServiceError('Configuration temporarily unavailable. Try again shortly.', 409) from None
+        yield
 
 
 def _object(value, default=None):
@@ -216,17 +238,27 @@ class Services:
         return client, user, result
 
     def configuration(self, user_id, scope, username, server_id):
-        from . import account_operations
         from .public_branding import require_public
         # Serialize authorization and retrieval with renames/migrations.
-        with account_operations.serialize(server_id, username):
-            account_operations.assert_available(server_id, username)
+        with _configuration_lock(server_id, username):
             client, _, _ = self.resolve_account(user_id, scope, username, server_id)
             uri = client.get_user_uri(username)
         if uri is None:
             raise ServiceError("Configuration temporarily unavailable", 503)
         if isinstance(uri, dict):
-            return require_public({key: value for key, value in uri.items() if key in {"uri", "url", "sub_url", "ipv4", "ipv4_url", "ipv6", "ipv6_url"} and isinstance(value, str)})
+            result = {key: value for key, value in uri.items()
+                      if key in {"uri", "url", "sub_url", "ipv4", "ipv4_url", "ipv6", "ipv6_url"}
+                      and isinstance(value, str) and value.strip()}
+            normal = uri.get('normal_sub')
+            if isinstance(normal, str) and normal.strip():
+                result.setdefault('uri' if uri.get('direct') else 'sub_url', normal)
+            links = uri.get('links')
+            if isinstance(links, list):
+                for index, link in enumerate(dict.fromkeys(value for value in links if isinstance(value, str) and value.strip()), 1):
+                    result['uri_' + str(index)] = link
+            if not result:
+                raise ServiceError("Configuration temporarily unavailable", 503)
+            return require_public(result)
         return require_public({"uri": str(uri)})
 
     def reseller_summary(self, user_id):

@@ -1,5 +1,6 @@
 import {test, expect, type Page} from '@playwright/test';
 import {createHmac, randomUUID} from 'node:crypto';
+import {readFile} from 'node:fs/promises';
 
 async function signIn(page:Page,user=123) {
   const data:Record<string,string>={auth_date:String(Math.floor(Date.now()/1000)),user:JSON.stringify({id:user,first_name:'Synthetic'}),query_id:randomUUID()};
@@ -34,7 +35,19 @@ test('customer can read owned account, configuration, and payment history',async
   await expect(page.locator('.account-card')).toContainText('s123a');
   await page.getByRole('button',{name:'Configuration',exact:true}).click();
   await expect(page.getByRole('dialog')).toBeVisible();
-  await expect(page.getByRole('textbox')).toHaveValue(/hysteria2:\/\//);
+  await expect(page.getByRole('textbox')).toHaveValue('https://subscription.invalid/synthetic');
+  await page.getByRole('dialog').getByRole('combobox').selectOption('uri_2');
+  await expect(page.getByRole('textbox')).toHaveValue(/server\.invalid:8443/);
+  await expect(page.getByRole('dialog').locator('img.qr')).toHaveAttribute('src', /key=uri_2/);
+  await expect.poll(() => page.getByRole('dialog').locator('img.qr').evaluate((image:HTMLImageElement) => image.complete && image.naturalWidth > 0)).toBeTruthy();
+  const [download] = await Promise.all([page.waitForEvent('download'), page.getByRole('link', {name:'Download configurations'}).click()]);
+  expect(download.suggestedFilename()).toBe('connections.txt');
+  const saved = test.info().outputPath('connections.txt');
+  await download.saveAs(saved);
+  const contents = await readFile(saved, 'utf8');
+  expect(contents).toContain('https://subscription.invalid/synthetic');
+  expect(contents).toContain('server.invalid:443/');
+  expect(contents).toContain('server.invalid:8443/');
   await page.getByRole('button',{name:'Close',exact:true}).click();
   await page.goto('/app/payments');
   await expect(page.locator('tbody')).toContainText('$1.20');

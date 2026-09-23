@@ -242,6 +242,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/accounts/{server_id}/{username}/configuration.txt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Configuration Download */
+        get: operations["configuration_download_api_v1_accounts__server_id___username__configuration_txt_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/accounts/{server_id}/{username}/qr": {
         parameters: {
             query?: never;
@@ -1309,7 +1326,9 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": {
+                        [key: string]: string;
+                    };
                 };
             };
             /** @description Validation Error */
@@ -1323,7 +1342,7 @@ export interface operations {
             };
         };
     };
-    qr_api_v1_accounts__server_id___username__qr_get: {
+    configuration_download_api_v1_accounts__server_id___username__configuration_txt_get: {
         parameters: {
             query?: never;
             header?: never;
@@ -1341,7 +1360,41 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "text/plain": string;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    qr_api_v1_accounts__server_id___username__qr_get: {
+        parameters: {
+            query?: {
+                key?: string | null;
+            };
+            header?: never;
+            path: {
+                server_id: string;
+                username: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/png": string;
                 };
             };
             /** @description Validation Error */

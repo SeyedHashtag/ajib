@@ -358,15 +358,26 @@ def create_app(settings=None, services=None):
         return options(services, value['scope'], value['language'],
                        writes=web_release.policy(settings)['accept_writes'])
 
-    @app.get("/api/v1/accounts/{server_id}/{username}/configuration")
+    @app.get("/api/v1/accounts/{server_id}/{username}/configuration", response_model=dict[str, str])
     def configuration(server_id: str, username: str, value=Depends(session)):
         return services.configuration(value["user_id"], value["scope"], username, server_id)
 
-    @app.get("/api/v1/accounts/{server_id}/{username}/qr")
-    def qr(server_id: str, username: str, value=Depends(session)):
+    @app.get("/api/v1/accounts/{server_id}/{username}/configuration.txt", response_class=Response,
+             responses={200: {'content': {'text/plain': {'schema': {'type': 'string'}}}}})
+    def configuration_download(server_id: str, username: str, value=Depends(session)):
+        data = services.configuration(value["user_id"], value["scope"], username, server_id)
+        content = '\n'.join(dict.fromkeys(data.values())) + '\n'
+        return Response(content, media_type='text/plain',
+                        headers={'Content-Disposition': 'attachment; filename="connections.txt"'})
+
+    @app.get("/api/v1/accounts/{server_id}/{username}/qr", response_class=Response,
+             responses={200: {'content': {'image/png': {'schema': {'type': 'string', 'format': 'binary'}}}}})
+    def qr(server_id: str, username: str, key: str | None = None, value=Depends(session)):
         import qrcode
         data = services.configuration(value["user_id"], value["scope"], username, server_id)
-        uri = data.get("uri") or data.get("sub_url") or data.get("ipv4") or data.get("url")
+        if key is not None and key not in data:
+            raise ServiceError("Configuration not found", 404)
+        uri = data[key] if key is not None else data.get("uri") or data.get("sub_url") or data.get("ipv4") or data.get("url")
         if not uri or len(uri) > 2000:
             raise ServiceError("QR code unavailable", 409)
         output = io.BytesIO()

@@ -1,4 +1,4 @@
-import type { components } from './api-schema';
+import type { components, paths } from './api-schema';
 
 export type Identity = components['schemas']['IdentityResponse'];
 export type Plan = components['schemas']['PlanResponse'];
@@ -8,6 +8,7 @@ export type Account = components['schemas']['AccountResponse'];
 export type Payment = components['schemas']['PaymentResponse'];
 export type RenewalOptions = components['schemas']['RenewalOptionsResponse'];
 export type PaymentMethod = components['schemas']['PaymentMethodResponse'];
+export type Configuration = paths['/api/v1/accounts/{server_id}/{username}/configuration']['get']['responses'][200]['content']['application/json'];
 
 let csrf = '';
 export function setCsrf(value: string) { csrf = value; }

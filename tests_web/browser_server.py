@@ -28,7 +28,10 @@ class Panel:
     server_id = "test"
 
     def get_user_uri(self, username):
-        return {"uri": "hysteria2://synthetic-password@server.invalid:443/?sni=server.invalid"}
+        one = "hysteria2://synthetic-password@server.invalid:443/?sni=server.invalid"
+        two = "hysteria2://synthetic-password@server.invalid:8443/?sni=server.invalid"
+        return {"normal_sub": "https://subscription.invalid/synthetic", "ipv4": one,
+                "links": [one, two], "direct": False}
 
 
 class Panels:
