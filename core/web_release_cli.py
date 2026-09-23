@@ -14,6 +14,7 @@ AUTOMATED_CHECKS = {'python', 'shell', 'api', 'frontend', 'browser', 'concurrenc
 LIVE_CHECKS = {'live_card', 'live_crypto', 'cross_interface', 'immediate_renewal', 'reserved_renewal',
                'trials', 'referrals_credits_withdrawals', 'pilot_observation'}
 ALL_CHECKS = AUTOMATED_CHECKS | LIVE_CHECKS
+WAIVABLE_CHECKS = {'live_card', 'live_crypto'}
 
 
 def dotenv_values(*args, **kwargs):
@@ -54,8 +55,17 @@ def state():
     plan = web.load()
     value = upgrade._policy(plan)
     with sqlite3.connect(Path(plan['database']).as_uri() + '?mode=ro', uri=True) as db:
-        checks = {row[0]: bool(row[1]) for row in db.execute('SELECT name,passed FROM web_release_checks WHERE revision=?', (value['revision'],))}
-    return {'policy': value, 'checks': checks, 'missing_checks': sorted(name for name in ALL_CHECKS if not checks.get(name)),
+        rows = db.execute('SELECT name,passed,evidence_json FROM web_release_checks WHERE revision=?',
+                          (value['revision'],))
+        checks = {}
+        waived = set()
+        for name, passed, evidence_json in rows:
+            checks[name] = bool(passed)
+            if name in WAIVABLE_CHECKS and not passed and json.loads(evidence_json).get('waiver') is True:
+                waived.add(name)
+    return {'policy': value, 'checks': checks,
+            'waived_checks': sorted(waived),
+            'missing_checks': sorted(name for name in ALL_CHECKS if not checks.get(name) and name not in waived),
             'health': diagnostics(plan)}
 
 
@@ -120,8 +130,15 @@ def record_check(name, passed, evidence):
     if name not in ALL_CHECKS:
         raise ValueError('Unknown acceptance check.')
     if (not isinstance(evidence, dict) or not isinstance(evidence.get('note'), str)
-            or not 10 <= len(evidence['note']) <= 2000 or set(evidence) - {'note', 'payment_ids', 'artifact_sha256'}):
-        raise ValueError('Evidence requires a 10–2000 character note; optional fields are payment_ids and artifact_sha256.')
+            or not 10 <= len(evidence['note']) <= 2000
+            or set(evidence) - {'note', 'payment_ids', 'artifact_sha256', 'waiver'}):
+        raise ValueError('Evidence requires a 10–2000 character note; optional fields are payment_ids, artifact_sha256 and waiver.')
+    if 'waiver' in evidence and evidence['waiver'] is not True:
+        raise ValueError('A waiver must explicitly be true.')
+    waived = evidence.get('waiver') is True
+    if waived and (passed or name not in WAIVABLE_CHECKS or len(evidence['note']) < 40
+                   or evidence.get('payment_ids') or not evidence.get('artifact_sha256')):
+        raise ValueError('Only an unpassed live card or crypto check may carry an explained, documented operator waiver.')
     if 'artifact_sha256' in evidence and not re.fullmatch(r'[a-f0-9]{64}', str(evidence['artifact_sha256'])):
         raise ValueError('artifact_sha256 must be a lowercase SHA-256 digest.')
     with web.maintenance():
@@ -131,6 +148,10 @@ def record_check(name, passed, evidence):
         revision = baseline['commit']
         if revision == 'adopted':
             raise ValueError('Evidence must reference an immutable installed release.')
+        if waived:
+            current = upgrade._policy(plan)
+            if current['access'] != 'pilot' or current['revision'] != revision:
+                raise ValueError('A live payment waiver requires an active named pilot on this revision.')
         with sqlite3.connect(plan['database']) as db:
             if passed and name in {'live_card', 'live_crypto', 'immediate_renewal', 'reserved_renewal'}:
                 ids = evidence.get('payment_ids')
@@ -177,8 +198,8 @@ def record_check(name, passed, evidence):
                         raise ValueError('Expected an immediate renewal.')
             db.execute('INSERT OR REPLACE INTO web_release_checks VALUES (?,?,?,?,?)',
                        (revision, name, int(passed), json.dumps(evidence), int(time.time())))
-            _audit(db, 'release.check', revision, {'name': name, 'passed': bool(passed)})
-        return {'revision': revision, 'name': name, 'passed': bool(passed)}
+            _audit(db, 'release.check', revision, {'name': name, 'passed': bool(passed), 'waived': waived})
+        return {'revision': revision, 'name': name, 'passed': bool(passed), 'waived': waived}
 
 
 @click.group('release')

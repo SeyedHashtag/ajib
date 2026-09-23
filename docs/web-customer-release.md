@@ -4,7 +4,7 @@ The release contract sets `customer_release_ready` to `true` after local accepta
 and recovery safeguards. This declares the code eligible for **gated customer
 writes**; it does not open the pilot or public access. The production release CLI
 still requires exact-revision automated evidence before enrolling two named
-non-admin customers, then real-payment evidence and at least 24 hours of healthy
+non-admin customers, then live acceptance evidence and at least 24 hours of healthy
 pilot operation before public promotion. Deployment status, pilot identities and
 acceptance evidence belong in private operator records, not this repository.
 
@@ -37,9 +37,13 @@ acceptance evidence belong in private operator records, not this repository.
   to the main store; hosted-commerce restrictions remain.
 - Pilot promotion requires the installed revision's acceptance records, at least
   two explicit non-admin customers, at least 24 hours of pilot operation, and
-  worker/notification/operation health. Real-payment evidence must reference a
-  positive completed payment for a selected customer on that revision. A reserved
-  renewal must actually be applied and cannot satisfy the immediate-renewal check.
+  worker/notification/operation health. A passed live card or crypto check must
+  reference a positive completed payment for a selected customer on that revision.
+  An explicitly documented operator waiver can replace either live-payment check
+  during the named pilot. It remains unpassed and visible as waived; it never
+  claims that settlement or fulfillment was tested. Renewal checks cannot be
+  waived: a reserved renewal must actually be applied and cannot satisfy the
+  immediate-renewal check.
 - Telegram-forbidden notification responses are retained as undeliverable audit
   records and are not retried. Operator health reports them separately from the
   actionable notification backlog; the pilot review must explain any such records.
@@ -90,6 +94,14 @@ ajib web release set pause --halt-worker --yes
 --evidence-file <private-json-file>` records operator evidence, including a note and
 payment IDs where required. It does not perform real payments or automatically
 attest that a live journey passed.
+
+For an operator-approved live card or crypto exception, use `--failed` and a
+private evidence file with a detailed `note`, `waiver: true`, and the
+`artifact_sha256` of private authorization/evidence. The CLI accepts this only
+on the active named-pilot revision. `release status` displays it under
+`waived_checks` while `checks` remains `false`. Record an ordinary failed check
+to withdraw the waiver. A rejected test receipt proves upload and review
+routing, not paid settlement or fulfillment.
 
 `ajib web adopt-baseline --yes` records reviewed installed files only when both
 installed code trees declare the same supported contract. It does not install or

@@ -116,6 +116,51 @@ def test_live_check_cannot_record_unpaid_or_other_revision_payment(managed):
         release.record_check('live_crypto', True, evidence)
 
 
+def test_payment_waiver_is_documented_scoped_and_never_claims_a_pass(managed):
+    note = ('The operator declined a real payment in the named pilot; automated provider '
+            'and receipt-flow checks are retained separately from this live-payment waiver.')
+    evidence = {'note': note, 'waiver': True, 'artifact_sha256': 'f'*64}
+    with pytest.raises(ValueError, match='active named pilot'):
+        release.record_check('live_crypto', False, evidence)
+    release.change('pilot', ['2', '3'])
+    with pytest.raises(ValueError, match='Only an unpassed'):
+        release.record_check('live_crypto', True, evidence)
+    with pytest.raises(ValueError, match='Only an unpassed'):
+        release.record_check('reserved_renewal', False, evidence)
+    with pytest.raises(ValueError, match='Only an unpassed'):
+        release.record_check('live_card', False, {**evidence, 'payment_ids': ['not-a-payment']})
+    with pytest.raises(ValueError, match='Only an unpassed'):
+        release.record_check('live_card', False, {'note': note, 'waiver': True})
+    assert release.record_check('live_card', False, evidence) == {
+        'revision': 'a'*40, 'name': 'live_card', 'passed': False, 'waived': True}
+    assert release.record_check('live_crypto', False, evidence)['waived']
+    report = release.state()
+    assert report['checks']['live_card'] is False and report['checks']['live_crypto'] is False
+    assert report['waived_checks'] == ['live_card', 'live_crypto']
+    assert not {'live_card', 'live_crypto'} & set(report['missing_checks'])
+    assert 'reserved_renewal' in report['missing_checks']
+    release.record_check('live_crypto', False, {'note': 'Waiver withdrawn after operator review.'})
+    report = release.state()
+    assert report['waived_checks'] == ['live_card']
+    assert 'live_crypto' in report['missing_checks']
+
+
+def test_public_promotion_accepts_documented_payment_waivers_but_no_other_missing_checks(managed):
+    from utils import database
+    release.change('pilot', ['2', '3'])
+    note = ('The operator explicitly accepted release without a live transfer; '
+            'this check remains untested and is recorded as a waiver, not a pass.')
+    for name in release.WAIVABLE_CHECKS:
+        release.record_check(name, False, {'note': note, 'waiver': True, 'artifact_sha256': 'f'*64})
+    with database.transaction() as db:
+        db.execute('UPDATE web_release_control SET pilot_started_at=?', (int(time.time())-86401,))
+        for name in release.LIVE_CHECKS - release.WAIVABLE_CHECKS:
+            db.execute('INSERT INTO web_release_checks VALUES (?,?,1,?,?)',
+                       ('a'*40, name, '{}', int(time.time())))
+    assert release.state()['missing_checks'] == []
+    assert release.change('public')['access'] == 'public'
+
+
 def test_live_evidence_requires_selected_customer_real_payment_and_correct_renewal_mode(managed):
     from utils import database
     from utils.web_orders import save_payment
