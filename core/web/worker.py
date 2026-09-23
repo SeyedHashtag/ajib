@@ -4,6 +4,18 @@ import os
 import time
 
 
+def _telegram_failure_code(response):
+    """Keep retry evidence useful without persisting a provider response or token."""
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        payload = {}
+    code = payload.get('error_code', response.status_code) if isinstance(payload, dict) else response.status_code
+    return {400: 'telegram_bad_request', 401: 'telegram_unauthorized',
+            403: 'telegram_forbidden', 429: 'telegram_rate_limited'}.get(
+                code, 'telegram_upstream_error' if isinstance(code, int) and code >= 500 else 'telegram_rejected')
+
+
 def run_once(services, *, writes_enabled=True):
     from utils import database, web_store
     from utils.web_orders import Orders, save_payment
@@ -42,7 +54,8 @@ def deliver_notification(services):
             response = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                 json={"chat_id": item["recipient"], "text": item["text"]}, timeout=20)
             if response.status_code != 200 or not response.json().get("ok"):
-                raise RuntimeError("Telegram delivery rejected")
+                web_store.finish_notification(item, _telegram_failure_code(response))
+                return True
         except Exception as error:
             # Do not log exception messages: requests errors can contain bot tokens.
             web_store.finish_notification(item, type(error).__name__)

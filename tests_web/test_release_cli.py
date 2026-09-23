@@ -80,6 +80,16 @@ def test_ready_contract_and_exact_revision_are_required(managed, monkeypatch):
         release.change('pilot', ['2', '3'])
 
 
+def test_ready_manifest_alone_keeps_customer_access_closed(managed):
+    contract = json.loads((Path(__file__).resolve().parents[1] / 'core/web/release-contract.json').read_text())
+    assert contract['customer_release_ready'] is True
+    policy = release.state()['policy']
+    assert not policy['accept_writes'] and not policy['process_existing']
+    assert json.loads(policy['pilot_users_json']) == []
+    with pytest.raises(ValueError, match='named-customer pilot'):
+        release.change('public')
+
+
 def test_live_check_cannot_record_unpaid_or_other_revision_payment(managed):
     from utils import database
     from utils.web_orders import save_payment

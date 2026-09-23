@@ -1,9 +1,12 @@
-# Coordinated upgrade and customer release candidate
+# Coordinated upgrade and gated customer pilot
 
-This is not an approved Stage 4 release. The release contract deliberately keeps
-`customer_release_ready` set to `false`. Deployment status, operator confirmations,
-pilot identities and acceptance evidence belong in private operator records, not
-in this repository. Keep customer writes disabled until required gates pass.
+The release contract sets `customer_release_ready` to `true` after local acceptance
+and recovery safeguards. This declares the code eligible for **gated customer
+writes**; it does not open the pilot or public access. The production release CLI
+still requires exact-revision automated evidence before enrolling two named
+non-admin customers, then real-payment evidence and at least 24 hours of healthy
+pilot operation before public promotion. Deployment status, pilot identities and
+acceptance evidence belong in private operator records, not this repository.
 
 ## Implemented controls
 
@@ -122,7 +125,8 @@ candidate is installed and verified.
    evidence, complete the 24-hour pilot, then consider main-store promotion.
 
 Synthetic tests cannot close production, real payment, or real Telegram-client
-acceptance gates. Do not set `customer_release_ready` merely because unit tests pass.
+acceptance gates. Readiness is a code compatibility decision, not a claim that
+the operator has completed the pilot or authorized public access.
 
 ## Local validation for this increment
 
@@ -174,6 +178,7 @@ writes paused and compatible recovery artifacts retained.
    deployed commit. Limit proxy/container changes to this application; unrelated
    VPS services remain outside this maintenance operation.
 
-Keep `customer_release_ready: false` until the full release evidence is approved.
-Real Telegram clients, operator-performed card/crypto payments and the 24-hour
-pilot are separate acceptance gates, not consequences of a passing local build.
+Keep administrator-only access and customer writes disabled until the pilot's
+automated production evidence is recorded. Real Telegram clients, operator-
+performed card/crypto payments and the 24-hour pilot remain separate public-
+promotion gates, not consequences of a passing local build.

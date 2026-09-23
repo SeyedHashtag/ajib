@@ -5,5 +5,5 @@
   "fulfillment_contract": 2,
   "unit_contract": 1,
   "live_release_policy": true,
-  "customer_release_ready": false
+  "customer_release_ready": true
 }

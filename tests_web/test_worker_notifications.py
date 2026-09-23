@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 
 def test_financial_pause_delivers_committed_notification_without_processing_orders(storage, monkeypatch):
     from core.web.worker import run_once
@@ -30,3 +32,20 @@ def test_notification_failure_retains_retry_without_touching_financial_state(sto
     assert run_once(SimpleNamespace(bot_token=lambda scope: 'synthetic-token'), writes_enabled=False)
     row = database.get_connection().execute('SELECT status,attempts,last_error FROM web_outbox').fetchone()
     assert row['status'] == 'pending' and row['attempts'] == 1 and row['last_error'] == 'TimeoutError'
+
+
+@pytest.mark.parametrize(('code', 'stored'), [(400, 'telegram_bad_request'),
+    (401, 'telegram_unauthorized'), (403, 'telegram_forbidden'),
+    (429, 'telegram_rate_limited'), (502, 'telegram_upstream_error')])
+def test_notification_rejection_stores_only_safe_code(storage, monkeypatch, code, stored):
+    from core.web.worker import deliver_notification
+    from utils import database, web_store
+    web_store.initialize()
+    with database.transaction() as db:
+        web_store.enqueue(db, 'event', 'main', 123, 'Your service is ready.')
+    monkeypatch.setattr('requests.post', lambda *a, **k: SimpleNamespace(
+        status_code=code, json=lambda: {'ok': False, 'error_code': code,
+                                        'description': 'private provider response'}))
+    assert deliver_notification(SimpleNamespace(bot_token=lambda scope: 'synthetic-token'))
+    row = database.get_connection().execute('SELECT status,attempts,last_error FROM web_outbox').fetchone()
+    assert (row['status'], row['attempts'], row['last_error']) == ('pending', 1, stored)
