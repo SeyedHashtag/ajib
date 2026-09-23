@@ -62,3 +62,28 @@ def test_cli_redacts_unexpected_error(cli, monkeypatch):
     result = runner.invoke(group, ['inspect', 'id', '--json'])
     assert result.exit_code == 1
     assert 'RuntimeError' in result.output and 'synthetic-sensitive' not in result.output
+
+
+def test_backup_reconciliation_requires_evidence_and_yes(cli, monkeypatch, tmp_path):
+    from core import operations_cli
+    import sys
+    runner, group, calls, _ = cli
+    paths = []
+    for name in ('before.db', 'after.db', 'prior.db'):
+        path = tmp_path / name
+        path.write_bytes(b'synthetic')
+        paths.extend(['--panel-before' if name == 'before.db' else '--panel-after' if name == 'after.db' else '--payment-before', str(path)])
+    inspected = []
+    recovery = SimpleNamespace(inspect=lambda *args: inspected.append(args) or {'evidence_digest': 'digest'})
+    monkeypatch.setattr(operations_cli, '_backup_recovery', lambda: (recovery, None))
+    applied = []
+    monkeypatch.setitem(sys.modules, 'renewal_backup_maintenance',
+                        SimpleNamespace(apply=lambda *args: applied.append(args) or {'applied': True}))
+    result = runner.invoke(group, ['inspect-renewal-backup', 'id', *paths])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)['evidence_digest'] == 'digest'
+    result = runner.invoke(group, ['reconcile-renewal-backup', 'id', *paths, '--evidence', 'digest'])
+    assert result.exit_code != 0 and not applied
+    result = runner.invoke(group, ['reconcile-renewal-backup', 'id', *paths, '--evidence', 'digest', '--yes'])
+    assert result.exit_code == 0, result.output
+    assert len(applied) == 1

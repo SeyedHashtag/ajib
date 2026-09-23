@@ -74,7 +74,7 @@ def reconcile_command(operation_id, dry_run, evidence, reason, yes):
         else:
             import web_operator
             with web_operator.maintenance():
-                if any((web_operator.CONFIG / name).exists() for name in ('upgrade.json', 'config-sync.json', 'settings.json')):
+                if any((web_operator.CONFIG / name).exists() for name in ('upgrade.json', 'config-sync.json', 'settings.json', 'renewal-evidence.json')):
                     raise ValueError('Finish coordinated maintenance before reconciling operations.')
                 report = recovery.reconcile(operation_id, panels, evidence, reason=reason)
         click.echo(json.dumps(report, indent=2))
@@ -82,3 +82,68 @@ def reconcile_command(operation_id, dry_run, evidence, reason, yes):
         raise click.ClickException(str(error)) from error
     except Exception as error:
         raise click.ClickException('Reconciliation failed; reservations retained: ' + type(error).__name__) from error
+
+
+def _backup_recovery():
+    _services()
+    from utils import renewal_backup_recovery
+    from utils.api_client import MultiServerAPI
+    return renewal_backup_recovery, MultiServerAPI()
+
+
+def _backup_options(function):
+    for option in (
+        click.option('--payment-before', required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path)),
+        click.option('--panel-after', required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path)),
+        click.option('--panel-before', required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path)),
+    ):
+        function = option(function)
+    return function
+
+
+@operations_group.command('inspect-renewal-backup')
+@click.argument('operation_id')
+@_backup_options
+def inspect_renewal_backup(operation_id, panel_before, panel_after, payment_before):
+    try:
+        recovery, panels = _backup_recovery()
+        click.echo(json.dumps(recovery.inspect(operation_id, panels, panel_before, panel_after, payment_before), indent=2))
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
+    except Exception as error:
+        raise click.ClickException('Backup inspection failed: ' + type(error).__name__) from error
+
+
+@operations_group.command('reconcile-renewal-backup')
+@click.argument('operation_id')
+@_backup_options
+@click.option('--evidence', required=True, help='Digest from inspect-renewal-backup.')
+@click.option('--yes', is_flag=True, required=True)
+def reconcile_renewal_backup(operation_id, panel_before, panel_after, payment_before, evidence, yes):
+    try:
+        if not yes:
+            raise ValueError('Inspect first, then pass --evidence and --yes')
+        _, panels = _backup_recovery()
+        import renewal_backup_maintenance
+        report = renewal_backup_maintenance.apply(operation_id, panels, panel_before, panel_after,
+                                                  payment_before, evidence)
+        click.echo(json.dumps(report, indent=2))
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
+    except Exception as error:
+        raise click.ClickException('Backup reconciliation stopped: ' + type(error).__name__) from error
+
+
+@operations_group.command('recover-renewal-backup')
+@click.option('--yes', is_flag=True, required=True)
+def recover_renewal_backup(yes):
+    try:
+        if not yes:
+            raise ValueError('Pass --yes to recover the saved service states')
+        _services(needs_panel=False)
+        import renewal_backup_maintenance
+        click.echo(json.dumps(renewal_backup_maintenance.recover(), indent=2))
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
+    except Exception as error:
+        raise click.ClickException('Recovery needs investigation: ' + type(error).__name__) from error

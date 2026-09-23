@@ -144,6 +144,9 @@ def maintained(function):
             if (CONFIG / 'config-sync.json').exists():
                 raise ValueError('Recover the interrupted configuration sync before other website changes: '
                                  'ajib web sync-config --recover --yes.')
+            if (CONFIG / 'renewal-evidence.json').exists():
+                raise ValueError('Recover the interrupted renewal reconciliation before other website changes: '
+                                 'ajib operations recover-renewal-backup --yes.')
             return function(*args, **kwargs)
     return wrapped
 

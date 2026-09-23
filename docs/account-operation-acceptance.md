@@ -69,6 +69,23 @@ or configuration-sync journal. It never switches a bot-owned payment to the web
 worker. Unsupported or ambiguous outcomes remain under investigation with their
 reservations retained. List/inspect and dry-run do not authorize completion.
 
+For a 3x-ui reserved renewal whose panel response was lost, use the separate
+backup-evidence path only when private panel snapshots bracket the original
+dispatch and a private payment snapshot contains the original terms:
+
+```sh
+ajib operations inspect-renewal-backup <operation-id> --panel-before <private-db> --panel-after <private-db> --payment-before <private-db>
+ajib operations reconcile-renewal-backup <operation-id> --panel-before <private-db> --panel-after <private-db> --payment-before <private-db> --evidence <fresh-digest> --yes
+ajib operations recover-renewal-backup --yes
+```
+
+Inspection checks identity, generation, entitlement, traffic reset, original
+payment terms and the current panel without changing state. Reconciliation stops
+only this application's services, keeps a private journal and verified database
+backup, and commits the original renewal through its existing finalizer. A crash
+after commit resumes service recovery from the journal; it never restores an old
+database or repeats the panel request. Customer access gates remain closed.
+
 ## Local validation
 
 Tests live in `tests_web/test_account_operations.py`,
