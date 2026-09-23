@@ -90,6 +90,17 @@ def test_ready_manifest_alone_keeps_customer_access_closed(managed):
         release.change('public')
 
 
+def test_undeliverable_notifications_are_visible_without_retry_backlog(managed):
+    from utils import database, web_store
+    with database.transaction() as db:
+        web_store.enqueue(db, 'old-event', 'main', 123, 'Your service is ready.')
+    item = web_store.claim_notification()
+    web_store.finish_notification(item, 'telegram_forbidden', terminal=True)
+    health = release.diagnostics(web.load())
+    assert health['notification_backlog'] == 0
+    assert health['undeliverable_notifications'] == 1
+
+
 def test_live_check_cannot_record_unpaid_or_other_revision_payment(managed):
     from utils import database
     from utils.web_orders import save_payment

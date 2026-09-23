@@ -48,4 +48,18 @@ def test_notification_rejection_stores_only_safe_code(storage, monkeypatch, code
                                         'description': 'private provider response'}))
     assert deliver_notification(SimpleNamespace(bot_token=lambda scope: 'synthetic-token'))
     row = database.get_connection().execute('SELECT status,attempts,last_error FROM web_outbox').fetchone()
-    assert (row['status'], row['attempts'], row['last_error']) == ('pending', 1, stored)
+    expected_status = 'undeliverable' if code == 403 else 'pending'
+    assert (row['status'], row['attempts'], row['last_error']) == (expected_status, 1, stored)
+
+
+def test_prior_forbidden_retry_is_retained_without_another_send(storage, monkeypatch):
+    from core.web.worker import run_once
+    from utils import database, web_store
+    web_store.initialize()
+    with database.transaction() as db:
+        web_store.enqueue(db, 'old-event', 'main', 123, 'Your service is ready.')
+        db.execute("UPDATE web_outbox SET last_error='telegram_forbidden',attempts=5 WHERE id='old-event'")
+    monkeypatch.setattr('requests.post', lambda *a, **k: (_ for _ in ()).throw(AssertionError('must not retry')))
+    assert not run_once(SimpleNamespace(bot_token=lambda scope: 'synthetic-token'), writes_enabled=False)
+    row = database.get_connection().execute('SELECT status,attempts,last_error FROM web_outbox').fetchone()
+    assert (row['status'], row['attempts'], row['last_error']) == ('undeliverable', 5, 'telegram_forbidden')

@@ -40,6 +40,9 @@ acceptance evidence belong in private operator records, not this repository.
   worker/notification/operation health. Real-payment evidence must reference a
   positive completed payment for a selected customer on that revision. A reserved
   renewal must actually be applied and cannot satisfy the immediate-renewal check.
+- Telegram-forbidden notification responses are retained as undeliverable audit
+  records and are not retried. Operator health reports them separately from the
+  actionable notification backlog; the pilot review must explain any such records.
 
 ## Shared financial safeguards
 

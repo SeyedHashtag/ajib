@@ -54,7 +54,8 @@ def deliver_notification(services):
             response = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                 json={"chat_id": item["recipient"], "text": item["text"]}, timeout=20)
             if response.status_code != 200 or not response.json().get("ok"):
-                web_store.finish_notification(item, _telegram_failure_code(response))
+                reason = _telegram_failure_code(response)
+                web_store.finish_notification(item, reason, terminal=reason == 'telegram_forbidden')
                 return True
         except Exception as error:
             # Do not log exception messages: requests errors can contain bot tokens.

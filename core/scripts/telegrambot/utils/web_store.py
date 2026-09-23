@@ -115,6 +115,10 @@ def rate_limit(bucket, maximum=10, window=60):
 def claim_notification(scope=None):
     now = int(time.time())
     with database.transaction(operation="web_outbox_claim") as connection:
+        # Older workers retained provider-forbidden responses as retryable. The
+        # safe error code proves the recipient cannot receive this message.
+        connection.execute("""UPDATE web_outbox SET status='undeliverable',next_attempt_at=?
+            WHERE status='pending' AND last_error='telegram_forbidden'""", (now,))
         row = connection.execute("""SELECT * FROM web_outbox
             WHERE ((status='pending' AND next_attempt_at<=?)
                OR (status='sending' AND lease_until<=?)) AND (? IS NULL OR scope=?)
@@ -127,11 +131,11 @@ def claim_notification(scope=None):
         return {**dict(row), "lease_token": token}
 
 
-def finish_notification(item, error=None):
+def finish_notification(item, error=None, *, terminal=False):
     with database.transaction(operation="web_outbox_finish") as connection:
         connection.execute("""UPDATE web_outbox SET status=?,last_error=?,
             next_attempt_at=?,lease_until=NULL,lease_token=NULL
             WHERE id=? AND lease_token=? AND status='sending'""",
-            ("pending" if error else "sent", error,
-             int(time.time()) + min(3600, 2 ** min(item["attempts"] + 2, 12)),
+            ("undeliverable" if error and terminal else "pending" if error else "sent", error,
+             int(time.time()) if terminal else int(time.time()) + min(3600, 2 ** min(item["attempts"] + 2, 12)),
              item["id"], item["lease_token"]))

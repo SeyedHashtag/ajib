@@ -41,10 +41,12 @@ def diagnostics(plan):
             (SELECT COUNT(*) FROM web_trials WHERE status='uncertain') +
             (SELECT COUNT(*) FROM account_operations WHERE status='uncertain' OR (status='executing' AND updated_at<?))""",
             (now - 600,)).fetchone()[0]
-        notifications = db.execute("SELECT COUNT(*),MIN(next_attempt_at) FROM web_outbox WHERE status!='sent'").fetchone()
+        notifications = db.execute("SELECT COUNT(*),MIN(next_attempt_at) FROM web_outbox WHERE status NOT IN ('sent','undeliverable')").fetchone()
+        undeliverable = db.execute("SELECT COUNT(*) FROM web_outbox WHERE status='undeliverable'").fetchone()[0]
         return {'worker_healthy': bool(worker and worker[0] >= now-30 and worker[1] is None),
                 'pending_operations': pending[0], 'oldest_pending_age_seconds': now-pending[1] if pending[1] else 0,
                 'uncertain_operations': uncertain, 'notification_backlog': notifications[0],
+                'undeliverable_notifications': undeliverable,
                 'oldest_notification_delay_seconds': max(0, now-notifications[1]) if notifications[1] else 0}
 
 
