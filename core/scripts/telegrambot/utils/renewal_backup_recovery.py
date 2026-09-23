@@ -146,9 +146,16 @@ def _evidence(operation_id, panels, before, after, payment_before):
     after_state['captured_at'] = datetime.fromtimestamp(updated_ms / 1000, timezone.utc).isoformat().replace('+00:00', 'Z')
     hashes = {name: _file_digest(path) for name, path in (
         ('panel_before', before), ('panel_after', after), ('payment_before', payment_before))}
+    # Traffic continues to accrue while the operator reviews evidence. Bind the
+    # digest to the live entitlement instead of volatile usage counters; the
+    # panel is fetched again under the account lock immediately before commit.
+    live_entitlement = {key: user.get(key) for key in (
+        'username', 'account_creation_date', 'expiration_days',
+        'max_download_bytes', 'unlimited_ip')}
+    live_entitlement['server_id'] = str(client.server_id)
     bound = {'operation': {key: row[key] for key in ('operation_id', 'revision', 'request_json', 'result_json', 'origin_json')},
              'payment': operation_recovery._digest(current), 'original_baseline': old.get('renewal_baseline'),
-             'files': hashes, 'panel': operation_recovery._snapshot(user), 'after_state': after_state}
+             'files': hashes, 'panel': live_entitlement, 'after_state': after_state}
     digest = hashlib.sha256(json.dumps(bound, sort_keys=True, default=str).encode()).hexdigest()
     report = {'operation_id': operation_id, 'classification': 'panel_verified', 'action': 'complete_accounting',
               'reason': 'paired_panel_backups_verify_original_renewal', 'evidence_digest': digest,

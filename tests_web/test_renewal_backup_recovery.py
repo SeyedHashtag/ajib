@@ -135,3 +135,14 @@ def test_evidence_rejects_changed_snapshot_after_inspection(evidence):
     with pytest.raises(ValueError, match='Evidence changed'):
         renewal_backup_recovery.reconcile(evidence.ident, evidence.panels, *evidence.files,
                                           report['evidence_digest'])
+
+
+def test_live_traffic_can_accrue_after_inspection(evidence):
+    from utils import account_operations, renewal_backup_recovery
+    report = renewal_backup_recovery.inspect(evidence.ident, evidence.panels, *evidence.files)
+    evidence.live['upload_bytes'] += 1024 * 1024
+    evidence.live['download_bytes'] += 1024 * 1024
+    assert renewal_backup_recovery.inspect(evidence.ident, evidence.panels, *evidence.files)['evidence_digest'] == report['evidence_digest']
+    assert renewal_backup_recovery.reconcile(evidence.ident, evidence.panels, *evidence.files,
+                                             report['evidence_digest'])['applied']
+    assert account_operations.details(evidence.ident)['phase'] == 'completed'
