@@ -39,11 +39,13 @@ acceptance evidence belong in private operator records, not this repository.
   two explicit non-admin customers, at least 24 hours of pilot operation, and
   worker/notification/operation health. A passed live card or crypto check must
   reference a positive completed payment for a selected customer on that revision.
-  An explicitly documented operator waiver can replace either live-payment check
-  during the named pilot. It remains unpassed and visible as waived; it never
-  claims that settlement or fulfillment was tested. Renewal checks cannot be
-  waived: a reserved renewal must actually be applied and cannot satisfy the
-  immediate-renewal check.
+  An explicitly documented operator waiver can replace the live card, crypto,
+  immediate/reserved renewal, trial, or referral/withdrawal check during the
+  named pilot. It remains unpassed and visible as waived; it never claims that
+  settlement, fulfillment, or activation was tested. A passed reserved-renewal
+  check still requires an actual applied renewal and cannot satisfy the
+  immediate-renewal check. Cross-interface continuation and the 24-hour pilot
+  observation cannot be waived.
 - Telegram-forbidden notification responses are retained as undeliverable audit
   records and are not retried. Operator health reports them separately from the
   actionable notification backlog; the pilot review must explain any such records.
@@ -95,13 +97,14 @@ ajib web release set pause --halt-worker --yes
 payment IDs where required. It does not perform real payments or automatically
 attest that a live journey passed.
 
-For an operator-approved live card or crypto exception, use `--failed` and a
+For an operator-approved exception to one of those six live checks, use `--failed` and a
 private evidence file with a detailed `note`, `waiver: true`, and the
 `artifact_sha256` of private authorization/evidence. The CLI accepts this only
 on the active named-pilot revision. `release status` displays it under
 `waived_checks` while `checks` remains `false`. Record an ordinary failed check
 to withdraw the waiver. A rejected test receipt proves upload and review
-routing, not paid settlement or fulfillment.
+routing, not paid settlement or fulfillment. A waiver of reserved activation
+leaves that production behavior unproven and must be named in release notes.
 
 `ajib web adopt-baseline --yes` records reviewed installed files only when both
 installed code trees declare the same supported contract. It does not install or

@@ -14,7 +14,8 @@ AUTOMATED_CHECKS = {'python', 'shell', 'api', 'frontend', 'browser', 'concurrenc
 LIVE_CHECKS = {'live_card', 'live_crypto', 'cross_interface', 'immediate_renewal', 'reserved_renewal',
                'trials', 'referrals_credits_withdrawals', 'pilot_observation'}
 ALL_CHECKS = AUTOMATED_CHECKS | LIVE_CHECKS
-WAIVABLE_CHECKS = {'live_card', 'live_crypto'}
+WAIVABLE_CHECKS = {'live_card', 'live_crypto', 'immediate_renewal', 'reserved_renewal',
+                   'trials', 'referrals_credits_withdrawals'}
 
 
 def dotenv_values(*args, **kwargs):
@@ -138,7 +139,7 @@ def record_check(name, passed, evidence):
     waived = evidence.get('waiver') is True
     if waived and (passed or name not in WAIVABLE_CHECKS or len(evidence['note']) < 40
                    or evidence.get('payment_ids') or not evidence.get('artifact_sha256')):
-        raise ValueError('Only an unpassed live card or crypto check may carry an explained, documented operator waiver.')
+        raise ValueError('Only an unpassed designated live check may carry an explained, documented operator waiver.')
     if 'artifact_sha256' in evidence and not re.fullmatch(r'[a-f0-9]{64}', str(evidence['artifact_sha256'])):
         raise ValueError('artifact_sha256 must be a lowercase SHA-256 digest.')
     with web.maintenance():

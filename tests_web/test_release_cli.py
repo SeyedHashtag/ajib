@@ -116,9 +116,9 @@ def test_live_check_cannot_record_unpaid_or_other_revision_payment(managed):
         release.record_check('live_crypto', True, evidence)
 
 
-def test_payment_waiver_is_documented_scoped_and_never_claims_a_pass(managed):
-    note = ('The operator declined a real payment in the named pilot; automated provider '
-            'and receipt-flow checks are retained separately from this live-payment waiver.')
+def test_live_waiver_is_documented_scoped_and_never_claims_a_pass(managed):
+    note = ('The operator declined this live journey in the named pilot; automated '
+            'acceptance and private authorization are retained separately from the waiver.')
     evidence = {'note': note, 'waiver': True, 'artifact_sha256': 'f'*64}
     with pytest.raises(ValueError, match='active named pilot'):
         release.record_check('live_crypto', False, evidence)
@@ -126,34 +126,41 @@ def test_payment_waiver_is_documented_scoped_and_never_claims_a_pass(managed):
     with pytest.raises(ValueError, match='Only an unpassed'):
         release.record_check('live_crypto', True, evidence)
     with pytest.raises(ValueError, match='Only an unpassed'):
-        release.record_check('reserved_renewal', False, evidence)
+        release.record_check('cross_interface', False, evidence)
+    with pytest.raises(ValueError, match='Only an unpassed'):
+        release.record_check('pilot_observation', False, evidence)
+    with pytest.raises(ValueError, match='Only an unpassed'):
+        release.record_check('python', False, evidence)
     with pytest.raises(ValueError, match='Only an unpassed'):
         release.record_check('live_card', False, {**evidence, 'payment_ids': ['not-a-payment']})
     with pytest.raises(ValueError, match='Only an unpassed'):
         release.record_check('live_card', False, {'note': note, 'waiver': True})
     assert release.record_check('live_card', False, evidence) == {
         'revision': 'a'*40, 'name': 'live_card', 'passed': False, 'waived': True}
-    assert release.record_check('live_crypto', False, evidence)['waived']
+    for name in release.WAIVABLE_CHECKS - {'live_card'}:
+        assert release.record_check(name, False, evidence)['waived']
     report = release.state()
     assert report['checks']['live_card'] is False and report['checks']['live_crypto'] is False
-    assert report['waived_checks'] == ['live_card', 'live_crypto']
-    assert not {'live_card', 'live_crypto'} & set(report['missing_checks'])
-    assert 'reserved_renewal' in report['missing_checks']
+    assert set(report['waived_checks']) == release.WAIVABLE_CHECKS
+    assert set(report['missing_checks']) == {'cross_interface', 'pilot_observation'}
     release.record_check('live_crypto', False, {'note': 'Waiver withdrawn after operator review.'})
     report = release.state()
-    assert report['waived_checks'] == ['live_card']
+    assert set(report['waived_checks']) == release.WAIVABLE_CHECKS - {'live_crypto'}
     assert 'live_crypto' in report['missing_checks']
 
 
-def test_public_promotion_accepts_documented_payment_waivers_but_no_other_missing_checks(managed):
+def test_public_promotion_accepts_documented_live_waivers_but_requires_cross_interface_and_time(managed):
     from utils import database
     release.change('pilot', ['2', '3'])
-    note = ('The operator explicitly accepted release without a live transfer; '
-            'this check remains untested and is recorded as a waiver, not a pass.')
+    note = ('The operator explicitly accepted release without this live journey; '
+            'it remains untested and is recorded as a waiver, not a pass.')
     for name in release.WAIVABLE_CHECKS:
         release.record_check(name, False, {'note': note, 'waiver': True, 'artifact_sha256': 'f'*64})
     with database.transaction() as db:
         db.execute('UPDATE web_release_control SET pilot_started_at=?', (int(time.time())-86401,))
+    with pytest.raises(ValueError, match='evidence'):
+        release.change('public')
+    with database.transaction() as db:
         for name in release.LIVE_CHECKS - release.WAIVABLE_CHECKS:
             db.execute('INSERT INTO web_release_checks VALUES (?,?,1,?,?)',
                        ('a'*40, name, '{}', int(time.time())))
