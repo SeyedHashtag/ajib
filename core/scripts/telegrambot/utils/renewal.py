@@ -1537,6 +1537,14 @@ def refresh_payment_renewal_baseline(payment_id, user_data, payments_file=None):
         record = payments.get(str(payment_id)) if isinstance(payments, dict) else None
         if not isinstance(record, dict) or record.get('renewal_status') != 'attention':
             return False
+        if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+            from . import account_operations
+            from .state_store import describe_path
+            descriptor = describe_path(path)
+            if not descriptor:
+                raise account_operations.AccountBusy('Renewal ownership requires investigation')
+            account_operations.assert_obligation_releasable(descriptor.scope, payment_id)
+            account_operations.assert_available(_record_server_id(record), _record_username(record))
         record['renewal_baseline'] = capture_user_state(user_data)
         record['renewal_status'] = 'reserved'
         record['renewal_reviewed_at'] = _now_str()

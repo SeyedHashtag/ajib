@@ -721,7 +721,7 @@
   },
   {
     "source": "core/scripts/telegrambot/hosted_worker.py",
-    "line": 5394,
+    "line": 5398,
     "function": "owner_credit_customer_controls",
     "entrypoints": [
       "bot.callback_query_handler(func=lambda call: call.data.startswith('hb:ownercustomers:') or call.data == 'hb:credithelp')"

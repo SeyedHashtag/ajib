@@ -4823,6 +4823,7 @@ def _process_hosted_reserved_renewals(now=None):
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hb:rr:"))
 def hosted_renewal_review(call):
+    from utils.account_operations import AccountBusy
     if call.from_user.id != OWNER_ID:
         bot.answer_callback_query(call.id, _hosted_message(call.from_user.id, "owner_only"), show_alert=True)
         return
@@ -4925,6 +4926,9 @@ def hosted_renewal_review(call):
             feedback[:190],
             show_alert=True,
         )
+    except AccountBusy:
+        bot.answer_callback_query(call.id,
+            'This renewal needs operator reconciliation. The existing reservation is retained.', show_alert=True)
     except Exception:
         bot.answer_callback_query(
             call.id,

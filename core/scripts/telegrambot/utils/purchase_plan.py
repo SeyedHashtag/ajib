@@ -4404,6 +4404,7 @@ def process_main_reserved_renewals(now=None):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('rr:'))
 def handle_reserved_renewal_review(call):
+    from utils.account_operations import AccountBusy
     if not is_admin(call.from_user.id):
         safe_answer_callback_query(bot, call.id, text='Admin access required.', show_alert=True)
         return
@@ -4557,6 +4558,9 @@ def handle_reserved_renewal_review(call):
             text=feedback[:190],
             show_alert=True,
         )
+    except AccountBusy:
+        safe_answer_callback_query(bot, call.id,
+            text='This renewal needs operator reconciliation. The existing reservation is retained.', show_alert=True)
     except Exception as error:
         logging.getLogger('ajib.renewals').exception('Renewal review failed: %s', error)
         safe_answer_callback_query(

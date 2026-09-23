@@ -123,3 +123,10 @@ Additional workflow evidence is in `test_account_rename.py`,
 `test_migration_operations.py`, `test_hosted_settlement.py` and `test_trials.py`,
 all under `tests_web/`. These tests do not attest to live financial settlement or
 complete every Stage 4 journey.
+
+Reserved-renewal review cannot replace the saved account baseline while an
+unresolved operation owns the obligation or account. Main-store, hosted payment
+and reseller review paths retain the original reservation and direct the operator
+to reconciliation. Unclaimed reviews retain their existing behavior.
+`tests_web/test_renewal_review_claims.py` verifies this across durable operation
+phases without dispatching panel mutations.

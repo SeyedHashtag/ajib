@@ -1904,6 +1904,11 @@ def refresh_reseller_renewal_baseline(user_id, reservation_id, user_data):
                 for config in current.get('configs', []):
                     for reservation in config.get('renewals', []) if isinstance(config, dict) else []:
                         if isinstance(reservation, dict) and str(reservation.get('reservation_id') or '') == str(reservation_id):
+                            if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+                                from . import account_operations
+                                account_operations.assert_obligation_releasable('reseller:' + user_id, reservation_id)
+                                account_operations.assert_obligation_releasable('hosted:' + user_id, reservation_id)
+                                account_operations.assert_available(config.get('server_id') or 'primary', config.get('username'))
                             reservation['renewal_baseline'] = dict(user_data or {})
                             reservation['renewal_status'] = 'reserved'
                             reservation['renewal_reviewed_at'] = _now_str()
@@ -1918,7 +1923,11 @@ def refresh_reseller_renewal_baseline(user_id, reservation_id, user_data):
                             _write_resellers_file(resellers)
                             return True
                 return False
-        except Exception:
+        except Exception as error:
+            if os.getenv('AJIB_SQLITE_ACTIVE') == '1':
+                from .account_operations import AccountBusy
+                if isinstance(error, AccountBusy):
+                    raise
             return False
 
 
