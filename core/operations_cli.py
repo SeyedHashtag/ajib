@@ -84,6 +84,36 @@ def reconcile_command(operation_id, dry_run, evidence, reason, yes):
         raise click.ClickException('Reconciliation failed; reservations retained: ' + type(error).__name__) from error
 
 
+@operations_group.command('reconcile-unpaid-crypto')
+@click.argument('payment_id')
+@click.option('--dry-run', is_flag=True, help='Inspect the original invoice and return an evidence digest.')
+@click.option('--evidence', help='Digest returned by a fresh dry run.')
+@click.option('--yes', is_flag=True)
+def reconcile_unpaid_crypto(payment_id, dry_run, evidence, yes):
+    """Close a provider-cancelled zero-receipt web invoice without panel calls."""
+    try:
+        if not dry_run and (not yes or not evidence):
+            raise ValueError('Inspect first, then apply with --evidence <digest> --yes.')
+        _services(needs_panel=False)
+        from utils.payments import CryptoPayment
+        from utils import unpaid_crypto_recovery
+        gateway = CryptoPayment()
+        if dry_run:
+            report = unpaid_crypto_recovery.inspect(payment_id, gateway)
+        else:
+            import web_operator
+            import web_upgrade
+            with web_operator.maintenance():
+                web_upgrade._no_pending()
+                report = unpaid_crypto_recovery.apply(payment_id, evidence, gateway)
+        click.echo(json.dumps(report, indent=2))
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
+    except Exception as error:
+        raise click.ClickException('Unpaid invoice reconciliation stopped; reservation retained: '
+                                   + type(error).__name__) from error
+
+
 def _backup_recovery():
     _services()
     from utils import renewal_backup_recovery

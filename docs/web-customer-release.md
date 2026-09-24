@@ -89,7 +89,17 @@ ajib web release status
 ajib web release set admin --yes
 ajib web release set pause --yes
 ajib web release set pause --halt-worker --yes
+ajib operations reconcile-unpaid-crypto PAYMENT_ID --dry-run
+ajib operations reconcile-unpaid-crypto PAYMENT_ID --evidence EVIDENCE_DIGEST --yes
 ```
+
+The unpaid-crypto command is operator-only. It closes the original web order
+only when a fresh provider lookup proves the same merchant, invoice, order,
+currency and amount, a final `cancel` status, and an explicit zero USD payment.
+It also requires paused new customer writes and an unchanged evidence digest.
+It releases only that checkout's unconsumed benefits in the same transaction as
+the payment and operation status changes; it sends no panel request. Any
+incomplete or changed evidence leaves the original reservation under review.
 
 `release set pilot --users <comma-separated-ids> --yes` and `release set public
 --yes` enforce the gates above. `release record-check --name <check> --passed
