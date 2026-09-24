@@ -309,6 +309,29 @@ def _format_checkout_incentives(language, quote, *, include_renewal_discount=Tru
     return "\n".join(lines)
 
 
+def _customer_card_payment_message(language, plan_gb, amount, card_number, *,
+                                   exchange_rate=None, quote=None, renewal=False):
+    """Keep initial and resumed customer card instructions identical."""
+    formatted_amount = format_toman_amount(amount)
+    parts = [
+        get_message_text(language, "purchase_progress_payment"),
+        get_message_text(language, "card_checkout_summary").format(
+            plan_gb=plan_gb, final_amount=formatted_amount),
+        get_message_text(language, "card_to_card_payment").format(
+            price=formatted_amount,
+            exchange_rate=format_toman_amount(exchange_rate) if exchange_rate is not None else "",
+            card_number=card_number,
+        ),
+    ]
+    incentive_summary = _format_checkout_incentives(language, quote or {})
+    if incentive_summary:
+        parts.append(incentive_summary)
+    if renewal:
+        parts.append(get_message_text(language, "renewal_quota_reset_warning"))
+    parts.append(get_message_text(language, "purchase_delivery_note"))
+    return "\n\n".join(parts)
+
+
 def _finalize_checkout_incentives(payment_id, payment_record):
     """Finalize idempotent ledgers after fulfillment has succeeded."""
     try:
@@ -2556,21 +2579,9 @@ def _handle_customer_renewal_card_to_card(call, offer):
             _fulfill_credit_funded_renewal(call, offer, quote)
             return
         price_in_tomans = float(price) * exchange_rate
-        message = get_message_text(language, "purchase_progress_payment") + "\n\n"
-        message += get_message_text(language, "card_checkout_summary").format(
-            plan_gb=offer['plan_gb'],
-            final_amount=format_toman_amount(price_in_tomans),
-        ) + "\n\n"
-        message += get_message_text(language, "card_to_card_payment").format(
-            price=format_toman_amount(price_in_tomans),
-            exchange_rate=format_toman_amount(exchange_rate),
-            card_number=card_number
-        )
-        incentive_summary = _format_checkout_incentives(language, quote)
-        if incentive_summary:
-            message += "\n\n" + incentive_summary
-        message += "\n\n" + get_message_text(language, "renewal_quota_reset_warning")
-        message += "\n\n" + get_message_text(language, "purchase_delivery_note")
+        message = _customer_card_payment_message(
+            language, offer['plan_gb'], price_in_tomans, card_number,
+            exchange_rate=exchange_rate, quote=quote, renewal=True)
         markup = types.InlineKeyboardMarkup()
         markup.add(
             types.InlineKeyboardButton(get_button_text(language, "support"), callback_data="purchase_support"),
@@ -2824,20 +2835,9 @@ def handle_card_to_card_payment(call, plan_gb):
             return
         # Convert price to tomans using the exchange rate
         price_in_tomans = float(price) * exchange_rate
-        message = get_message_text(language, "purchase_progress_payment") + "\n\n"
-        message += get_message_text(language, "card_checkout_summary").format(
-            plan_gb=plan_gb,
-            final_amount=format_toman_amount(price_in_tomans),
-        ) + "\n\n"
-        message += get_message_text(language, "card_to_card_payment").format(
-            price=format_toman_amount(price_in_tomans),
-            exchange_rate=format_toman_amount(exchange_rate),
-            card_number=card_number
-        )
-        incentive_summary = _format_checkout_incentives(language, quote)
-        if incentive_summary:
-            message += "\n\n" + incentive_summary
-        message += "\n\n" + get_message_text(language, "purchase_delivery_note")
+        message = _customer_card_payment_message(
+            language, plan_gb, price_in_tomans, card_number,
+            exchange_rate=exchange_rate, quote=quote)
         markup = types.InlineKeyboardMarkup()
         markup.add(
             types.InlineKeyboardButton(get_button_text(language, "support"), callback_data="purchase_support"),
@@ -3083,9 +3083,13 @@ def resume_customer_payment(call):
             user_data[call.from_user.id] = {'state': 'waiting_receipt', 'payment_id': payment_id,
                                           'plan_gb': record['plan_gb'], 'price': record['price']}
             markup.add(types.InlineKeyboardButton(get_button_text(language, 'cancel'), callback_data='cancel_purchase'))
-            bot.send_message(call.message.chat.id, str(record['card_number']) + '\n' +
-                             str(record['converted_amount']) + ' ' + str(record.get('converted_currency', '')) + '\n' +
-                             get_message_text(language, 'upload_receipt'), reply_markup=markup)
+            bot.send_message(
+                call.message.chat.id,
+                _customer_card_payment_message(
+                    language, record['plan_gb'], record['converted_amount'],
+                    record['card_number'], exchange_rate=record.get('exchange_rate'),
+                    quote=record, renewal=record.get('type') == 'renewal'),
+                parse_mode="Markdown", reply_markup=markup)
         elif 'pay' in actions:
             markup.add(types.InlineKeyboardButton(get_button_text(language, 'payment_link'), url=record['payment_url']))
             bot.send_message(call.message.chat.id, get_message_text(language, 'purchase_delivery_note'), reply_markup=markup)

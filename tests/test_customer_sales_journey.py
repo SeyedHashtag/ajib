@@ -475,6 +475,42 @@ def test_card_checkout_cancel_closes_durable_reminder_state():
     assert module._CARD_CHECKOUT_FALLBACK[checkout_id]["status"] == "canceled"
 
 
+def test_resumed_card_checkout_uses_customer_instructions_and_formatted_amount():
+    bot = DummyBot()
+    module = load_purchase_plan(bot, [])
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        'customer_card_translations', Path(module.__file__).with_name('translations.py'))
+    translations = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(translations)
+    module.get_message_text = translations.get_message_text
+    module.get_user_language = lambda _user_id: 'fa'
+    record = {
+        'plan_gb': '40', 'price': 5, 'converted_amount': 299.0,
+        'converted_currency': 'Tomans', 'exchange_rate': 60,
+        'card_number': '1111-2222-3333-4444', 'status': 'waiting_receipt',
+    }
+    services = types.ModuleType('utils.web_services')
+    services.Services = lambda: types.SimpleNamespace(
+        payment=lambda _user_id, _scope, _payment_id: record)
+    payments = types.ModuleType('utils.customer_payments')
+    payments.customer_actions = lambda _payment_id, _record: ['upload_receipt', 'cancel']
+    sys.modules['utils.web_services'] = services
+    sys.modules['utils.customer_payments'] = payments
+
+    module.resume_customer_payment(make_call('customer_payment:test-order'))
+
+    (chat_id, message), kwargs = bot.sent_messages[-1]
+    assert chat_id == 555
+    assert message.startswith(translations.get_message_text('fa', 'purchase_progress_payment'))
+    assert translations.get_message_text('fa', 'card_to_card_payment').splitlines()[0] in message
+    assert '1111-2222-3333-4444' in message
+    assert '299 تومان' in message
+    assert '299.0' not in message
+    assert kwargs['parse_mode'] == 'Markdown'
+    assert module.user_data[1988]['payment_id'] == 'test-order'
+
+
 def test_card_checkout_persists_exact_incentive_quote_and_releases_on_cancel():
     bot = DummyBot()
     module = load_purchase_plan(bot, [])
