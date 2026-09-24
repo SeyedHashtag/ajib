@@ -34,7 +34,7 @@ def unpaid(storage):
         db.execute("INSERT INTO web_release_control VALUES (1,'pilot','[]',0,1,?,NULL,?)",
                    ('a' * 40, int(time.time())))
         save_payment(db, 'main', 'web_cancelled', {
-            'user_id': 123, 'status': 'uncertain', 'type': 'purchase', 'price': '10.00',
+            'user_id': 123, 'status': 'uncertain', 'price': '10.00',
             'currency': 'USD', 'payment_method': 'Crypto', 'gateway_order_id': 'web_cancelled',
             'gateway_payment_id': 'synthetic-invoice', 'gateway_merchant_id': 'synthetic-merchant',
             'fulfillment_owner': 'web', 'web_attention_reason': 'gateway_cancel'})

@@ -44,7 +44,7 @@ def _snapshot(connection, payment_id):
             or str(payment['user_id']) != str(operation['user_id'])
             or str(payment['user_id']) != str(record.get('user_id'))
             or operation['kind'] not in {'purchase', 'renewal'}
-            or record.get('type') != operation['kind']
+            or record.get('type', 'purchase') != operation['kind']
             or payment['kind'] != operation['kind']
             or payment['currency'] != record.get('currency', 'USD')
             or not _money(record.get('price'))
