@@ -106,7 +106,7 @@ def inspect(payment_id, gateway):
                 and str(result['payment_status']).lower() != 'cancel')
             or result.get('is_final') is not True
             or received != 0
-            or ('payment_amount' in result and paid_amount != 0)):
+            or (result.get('payment_amount') is not None and paid_amount != 0)):
         raise ValueError('Provider identity, terms, terminal status or zero receipt is unproven.')
     evidence = {'row_digest': row_digest, 'merchant': record['gateway_merchant_id'],
                 'invoice': record['gateway_payment_id'], 'order': payment_id,

@@ -68,6 +68,12 @@ def test_inspect_is_read_only_and_apply_closes_original_once(unpaid):
         "SELECT COUNT(*) FROM web_audit WHERE action='gateway.cancelled_unfunded'").fetchone()[0] == 1
 
 
+def test_final_cancel_with_null_crypto_amount_and_explicit_zero_usd_is_eligible(unpaid):
+    from utils import unpaid_crypto_recovery as recovery
+    report = recovery.inspect(unpaid, Gateway(payment_amount=None))
+    assert report['status'] == 'provider_cancelled_unfunded'
+
+
 @pytest.mark.parametrize('change', [
     {'status': 'paid'}, {'payment_amount_usd': '0.01'}, {'payment_amount_usd': None},
     {'is_final': False},
